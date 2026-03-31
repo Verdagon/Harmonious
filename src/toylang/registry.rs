@@ -15,7 +15,7 @@ pub enum ToyFieldType {
     I64,
     F64,
     Bool,
-    // Future: ToyStruct(String) for nested Toylang types
+    TypeParam(String),   // e.g. "A", "B"
 }
 
 impl ToyFieldType {
@@ -25,6 +25,7 @@ impl ToyFieldType {
             Self::I64  => 8,
             Self::F64  => 8,
             Self::Bool => 1,
+            Self::TypeParam(_) => panic!("size() called on TypeParam — use dynamic layout instead"),
         }
     }
 
@@ -34,6 +35,7 @@ impl ToyFieldType {
             Self::I64  => 8,
             Self::F64  => 8,
             Self::Bool => 1,
+            Self::TypeParam(_) => panic!("align() called on TypeParam — use dynamic layout instead"),
         }
     }
 }
@@ -42,6 +44,7 @@ impl ToyFieldType {
 #[derive(Clone, Debug)]
 pub struct ToyStruct {
     pub name: String,
+    pub type_params: Vec<String>,   // e.g. ["A", "B"]; empty for non-generic
     pub fields: Vec<ToyField>,
 }
 
@@ -93,6 +96,7 @@ impl ToylangRegistry {
         let mut structs = HashMap::new();
         structs.insert("Point".to_string(), ToyStruct {
             name: "Point".to_string(),
+            type_params: vec![],
             fields: vec![
                 ToyField { name: "x".to_string(), rust_type: ToyFieldType::I32 },
                 ToyField { name: "y".to_string(), rust_type: ToyFieldType::I32 },
@@ -105,18 +109,21 @@ impl ToylangRegistry {
             params: vec![],
             return_ty: Some("Vec<Point>".to_string()),
             body: None,
+            external_symbol: None,
         });
         functions.insert("vec_len".to_string(), ToyFunction {
             name: "vec_len".to_string(),
             params: vec![ToyParam { name: "v".to_string(), ty: "&Vec<Point>".to_string() }],
             return_ty: Some("usize".to_string()),
             body: None,
+            external_symbol: None,
         });
         functions.insert("get_x".to_string(), ToyFunction {
             name: "get_x".to_string(),
             params: vec![],
             return_ty: None,
             body: None,
+            external_symbol: None,
         });
 
         Self { structs, functions }
@@ -140,4 +147,7 @@ pub struct ToyFunction {
     pub params: Vec<ToyParam>,
     pub return_ty: Option<String>,
     pub body: Option<crate::toylang::ast::FnBody>,
+    /// If set, this function was compiled by the Toylang LLVM backend.
+    /// The value is the external symbol name (e.g. "__toylang_impl_make_counter").
+    pub external_symbol: Option<String>,
 }

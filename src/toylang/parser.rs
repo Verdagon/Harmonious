@@ -177,11 +177,22 @@ impl Parser {
         // consume "struct"
         self.consume();
         let name = self.expect_ident()?;
-        self.expect(Token::LBrace)?;
 
+        // Optional generic type params: <A, B>
+        let mut type_params = Vec::new();
+        if self.peek() == &Token::LAngle {
+            self.consume();
+            while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
+                type_params.push(self.expect_ident()?);
+                if self.peek() == &Token::Comma { self.consume(); }
+            }
+            self.expect(Token::RAngle)?;
+        }
+
+        self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-            fields.push(self.parse_field()?);
+            fields.push(self.parse_field(&type_params)?);
             // optional trailing comma
             if self.peek() == &Token::Comma {
                 self.consume();
@@ -189,25 +200,28 @@ impl Parser {
         }
         self.expect(Token::RBrace)?;
 
-        Ok((name.clone(), ToyStruct { name, fields }))
+        Ok((name.clone(), ToyStruct { name, type_params, fields }))
     }
 
-    fn parse_field(&mut self) -> Result<ToyField, String> {
+    fn parse_field(&mut self, type_params: &[String]) -> Result<ToyField, String> {
         let name = self.expect_ident()?;
         self.expect(Token::Colon)?;
-        let rust_type = self.parse_primitive_type()?;
+        let rust_type = self.parse_field_type(type_params)?;
         Ok(ToyField { name, rust_type })
     }
 
-    fn parse_primitive_type(&mut self) -> Result<ToyFieldType, String> {
+    fn parse_field_type(&mut self, type_params: &[String]) -> Result<ToyFieldType, String> {
         let s = self.expect_ident()?;
+        if type_params.contains(&s) {
+            return Ok(ToyFieldType::TypeParam(s));
+        }
         match s.as_str() {
-            "i32" => Ok(ToyFieldType::I32),
-            "i64" => Ok(ToyFieldType::I64),
-            "f64" => Ok(ToyFieldType::F64),
+            "i32"  => Ok(ToyFieldType::I32),
+            "i64"  => Ok(ToyFieldType::I64),
+            "f64"  => Ok(ToyFieldType::F64),
             "bool" => Ok(ToyFieldType::Bool),
-            other => Err(format!(
-                "unsupported field type '{}'; only i32, i64, f64, bool are allowed",
+            other  => Err(format!(
+                "unsupported field type '{}'; expected i32/i64/f64/bool or a type parameter",
                 other
             )),
         }
@@ -233,7 +247,7 @@ impl Parser {
         let body = self.parse_fn_body()?;
         // parse_fn_body consumes everything up to and including the closing RBrace
 
-        Ok((name.clone(), ToyFunction { name, params, return_ty, body: Some(body) }))
+        Ok((name.clone(), ToyFunction { name, params, return_ty, body: Some(body), external_symbol: None }))
     }
 
     fn parse_fn_body(&mut self) -> Result<FnBody, String> {

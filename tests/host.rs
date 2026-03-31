@@ -1,8 +1,5 @@
-#[repr(C)]
-struct Point {
-    x: i32,
-    y: i32,
-}
+mod __toylang_stubs;
+use __toylang_stubs::*;
 
 // make_vec: Toylang-defined function. Body replaced by mir_built override.
 fn make_vec() -> Vec<Point> {

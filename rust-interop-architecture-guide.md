@@ -1007,7 +1007,58 @@ Covers the Toylang guide. Goal: validate all five mechanisms work.
 
 ---
 
-### Milestone 1: Your real language's type system, non-generic types only
+### Milestone 1: External codegen — your language compiles its own function bodies
+
+The fundamental architectural shift: your language's compiler generates LLVM IR (or object
+code) for function bodies, rather than lowering everything to MIR. The `mir_built` override
+becomes a thin stub generator, not a code generator.
+
+**What to implement:**
+- Your language's LLVM backend (generates `.bc` bitcode for function bodies)
+- `mir_built` override produces call stubs with phantom function pointer casts
+  (ReifyFnPointer) that trigger monomorphization of Rust generics
+- Fat LTO (`-C lto=fat`) merges all bitcode — Rust and yours — into one LLVM module,
+  solving symbol visibility uniformly for both generic and non-generic functions
+- LLVM IR generation in the `after_analysis` callback, where `tcx.symbol_name(instance)`
+  provides mangled names for Rust generic instantiations
+- End-to-end test: a function compiled by your LLVM backend, linked and called from Rust
+
+**Codegen integration approach** (see `design-codegen-integration.md` for full details):
+
+Two mechanisms work together, no fork required:
+
+1. **Phantom struct** (ReifyFnPointer casts in MIR stubs) triggers monomorphization
+   of Rust generic instantiations (Vec::new<Point>, Vec::push<Point>, etc.).
+
+2. **`-C codegen-units=N`** (N > 1) forces rustc's partitioner to give those
+   instantiations external linkage (needed for cross-CGU references).
+
+3. **CodegenBackend wrapper** injects Toylang's `.o` into `CodegenResults` during
+   `join_codegen`, so it participates in the link step.
+
+4. **`after_analysis` hook** generates LLVM IR using `tcx.symbol_name(instance)` for
+   mangled Rust function names.
+
+See `design-codegen-integration.md` for the full investigation — Fat LTO, linker-plugin
+LTO, objcopy, ld -r, and ExtraBackendMethods were all explored but hit platform or API
+barriers. The codegen-units approach is the simplest working solution.
+
+**Key architectural decision at this milestone:**
+The `mir_built` override no longer generates real code. It generates:
+1. A call stub to the external symbol (`__yourlang_impl_foo`)
+2. Phantom `ReifyFnPointer` casts for all Rust generic instantiations the external
+   code needs (triggering monomorphization)
+The existing MIR lowering code (`lower.rs`) can be retired.
+
+**Exit criteria:**
+- A function with pure your-language logic (struct construction, field access, arithmetic)
+  compiles through your LLVM backend and runs correctly via Fat LTO
+- Monomorphization triggers work: your code calls `Vec::push` by mangled symbol name,
+  the phantom struct ensures rustc generates the instantiation, and LTO merges everything
+
+---
+
+### Milestone 2: Your real language's type system
 
 Connect your real compiler's type checker output to the query provider infrastructure.
 
@@ -1015,27 +1066,14 @@ Connect your real compiler's type checker output to the query provider infrastru
 - Your language's real parser and type checker (probably already exists)
 - Serialized registry format (your types → registry)
 - `layout_of` for your language's concrete (non-generic) types, using actual field info
-- `mir_built` for simple function bodies (no generics, no closures)
+- `layout_of` for generic types, calling `tcx.layout_of` for type args
+- Stub generation from your language's type definitions (FileLoader injection)
 - Build script / RUSTC_WRAPPER integration
 - End-to-end test: a real program in your language calling a Rust stdlib function
 
 **Key question to answer at this milestone:**
 Does your language's type representation map cleanly to the registry format? Are there
 features of your type system that don't fit the "struct with fields" model?
-
----
-
-### Milestone 2: Generic types (your language's generics over Rust types)
-
-**What to implement:**
-- `layout_of` for your language's generic types, calling `tcx.layout_of` for type args
-- `mir_built` that instantiates generic MIR bodies with concrete type args
-- `needs_drop_raw` override for your generic types
-- Test: `YourVec<i32>`, `YourOption<RustStruct>` — your generic types wrapping Rust types
-
-**Key challenge:** Generic MIR body instantiation. Decide whether you produce generic bodies
-in Phase 1 and instantiate them in Phase 2, or always generate concrete bodies in the query
-provider. The latter is simpler but may be slower for heavily-parameterized types.
 
 ---
 
@@ -1060,18 +1098,26 @@ trait dispatch works correctly. See Milestone 4.
 ### Milestone 4: Trait implementations
 
 **What to implement:**
-- Registering your language's trait implementations with rustc's trait system
-- For each `impl SomeTrait for YourType`, providing MIR bodies for all trait methods
-- Override `trait_impls_of` or similar queries to make your impls visible
+- Generated Rust `impl` blocks in the stub file (e.g., `impl Hash for YourType`)
+- Trait method stubs with `unreachable!()` bodies, intercepted by `mir_built`
+- `mir_built` generates call stubs to your language's compiled trait method implementations
+- For generic trait methods (like `Hash::hash<H: Hasher>`): the stub calls a generic
+  your-language function; your language's LLVM backend compiles the generic body
+
+Two approaches for trait methods (discussed in prior design sessions):
+- Non-generic methods (`PartialEq::eq`, `Drop::drop`): straightforward call stub
+- Generic methods (`Hash::hash<H>`): your language defines a generic function, compiled
+  by your LLVM backend. The MIR stub calls it with type parameters. Rustc's monomorphizer
+  instantiates the stub, which calls the monomorphized external implementation.
+
+For a first implementation, limit trait support to a specific list of traits your language
+explicitly implements: `Clone`, `Copy`, `Debug`, `Display`, `Hash`, `Eq`, `Ord`, `Drop`.
 
 This is the most complex milestone. Trait implementations affect:
 - Method resolution (`obj.method()` selecting the right impl)
 - Trait object dispatch (`dyn Trait`)
 - Blanket impl applicability (does `impl<T: YourTrait> for Vec<T>` apply to your types?)
 - Coherence checking (no duplicate impls)
-
-For a first implementation, limit trait support to a specific list of traits your language
-explicitly implements: `Clone`, `Copy`, `Debug`, `Display`, `Hash`, `Eq`, `Ord`, `Drop`.
 
 ---
 
@@ -1109,7 +1155,20 @@ handles arbitrary nesting without issues.
 
 ---
 
-### Milestone 7: Diagnostics and debugger support
+### Milestone 7: Codegen optimization
+
+**What to implement:**
+- Evaluate whether `codegen-units=16` causes optimization regressions in practice
+- If so, investigate proper LTO integration:
+  - Upstream rustc change to make `ModuleLlvm`/`Linker` public → enables wrapping
+    `ExtraBackendMethods` → inject bitcode before LTO runs
+  - Or wait for rust-lld Mach-O support → linker-plugin LTO works
+  - Or inject into coordinator thread during `codegen_crate`
+- See `design-codegen-integration.md` for the full analysis of what was tried and why
+
+---
+
+### Milestone 8: Diagnostics and debugger support
 
 **What to implement:**
 - Source spans for your language's items registered with rustc's `SourceMap`
@@ -1118,10 +1177,11 @@ handles arbitrary nesting without issues.
   the right file name and line number
 - Panic messages from Rust code that mention your language's types should use human-readable
   names (requires `tcx.def_path_str` to return sensible names)
+- DWARF debug info in your LLVM-generated code pointing back to your source files
 
 ---
 
-### Milestone 8: Migration to rustc_public
+### Milestone 9: Migration to rustc_public
 
 **Contingent on:** rustc_public stabilization (expected 2025–2026)
 
