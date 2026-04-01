@@ -1,0 +1,12 @@
+[package]
+name = "rustc-lang-facade"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rustc_lang_facade"
+
+[dependencies]
+
+[package.metadata.rust-analyzer]
+rustc_private = true
