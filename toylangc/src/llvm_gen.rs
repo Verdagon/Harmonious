@@ -79,18 +79,116 @@ fn expr_uses_vec(expr: &Expr) -> bool {
     }
 }
 
-/// Map a ToyFieldType to its LLVM IR type name.
+/// Map a ToyFieldType to its LLVM IR type string.
+/// For nested structs, recursively looks up the struct in the registry.
+/// For Rust generic types like Vec<T>, uses the target's pointer size.
+fn llvm_type_full(ft: &ToyFieldType, registry: &ToylangRegistry, pointer_bits: u64) -> String {
+    match ft {
+        ToyFieldType::I32 => "i32".to_string(),
+        ToyFieldType::I64 => "i64".to_string(),
+        ToyFieldType::F64 => "double".to_string(),
+        ToyFieldType::Bool => "i1".to_string(),
+        ToyFieldType::TypeParam(_) => panic!("TypeParam not supported in llvm_type_full"),
+        ToyFieldType::ToyStruct(name) => {
+            let inner = registry.structs.get(name.as_str())
+                .unwrap_or_else(|| panic!("LLVM gen: struct '{}' not found in registry", name));
+            llvm_struct_type_full(inner, registry, pointer_bits)
+        }
+        ToyFieldType::RustGeneric(type_name, _type_args) => {
+            match type_name.as_str() {
+                "Vec" => {
+                    // Vec is 3 pointers: { iN, iN, iN }
+                    let ptr_ty = format!("i{}", pointer_bits);
+                    format!("{{ {0}, {0}, {0} }}", ptr_ty)
+                }
+                other => panic!("LLVM gen: unsupported Rust generic type '{}'", other),
+            }
+        }
+    }
+}
+
+/// Backwards-compatible wrapper for simple (primitive-only) field types.
 fn llvm_type(ft: &ToyFieldType) -> &'static str {
     match ft {
         ToyFieldType::I32 => "i32",
         ToyFieldType::I64 => "i64",
         ToyFieldType::F64 => "double",
         ToyFieldType::Bool => "i1",
-        ToyFieldType::TypeParam(_) => panic!("TypeParam not supported in LLVM gen"),
+        _ => panic!("llvm_type: use llvm_type_full for complex field types"),
     }
 }
 
-/// Generate the LLVM struct type string for a ToyStruct, e.g. "{ i32 }" or "{ i32, i32 }".
+/// Generate the LLVM struct type string, handling all field types including nested structs.
+fn llvm_struct_type_full(s: &ToyStruct, registry: &ToylangRegistry, pointer_bits: u64) -> String {
+    let fields: Vec<String> = s.fields.iter()
+        .map(|f| llvm_type_full(&f.rust_type, registry, pointer_bits))
+        .collect();
+    format!("{{ {} }}", fields.join(", "))
+}
+
+// --- Public helpers for callbacks_impl to compute LLVM types ---
+
+/// Public version of llvm_struct_type_full.
+pub fn llvm_struct_type_full_pub(s: &ToyStruct, registry: &ToylangRegistry, pointer_bits: u64) -> String {
+    llvm_struct_type_full(s, registry, pointer_bits)
+}
+
+/// Convert a rustc Ty to an LLVM type string.
+pub fn rust_ty_to_llvm_str<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+    registry: &ToylangRegistry,
+    pointer_bits: u64,
+) -> String {
+    use rustc_middle::ty::TyKind;
+    match ty.kind() {
+        TyKind::Int(rustc_middle::ty::IntTy::I32) => "i32".to_string(),
+        TyKind::Int(rustc_middle::ty::IntTy::I64) => "i64".to_string(),
+        TyKind::Float(rustc_middle::ty::FloatTy::F64) => "double".to_string(),
+        TyKind::Bool => "i1".to_string(),
+        TyKind::Adt(adt_def, args) => {
+            let name = tcx.item_name(adt_def.did()).to_string();
+            if let Some(toy_struct) = registry.structs.get(name.as_str()) {
+                if toy_struct.type_params.is_empty() {
+                    llvm_struct_type_full(toy_struct, registry, pointer_bits)
+                } else {
+                    // Recursively resolve generic struct
+                    let mut subst = std::collections::HashMap::new();
+                    for (i, param_name) in toy_struct.type_params.iter().enumerate() {
+                        let inner_ty = args[i].expect_ty();
+                        subst.insert(param_name.clone(), rust_ty_to_llvm_str(tcx, inner_ty, registry, pointer_bits));
+                    }
+                    let fields: Vec<String> = toy_struct.fields.iter()
+                        .map(|f| resolve_field_type_with_subst(&f.rust_type, registry, pointer_bits, &subst))
+                        .collect();
+                    format!("{{ {} }}", fields.join(", "))
+                }
+            } else {
+                // Not a toylang struct — assume Vec-like for now
+                let ptr_ty = format!("i{}", pointer_bits);
+                format!("{{ {0}, {0}, {0} }}", ptr_ty)
+            }
+        }
+        _ => panic!("rust_ty_to_llvm_str: unsupported type {:?}", ty),
+    }
+}
+
+/// Resolve a ToyFieldType to LLVM type string with type param substitution.
+pub fn resolve_field_type_with_subst(
+    ft: &ToyFieldType,
+    registry: &ToylangRegistry,
+    pointer_bits: u64,
+    subst: &std::collections::HashMap<String, String>,
+) -> String {
+    match ft {
+        ToyFieldType::TypeParam(name) => {
+            subst.get(name).unwrap_or_else(|| panic!("TypeParam '{}' not in subst", name)).clone()
+        }
+        _ => llvm_type_full(ft, registry, pointer_bits),
+    }
+}
+
+/// Generate the LLVM struct type string for a ToyStruct with only primitive fields.
 fn llvm_struct_type(s: &ToyStruct) -> String {
     let fields: Vec<&str> = s.fields.iter().map(|f| llvm_type(&f.rust_type)).collect();
     format!("{{ {} }}", fields.join(", "))
@@ -116,6 +214,9 @@ fn resolve_field_type(ft: &ToyFieldType, type_params: &[String], type_args: &[&s
             let idx = type_params.iter().position(|p| p == name)
                 .unwrap_or_else(|| panic!("type param '{}' not found in struct", name));
             llvm_param_type(type_args[idx], pointer_bits)
+        }
+        ToyFieldType::ToyStruct(_) | ToyFieldType::RustGeneric(_, _) => {
+            todo!("resolve_field_type: complex field types in generic structs not yet supported")
         }
     }
 }
@@ -228,6 +329,89 @@ fn llvm_param_type(ty_str: &str, pointer_bits: u64) -> String {
     }
 }
 
+/// Recursively store a struct literal expression to memory at `dest_ptr`.
+/// Handles nested StructLit expressions by recursively GEP-ing into subfields.
+fn lower_store_struct_lit(
+    lines: &mut Vec<String>,
+    tmp: &mut usize,
+    expr: &Expr,
+    dest_ptr: &str,
+    struct_ty: &str,
+    toy_struct: &ToyStruct,
+    registry: &ToylangRegistry,
+    pointer_bits: u64,
+) {
+    match expr {
+        Expr::StructLit { fields, .. } => {
+            for (i, (field_name, field_expr)) in fields.iter().enumerate() {
+                let toy_field = toy_struct.fields.iter()
+                    .find(|f| f.name == *field_name)
+                    .unwrap_or_else(|| panic!("field '{}' not found", field_name));
+                let field_ty = llvm_type_full(&toy_field.rust_type, registry, pointer_bits);
+
+                let gep_name = format!("_gep{}", *tmp);
+                *tmp += 1;
+                lines.push(format!(
+                    "  %{} = getelementptr inbounds {}, ptr %{}, i32 0, i32 {}",
+                    gep_name, struct_ty, dest_ptr, i
+                ));
+
+                match field_expr {
+                    Expr::StructLit { name: inner_name, .. } => {
+                        // Nested struct literal — recurse
+                        let inner_struct = registry.structs.get(inner_name.as_str())
+                            .unwrap_or_else(|| panic!("struct '{}' not found", inner_name));
+                        lower_store_struct_lit(
+                            lines, tmp, field_expr, &gep_name, &field_ty, inner_struct,
+                            registry, pointer_bits,
+                        );
+                    }
+                    Expr::IntLit(n) => {
+                        lines.push(format!("  store {} {}, ptr %{}", field_ty, n, gep_name));
+                    }
+                    Expr::Var(name) => {
+                        lines.push(format!("  store {} %{}, ptr %{}", field_ty, name, gep_name));
+                    }
+                    _ => panic!("LLVM gen: unsupported field expression: {:?}", field_expr),
+                }
+            }
+        }
+        _ => panic!("LLVM gen: expected StructLit in lower_store_struct_lit"),
+    }
+}
+
+/// Store a simple (primitive-field) struct literal into an sret pointer via GEP+store.
+fn lower_store_struct_lit_simple(
+    lines: &mut Vec<String>,
+    expr: &Expr,
+    dest_ptr: &str,
+    struct_ty: &str,
+    toy_struct: &ToyStruct,
+) {
+    match expr {
+        Expr::StructLit { fields, .. } => {
+            for (i, (field_name, field_expr)) in fields.iter().enumerate() {
+                let toy_field = toy_struct.fields.iter()
+                    .find(|f| f.name == *field_name)
+                    .unwrap_or_else(|| panic!("field '{}' not found", field_name));
+                let ty = llvm_type(&toy_field.rust_type);
+                let val = match field_expr {
+                    Expr::IntLit(n) => format!("{}", n),
+                    Expr::Var(name) => format!("%{}", name),
+                    _ => panic!("LLVM gen: unsupported field expression"),
+                };
+                let gep_name = format!("{}_f{}", dest_ptr, i);
+                lines.push(format!(
+                    "  %{} = getelementptr inbounds {}, ptr %{}, i32 0, i32 {}",
+                    gep_name, struct_ty, dest_ptr, i
+                ));
+                lines.push(format!("  store {} {}, ptr %{}", ty, val, gep_name));
+            }
+        }
+        _ => panic!("LLVM gen: expected StructLit"),
+    }
+}
+
 /// Lower a field value expression to an LLVM IR value string (e.g. "i32 42" or "i32 %x").
 fn lower_field_val(field_expr: &Expr, llvm_ty: &str) -> String {
     match field_expr {
@@ -315,12 +499,45 @@ fn field_align(ft: &ToyFieldType, type_params: &[String], type_args: &[&str]) ->
                 _ => panic!("field_align: unsupported resolved type '{}'", resolved),
             }
         }
+        ToyFieldType::ToyStruct(_) | ToyFieldType::RustGeneric(_, _) => {
+            todo!("field_align: complex field types in generic struct not yet supported")
+        }
     }
 }
 
 /// Compute the alignment of a non-generic ToyStruct.
 fn struct_align(toy_struct: &ToyStruct) -> u64 {
     struct_align_with_args(toy_struct, &[])
+}
+
+/// Compute alignment of a field type, supporting nested structs and Rust generics.
+fn field_align_full(ft: &ToyFieldType, registry: &ToylangRegistry, pointer_bits: u64) -> u64 {
+    match ft {
+        ToyFieldType::I32 => 4,
+        ToyFieldType::I64 => 8,
+        ToyFieldType::F64 => 8,
+        ToyFieldType::Bool => 1,
+        ToyFieldType::TypeParam(_) => panic!("field_align_full: TypeParam requires substitution"),
+        ToyFieldType::ToyStruct(name) => {
+            let inner = registry.structs.get(name.as_str())
+                .unwrap_or_else(|| panic!("field_align_full: struct '{}' not found", name));
+            struct_align_full(inner, registry, pointer_bits)
+        }
+        ToyFieldType::RustGeneric(type_name, _) => {
+            match type_name.as_str() {
+                "Vec" => pointer_bits as u64 / 8, // pointer-aligned
+                other => panic!("field_align_full: unsupported Rust generic '{}'", other),
+            }
+        }
+    }
+}
+
+/// Compute alignment of a ToyStruct, supporting all field types.
+fn struct_align_full(toy_struct: &ToyStruct, registry: &ToylangRegistry, pointer_bits: u64) -> u64 {
+    toy_struct.fields.iter()
+        .map(|f| field_align_full(&f.rust_type, registry, pointer_bits))
+        .max()
+        .unwrap_or(1)
 }
 
 /// Compute the alignment of a ToyStruct, resolving type params with the given args.
@@ -334,7 +551,11 @@ fn struct_align_with_args(toy_struct: &ToyStruct, type_args: &[&str]) -> u64 {
 /// Generate LLVM IR using tcx for symbol name resolution.
 /// Returns (llvm_ir_text, rust_symbols_to_globalize).
 /// Called from after_analysis where we have full access to the type context.
-pub fn generate_with_tcx<'tcx>(tcx: TyCtxt<'tcx>, registry: &ToylangRegistry) -> (String, Vec<String>) {
+pub fn generate_with_tcx<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    registry: &ToylangRegistry,
+    discovered_accessors: &[crate::toylang::callbacks_impl::DiscoveredAccessor],
+) -> (String, Vec<String>) {
     let mut functions_ir = Vec::new();
     let mut declares = Vec::new();
     let mut rust_symbols = Vec::new();
@@ -356,7 +577,13 @@ pub fn generate_with_tcx<'tcx>(tcx: TyCtxt<'tcx>, registry: &ToylangRegistry) ->
 
         let uses_vec = body_uses_vec(body);
 
-        if uses_vec && ret_ty_name.starts_with("Vec<") {
+        if uses_vec && registry.structs.contains_key(ret_ty_name.as_str())
+            && registry.structs[ret_ty_name.as_str()].fields.iter().any(|f|
+                matches!(&f.rust_type, ToyFieldType::RustGeneric(_, _)))
+        {
+            // TODO: struct with Vec fields — will be handled by inkwell rewrite
+            todo!("LLVM gen: struct-with-Vec codegen not yet implemented (inkwell rewrite pending)");
+        } else if uses_vec && ret_ty_name.starts_with("Vec<") {
             let func_ir = generate_vec_function(
                 tcx, registry, name, symbol, ret_ty_name, func, body,
                 &mut declares, &mut rust_symbols,
@@ -371,9 +598,9 @@ pub fn generate_with_tcx<'tcx>(tcx: TyCtxt<'tcx>, registry: &ToylangRegistry) ->
             );
             functions_ir.push(func_ir);
         } else if let Some(toy_struct) = registry.structs.get(ret_ty_name.as_str()) {
-            // Simple struct-returning function — query ABI for coerced return type
-            let struct_ty = llvm_struct_type(toy_struct);
-            let align = struct_align(toy_struct);
+            // Struct-returning function — query ABI for coerced return type
+            let struct_ty = llvm_struct_type_full(toy_struct, registry, pointer_bits);
+            let align = struct_align_full(toy_struct, registry, pointer_bits);
             let ret_expr = body.ret.as_ref()
                 .unwrap_or_else(|| panic!("LLVM gen: function '{}' has no return expression", name));
 
@@ -384,32 +611,90 @@ pub fn generate_with_tcx<'tcx>(tcx: TyCtxt<'tcx>, registry: &ToylangRegistry) ->
             let mut params: Vec<String> = func.params.iter()
                 .map(|p| format!("{} %{}", llvm_param_type(&p.ty, pointer_bits), p.name))
                 .collect();
-            params.push("ptr %_deps".to_string());
+            // _deps removed — per_instance_mir handles deps, callers use Rust ABI
             let params_str = params.join(", ");
 
-            let (llvm_ret_ty, ret_inst) = match coerced {
-                rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) if coerced_ty == &struct_ty => {
-                    // Natural type matches coerced type — use direct return
-                    (struct_ty.clone(), lower_ret_expr(ret_expr, &struct_ty, toy_struct))
-                }
-                rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) => {
-                    // Coerced to a different type — use alloca+load pattern
-                    let ts = toy_struct;
-                    let resolver = move |field_name: &str| -> String {
-                        let f = ts.fields.iter().find(|f| f.name == field_name).unwrap();
-                        llvm_type(&f.rust_type).to_string()
+            // Check if struct has complex (non-primitive) fields
+            let has_complex_fields = toy_struct.fields.iter().any(|f| {
+                matches!(&f.rust_type, ToyFieldType::ToyStruct(_) | ToyFieldType::RustGeneric(_, _))
+            });
+
+            // Handle return ABI: Direct (in registers) vs Indirect (sret pointer)
+            match coerced {
+                rustc_lang_facade::abi_helpers::CoercedReturn::Indirect => {
+                    // Indirect return: caller provides sret pointer as first arg.
+                    // Function stores result into it and returns void.
+                    let sret_param = format!("ptr sret({}) align {} %retval", struct_ty, align);
+                    let sret_params = if params_str.is_empty() {
+                        sret_param
+                    } else {
+                        format!("{}, {}", sret_param, params_str)
                     };
-                    (coerced_ty.clone(), lower_ret_coerced(ret_expr, &struct_ty, coerced_ty, align, &resolver))
+                    let mut lines = Vec::new();
+                    let mut tmp = 0usize;
+                    if has_complex_fields {
+                        lower_store_struct_lit(
+                            &mut lines, &mut tmp, ret_expr, "retval", &struct_ty, toy_struct,
+                            registry, pointer_bits,
+                        );
+                    } else {
+                        // Store fields directly into sret pointer
+                        lower_store_struct_lit_simple(
+                            &mut lines, ret_expr, "retval", &struct_ty, toy_struct,
+                        );
+                    }
+                    lines.push("  ret void".to_string());
+                    let ret_inst = lines.join("\n");
+                    functions_ir.push(format!(
+                        "define void @{}({}) {{\n{}\n}}",
+                        symbol, sret_params, ret_inst
+                    ));
                 }
                 _ => {
-                    (struct_ty.clone(), lower_ret_expr(ret_expr, &struct_ty, toy_struct))
+                    // Direct return (possibly coerced)
+                    if has_complex_fields {
+                        let ret_ty = match coerced {
+                            rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref ct) => ct.clone(),
+                            _ => struct_ty.clone(),
+                        };
+                        let mut lines = Vec::new();
+                        let mut tmp = 0usize;
+                        lines.push(format!("  %retval = alloca {}, align {}", struct_ty, align));
+                        lower_store_struct_lit(
+                            &mut lines, &mut tmp, ret_expr, "retval", &struct_ty, toy_struct,
+                            registry, pointer_bits,
+                        );
+                        lines.push(format!("  %result = load {}, ptr %retval, align {}", ret_ty, align));
+                        lines.push(format!("  ret {} %result", ret_ty));
+                        let ret_inst = lines.join("\n");
+                        functions_ir.push(format!(
+                            "define {} @{}({}) {{\n{}\n}}",
+                            ret_ty, symbol, params_str, ret_inst
+                        ));
+                    } else {
+                        let (llvm_ret_ty, ret_inst) = match coerced {
+                            rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) if coerced_ty == &struct_ty => {
+                                (struct_ty.clone(), lower_ret_expr(ret_expr, &struct_ty, toy_struct))
+                            }
+                            rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) => {
+                                let ts = toy_struct;
+                                let resolver = move |field_name: &str| -> String {
+                                    let f = ts.fields.iter().find(|f| f.name == field_name).unwrap();
+                                    llvm_type(&f.rust_type).to_string()
+                                };
+                                (coerced_ty.clone(), lower_ret_coerced(ret_expr, &struct_ty, coerced_ty, align, &resolver))
+                            }
+                            _ => {
+                                (struct_ty.clone(), lower_ret_expr(ret_expr, &struct_ty, toy_struct))
+                            }
+                        };
+                        functions_ir.push(format!(
+                            "define {} @{}({}) {{\n{}\n}}",
+                            llvm_ret_ty, symbol, params_str, ret_inst
+                        ));
+                    }
                 }
-            };
-
-            functions_ir.push(format!(
-                "define {} @{}({}) {{\n{}\n}}",
-                llvm_ret_ty, symbol, params_str, ret_inst
-            ));
+            }
         } else if let Some((base_name, type_args)) = parse_generic_type(ret_ty_name) {
             // Generic struct return: Pair<i32, i32> etc. — query ABI for coerced type
             if let Some(toy_struct) = registry.structs.get(base_name) {
@@ -425,35 +710,75 @@ pub fn generate_with_tcx<'tcx>(tcx: TyCtxt<'tcx>, registry: &ToylangRegistry) ->
                 let mut params: Vec<String> = func.params.iter()
                     .map(|p| format!("{} %{}", llvm_param_type(&p.ty, pointer_bits), p.name))
                     .collect();
-                params.push("ptr %_deps".to_string());
+                // _deps removed — per_instance_mir handles deps, callers use Rust ABI
                 let params_str = params.join(", ");
 
-                let (llvm_ret_ty, ret_inst) = match coerced {
-                    rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) if coerced_ty == &struct_ty => {
-                        let inst = lower_ret_expr_generic(ret_expr, &struct_ty, toy_struct, &type_args, pointer_bits);
-                        (struct_ty.clone(), inst)
-                    }
-                    rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) => {
-                        let ts = toy_struct;
-                        let ta: Vec<String> = type_args.iter().map(|s| s.to_string()).collect();
-                        let pb = pointer_bits;
-                        let resolver = move |field_name: &str| -> String {
-                            let f = ts.fields.iter().find(|f| f.name == field_name).unwrap();
-                            let ta_refs: Vec<&str> = ta.iter().map(|s| s.as_str()).collect();
-                            resolve_field_type(&f.rust_type, &ts.type_params, &ta_refs, pb)
+                match coerced {
+                    rustc_lang_facade::abi_helpers::CoercedReturn::Indirect => {
+                        // Indirect return: sret pointer
+                        let sret_param = format!("ptr sret({}) align {} %retval", struct_ty, align);
+                        let sret_params = if params_str.is_empty() {
+                            sret_param
+                        } else {
+                            format!("{}, {}", sret_param, params_str)
                         };
-                        (coerced_ty.clone(), lower_ret_coerced(ret_expr, &struct_ty, coerced_ty, align, &resolver))
+                        let mut lines = Vec::new();
+                        // Store fields into sret pointer using GEP
+                        if let Expr::StructLit { fields, .. } = ret_expr {
+                            for (i, (field_name, field_expr)) in fields.iter().enumerate() {
+                                let toy_field = toy_struct.fields.iter()
+                                    .find(|f| f.name == *field_name)
+                                    .unwrap_or_else(|| panic!("field '{}' not found", field_name));
+                                let ty = resolve_field_type(&toy_field.rust_type, &toy_struct.type_params, &type_args, pointer_bits);
+                                let val = match field_expr {
+                                    Expr::IntLit(n) => format!("{}", n),
+                                    Expr::Var(name) => format!("%{}", name),
+                                    _ => panic!("LLVM gen: unsupported field expr"),
+                                };
+                                lines.push(format!(
+                                    "  %retval_f{} = getelementptr inbounds {}, ptr %retval, i32 0, i32 {}",
+                                    i, struct_ty, i
+                                ));
+                                lines.push(format!("  store {} {}, ptr %retval_f{}", ty, val, i));
+                            }
+                        } else {
+                            panic!("LLVM gen: only StructLit return supported for sret");
+                        }
+                        lines.push("  ret void".to_string());
+                        functions_ir.push(format!(
+                            "define void @{}({}) {{\n{}\n}}",
+                            symbol, sret_params, lines.join("\n")
+                        ));
                     }
                     _ => {
-                        let inst = lower_ret_expr_generic(ret_expr, &struct_ty, toy_struct, &type_args, pointer_bits);
-                        (struct_ty.clone(), inst)
+                        // Direct return (possibly coerced)
+                        let (llvm_ret_ty, ret_inst) = match coerced {
+                            rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) if coerced_ty == &struct_ty => {
+                                let inst = lower_ret_expr_generic(ret_expr, &struct_ty, toy_struct, &type_args, pointer_bits);
+                                (struct_ty.clone(), inst)
+                            }
+                            rustc_lang_facade::abi_helpers::CoercedReturn::Direct(ref coerced_ty) => {
+                                let ts = toy_struct;
+                                let ta: Vec<String> = type_args.iter().map(|s| s.to_string()).collect();
+                                let pb = pointer_bits;
+                                let resolver = move |field_name: &str| -> String {
+                                    let f = ts.fields.iter().find(|f| f.name == field_name).unwrap();
+                                    let ta_refs: Vec<&str> = ta.iter().map(|s| s.as_str()).collect();
+                                    resolve_field_type(&f.rust_type, &ts.type_params, &ta_refs, pb)
+                                };
+                                (coerced_ty.clone(), lower_ret_coerced(ret_expr, &struct_ty, coerced_ty, align, &resolver))
+                            }
+                            _ => {
+                                let inst = lower_ret_expr_generic(ret_expr, &struct_ty, toy_struct, &type_args, pointer_bits);
+                                (struct_ty.clone(), inst)
+                            }
+                        };
+                        functions_ir.push(format!(
+                            "define {} @{}({}) {{\n{}\n}}",
+                            llvm_ret_ty, symbol, params_str, ret_inst
+                        ));
                     }
-                };
-
-                functions_ir.push(format!(
-                    "define {} @{}({}) {{\n{}\n}}",
-                    llvm_ret_ty, symbol, params_str, ret_inst
-                ));
+                }
             } else {
                 panic!("LLVM gen: base struct '{}' not found in registry", base_name);
             }
@@ -466,6 +791,36 @@ pub fn generate_with_tcx<'tcx>(tcx: TyCtxt<'tcx>, registry: &ToylangRegistry) ->
             functions_ir.push(func_ir);
         } else {
             panic!("LLVM gen: unsupported return type '{}' for function '{}'", ret_ty_name, name);
+        }
+    }
+
+    // Generate field accessor functions.
+    // Non-generic: from registry (known at compile time).
+    // Generic: from discovered_accessors (found during monomorphization via per_instance_mir).
+    let mut accessor_syms = std::collections::HashSet::new();
+
+    for (name, toy_struct) in &registry.structs {
+        if toy_struct.type_params.is_empty() {
+            let struct_ty = llvm_struct_type_full(toy_struct, registry, pointer_bits);
+            for (i, field) in toy_struct.fields.iter().enumerate() {
+                let sym = format!("__toylang_accessor_{}_{}", name, field.name);
+                if accessor_syms.insert(sym.clone()) {
+                    functions_ir.push(format!(
+                        "define ptr @{}(ptr %self) {{\n  %ptr = getelementptr inbounds {}, ptr %self, i32 0, i32 {}\n  ret ptr %ptr\n}}",
+                        sym, struct_ty, i
+                    ));
+                }
+            }
+        }
+    }
+
+    // Generic accessor instances discovered during monomorphization
+    for acc in discovered_accessors {
+        if accessor_syms.insert(acc.extern_symbol.clone()) {
+            functions_ir.push(format!(
+                "define ptr @{}(ptr %self) {{\n  %ptr = getelementptr inbounds {}, ptr %self, i32 0, i32 {}\n  ret ptr %ptr\n}}",
+                acc.extern_symbol, acc.llvm_struct_ty, acc.field_index
+            ));
         }
     }
 
@@ -544,7 +899,7 @@ fn generate_vec_function<'tcx>(
 
     let mut lines = Vec::new();
     lines.push(format!(
-        "define void @{}(ptr sret({}) align {} %retval, ptr %_deps) {{",
+        "define void @{}(ptr sret({}) align {} %retval) {{",
         symbol, vec_llvm_ty, pointer_align
     ));
 
@@ -707,7 +1062,7 @@ fn generate_usize_function<'tcx>(
     declares.push(format!("declare {} @{}(ptr)", usize_ty, len_sym));
 
     let mut params = vec![format!("ptr %{}", param.name)];
-    params.push("ptr %_deps".to_string());
+    // _deps removed — per_instance_mir handles deps, callers use Rust ABI
     let params_str = params.join(", ");
 
     // The body should be v.len() → just call len

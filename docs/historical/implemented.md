@@ -2,6 +2,19 @@
 
 This is what's already implemented.
 
+> **Note (Milestone 2 progress):** As of the latest session, 9 integration tests pass
+> (up from 5), including toylang-struct-containing-toylang-struct (T(T)), mixed-size
+> generics, and generic-wrapping-toylang layout. Key architectural changes:
+> - **Opaque stubs:** Structs are now opaque (`pub struct Counter(())`) with generated
+>   accessor methods (`c.value()` instead of `c.value`). Layout reports 0 fields.
+> - **Module-qualified matching:** `layout_of` and `drop_glue` check `is_from_lang_stubs`
+>   (DefId parent module) to prevent name collisions with user-defined types.
+> - **Extended parser:** `ToyFieldType` has `ToyStruct(String)` and `RustGeneric(String, Vec<ToyFieldType>)`
+>   variants. Parser handles both.
+> - **Nested struct LLVM codegen:** Recursive `lower_store_struct_lit` handles nested StructLit
+>   expressions via alloca + GEP chains.
+> - See `docs/handoff-milestone-2-struct-nesting.md` for full details and next steps.
+
 > **Note (workspace split):** The project is now a Cargo workspace with two crates:
 > - `rustc-lang-facade/` — reusable library providing the `LangCallbacks` trait, query overrides,
 >   MIR helpers, ABI helpers, codegen wrapper, file loader, and `run_compiler<C>()` entry point.

@@ -1,5 +1,23 @@
-#![allow(unused)]
+//! MIR body construction utilities.
+//!
+//! These functions build hand-written MIR `Body` values for the query overrides.
+//! Constructing MIR is delicate — rustc's MIR validator checks structural
+//! correctness even with borrow checking disabled. Key rules:
+//!
+//! - `Local(0)` must be the return place with the exact type from `tcx.fn_sig`
+//! - Every non-argument local needs `StorageLive` before first use, `StorageDead` after
+//!   (except: the current code omits these for simplicity and it works on this nightly.
+//!    If a future nightly's validator enforces this, they'll need to be added.)
+//! - Every basic block must have a `terminator: Some(...)` — `None` panics in codegen
+//! - Use `SourceInfo::outermost(span)` for spans, not `DUMMY_SP` (can trigger ICEs)
+//! - mir_shims bodies MUST call `set_required_consts` + `set_mentioned_items` (empty vecs)
+//!   because `mir_promoted` doesn't set them for shims. mir_built bodies must NOT call
+//!   these — `mir_promoted` sets them and would panic on "already set".
+//!
+//! See `docs/historical/design-monomorphization-triggers.md` for why we use
+//! ReifyFnPointer casts (Approach A) instead of mentioned_items (Approach B).
 
+#![allow(unused)]
 
 use rustc_abi::VariantIdx;
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -16,77 +34,6 @@ use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::ty::{self, GenericArg, Ty, TyCtxt};
 use rustc_span::source_map::Spanned;
 use rustc_span::DUMMY_SP;
-
-/// Build a trivial MIR body for a zero-argument function that returns a
-/// constant i32. Used to verify the mir_built override fires correctly.
-///
-/// MIR structure:
-///   bb0:
-///     _0 = const VALUE_i32;
-///     return;
-pub fn build_const_i32_body<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-    value: i32,
-) -> Body<'tcx> {
-    let span = tcx.def_span(def_id);
-    let source_info = SourceInfo::outermost(span);
-
-    // Local(0) = return place of type i32
-    let mut local_decls = IndexVec::new();
-    local_decls.push(LocalDecl::new(tcx.types.i32, span));
-
-    // Assign constant to return place
-    let assign_stmt = Statement {
-        source_info,
-        kind: StatementKind::Assign(Box::new((
-            Place::from(Local::from_u32(0)), // RETURN_PLACE
-            Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                span,
-                user_ty: None,
-                const_: Const::Val(
-                    ConstValue::Scalar(Scalar::from_i32(value)),
-                    tcx.types.i32,
-                ),
-            }))),
-        ))),
-    };
-
-    let terminator = Terminator {
-        source_info,
-        kind: TerminatorKind::Return,
-    };
-
-    let mut basic_blocks = IndexVec::new();
-    basic_blocks.push(BasicBlockData::new(Some(terminator), false));
-    // Append statement to block (BasicBlockData::new sets statements: vec![])
-    basic_blocks[START_BLOCK].statements.push(assign_stmt);
-
-    // One source scope is required (OUTERMOST_SOURCE_SCOPE = index 0)
-    let source_scopes = IndexVec::from_elem_n(
-        SourceScopeData {
-            span,
-            parent_scope: None,
-            inlined: None,
-            inlined_parent_scope: None,
-            local_data: ClearCrossCrate::Clear,
-        },
-        1,
-    );
-
-    Body::new(
-        MirSource::item(def_id.to_def_id()),
-        basic_blocks,
-        source_scopes,
-        local_decls,
-        IndexVec::new(), // user_type_annotations
-        0,               // arg_count (get_x takes Point arg but we ignore it for PoC)
-        vec![],          // var_debug_info
-        span,
-        None,            // coroutine
-        None,            // tainted_by_errors
-    )
-}
 
 /// Build a MIR body for drop_in_place::<T> that calls __toylang_drop_T(ptr).
 ///
@@ -195,20 +142,38 @@ fn find_extern_fn(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
 }
 
 /// Build a MIR body that calls an extern "C" function and returns the result.
-/// The extern function always has one extra `*const ()` parameter at the end.
 ///
-/// If `rust_deps` is non-empty, emits ReifyFnPointer casts that trigger
-/// monomorphization of the specified Rust generic functions. All casts write
-/// to a single `deps_local` whose final value is passed as the extra arg.
-/// If `rust_deps` is empty, passes a null `*const ()`.
+/// This is the primary MIR construction function — used by the `mir_built` override
+/// for every consumer-defined function.
 ///
-/// The Toylang LLVM implementation ignores the extra arg at runtime.
+/// **Phantom deps mechanism:** If `rust_deps` is non-empty, emits `ReifyFnPointer`
+/// casts that force rustc's monomorphizer to stamp out those Rust generic
+/// instantiations (e.g. `Vec::push<Point>`). Each cast takes a zero-sized FnDef
+/// constant, coerces it to a function pointer, then transmutes to `*const ()`.
+/// The final `*const ()` is passed as an extra argument to the extern function.
+/// The consumer's compiled function ignores this argument at runtime.
+///
+/// If `rust_deps` is empty, passes a null `*const ()` instead.
+///
+/// **Why ReifyFnPointer?** The monomorphization collector scans reachable MIR for
+/// function type references. A `Const::zero_sized(FnDef(...))` in a `ReifyFnPointer`
+/// cast is treated as a "used" item — guaranteed to be codegen'd. This is stronger
+/// than `mentioned_items` which only produces "mentioned" items with no codegen
+/// guarantee. See `docs/historical/design-monomorphization-triggers.md`.
+///
+/// **Future: type deps.** Currently only handles function deps. When we need to
+/// monomorphize Rust types discovered inside consumer structs (e.g. `Vec<RustWing>`
+/// as a field), we'll need to emit phantom type locals here too. See
+/// `docs/historical/struct-opacity-and-type-deps.md`.
 pub fn build_extern_call_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     extern_symbol: &str,
-    rust_deps: &[(DefId, ty::GenericArgsRef<'tcx>)],
+    _rust_deps: &[(DefId, ty::GenericArgsRef<'tcx>)],
 ) -> Body<'tcx> {
+    // With per_instance_mir handling dependency discovery and codegen skip,
+    // this body is only used for type checking. It calls the extern function
+    // with the real args (no _deps phantom parameter).
     let span = tcx.def_span(def_id);
     let source_info = SourceInfo::outermost(span);
 
@@ -216,80 +181,10 @@ pub fn build_extern_call_body<'tcx>(
     let ret_ty = fn_sig.output();
     let real_arg_count = fn_sig.inputs().len();
 
-    // Locals: _0=return, _1.._N=real args
     let mut local_decls = IndexVec::new();
     local_decls.push(LocalDecl::new(ret_ty, span)); // _0
     for &input_ty in fn_sig.inputs() {
         local_decls.push(LocalDecl::new(input_ty, span));
-    }
-
-    let raw_ptr_ty = Ty::new_imm_ptr(tcx, tcx.types.unit); // *const ()
-
-    // Allocate a single local for the phantom deps argument
-    let deps_local = local_decls.push(LocalDecl::new(raw_ptr_ty, span));
-
-    let mut stmts = Vec::new();
-
-    // For each Rust dep: ReifyFnPointer into a unique fn_ptr_local,
-    // then Transmute into the shared deps_local (overwriting each time).
-    // All fn_ptr_locals stay live because their Transmutes read them.
-    // The monomorphizer sees the Const::zero_sized(fn_def_ty) in each cast.
-    for &(dep_def_id, dep_args) in rust_deps {
-        let fn_def_ty = Ty::new_fn_def(tcx, dep_def_id, dep_args);
-        let fn_sig_of_dep = tcx.fn_sig(dep_def_id).instantiate(tcx, dep_args);
-        let fn_ptr_ty = Ty::new_fn_ptr(tcx, fn_sig_of_dep);
-        let fn_ptr_local = local_decls.push(LocalDecl::new(fn_ptr_ty, span));
-
-        // _N = const <FnDef> as fn_ptr_ty (ReifyFnPointer)
-        stmts.push(Statement {
-            source_info,
-            kind: StatementKind::Assign(Box::new((
-                Place::from(fn_ptr_local),
-                Rvalue::Cast(
-                    CastKind::PointerCoercion(
-                        PointerCoercion::ReifyFnPointer,
-                        CoercionSource::Implicit,
-                    ),
-                    Operand::Constant(Box::new(ConstOperand {
-                        span,
-                        user_ty: None,
-                        const_: Const::zero_sized(fn_def_ty),
-                    })),
-                    fn_ptr_ty,
-                ),
-            ))),
-        });
-
-        // _deps = move _N as *const () (Transmute) — overwrites each time
-        stmts.push(Statement {
-            source_info,
-            kind: StatementKind::Assign(Box::new((
-                Place::from(deps_local),
-                Rvalue::Cast(
-                    CastKind::Transmute,
-                    Operand::Move(Place::from(fn_ptr_local)),
-                    raw_ptr_ty,
-                ),
-            ))),
-        });
-    }
-
-    // If no deps, initialize deps_local to null
-    if rust_deps.is_empty() {
-        stmts.push(Statement {
-            source_info,
-            kind: StatementKind::Assign(Box::new((
-                Place::from(deps_local),
-                Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                    span,
-                    user_ty: None,
-                    const_: Const::Val(
-                        ConstValue::Scalar(Scalar::from_target_usize(0, &tcx.data_layout)),
-                        raw_ptr_ty,
-                    ),
-                }))),
-            ))),
-        });
     }
 
     // Find the extern function
@@ -303,22 +198,16 @@ pub fn build_extern_call_body<'tcx>(
         const_: Const::zero_sized(extern_fn_ty),
     }));
 
-    // Build args: real args first, then the single phantom deps arg
-    let mut args: Vec<Spanned<Operand<'tcx>>> = Vec::new();
-    for i in 0..real_arg_count {
-        args.push(Spanned {
+    // Build args: just the real args
+    let args: Vec<Spanned<Operand<'tcx>>> = (0..real_arg_count)
+        .map(|i| Spanned {
             node: Operand::Move(Place::from(Local::from_u32((i + 1) as u32))),
             span,
-        });
-    }
-    args.push(Spanned {
-        node: Operand::Move(Place::from(deps_local)),
-        span,
-    });
+        })
+        .collect();
 
-    // bb0: phantom stmts + call
     let bb0 = BasicBlockData {
-        statements: stmts,
+        statements: vec![],
         terminator: Some(Terminator {
             source_info,
             kind: TerminatorKind::Call {

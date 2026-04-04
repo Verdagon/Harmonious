@@ -74,12 +74,18 @@ impl LangCallbacks for ToylangCallbacks {
                 ToyFieldType::TypeParam(name) => {
                     *subst.get(name.as_str()).expect("type param not in subst")
                 }
+                ToyFieldType::ToyStruct(struct_name) => {
+                    crate::oracle::find_local_struct_ty(tcx, struct_name)
+                        .unwrap_or_else(|| panic!("[toylang] monomorphize_type: struct '{}' not found", struct_name))
+                }
+                ToyFieldType::RustGeneric(type_name, type_args) => {
+                    resolve_rust_generic_ty(tcx, type_name, type_args, &subst)
+                }
             }
         }).collect();
 
         MonomorphizeTypeResult {
             field_types,
-            rust_deps: vec![],
         }
     }
 
@@ -88,7 +94,20 @@ impl LangCallbacks for ToylangCallbacks {
         name: &str,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
+        instance: ty::Instance<'tcx>,
     ) -> MonomorphizeFnResult<'tcx> {
+        // Accessor methods come in as "StructName.field_name"
+        if let Some((struct_name, field_name)) = name.split_once('.') {
+            // Use Instance to build a unique symbol per concrete instantiation
+            let sym = rustc_lang_facade::queries::per_instance::accessor_symbol_for_instance(
+                tcx, instance, struct_name, field_name,
+            );
+            return MonomorphizeFnResult {
+                extern_symbol: sym,
+                rust_deps: vec![],
+            };
+        }
+
         let toy_fn = self.registry.functions.get(name)
             .unwrap_or_else(|| panic!("[toylang] monomorphize_fn: function '{}' not in registry", name));
 
@@ -97,7 +116,7 @@ impl LangCallbacks for ToylangCallbacks {
 
         // Collect Rust generic dependencies by scanning the AST body.
         let rust_deps = if let Some(ref fn_body) = toy_fn.body {
-            collect_rust_deps(tcx, def_id, fn_body)
+            collect_rust_deps(tcx, def_id, fn_body, &self.registry)
         } else {
             vec![]
         };
@@ -111,7 +130,13 @@ impl LangCallbacks for ToylangCallbacks {
     fn generate_and_compile<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)> {
         let (ref ll_path, ref obj_path) = self.llvm_paths.as_ref()?;
 
-        let (llvm_ir, rust_symbols) = crate::llvm_gen::generate_with_tcx(tcx, &self.registry);
+        // Discover all consumer accessor instances from MonoItems.
+        // These need LLVM accessor functions generated for them.
+        let accessor_instances = discover_accessor_instances(tcx, self);
+
+        let (llvm_ir, rust_symbols) = crate::llvm_gen::generate_with_tcx(
+            tcx, &self.registry, &accessor_instances,
+        );
         std::fs::write(ll_path, &llvm_ir)
             .expect("toylang: failed to write .ll file");
         eprintln!("[toylang] compiling LLVM IR: {} → {}", ll_path.display(), obj_path.display());
@@ -119,6 +144,115 @@ impl LangCallbacks for ToylangCallbacks {
 
         Some((obj_path.clone(), rust_symbols))
     }
+}
+
+/// An accessor instance discovered from MonoItems, ready for LLVM codegen.
+pub struct DiscoveredAccessor {
+    pub extern_symbol: String,
+    pub struct_name: String,
+    pub field_index: usize,
+    /// LLVM struct type for the concrete instantiation, e.g. "{ i32, i32 }"
+    pub llvm_struct_ty: String,
+}
+
+/// Walk all MonoItems to find consumer accessor instances and compute their
+/// LLVM types using tcx. Called from generate_and_compile (after monomorphization).
+fn discover_accessor_instances<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callbacks: &ToylangCallbacks,
+) -> Vec<DiscoveredAccessor> {
+    let registry = &callbacks.registry;
+    let mut accessors = Vec::new();
+    let pointer_bits = tcx.data_layout.pointer_size.bits();
+
+    let (_, cgus) = tcx.collect_and_partition_mono_items(());
+    for cgu in cgus.iter() {
+        for (&mono_item, _) in cgu.items() {
+        if let rustc_middle::mir::mono::MonoItem::Fn(instance) = mono_item {
+            let def_id = instance.def_id();
+            if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+                continue;
+            }
+            // Check if it's an accessor method on a consumer type
+            if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
+                let impl_def_id = assoc_item.container_id(tcx);
+                let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
+                if let TyKind::Adt(adt_def, _) = self_ty.kind() {
+                    let struct_name = tcx.item_name(adt_def.did()).to_string();
+                    if let Some(toy_struct) = registry.structs.get(&struct_name) {
+                        let field_name = tcx.item_name(def_id).to_string();
+                        let field_index = toy_struct.fields.iter()
+                            .position(|f| f.name == field_name);
+                        if let Some(field_index) = field_index {
+                            // Get extern symbol through monomorphize_fn (single source of truth)
+                            let callback_name = format!("{}.{}", struct_name, field_name);
+                            if let Some(local_def_id) = def_id.as_local() {
+                                let result = callbacks.monomorphize_fn(
+                                    &callback_name, tcx, local_def_id, instance,
+                                );
+                                let extern_symbol = result.extern_symbol;
+
+                                // Compute LLVM struct type for this concrete instantiation
+                                let llvm_struct_ty = compute_llvm_struct_ty(
+                                    tcx, instance, toy_struct, registry, pointer_bits,
+                                );
+
+                                accessors.push(DiscoveredAccessor {
+                                    extern_symbol,
+                                    struct_name,
+                                    field_index,
+                                    llvm_struct_ty,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        }
+    }
+    accessors
+}
+
+/// Compute the LLVM struct type for an accessor's concrete self type.
+fn compute_llvm_struct_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    toy_struct: &crate::toylang::registry::ToyStruct,
+    registry: &ToylangRegistry,
+    pointer_bits: u64,
+) -> String {
+    // Get the concrete self type from the instance's generic args
+    let sig = tcx.fn_sig(instance.def_id()).instantiate(tcx, instance.args);
+    let sig = tcx.normalize_erasing_late_bound_regions(
+        ty::TypingEnv::fully_monomorphized(), sig,
+    );
+    let self_ref_ty = sig.inputs()[0]; // &Self
+
+    if let TyKind::Ref(_, self_ty, _) = self_ref_ty.kind() {
+        if let TyKind::Adt(_, args) = self_ty.kind() {
+            if !args.is_empty() && !toy_struct.type_params.is_empty() {
+                // Generic struct — resolve type params to LLVM types
+                let mut subst = std::collections::HashMap::new();
+                for (i, param_name) in toy_struct.type_params.iter().enumerate() {
+                    let concrete_ty = args[i].expect_ty();
+                    let llvm_ty = crate::llvm_gen::rust_ty_to_llvm_str(
+                        tcx, concrete_ty, registry, pointer_bits,
+                    );
+                    subst.insert(param_name.clone(), llvm_ty);
+                }
+                let fields: Vec<String> = toy_struct.fields.iter()
+                    .map(|f| crate::llvm_gen::resolve_field_type_with_subst(
+                        &f.rust_type, registry, pointer_bits, &subst,
+                    ))
+                    .collect();
+                return format!("{{ {} }}", fields.join(", "));
+            }
+        }
+    }
+
+    // Non-generic fallback
+    crate::llvm_gen::llvm_struct_type_full_pub(toy_struct, registry, pointer_bits)
 }
 
 // ============================================================================
@@ -130,9 +264,32 @@ fn collect_rust_deps<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     fn_body: &FnBody,
+    registry: &ToylangRegistry,
 ) -> Vec<(DefId, ty::GenericArgsRef<'tcx>)> {
     let fn_sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
-    let elem_ty = find_vec_elem_ty(tcx, fn_sig);
+
+    // First try: find Vec element type from the function signature
+    let mut elem_ty = find_vec_elem_ty(tcx, fn_sig);
+
+    // Second try: if return type is a toylang struct, search its fields for Vec types
+    if elem_ty.is_none() {
+        if let TyKind::Adt(adt_def, _) = fn_sig.output().kind() {
+            let struct_name = tcx.item_name(adt_def.did()).to_string();
+            if let Some(toy_struct) = registry.structs.get(&struct_name) {
+                for field in &toy_struct.fields {
+                    if let ToyFieldType::RustGeneric(type_name, type_args) = &field.rust_type {
+                        if type_name == "Vec" && !type_args.is_empty() {
+                            // Resolve the Vec element type to a rustc Ty
+                            let subst = HashMap::new();
+                            let resolved = resolve_field_ty(tcx, &type_args[0], &subst);
+                            elem_ty = Some(resolved);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let elem_ty = match elem_ty {
         Some(t) => t,
@@ -202,6 +359,75 @@ fn scan_expr_vec_ops(expr: &Expr, new: &mut bool, push: &mut bool, len: &mut boo
         }
         _ => {}
     }
+}
+
+/// Resolve a ToyFieldType to a rustc Ty, handling all variants.
+fn resolve_field_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ft: &ToyFieldType,
+    subst: &HashMap<&str, Ty<'tcx>>,
+) -> Ty<'tcx> {
+    match ft {
+        ToyFieldType::I32 => tcx.types.i32,
+        ToyFieldType::I64 => tcx.types.i64,
+        ToyFieldType::F64 => tcx.types.f64,
+        ToyFieldType::Bool => tcx.types.bool,
+        ToyFieldType::TypeParam(name) => {
+            *subst.get(name.as_str()).expect("type param not in subst")
+        }
+        ToyFieldType::ToyStruct(struct_name) => {
+            crate::oracle::find_local_struct_ty(tcx, struct_name)
+                .unwrap_or_else(|| panic!("[toylang] resolve_field_ty: struct '{}' not found", struct_name))
+        }
+        ToyFieldType::RustGeneric(type_name, type_args) => {
+            resolve_rust_generic_ty(tcx, type_name, type_args, subst)
+        }
+    }
+}
+
+/// Construct a rustc Ty for a Rust generic type like Vec<i32> or HashMap<K, V>.
+fn resolve_rust_generic_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    type_name: &str,
+    type_args: &[ToyFieldType],
+    subst: &HashMap<&str, Ty<'tcx>>,
+) -> Ty<'tcx> {
+    // Find the DefId for the type name
+    let def_id = match type_name {
+        "Vec" => tcx.get_diagnostic_item(sym::Vec)
+            .expect("[toylang] Vec not found via diagnostic item"),
+        other => {
+            // Fallback: search local definitions
+            crate::oracle::find_local_struct_ty(tcx, other)
+                .map(|ty| {
+                    if let TyKind::Adt(adt_def, _) = ty.kind() {
+                        adt_def.did()
+                    } else {
+                        panic!("[toylang] resolve_rust_generic_ty: '{}' is not an ADT", other)
+                    }
+                })
+                .unwrap_or_else(|| panic!("[toylang] resolve_rust_generic_ty: type '{}' not found", other))
+        }
+    };
+    let adt_def = tcx.adt_def(def_id);
+    let mut args: Vec<GenericArg<'tcx>> = type_args.iter()
+        .map(|arg| GenericArg::from(resolve_field_ty(tcx, arg, subst)))
+        .collect();
+
+    // Some Rust types have hidden type params with defaults (e.g., Vec<T, A = Global>).
+    // If we provided fewer args than the ADT expects, fill in the defaults.
+    let expected_params = tcx.generics_of(def_id).count();
+    if args.len() < expected_params && type_name == "Vec" {
+        // Vec<T, A = Global> — get the Global allocator type
+        let elem_ty = args[0].expect_ty();
+        let new_def_id = crate::oracle::find_vec_method(tcx, "new")
+            .expect("[toylang] Vec::new not found");
+        let global_ty = crate::oracle::extract_global_ty(tcx, elem_ty, new_def_id)
+            .expect("[toylang] could not extract Global allocator type");
+        args.push(GenericArg::from(global_ty));
+    }
+
+    Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
 }
 
 fn find_vec_elem_ty<'tcx>(tcx: TyCtxt<'tcx>, fn_sig: ty::FnSig<'tcx>) -> Option<Ty<'tcx>> {

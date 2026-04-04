@@ -1,3 +1,16 @@
+//! ABI coercion helpers.
+//!
+//! When rustc compiles a function that returns a small struct (e.g. `{ i32, i32 }`),
+//! it may coerce the return into a scalar register (e.g. `i64` on aarch64). The
+//! consumer's LLVM backend must match this coercion exactly, or the caller will
+//! read garbage from the wrong registers.
+//!
+//! This module wraps rustc's `fn_abi_of_instance` query to determine what LLVM
+//! return type rustc expects. The consumer calls this during `generate_and_compile`
+//! (Phase 3) when generating LLVM IR for its function bodies.
+//!
+//! See `docs/historical/problem-abi-coercion.md` for the investigation that led to
+//! this approach — small struct returns were silently zeroing fields before this fix.
 
 use rustc_abi::Size;
 use rustc_target::callconv::{Reg, RegKind};
@@ -6,16 +19,31 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_target::callconv::{CastTarget, PassMode};
 
 /// Describes how a function's return value should be represented in LLVM IR.
+///
+/// The consumer's LLVM backend uses this to decide how to emit the `ret` instruction:
+/// - `Direct("i64")` → the struct is returned as a scalar, use alloca+store+load pattern
+/// - `Indirect` → the caller provides an sret pointer, return via pointer write
+/// - `Void` → no return value
 pub enum CoercedReturn {
-    /// Return directly in the coerced type (e.g., "i64" for `{ i32, i32 }` on aarch64)
+    /// Return directly in the coerced type (e.g., "i64" for `{ i32, i32 }` on aarch64).
+    /// The string is an LLVM type like "i64", "[2 x i32]", or "{ i32, float }".
     Direct(String),
-    /// Return via sret pointer (large structs, >16 bytes on aarch64)
+    /// Return via sret pointer. The caller allocates space and passes a pointer as
+    /// the first argument. Used for large structs (>16 bytes on aarch64).
     Indirect,
-    /// No return value (ZST or void)
+    /// No return value (ZST or void).
     Void,
 }
 
 /// Query rustc for the ABI-coerced LLVM return type of a function.
+///
+/// This wraps `tcx.fn_abi_of_instance` and translates the `PassMode` into an
+/// LLVM type string. The consumer calls this for each function it compiles to
+/// LLVM IR, to ensure the return instruction matches what rustc's caller expects.
+///
+/// The coercion rules are target-specific (aarch64 vs x86_64 vs wasm have different
+/// thresholds and register assignments). By querying rustc, we get the correct answer
+/// for whatever target rustc is compiling for.
 pub fn coerced_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,

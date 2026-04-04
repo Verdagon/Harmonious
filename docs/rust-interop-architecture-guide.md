@@ -1,33 +1,18 @@
-# Rust Interop via rustc Query Provider: The Broader Architecture
+# Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** The project is a two-crate workspace: `rustc-lang-facade` (reusable library)
-> and `toylangc` (toylang consumer). The library exposes a `LangCallbacks` trait with 7 methods
-> (`type_names`, `fn_names`, `generate_stubs`, `after_rust_analysis`, `monomorphize_type`,
-> `monomorphize_fn`, `generate_and_compile`). Consumers implement this trait and call
-> `run_compiler(callbacks, &rustc_args)`. See `rustc-lang-facade/README.md` for the API.
+> **Current status:** Two-crate workspace: `rustc-lang-facade` (reusable library) and
+> `toylangc` (toylang consumer). 9 integration tests passing. Preparing a minimal rustc
+> fork to add a `per_instance_mir` query for per-instantiation function codegen.
 
-## Scope of This Document
+## Scope
 
-The [Toylang guide](./toylang-rustc-driver-guide.md) covers the proof-of-concept: a toy
-language with no generics, a hardcoded struct, and five rustc mechanisms exercised in
-isolation. This document covers everything beyond that — the full architecture needed for a
-real language that wants first-class interop with Rust's type system and ecosystem.
+This document covers the full architecture for integrating a custom language with rustc.
+The project is a Cargo workspace:
+- `rustc-lang-facade` — reusable library implementing the rustc integration layer
+- `toylangc` — toylang consumer, growing into a full language with linear types,
+  deferred borrows, automatic refcounting, etc.
 
-It addresses:
-
-- How the toy's five mechanisms generalize to a real compiler
-- What "your language as a rustc query provider" actually means end-to-end
-- How API discovery works without rustdoc hacks
-- How type layout works for generics, including mutually recursive cases
-- How monomorphization ownership is divided and how the two compilers stay consistent
-- How drop glue works across arbitrary nesting depths
-- How your language's safety guarantees are preserved at the boundary
-- How the build system integrates two compilers into one coherent toolchain
-- How to handle nightly API churn without constant firefighting
-- The migration path from the toy to production
-
-This document is written for someone who has read and understood the Toylang guide and is
-now planning the real implementation.
+Pinned to `nightly-2025-01-15` (rustc 1.86.0-nightly, commit `8361aef0d7c`).
 
 ---
 
@@ -35,1362 +20,538 @@ now planning the real implementation.
 
 ### 1.1 What "query provider" means
 
-rustc is not a sequential pipeline. It is a **demand-driven computation graph** built on a
-query system. When rustc needs to know the layout of `Vec<YourStruct>`, it calls
-`tcx.layout_of(Vec<YourStruct>)`. That query calls `tcx.layout_of(YourStruct)`. If your
-language has registered a custom provider for `layout_of`, that call lands in your code.
+rustc is a demand-driven computation graph. When rustc needs the layout of
+`Vec<YourStruct>`, it calls `tcx.layout_of(Vec<YourStruct>)`, which calls
+`tcx.layout_of(YourStruct)`. If your language has a custom provider for `layout_of`,
+that call lands in your code. Your provider can call back into `tcx` freely. The query
+system memoizes results and detects cycles.
 
-Your provider can then call back into `tcx` freely — to get the layout of fields, to resolve
-trait implementations, to get function signatures. The query system memoizes every result and
-detects cycles (which represent infinite-size types and are correctly rejected as errors).
-
-The key insight: **your language does not need its own monomorphizer.** Rust's monomorphizer
-drives the whole process. When it encounters `YourStruct` as a generic argument, it queries
-your provider for whatever it needs. You respond. Rust continues. The two compilers are not
-running in parallel or taking turns — your language's logic executes *inside* rustc's query
-evaluation, as a first-class participant.
+**Your language does not need its own monomorphizer.** Rust's monomorphizer drives
+the process. When it encounters `YourStruct` as a generic argument, it queries your
+provider. You respond. Rust continues. Your language's logic executes *inside* rustc's
+query evaluation.
 
 ### 1.2 The relationship to `unsafe`
 
-Your language's safety guarantees — whatever they are — are enforced by *your* type checker,
-not by Rust's borrow checker. From rustc's perspective, your language's generated MIR is
-trusted, the same way `unsafe` blocks are trusted. Rust does not re-verify your language's
-invariants. It only verifies its own.
+Your language's safety guarantees are enforced by *your* type checker, not by Rust's
+borrow checker. From rustc's perspective, your language's generated MIR is trusted,
+the same way `unsafe` blocks are trusted.
 
-This means:
-- Your language's type checker must run to completion *before* MIR is generated
-- MIR you inject must be structurally valid (rustc's MIR validator still runs)
-- MIR you inject need not satisfy borrow checker rules (you disable borrowck for your items)
-- Any safety property your language provides is your responsibility to uphold
-
-The analogy is exact: you are writing a trusted backend, like an `unsafe` block that spans
-an entire language.
-
-### 1.3 The compilation order
+### 1.3 The compilation flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Your language's frontend (runs first, entirely outside rustc)  │
-│                                                                  │
+│  Consumer frontend (runs first, entirely outside rustc)          │
 │  1. Parse source files                                           │
-│  2. Type check (your language's rules, fully)                    │
+│  2. Type check (your language's rules)                           │
 │  3. Produce generic IR (pre-monomorphization)                    │
-│     - One IR body per function, parameterized over type vars     │
-│  4. Compute layout formulas for your generic types               │
-│     - "MyStruct<T>.size = sizeof(T) + 4, padded to align(T)"    │
-│  5. Register everything in a ToylangRegistry                     │
+│  4. Register everything in a ToylangRegistry                     │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  rustc session (your language embedded as query providers)       │
-│                                                                  │
-│  6. rustc starts with Config::override_queries installed         │
-│  7. rustc parses and type-checks Rust source files normally      │
-│  8. rustc's monomorphizer begins traversing the call graph       │
-│     - Encounters YourStruct as a generic arg                     │
-│     - Calls tcx.layout_of(YourStruct<int>)                       │
-│     → Your layout provider computes it, calling tcx as needed    │
-│     - Calls tcx.optimized_mir(your_fn<int>)                      │
-│     → Your MIR provider instantiates your generic IR body        │
-│     - Calls drop_in_place::<YourStruct<int>>()                   │
-│     → Your drop provider returns a MIR body with your destructor │
-│  9. rustc codegens everything into a single LLVM module          │
-│  10. Link, producing a final binary                              │
+│  5. rustc starts with Config::override_queries installed         │
+│  6. rustc parses and type-checks Rust source files               │
+│  7. Monomorphization begins (inside codegen_crate)               │
+│     - per_instance_mir fires for each consumer function instance │
+│     - layout_of fires for each consumer type instantiation       │
+│     - mir_shims fires for each consumer drop glue instantiation  │
+│  8. Consumer's generate_and_compile callback fires               │
+│     - LLVM backend compiles all discovered instances to .o       │
+│  9. codegen_mir skips consumer functions (leaves as extern decl) │
+│  10. Link: consumer .o + rustc .o → final binary                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Steps 1–5 are your compiler. Steps 6–10 are rustc, with your code called from within.
+---
+
+## Part 2: The Five Mechanisms
+
+### 2.1 Opaque stubs via FileLoader
+
+A custom `FileLoader` injects generated Rust source (`__lang_stubs.rs`) into rustc's
+parsing pipeline. The stubs contain:
+
+- **Opaque struct definitions:** `pub struct Counter(());` or
+  `pub struct Pair<A, B>(PhantomData<(A, B)>);` — layout_of reports 0 fields, so
+  rustc treats these as opaque memory blobs.
+- **Wrapper functions:** `pub fn make_counter() -> Counter { unreachable!() }` —
+  gives Rust something to typecheck against. The body is never executed.
+- **Accessor methods:** `impl Counter { pub fn value(&self) -> &i32 { unreachable!() } }`
+  — Rust-side field access through methods. Bodies are never executed.
+- **Extern declarations:** `extern "C" { fn __toylang_impl_make_counter(...); }` —
+  for the linker to resolve against the consumer .o.
+
+All consumer items (structs, functions, methods) live in `__lang_stubs`. Query overrides
+use `is_from_lang_stubs(tcx, def_id)` to match by module path, preventing name collisions
+with user-defined items.
+
+### 2.2 layout_of override
+
+**Key:** `Ty<'tcx>` (includes generic args) → fires **per instantiation**.
+
+When rustc needs the size/alignment of a consumer type, our override calls
+`monomorphize_type` on the consumer, which returns concrete field types. We compute
+C-style layout (field offsets with padding) and return `BackendRepr::Memory { sized: true }`
+with 0 fields in `FieldsShape`. The struct is a pure opaque blob to rustc.
+
+### 2.3 per_instance_mir (requires rustc fork)
+
+**Key:** `Instance<'tcx>` (includes concrete generic args) → fires **per instantiation**.
+
+This is a new query added via a minimal rustc fork. When the monomorphization collector
+encounters a consumer function instance (e.g., `identity::<i32>`), it calls
+`per_instance_mir` instead of `instance_mir`. Our provider:
+
+1. Asks the consumer for Rust-side dependencies (types and functions needed)
+2. Records the instance for later batch compilation
+3. Returns a MIR body that references those dependencies (driving the collector's
+   fixpoint loop) with a panic terminator (never executed)
+
+The collector walks this MIR body, discovers the referenced types and functions, adds
+them to its work queue, and continues the fixpoint loop. This handles arbitrary
+cascading depth naturally.
+
+At codegen time, the `MonoItem::Fn` dispatch skips `codegen_mir` for consumer instances.
+The predefine phase already created the LLVM function declaration; without `codegen_mir`
+filling in a body, it remains an extern declaration. The `symbol_name` override maps
+each consumer instance to the consumer's symbol name (e.g., `__toylang_impl_identity__i32`).
+The consumer .o provides the definition. Standard extern linking, zero overhead.
+
+**Why not mir_built?** `mir_built` is keyed by `LocalDefId` — one body per definition,
+not per instantiation. For generic functions, rustc takes the single MIR body and
+substitutes type parameters internally. We never get called for specific instantiations
+like `identity::<i32>` vs `identity::<bool>`. The `per_instance_mir` query fixes this.
+
+### 2.4 mir_shims override (drop glue)
+
+**Key:** `InstanceKind::DropGlue(_, Some(ty))` → fires **per instantiation**.
+
+When rustc drops a consumer type, our override builds a MIR body that calls
+`__toylang_drop_TypeName(ptr)`. The consumer provides the destructor implementation.
+
+### 2.5 CodegenBackend wrapper
+
+`LangCodegenBackend` wraps `rustc_codegen_llvm`. During `join_codegen`, it injects
+the consumer's .o into `CodegenResults` so it participates in the link step.
 
 ---
 
-## Part 2: API Discovery — Replacing the Rustdoc Approach
+## Part 3: The rustc Fork
 
-### 2.1 The problem with rustdoc JSON
+### 3.1 What we're adding
 
-The blog posts established an approach based on invoking `cargo rustdoc --output-format=json`
-and parsing the output with the `rustdoc_types` crate. This works for simple cases but has
-several hard limits:
+A single new query: `per_instance_mir(Instance<'tcx>) -> Option<&'tcx Body<'tcx>>`.
+Plus patches to two call sites so they check this query first.
 
-- Rustdoc JSON format is unstable and changes between nightly releases
-- Rustdoc organizes information for documentation generation, not for compiler use — some
-  information is missing or structured inconveniently
-- Overload resolution and generics must be reimplemented by hand (3,200+ lines of fragile
-  code, as documented in the blog posts)
-- Running `cargo rustdoc` as a subprocess is slow and adds build latency
+### 3.2 Patch sites
 
-The `rustc_driver` approach replaces all of this with direct `TyCtxt` queries.
+| File | Change | Purpose |
+|------|--------|---------|
+| `rustc_middle/src/queries.rs` | Add `per_instance_mir` query definition | Define the new query |
+| `rustc_monomorphize/src/collector.rs` | Check `per_instance_mir` before `instance_mir` | Drive dependency discovery in fixpoint loop |
+| `rustc_codegen_ssa/src/mono_item.rs` | Skip `codegen_instance` for consumer items | Leave as extern declaration |
+| `rustc_mir_transform/src/lib.rs` | Default provider returning `None` | No-op for non-consumer compilations |
 
-### 2.2 The type oracle binary
+Additionally, in the consumer driver (not the fork):
 
-The right architecture is a standalone `your-lang-oracle` binary — a `rustc_driver` that
-takes a crate, a type path, a method name, and optional generic argument types, and outputs
-a JSON description of the resolved signature, parameter types, sizes, and alignments.
+| Override | Purpose |
+|----------|---------|
+| `per_instance_mir` | Return dependency-referencing MIR body |
+| `symbol_name` | Map consumer instances to consumer symbol names |
+| `mir_built` | Return trivial `unreachable!()` for consumer functions |
 
-```bash
-# Query: what is Vec<MyStruct>::push's signature, given MyStruct is 8 bytes, align 4?
-your-lang-oracle \
-  --crate std \
-  --type "std::vec::Vec" \
-  --method "push" \
-  --type-arg "MyStruct:size=8:align=4" \
-  --output json
+### 3.3 How codegen skipping works
+
+The codegen pipeline has two phases per MonoItem:
+
+1. **Predefine:** Creates LLVM function declaration (`declare_fn` → `LLVMRustGetOrInsertFunction`)
+2. **Define:** Calls `codegen_mir` to fill in the body
+
+If we skip step 2 for consumer items, the function stays as an extern declaration.
+Callers already reference it by the symbol name from our `symbol_name` override.
+The linker resolves it to the consumer .o.
+
+### 3.4 Two-phase consumer callout
+
+1. **During monomorphization (fixpoint loop):** `per_instance_mir` calls the consumer's
+   dependency analyzer. Lightweight — no LLVM, no codegen. Returns which Rust types and
+   functions this instantiation needs. Must be fast (fires many times).
+
+2. **After monomorphization (during codegen_crate):** `generate_and_compile` fires.
+   All instances are known. Consumer's LLVM backend runs in batch — full IR generation,
+   optimization, .o emission.
+
+### 3.5 How the fixpoint loop works for cascading dependencies
+
+```
+Collector discovers consumer_map::<i32>
+  → per_instance_mir fires
+  → Consumer says: "I need Vec<ConsumerPair<i32, i32>>"
+  → MIR body references Vec<ConsumerPair<i32, i32>>
+  → Collector discovers this type
+    → layout_of fires (existing override)
+    → drop_in_place discovered → mir_shims fires (existing override)
+    → accessor methods discovered → per_instance_mir fires again
+  → Repeat until fixpoint — no new items
 ```
 
-Output:
-```json
-{
-  "resolved_fn": "alloc::vec::Vec::<MyStruct>::push",
-  "params": [
-    { "name": "self", "type": "&mut Vec<MyStruct>", "size": 8, "align": 8 },
-    { "name": "value", "type": "MyStruct", "size": 8, "align": 4 }
-  ],
-  "return": { "type": "()", "size": 0, "align": 1 },
-  "trait_bounds_satisfied": true
-}
-```
+### 3.6 Maintenance
 
-### 2.3 How to implement the oracle using TyCtxt
-
-The oracle is a `rustc_driver` binary with a `Callbacks::after_analysis` hook. Inside
-`after_analysis`, it has access to a fully-initialized `TyCtxt` with all Rust crates loaded.
-
-**Finding a type by path:**
-
-```rust
-// For well-known std types, use diagnostic items
-let vec_did = tcx.get_diagnostic_item(rustc_span::sym::Vec)?;
-
-// For arbitrary types, walk the crate graph
-fn find_def_id_by_path(tcx: TyCtxt<'_>, path: &[&str]) -> Option<DefId> {
-    for krate in tcx.crates(()) {
-        for item in tcx.module_children(krate.as_def_id()) {
-            // walk the item tree matching path segments
-        }
-    }
-    None
-}
-```
-
-**Resolving a method with generic arguments:**
-
-```rust
-fn resolve_method<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    type_def_id: DefId,
-    method_name: &str,
-    type_args: &[Ty<'tcx>],   // concrete types for the generic params
-) -> Option<(DefId, FnSig<'tcx>)> {
-    let method_did = tcx
-        .inherent_impls(type_def_id)
-        .iter()
-        .flat_map(|&impl_id| tcx.associated_item_def_ids(impl_id))
-        .find(|&&did| tcx.item_name(did).as_str() == method_name)?;
-
-    // Substitute the type args into the generic signature
-    let args = tcx.mk_args_trait(
-        tcx.mk_ty_from_kind(TyKind::Adt(tcx.adt_def(type_def_id), tcx.mk_args(
-            &type_args.iter().map(|&t| GenericArg::from(t)).collect::<Vec<_>>()
-        ))),
-        type_args.iter().map(|&t| GenericArg::from(t)),
-    );
-
-    let sig = tcx.fn_sig(method_did).instantiate(tcx, args);
-    let sig = tcx.normalize_erasing_regions(ParamEnv::reveal_all(), sig.skip_binder());
-    Some((method_did, sig))
-}
-```
-
-**Trait method resolution (for overloaded methods via traits):**
-
-The UFCS syntax `<OsString as From<&str>>::from` is the correct way to select a specific
-trait implementation. In TyCtxt terms:
-
-```rust
-// Find the impl of From<&str> for OsString
-fn find_trait_impl<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    self_ty: Ty<'tcx>,
-    trait_did: DefId,
-    trait_args: &[GenericArg<'tcx>],
-) -> Option<DefId> {
-    tcx.trait_impls_of(trait_did)
-        .non_blanket_impls()
-        .values()
-        .flatten()
-        .find(|&&impl_did| {
-            let impl_self_ty = tcx.type_of(impl_did).skip_binder();
-            // Check that this impl is for our self_ty
-            // and that the trait args match
-            impl_self_ty == self_ty
-        })
-        .copied()
-}
-```
-
-This is exact overload resolution — you're asking rustc's type system to do the work, not
-reimplementing it.
-
-### 2.4 Caching oracle results
-
-The oracle is invoked during your language's build process, before the main compilation
-starts. Cache results aggressively — the results are deterministic for a given (crate version,
-type, method, type args) tuple. Store the cache in the build directory keyed by a hash of
-the inputs.
-
-For standard library types, the oracle results can be cached indefinitely within a nightly
-version pin. They change only when the Rust version changes. Use the nightly date as part of
-the cache key.
-
-### 2.5 Distinguishing method sources
-
-A type's methods come from multiple sources that need different handling:
-
-| Source | Example | How to find |
-|--------|---------|-------------|
-| Inherent impl | `Vec::push` | `tcx.inherent_impls(type_did)` |
-| Trait impl in same crate | `impl Display for MyType` | `tcx.trait_impls_of(trait_did)` |
-| Trait impl in external crate | `impl Iterator for std::vec::IntoIter` | `tcx.all_impls(trait_did)` |
-| Blanket impl | `impl<T: Clone> Clone for Vec<T>` | Requires predicate checking |
-| Auto trait | `Send`, `Sync` | `tcx.is_auto_trait(trait_did)` |
-
-Your oracle needs to handle all of these to give users a complete picture of what methods are
-available on a type.
+The fork patches ~11 lines of rustc across 4 files. Expected maintenance: 0-30 minutes
+per nightly bump. Most bumps apply cleanly.
 
 ---
 
-## Part 3: Type Layout for Generics
+## Part 4: Type Layout
 
-### 3.1 The shallow case (non-generic types)
+### 4.1 Opaque layout (0-field FieldsShape)
 
-For a non-generic type like `struct Point { x: i32, y: i32 }`, the layout is computed once
-and cached by the query system. Your `layout_of` provider runs once and returns the same
-`LayoutS` every time.
+Consumer types use `BackendRepr::Memory { sized: true }` with empty `FieldsShape::Arbitrary`.
+Rustc sees them as opaque memory blobs. Size and alignment come from the consumer's
+`monomorphize_type` callback, which returns concrete field types that the library uses
+to compute C-style layout.
 
-Implementation is straightforward: compute offsets field by field, applying alignment padding,
-exactly as described in the Toylang guide.
+### 4.2 Why 0 fields
 
-### 3.2 The generic case — your language's generic types
+Reporting per-field offsets in the layout caused rustc's ABI code to index into the
+ADT's fields (which are dummy stubs, not real field types) — field count mismatch caused
+panics. With 0 fields, the ABI code treats the type as an opaque aggregate. No field
+decomposition, no mismatch.
 
-When your language has generics (`struct MyVec<T> { ptr: *mut T, len: usize, cap: usize }`),
-the layout depends on the type argument `T`. The `layout_of` query is called with a specific
-instantiation — `layout_of(MyVec<i32>)`, `layout_of(MyVec<Point>)`, etc.
+### 4.3 Generic types
 
-Your provider receives a `Ty<'tcx>` which is already a specific instantiation. Extract the
-type arguments:
+`layout_of` is keyed by `Ty<'tcx>`, which includes generic args. So
+`layout_of(Pair<i32, i32>)` and `layout_of(Pair<i64, i32>)` are separate invocations.
+The consumer's `monomorphize_type` resolves type params from the concrete `Ty<'tcx>`,
+returns field types, and the library computes layout. Mutually recursive layouts
+(Rust type containing consumer type containing Rust type) work naturally via re-entrant
+query calls.
 
-```rust
-fn toy_layout_of<'tcx>(tcx: TyCtxt<'tcx>, query: ParamEnvAnd<'tcx, Ty<'tcx>>) -> ... {
-    let ty = query.value;
+### 4.4 Target portability
 
-    if let TyKind::Adt(adt_def, args) = ty.kind() {
-        if is_your_lang_type(adt_def.did()) {
-            // args contains the concrete type arguments, e.g. [i32] for MyVec<i32>
-            let type_arg: Ty<'tcx> = args.type_at(0);
-
-            // Get the layout of the type argument by calling back into tcx
-            let arg_layout = tcx.layout_of(query.param_env.and(type_arg))?;
-
-            // Now compute your struct's layout using arg_layout.size, arg_layout.align
-            let ptr_size   = tcx.data_layout().pointer_size;
-            let ptr_align  = tcx.data_layout().pointer_align.abi;
-            let usize_size = tcx.data_layout().pointer_size;  // same as pointer on most targets
-
-            return Ok(build_myvec_layout(tcx, ty, ptr_size, arg_layout));
-        }
-    }
-    DEFAULT_LAYOUT_OF(tcx, query)
-}
-```
-
-The call to `tcx.layout_of(arg_layout)` is the key: it asks rustc to compute the layout of
-the type argument, which may itself be a Rust type, a type from your language, or another
-generic instantiation. The query system handles all of this recursively.
-
-### 3.3 The mutually recursive case
-
-This is the case that breaks every simpler architecture:
-
-```rust
-// In Rust
-struct RustOuter<T> { inner: YourInner<T> }
-
-// In your language  
-struct YourInner<T> { field: RustField<T> }
-```
-
-When rustc computes `layout_of(RustOuter<i32>)`:
-
-1. rustc needs `layout_of(YourInner<i32>)`
-2. Your provider is called with `YourInner<i32>`
-3. Your provider needs `layout_of(RustField<i32>)` — calls `tcx.layout_of(RustField<i32>)`
-4. rustc computes `layout_of(RustField<i32>)` normally
-5. Returns to your provider, which completes `layout_of(YourInner<i32>)`
-6. Returns to rustc, which completes `layout_of(RustOuter<i32>)`
-
-**This just works.** The query system's memoization ensures step 4 runs at most once. The
-re-entrant call in step 3 (`tcx.layout_of` called from within a `layout_of` provider) is
-allowed — rustc's query system is designed for this. The only forbidden case is a true
-cycle, which would represent an infinite-size type and is correctly reported as an error.
-
-The critical requirement: your provider must call `tcx.layout_of` for any field whose size
-comes from a Rust type, rather than hardcoding sizes. Only `tcx` knows the target-specific
-layout of Rust types (pointer size varies by target, struct padding rules vary, etc.).
-
-### 3.4 Target-specific layout concerns
-
-Your language's layout computation must use `tcx.data_layout()` for target-specific sizes,
-not hardcoded constants. Key fields:
-
-```rust
-let dl = tcx.data_layout();
-dl.pointer_size          // usize/isize/pointer width (4 on 32-bit, 8 on 64-bit)
-dl.pointer_align.abi     // pointer alignment
-dl.i32_align.abi         // i32 alignment (usually 4, but not always)
-dl.f64_align.abi         // f64 alignment (varies by target)
-dl.aggregate_align.abi   // minimum alignment for aggregate types
-```
-
-Never write `size = 8` for a pointer — write `size = dl.pointer_size`. Your language needs
-to produce correct code for every rustc target, including 32-bit embedded targets.
-
-### 3.5 Niche optimization
-
-rustc performs niche optimization — it stores enum discriminants in the "niche" of fields
-that have unused bit patterns (e.g., `Option<&T>` has the same size as `&T` because null
-is the `None` discriminant). If your language has enum-like types, you should populate the
-`largest_niche` field of `LayoutS` correctly. If you always set `largest_niche: None`, your
-types will never participate in niche optimization, which is safe but suboptimal.
-
-For a first implementation, always use `largest_niche: None`. Add niche support later.
+All layout computation uses `tcx.data_layout` — no hardcoded sizes. Pointer size,
+alignment, and padding rules come from the target specification.
 
 ---
 
-## Part 4: MIR Generation
+## Part 5: Accessor Methods
 
-### 4.1 The two-phase MIR strategy
+### 5.1 Why accessors
 
-Your language's MIR generation has two phases that must be clearly separated:
-
-**Phase 1 — Generic MIR (your frontend's output):**
-Each function produces one MIR body parameterized over its type variables. This is analogous
-to what rustc stores for generic Rust functions — the body uses `TyKind::Param` for type
-arguments, and `layout_of` calls within it are deferred.
-
-**Phase 2 — Monomorphized MIR (on-demand from the query provider):**
-When rustc's monomorphizer needs `your_fn<i32>`, it calls your `mir_built` (or
-`optimized_mir`) provider with the specific generic arguments. Your provider takes the
-generic body from Phase 1 and substitutes the concrete type arguments, producing a fully
-concrete MIR body. This body uses `TyKind::Adt`, `TyKind::Int`, etc. — no `TyKind::Param`.
-
-The substitution is not trivial if done manually, but you can use rustc's own substitution
-machinery:
+Consumer structs are opaque to Rust. Rust can't access fields directly. Instead,
+the stub generates accessor methods:
 
 ```rust
-fn instantiate_body<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    generic_body: &Body<'tcx>,
-    args: GenericArgsRef<'tcx>,
-) -> Body<'tcx> {
-    // rustc provides EarlyBinder::instantiate_identity and
-    // rustc_middle::mir::utils::replace_ty for this purpose
-    let mut body = generic_body.clone();
-    // Apply substitution to every Ty<'tcx> in the body
-    // This requires implementing TypeFoldable or using rustc's own folder
-    body
+impl Counter {
+    pub fn value(&self) -> &i32 { unreachable!() }
 }
 ```
 
-Alternatively, generate concrete MIR directly in the provider — for simple type systems,
-this avoids the need for generic MIR entirely and simplifies the implementation.
+The `unreachable!()` body is intercepted by the query system and replaced with
+a call to the consumer's accessor implementation.
 
-> **Note (Milestone 1 complete):** The current architecture does NOT lower function bodies to
-> MIR. Instead, function bodies are compiled to LLVM IR by the external backend
-> (`src/llvm_gen.rs`), and the `mir_built` override produces thin call stubs that delegate to
-> extern symbols (`__toylang_impl_*`) plus phantom `ReifyFnPointer` casts to trigger
-> monomorphization. The two-phase MIR strategy described above would apply if you wanted to go
-> through rustc's full optimization pipeline (e.g., for cross-language inlining), but the
-> external codegen approach is simpler for languages that already have their own LLVM backend.
+### 5.2 Non-generic accessors (current implementation)
 
-### 4.2 MIR body structure — full requirements
-
-A valid MIR body requires more than basic blocks and statements. These fields must all be
-correctly populated:
-
-**`source_scopes`:** At minimum one scope (`SourceScope(0)`) with:
+For non-generic structs, the stub also declares an extern symbol:
 ```rust
-SourceScopeData {
-    span: fn_def_span,
-    parent_scope: None,
-    inlined: None,
-    inlined_parent_scope: None,
-    local_data: ClearCrossCrate::Clear,
-}
-```
-Every `SourceInfo` in statements and terminators references a scope index. Using index 0 for
-everything is valid and sufficient for a first implementation.
-
-**`var_debug_info`:** Empty vec is fine for now. Populate this later for debugger support.
-Without it, your language's variables won't be visible in `gdb`/`lldb`, but the code will
-still compile and run correctly.
-
-**`local_decls`:** `Local(0)` must have the exact type matching the function's return type
-as declared in the function signature (`tcx.fn_sig(def_id).output().skip_binder()`). Every
-other local must have an explicit type — `TyKind::Error` locals cause ICEs in codegen.
-
-**`arg_count`:** Must exactly match the number of parameters in the function signature.
-`Local(1)` through `Local(arg_count)` correspond to the parameters in order.
-
-**`StorageLive`/`StorageDead` pairs:** Every local except `_0` and arguments must have:
-```rust
-// Before first use of local N:
-StatementKind::StorageLive(Local::from_u32(N))
-
-// After last use of local N:
-StatementKind::StorageDead(Local::from_u32(N))
-```
-Without these, the MIR validator will reject the body. The storage markers tell the borrow
-checker (and memory allocators) when a local's stack slot is live.
-
-**`span` field of Body:** Should be the span of the function definition in your language's
-source. Use a span derived from your source file — rustc uses this for error attribution and
-debug info line numbers. Creating spans for your language's source files requires registering
-them with the `SourceMap`:
-
-```rust
-let source_file = tcx.sess.source_map().load_file(
-    Path::new("myfile.yourlang")
-).expect("file not found");
-let span = source_file.start_pos..source_file.end_pos;
+extern "C" { fn __toylang_accessor_Counter_value(s: *const Counter, _deps: *const ()) -> *const i32; }
 ```
 
-### 4.3 Calling Rust functions from your language's MIR
+The LLVM backend generates a simple GEP function for each accessor.
 
-The `TerminatorKind::Call` is the primary way your language calls Rust functions. The full
-form:
+### 5.3 Generic accessors (via per_instance_mir)
 
+For generic structs like `Pair<A, B>`, accessor methods are generic:
 ```rust
-TerminatorKind::Call {
-    // The function to call. For a known Rust function:
-    func: Operand::function_handle(
-        tcx,
-        callee_def_id,      // DefId of the Rust function
-        generic_args,       // GenericArgsRef for any type params
-        call_span,
-    ),
-
-    // Arguments. Each is an Operand — Move, Copy, or Constant.
-    // The types must match the callee's parameter types exactly.
-    args: vec![
-        Spanned { node: Operand::Move(vec_place), span: call_span },
-        Spanned { node: Operand::Move(elem_place), span: call_span },
-    ],
-
-    // Where to write the return value. Must match callee's return type.
-    destination: return_place,
-
-    // Where to go after the call returns normally.
-    target: Some(next_bb),
-
-    // What to do if the call panics.
-    unwind: UnwindAction::Continue,
-
-    call_source: CallSource::Normal,
-    fn_span: call_span,
-}
+impl<A, B> Pair<A, B> { pub fn first(&self) -> &A { unreachable!() } }
 ```
 
-**Getting the `DefId` for a Rust function:** Use the oracle or the `TyCtxt` query directly:
+When rustc monomorphizes `Pair::<i32, i32>::first`, `per_instance_mir` fires with the
+concrete instance. The consumer returns the extern symbol
+`__toylang_accessor_Pair_first__i32__i32` and records the accessor request. The LLVM
+backend generates a GEP function for that specific instantiation.
 
-```rust
-// For Vec::push specifically:
-let push_did = tcx.inherent_impls(vec_did)
-    .iter()
-    .flat_map(|&impl_id| tcx.associated_item_def_ids(impl_id))
-    .find(|&&did| tcx.item_name(did).as_str() == "push")
-    .expect("Vec::push not found");
-```
+This is the same mechanism used for all consumer functions — accessors are not special-cased.
 
-**Type checking your calls:** rustc's MIR validator will check that the argument types match
-the callee signature. If they don't, you get a validation error. Always call `tcx.fn_sig`
-and verify the types before constructing the `Call` terminator.
+### 5.4 Toylang stays UFCS
 
-### 4.4 Calling your language's functions from Rust MIR
-
-This direction also needs to work — a Rust function that calls a function defined in your
-language. Because your language's functions appear in the same `TyCtxt` (they're registered
-via `mir_built` override), they already have `DefId`s and Rust can call them via normal
-`Call` terminators. No special handling needed on this side.
-
-The only requirement: your language's exported functions must have `extern "C"` or another
-stable ABI if they're called across the FFI boundary (e.g., from a separately compiled Rust
-crate). For calls within the same compilation unit, the Rust ABI is fine.
-
-### 4.5 Unwind handling
-
-Every `Call` terminator has an `unwind` field. For the first implementation, use
-`UnwindAction::Continue` everywhere — this means panics from Rust code will unwind through
-your language's frames without any cleanup. This is incorrect in general (your language's
-destructors won't run if Rust panics mid-call) but is safe enough to start with.
-
-Full unwind support requires:
-1. Generating landing pad basic blocks (`is_cleanup: true`) for each frame that has live
-   values needing cleanup
-2. Using `UnwindAction::Cleanup(cleanup_bb)` in Call terminators
-3. Generating drop calls in cleanup blocks
-
-This is a significant amount of work and should be treated as a separate milestone.
-
-### 4.6 Constants and static values
-
-Constant values in MIR use `ConstOperand`:
-
-```rust
-// An integer constant
-Operand::Constant(Box::new(ConstOperand {
-    span,
-    user_ty: None,
-    const_: Const::Val(
-        ConstValue::Scalar(Scalar::from_u64(42)),
-        tcx.types.u64,
-    ),
-}))
-
-// A zero-sized type constant (e.g., a function item)
-Operand::Constant(Box::new(ConstOperand {
-    span,
-    user_ty: None,
-    const_: Const::zero_sized(tcx.mk_fn_def(fn_did, generic_args)),
-}))
-```
-
-For string literals, use `ConstValue::Slice` with the string bytes interned in the `TyCtxt`.
+Toylang has no `impl` blocks. All functions are top-level. The `impl` blocks in stubs
+are purely a Rust-facing presentation layer. A `RustPresentation` enum controls how
+each function appears to Rust: `FreeFunction`, `Method { on_type }`,
+`TraitMethod { on_type, trait_name }`.
 
 ---
 
-## Part 5: Monomorphization Ownership
+## Part 6: Monomorphization Ownership
 
-### 5.1 The division of labor
+### 6.1 Division of labor
 
-rustc's monomorphizer (in `rustc_monomorphize`) traverses the MIR reachability graph
-starting from all `#[no_mangle]` and `pub extern` functions, following every `Call`
-terminator and every mention of a concrete type. It collects all `MonoItem`s — concrete
-function bodies and static values — that need code generation.
+- **Consumer compiles consumer functions** (to LLVM IR → .o file)
+- **Rustc compiles Rust functions** (including generic instantiations like `Vec::push<YourStruct>`)
+- **No overlap.** The `MonoItem::Fn` dispatch skips `codegen_mir` for consumer items,
+  so rustc never emits code for them.
 
-When it encounters a call to one of your language's functions with concrete type arguments,
-it:
-1. Requests `tcx.optimized_mir(your_fn_instance)` via the query system
-2. Your provider returns the instantiated body
-3. The monomorphizer adds `your_fn<ConcreteType>` to its worklist
-4. It recurses into the body, following any Rust calls it finds there
+### 6.2 Triggering Rust monomorphization
 
-**Your language does not need to maintain a separate list of "things to monomorphize."**
-The monomorphizer discovers everything by following calls. You just need to respond correctly
-when asked for a specific instantiation.
+The MIR body returned by `per_instance_mir` references Rust types (via `NullaryOp::SizeOf`)
+and Rust functions (via `Call` terminators). The collector discovers these and adds them
+to its work queue. This replaces the old `ReifyFnPointer` phantom cast mechanism, which
+only worked for concrete (non-generic) consumer functions through `mir_built`.
 
-### 5.2 Ensuring all instantiations are reachable
+### 6.3 Duplicate monomorphization prevention
 
-The monomorphizer only visits items reachable from root items. If a function in your language
-is only called from your language, and not from any `pub extern` Rust function, the
-monomorphizer may not visit it.
-
-The solution: every entry point in your language that needs to be accessible from outside
-must have a corresponding `pub extern "C"` wrapper function, either:
-- Written explicitly in Rust glue code
-- Generated by your compiler and registered with rustc via `mir_built`
-
-Alternatively, use `#[rustc_std_internal_symbol]` or a similar attribute to force
-monomorphization of items that aren't otherwise reachable. In practice, exposing everything
-through `pub extern "C"` wrappers is simpler and more portable.
-
-### 5.3 Duplicate monomorphization
-
-If both your language's compiler and rustc attempt to emit machine code for the same
-function (e.g., `Vec::push<YourStruct>`), you'll get duplicate symbol linker errors.
-
-The solution is a clean division of labor: **your language produces `.o` files for its own
-function bodies** (compiled from LLVM IR by your backend), and **rustc produces machine code
-for all Rust functions** (including generic instantiations like `Vec::push<YourStruct>`).
-There is no overlap — your language compiles your functions, rustc compiles Rust functions,
-and the linker combines the resulting object files.
-
-The key constraint is that your language must NOT emit code for Rust generic instantiations.
-Those are owned by rustc's monomorphizer. Your language triggers their monomorphization (via
-phantom `ReifyFnPointer` casts in MIR stubs) and calls them by mangled symbol name, but
-rustc is the one that actually compiles them to machine code. As long as neither compiler
-emits code for functions owned by the other, there are no duplicate symbols.
-
-### 5.4 Incremental compilation
-
-rustc's incremental compilation system (`rustc -C incremental=dir`) caches query results
-between compilations. When a source file changes, only the affected queries are recomputed.
-
-Your query providers participate in this system automatically — if `layout_of(YourStruct)`
-returns the same result as last time (because `YourStruct` didn't change), rustc won't
-recompute it. The cache key is based on the query inputs.
-
-However, rustc has no way to know that a change to your language's source file invalidates
-a specific `layout_of` result. You must tell it, by adjusting the `DefId` or `Ty` used as
-the query key to incorporate a hash of the relevant source.
-
-For a first implementation, disable incremental compilation for your language's outputs by
-setting an always-changing hash in the query inputs. Add proper incremental support later.
+The `symbol_name` override ensures consumer functions get consumer symbol names.
+The `MonoItem::Fn` dispatch skips `codegen_mir` for consumer items. Rustc never
+emits code for consumer functions, so there are no duplicate symbols.
 
 ---
 
-## Part 6: Drop Glue — The Full Picture
+## Part 7: Drop Glue
 
-### 6.1 The drop chain
-
-When a value of type `T` is dropped, rustc executes this logic:
-
-1. If `T` has an explicit `Drop` impl, call `<T as Drop>::drop(&mut self)`
-2. Then drop each field in declaration order, recursively
-
-For `Vec<YourStruct>`, dropping works like this:
+### 7.1 The drop chain
 
 ```
 drop(Vec<YourStruct>)
-  → Vec's Drop impl runs (frees the heap allocation)
-  → before freeing, drops each element: drop(YourStruct)
-    → your language's destructor runs (Step 1 for YourStruct)
-    → drop each field of YourStruct (Step 2)
-      → if a field is of Rust type, rustc's drop glue runs for it
+  → Vec's Drop impl runs
+  → drops each element: drop(YourStruct)
+    → your destructor runs (__toylang_drop_YourStruct)
+    → drop each field recursively
 ```
 
-This entire chain must be correctly wired up.
+### 7.2 Implementation
 
-### 6.2 Providing drop glue via `instance_mir`
+`mir_shims` override intercepts `InstanceKind::DropGlue(_, Some(ty))` for consumer types.
+Builds a MIR body calling `__toylang_drop_TypeName(ptr)`. The consumer provides the
+destructor in its .o file.
 
-The `mir_built` query handles user-defined function bodies. Drop glue for synthetic items
-(including `drop_in_place` shims) comes through `instance_mir`:
-
-```rust
-providers.instance_mir = |tcx, instance_kind| {
-    match instance_kind {
-        InstanceKind::DropGlue(_, Some(ty)) if is_your_lang_type(tcx, ty) => {
-            build_drop_body(tcx, ty)
-        }
-        _ => DEFAULT_INSTANCE_MIR(tcx, instance_kind)
-    }
-};
-```
-
-### 6.3 Building the drop body
-
-For a type with no destructor and no fields needing drop, the body is a single `Return`:
-
-```
-fn drop_in_place::<YourStruct>(ptr: *mut YourStruct) {
-    return;
-}
-```
-
-For a type with a destructor:
-
-```
-fn drop_in_place::<YourStruct>(ptr: *mut YourStruct) {
-  bb0:
-    your_destructor(ptr as *mut ());   // call your lang's destructor
-    goto bb1;
-
-  bb1:
-    drop_in_place::<FieldType>(&mut (*ptr).field);  // drop each field
-    goto bb2;
-
-  bb2:
-    return;
-}
-```
-
-For generic types (`YourStruct<T>` where `T` might need drop):
-
-```
-fn drop_in_place::<YourStruct<T>>(ptr: *mut YourStruct<T>) {
-  bb0:
-    your_destructor_generic(ptr as *mut (), drop_in_place::<T> as fn(*mut T));
-    // ^ pass a pointer to T's drop function so your destructor can call it
-    goto bb1;
-
-  bb1:
-    return;
-}
-```
-
-Passing function pointers to drop functions is how rustc itself implements
-generic drop glue — it's the same mechanism used by `Box<dyn Any>` internally.
-
-### 6.4 The `NeedsDrop` query
-
-`tcx.needs_drop(ty, param_env)` returns whether a type needs drop glue. rustc uses this to
-optimize away drop calls for types that don't need them (e.g., `i32`). Your `layout_of`
-provider should also inform `needs_drop` for your types:
-
-```rust
-providers.needs_drop_raw = |tcx, query| {
-    let ty = query.value;
-    if is_your_lang_type_with_destructor(tcx, ty) {
-        return true;
-    }
-    // Check fields too
-    for field_ty in your_lang_field_types(tcx, ty) {
-        if tcx.needs_drop_raw(query.param_env.and(field_ty)) {
-            return true;
-        }
-    }
-    false
-};
-```
-
-Without this, rustc may elide drop calls for your types even when they have destructors.
-
-### 6.5 Panic safety during drop
-
-If your language's destructor panics (or if a Rust function called from your destructor
-panics), the behavior depends on how you set up unwind handling in your drop MIR body. For
-a first implementation, `UnwindAction::Terminate` in the drop body is safest — it terminates
-the process rather than attempting to unwind through a partially-dropped value, which mirrors
-Rust's behavior when a `Drop` impl itself panics.
+**Important:** `mir_shims` bodies MUST call `set_required_consts` and `set_mentioned_items`
+(both empty). The `mir_promoted` pass doesn't run for shims. Without this, the
+monomorphization collector panics.
 
 ---
 
-## Part 7: Your Language's Safety Guarantees at the Boundary
+## Part 8: Module-Qualified Matching
 
-### 7.1 What rustc checks vs. what you check
+All query overrides use `is_from_lang_stubs(tcx, def_id)` to verify the item comes from
+the `__lang_stubs` module. This checks `tcx.def_path_str(def_id).starts_with("__lang_stubs::")`.
 
-With borrowck disabled for your language's items, rustc performs the following checks on
-your MIR:
-
-- **MIR structural validity** (the MIR validator): basic block structure, local types,
-  terminator correctness. You cannot disable this.
-- **Type checking of MIR operations**: assignment types must match, call argument types
-  must match callee signatures. You cannot disable this.
-- **Codegen correctness**: rustc will generate correct machine code for the MIR you provide,
-  including correct ABI handling for calls.
-
-rustc does **not** check:
-
-- Whether your language's ownership/lifetime rules are satisfied
-- Whether your language's linear type invariants are upheld
-- Whether your language's safety properties hold at the boundary
-
-These are your responsibility. The guarantee is: if your language's type checker approves a
-program, the MIR you generate must correctly implement the semantics your type checker
-verified.
-
-### 7.2 The boundary invariant
-
-The key invariant to maintain is: **Rust never observes a partially-initialized or
-use-after-free'd value of your language's types.** This means:
-
-- When you pass a value from your language to Rust (e.g., push it into `Vec`), the value
-  must be fully initialized and the memory at the correct layout rustc expects.
-- When Rust drops a value of your language's type, your destructor will be called exactly
-  once, at a time when the value is still fully initialized.
-- When your language receives a reference from Rust, the value behind the reference is
-  live for at least as long as you use the reference.
-
-These are the same invariants that `unsafe` Rust code must maintain. Your language's type
-checker should verify them on your language's side; the drop glue and layout machinery
-ensures Rust holds up its end.
-
-### 7.3 Linear types at the boundary
-
-If your language has linear types (values that must be used exactly once), the boundary
-introduces a risk: when you pass a linear value to Rust (e.g., into `Vec`), Rust takes
-ownership. If Rust drops the `Vec` without calling your language's destructor through the
-correct drop glue chain, you have a leak. Conversely, if Rust calls `drop_in_place` twice
-(a bug in your drop glue), you have a double-destroy.
-
-The drop glue implementation described in Part 6 handles the destroy side correctly. For
-the tracking side (ensuring linear values aren't forgotten), your language's type checker
-must verify that every value passed to Rust is consumed by a path that guarantees eventual
-destruction — e.g., that `Vec<YourLinear>` will eventually be dropped, which triggers the
-drop chain.
-
-This is a type-system concern, not a codegen concern. Your type checker must model Rust
-types that hold your language's types, tracking that they will be dropped.
+This prevents name collisions between consumer types and user-defined types with the
+same name (e.g., a user-defined `Point` struct vs the consumer's `Point`).
 
 ---
 
-## Part 8: The Build System
+## Part 9: Nightly API Churn
 
-### 8.1 The two-compiler build flow
-
-The build system must orchestrate two compilers in the correct order:
-
-```
-Source files
-  ├── *.yourlang  → your frontend compiler → ToylangRegistry + generic MIR
-  └── *.rs        ─────────────────────────────────────────────────────────┐
-                                                                           ▼
-                                               rustc_driver (your binary) ──→ binary
-                                               (embeds registry, provides
-                                                queries on demand)
-```
-
-In practice, the "two compilers" are:
-1. Your frontend binary (parses, type-checks, produces a registry)
-2. Your rustc_driver binary (runs the rustc session with your providers)
-
-These can be the same binary with two subcommands, or two separate binaries. The registry
-is passed from step 1 to step 2 via a serialized file (JSON, CBOR, or your own format) or
-via shared memory if both are in-process.
-
-### 8.2 Cargo integration
-
-The cleanest Cargo integration uses a **build script** (`build.rs`) plus a **custom runner**
-or **cargo subcommand**:
-
-**Option A: Build script invokes your compiler, outputs files consumed by a custom Cargo
-runner that replaces `rustc`:**
-
-```toml
-# Cargo.toml
-[package]
-build = "build.rs"
-
-[build-dependencies]
-your-lang-build = { path = "../your-lang-build" }
-```
-
-```rust
-// build.rs
-fn main() {
-    // Invoke your language's frontend on all .yourlang files
-    let registry = your_lang_build::compile_yourlang_files();
-    
-    // Write registry to a file in OUT_DIR
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    registry.write_to(&format!("{}/toylang_registry.bin", out_dir));
-    
-    // Tell cargo to rerun if any .yourlang file changes
-    for file in glob::glob("src/**/*.yourlang").unwrap() {
-        println!("cargo:rerun-if-changed={}", file.unwrap().display());
-    }
-}
-```
-
-**Option B: `RUSTC_WRAPPER` environment variable:**
-
-Cargo supports replacing the `rustc` invocation with a custom binary via `RUSTC_WRAPPER`.
-Your binary receives the same arguments `rustc` would receive, plus an additional first
-argument (the path to the real `rustc`). This is how tools like `sccache` (a caching
-compiler wrapper) work.
-
-```bash
-RUSTC_WRAPPER=your-lang-rustc-wrapper cargo build
-```
-
-Inside your wrapper, detect whether the current compilation unit contains your language's
-items. If it does, run your full driver. If not, exec the real `rustc` directly. This
-approach requires no changes to the user's `Cargo.toml`.
-
-**Option C: Cargo's `build.target-dir` + `cargo +your-toolchain`:**
-
-For projects that are all-in on your language, define a custom toolchain that replaces
-`rustc` entirely:
-
-```toml
-# rust-toolchain.toml (in user's project)
-[toolchain]
-channel = "nightly-2025-01-15"
-
-# Custom rustc replacement
-[toolchain.components]
-rustc = "your-lang-rustc"
-```
-
-This requires publishing your driver as a rustup component, which is the most involved but
-most seamless user experience.
-
-For the near term, Option B (RUSTC_WRAPPER) is the simplest path and the one most existing
-tools use.
-
-### 8.3 Registry serialization
-
-The registry produced by your frontend and consumed by the rustc driver needs a
-serialization format. Requirements:
-
-- **Deterministic:** same input → same bytes. Needed for build caching.
-- **Incremental:** only the changed structs/functions are recomputed when a .yourlang file
-  changes.
-- **Version-stamped:** include the registry format version and nightly pin date. Reject
-  registries from incompatible versions with a clear error.
-
-A simple approach: use `serde` + `bincode` for compact binary, or `serde` + `json` for
-debuggability. Stamp with a hash of the nightly toolchain version.
-
-### 8.4 Dependency tracking
-
-When a Toylang type changes:
-- `layout_of` results for that type are invalid (and for any type that contains it)
-- MIR bodies that use that type are invalid
-- Rust crates that depend on the type's size/layout need recompilation
-
-Cargo's dependency tracking doesn't know about your language's types. You must tell it:
-
-```rust
-// In build.rs, emit rerun-if-changed for every .yourlang file
-for file in find_yourlang_files() {
-    println!("cargo:rerun-if-changed={}", file);
-}
-// Also emit a hash of the registry itself, so Rust files recompile when any type changes
-println!("cargo:rerun-if-env-changed=TOYLANG_REGISTRY_HASH");
-std::env::set_var("TOYLANG_REGISTRY_HASH", registry_hash);
-```
-
----
-
-## Part 9: Handling Nightly API Churn
-
-### 9.1 What changes, what doesn't
-
-Between nightly versions, the following typically change:
+### 9.1 What changes
 
 | Component | Stability | Change frequency |
 |-----------|-----------|-----------------|
 | `Callbacks` trait | Very stable | Rarely |
 | `override_queries` mechanism | Very stable | Rarely |
-| `TyCtxt` query names | Stable | Rarely |
-| `Body`, `BasicBlock`, `Statement` structure | Mostly stable | Occasionally |
-| `LayoutS` field names and constructor | Unstable | Frequently |
-| `TerminatorKind` variant fields | Unstable | Occasionally |
-| `Providers` struct (new fields) | Grows frequently | Always safe to ignore |
-| `BorrowCheckResult` fields | Unstable | Occasionally |
-| `GenericArgs` API | Somewhat stable | Occasionally |
+| `Body`, `BasicBlock`, `Statement` | Mostly stable | Occasionally |
+| `LayoutData` constructor | Unstable | Frequently |
+| `TerminatorKind` fields | Unstable | Occasionally |
 
-The `LayoutS` constructor is the most common source of breakage. Expect to fix it on most
-monthly updates.
+### 9.2 Isolate rustc_private usage
 
-### 9.2 The update process
+All `rustc_private` imports are confined to `rustc-lang-facade/src/`. The consumer
+(`toylangc`) uses the library's public API. When a nightly breaks something, only the
+library needs fixing.
 
-Define an explicit monthly process:
+### 9.3 The rustc fork adds maintenance
 
-1. Create a `chore/nightly-YYYY-MM` branch
-2. Update `rust-toolchain.toml` date
-3. Run `cargo build`
-4. For each compilation error:
-   - Check the rustc changelog or git blame for what changed
-   - Fix the usage
-5. Run the full test suite
-6. Merge with a commit message: `chore: bump nightly to YYYY-MM-DD`
-
-Keep the update commits clean and atomic. They make it easy to bisect if a nightly
-introduces a regression in your code vs. a regression in rustc.
-
-### 9.3 Abstraction layer
-
-Isolate all `rustc_private` API usage behind a thin abstraction layer in your codebase.
-Never use `LayoutS`, `BasicBlockData`, or similar types directly in your language's
-frontend code. Only your `queries/` module should touch these types.
-
-```
-your_lang/
-  frontend/     ← zero rustc_private imports
-  queries/      ← all rustc_private usage isolated here
-  mir_helpers/  ← rustc_private, but only MIR construction utilities
-```
-
-When a nightly breaks something, the fix is confined to `queries/` and `mir_helpers/`.
-Your frontend code is untouched.
-
-### 9.4 Migration to rustc_public
-
-The `rustc_public` / Stable MIR project (https://github.com/rust-lang/project-stable-mir)
-is designing a stable, versioned public API for exactly this use case. Monitor it actively.
-
-When it stabilizes:
-- Replace `#![feature(rustc_private)]` with a versioned dependency on `rustc_public`
-- Replace `LayoutS` construction with the stable layout API
-- Replace `Body::new()` with the stable MIR construction API
-
-The query override mechanism (`Config::override_queries`) is expected to be part of the
-stable API. The migration will be significant work but will eliminate nightly coupling.
+The fork patches 4 files. When bumping nightlies:
+1. Rebase the fork branch onto the new commit
+2. Verify the 4 patch sites still exist (grep for `instance_mir`)
+3. Fix any API changes in MIR data structures
+4. Rebuild the forked toolchain
 
 ---
 
-## Part 10: Milestones — From Toy to Production
+## Part 10: Milestones
 
-### Milestone 0: Toylang proof of concept ✓
+### Milestone 0: Proof of concept ✓
 
-**Status: COMPLETE.**
-
-Validated all five query mechanisms: `layout_of`, `mir_built`, `mir_borrowck`, `mir_shims`
-(drop glue), and the type oracle. `Vec<Point>` compiles and runs, drop glue fires, build
-compiles on a pinned nightly.
-
----
+Validated query mechanisms: `layout_of`, `mir_built`, `mir_borrowck`, `mir_shims`,
+type oracle. `Vec<Point>` compiles and runs.
 
 ### Milestone 1: External codegen ✓
 
-**Status: COMPLETE.** See `problem-abi-coercion.md` for the ABI solution.
+Function bodies compiled to LLVM IR by external backend. `mir_built` produces thin
+call stubs. CodegenBackend wrapper injects .o. ABI coercion via `fn_abi_of_instance`.
 
-The fundamental architectural shift: function bodies are compiled to LLVM IR by our backend
-(`src/llvm_gen.rs`), not lowered to MIR. The `mir_built` override produces thin call stubs,
-not real code. The old MIR lowering code (`lower.rs`) has been deleted.
+### Milestone 2: Struct nesting (in progress)
 
-Four mechanisms work together, no rustc fork required:
+**Status:** 9 tests passing (up from 5).
 
-1. **Phantom struct** (ReifyFnPointer casts in MIR stubs) triggers monomorphization
-   of Rust generic instantiations.
-2. **`-C codegen-units=16`** forces external linkage for cross-CGU references.
-3. **CodegenBackend wrapper** injects Toylang's `.o` into `CodegenResults`.
-4. **`after_analysis` hook** generates LLVM IR using `tcx.symbol_name(instance)` for
-   mangled Rust function names, and `fn_abi_of_instance` for ABI coercion.
+**Done:**
+- Opaque stubs with accessor methods
+- Zero-field FieldsShape
+- Module-qualified matching (`is_from_lang_stubs`)
+- Parser + registry extended for ToyStruct and RustGeneric field types
+- monomorphize_type handles nested structs and Rust generic fields
+- Recursive LLVM codegen for nested struct construction
+- Function wrapper generation in __lang_stubs (in progress)
 
-**What was demonstrated:**
-- Simple struct (Counter): single-field struct with parameters ✓
-- Generic struct (Pair<i32,i32>): multi-field ABI coercion on aarch64 ✓
-- Vec operations (make_vec, vec_len): phantom struct + mangled symbols ✓
-- Custom FileLoader injecting generated Rust stubs ✓
-- All four tests pass: counter_test, pair_test, host, layout_test ✓
+**Blocked on rustc fork:**
+- Generic accessor methods (need per_instance_mir)
+- Phantom type dep monomorphization for T(R) tests
+- All remaining test groups
 
-**What already works beyond this milestone's original scope:**
-- Generic types with type parameters (Pair<T,U>)
-- `Vec<YourStruct>` as a return type (originally planned for Milestone 3)
-- Drop glue for Toylang types (originally planned for Milestone 3)
-- `layout_of` for both generic and non-generic Toylang types
+**Test status:**
+- Passing: counter_construct, pair_construct, vec_point, point_layout, point_drop,
+  t_of_t_construct, t_of_t_layout, tg_i32_i64, tg_of_toypoint_layout
+- Ignored (17): T(R), R(T(R)), T(R(T)), deep nesting, mixed fields, toylang main
 
----
+### Milestone 3: rustc fork + per_instance_mir
 
-### Milestone 2: Expand the LLVM backend's expression coverage
+Implement the minimal rustc fork:
+- Add `per_instance_mir` query
+- Patch monomorphization collector
+- Patch codegen MonoItem dispatch
+- Override `symbol_name` for consumer instances
+- Convert `mir_built` override to use `per_instance_mir`
+- Unify concrete and generic function handling
 
-The LLVM backend currently handles struct literals, integer literals, variables, and
-function parameters. Real programs need more.
+This unblocks all remaining Milestone 2 tests plus generic accessor methods.
 
-**What to implement:**
-- Arithmetic expressions (`+`, `-`, `*`, `/`, `%`) → LLVM `add`, `sub`, `mul` etc.
-- Field access (`p.x`) → LLVM `getelementptr` + `load`
-- Comparison operators (`==`, `<`, etc.) → LLVM `icmp`
-- Control flow (`if`/`else`) → LLVM conditional branches
-- Loops (`while`, `loop`) → LLVM back-edge branches
-- Local variables beyond function parameters (`let x = expr`)
-- Function calls to other Toylang functions
+### Milestone 4: LLVM backend expression coverage
 
-**Exit criteria:**
-- A Toylang function with an `if` expression compiles and runs
-- A Toylang function with a loop compiles and runs
-- Field access on a struct parameter works
+Arithmetic, field access, comparisons, control flow (if/else, loops), local
+variables, function calls between consumer functions.
 
----
+### Milestone 5: Trait implementations
 
-### Milestone 3: Connect your real language
+Generated `impl Trait for ConsumerType` blocks in stubs. Trait method stubs intercepted
+by `per_instance_mir`. Consumer compiles trait method implementations to LLVM.
 
-Replace Toylang's parser and registry with your real language's frontend output.
+### Milestone 6: Consumer owns main
 
-**What to implement:**
-- Serialized registry format (your compiler → `ToylangRegistry` equivalent)
-- Map your language's type definitions to the registry's struct/field model
-- Map your language's function signatures to the registry's function model
-- Wire your language's compiled LLVM IR into the `after_analysis` hook
-- End-to-end test: a real program in your language, compiled by this driver
+Consumer-defined `main` function as program entry point.
 
-**Key question:** Does your language's type representation map cleanly to the registry
-format? Are there features (enums, unions, DSTs, closures) that need new registry support?
+### Milestone 7: Build system integration
 
-**What already works and just needs wiring:**
-- `layout_of` for structs with primitive fields (including generics)
-- FileLoader stub generation from registry
-- `mir_built` call stubs + phantom deps
-- CodegenBackend `.o` injection
-- ABI coercion for struct returns
+RUSTC_WRAPPER, Cargo rerun-if-changed, CI pipeline.
+
+### Milestone 8: Codegen optimization
+
+Evaluate codegen-units=16 performance. Investigate LTO if needed.
+
+### Milestone 9: Diagnostics and debugger support
+
+DWARF debug info, error attribution, source spans.
 
 ---
 
-### Milestone 4: Trait implementations
-
-**What to implement:**
-- Generated Rust `impl` blocks in the stub file (e.g., `impl Hash for YourType`)
-- Trait method stubs with `unreachable!()` bodies, intercepted by `mir_built`
-- `mir_built` generates call stubs to your language's compiled trait method implementations
-- For generic trait methods (like `Hash::hash<H: Hasher>`): the stub calls a generic
-  your-language function; your language's LLVM backend compiles the generic body
-
-Two approaches for trait methods:
-- Non-generic methods (`PartialEq::eq`, `Drop::drop`): straightforward call stub
-- Generic methods (`Hash::hash<H>`): your language defines a generic function, compiled
-  by your LLVM backend. The MIR stub calls it with type parameters. Rustc's monomorphizer
-  instantiates the stub, which calls the monomorphized external implementation.
-
-For a first implementation, limit trait support to a specific list: `Clone`, `Copy`,
-`Debug`, `Display`, `Hash`, `Eq`, `Ord`, `Drop`.
-
-This is the most complex milestone. Trait implementations affect:
-- Method resolution (`obj.method()` selecting the right impl)
-- Trait object dispatch (`dyn Trait`)
-- Blanket impl applicability
-- Coherence checking (no duplicate impls)
-
-**Test:** `HashMap<YourKey, YourValue>` — exercises `Hash + Eq` trait impls, layout, and drop.
-
----
-
-### Milestone 5: Mutually recursive generic nesting
-
-```rust
-// Rust
-struct RustOuter<T> { inner: YourInner<T> }
-
-// Your language
-struct YourInner<T> { field: RustField<T> }
-```
-
-**What to implement:**
-- Verify that `layout_of` calls `tcx.layout_of` for Rust-typed fields (should already
-  work from Milestone 1's generic type support, but needs explicit testing)
-- Comprehensive test cases for 3+ levels of nesting
-- Cycle detection test: verify that a genuinely cyclic layout produces a clear error
-
-**This milestone should "just work"** if earlier milestones were implemented correctly.
-The test suite is the main deliverable.
-
----
-
-### Milestone 6: Build system integration
-
-**What to implement:**
-- `RUSTC_WRAPPER` integration tested in a real Cargo workspace
-- Registry serialization (frontend → driver, versioned format)
-- Cargo `rerun-if-changed` for your language's source files
-- CI pipeline that tests on the current pinned nightly
-- Hermetic build: nightly version embedded in registry
-
-Incremental compilation can be deferred — disable it initially by always invalidating.
-
----
-
-### Milestone 7: Codegen optimization
-
-**What to evaluate:**
-- Does `codegen-units=16` cause measurable optimization regressions in practice?
-- If so, investigate proper LTO integration:
-  - Upstream rustc change to make `ModuleLlvm`/`Linker` public
-  - rust-lld Mach-O support → linker-plugin LTO
-  - Inject into coordinator thread during `codegen_crate`
-- See `design-codegen-integration.md` for the full analysis
-
-This milestone may be unnecessary if `codegen-units=16` performs well enough in practice.
-
----
-
-### Milestone 8: Diagnostics and debugger support
-
-**What to implement:**
-- DWARF debug info in LLVM-generated code pointing back to your source files
-- Error attribution: rustc errors mentioning your types show human-readable names
-- Panic messages from Rust code use sensible type names (`tcx.def_path_str`)
-- Source spans for your language's items registered with rustc's `SourceMap`
-
----
-
-### Milestone 9: Migration to rustc_public
-
-**Contingent on:** rustc_public / Stable MIR stabilization
-
-**What to implement:**
-- Replace all `rustc_private` usage with `rustc_public` equivalents
-- Remove `#![feature(rustc_private)]` and nightly requirement
-- Test on stable Rust toolchain
-
----
-
-## Part 11: Reference — Key rustc APIs
-
-This section collects the most important `TyCtxt` queries and types for quick reference.
+## Part 11: Key rustc APIs (Quick Reference)
 
 ### Layout queries
-
 ```rust
-tcx.layout_of(param_env.and(ty))     // LayoutS for a type in a param env
-tcx.data_layout()                     // Target-specific layout info
-tcx.is_sized(ty, param_env)          // Is this type Sized?
-tcx.needs_drop_raw(param_env.and(ty)) // Does this type need drop glue?
+tcx.layout_of(PseudoCanonicalInput { value: ty, typing_env })
+tcx.data_layout                       // Target-specific layout info
 ```
 
 ### Type construction
-
 ```rust
-tcx.types.i32                         // Ty<'tcx> for i32
-tcx.types.bool                        // Ty<'tcx> for bool
-tcx.types.unit                        // Ty<'tcx> for ()
-tcx.mk_ptr(TypeAndMut { ty, mutbl })  // *mut T or *const T
-tcx.mk_ref(region, TypeAndMut { ty, mutbl }) // &T or &mut T
-tcx.mk_adt(adt_def, args)             // An ADT type with generic args
-tcx.mk_fn_ptr(sig)                    // A function pointer type
+tcx.types.i32 / tcx.types.bool / tcx.types.unit
+Ty::new_adt(tcx, adt_def, args)       // ADT with generic args
+Ty::new_mut_ptr(tcx, ty)              // *mut T
+Ty::new_fn_def(tcx, def_id, args)     // Function item type
 ```
 
 ### Definition lookup
-
 ```rust
-tcx.def_kind(def_id)                  // What kind of item (Fn, Struct, Trait, etc.)
-tcx.item_name(def_id)                 // Name of an item as a Symbol
-tcx.def_span(def_id)                  // Source span of a definition
-tcx.get_diagnostic_item(sym::Vec)     // DefId of a well-known item by name
-tcx.inherent_impls(type_did)          // All inherent impls for a type
-tcx.trait_impls_of(trait_did)         // All impls of a trait
-tcx.associated_item_def_ids(impl_did) // All items in an impl block
-tcx.associated_item(assoc_did)        // Info about an associated item
+tcx.def_kind(def_id)                  // Fn, Struct, Trait, etc.
+tcx.item_name(def_id)                 // Name as Symbol
+tcx.get_diagnostic_item(sym::Vec)     // DefId of well-known item
+tcx.inherent_impls(type_did)          // All inherent impls
+tcx.associated_item_def_ids(impl_did) // Items in an impl block
 ```
 
 ### MIR queries
-
 ```rust
 tcx.mir_built(local_def_id)           // Raw MIR (before optimization)
-tcx.optimized_mir(def_id)             // Optimized MIR (for codegen)
-tcx.mir_keys(())                      // All LocalDefIds that have MIR
-tcx.instance_mir(instance_kind)       // MIR for a specific instance (incl. shims)
-```
-
-### Type inspection
-
-```rust
-ty.kind()                             // TyKind — the type's variant
-ty.is_primitive()                     // Is it a primitive type?
-ty.is_adt()                           // Is it a struct/enum/union?
-ty.is_fn()                            // Is it a function type?
-if let TyKind::Adt(adt_def, args) = ty.kind() { ... }
-if let TyKind::Ref(region, inner_ty, mutbl) = ty.kind() { ... }
-```
-
-### Function signatures
-
-```rust
-tcx.fn_sig(def_id)                    // Generic signature (EarlyBinder)
-tcx.fn_sig(def_id).skip_binder()      // FnSig without binder
-tcx.fn_sig(def_id).instantiate(tcx, args) // Monomorphized signature
-sig.inputs()                          // Parameter types (slice)
-sig.output()                          // Return type
-sig.abi                               // Calling convention (Rust, C, etc.)
-```
-
-### ABI queries
-
-```rust
-tcx.fn_abi_of_instance(             // Get the LLVM-level ABI for a function
-  typing_env, (instance, extra_args))
-fn_abi.ret.mode                      // PassMode — how the return value is passed
-fn_abi.args[i].mode                  // PassMode for each argument
-// PassMode::Direct — passed as-is
-// PassMode::Cast { rest, .. } — coerced to a different LLVM type
-// PassMode::Indirect — passed via pointer (sret)
-```
-
-### Trait system
-
-```rust
-tcx.trait_def(trait_did)              // TraitDef for a trait
-tcx.is_auto_trait(trait_did)          // Is this an auto trait (Send, Sync)?
-tcx.impl_trait_ref(impl_did)          // The trait + args this impl implements
-tcx.check_impls_are_allowed_to_overlap(def_id, other) // Coherence check
+tcx.instance_mir(instance_kind)       // MIR for a specific instance
+tcx.per_instance_mir(instance)        // NEW: per-instantiation override
 ```
 
 ### Symbol names
-
 ```rust
-tcx.symbol_name(instance)            // Mangled symbol name for a mono instance
-instance.name                         // The mangled name as &str
-// Use this in after_analysis to get correct mangled names for Rust generic
-// instantiations that your LLVM backend needs to call.
+tcx.symbol_name(instance)            // Mangled symbol name
 ```
 
-### Source map and spans
-
+### Function signatures and ABI
 ```rust
-tcx.sess.source_map()                 // The SourceMap
-source_map.lookup_source_file(pos)    // Which file contains a byte position
-source_map.load_file(path)            // Load a source file and get its span range
+tcx.fn_sig(def_id).instantiate(tcx, args)  // Monomorphized signature
+rustc_lang_facade::abi_helpers::coerced_return_type(tcx, def_id)  // ABI coercion
 ```
 
 ---
 
 ## Part 12: Known Unknowns
 
-These are areas where the approach described in this document has open questions that will
-require research and experimentation during implementation:
+**Cross-crate type registration:** Consumer types in crate A need to be visible to
+crate B without re-running the consumer frontend. Requires `.rmeta` integration.
+Workaround: compile in the same session.
 
-**Cross-crate type registration:** The query provider approach works when your language's
-types and the Rust code using them are compiled in the same `rustc` session. When Rust code
-in crate B depends on types defined in your language's code compiled in crate A (a separate
-earlier session), the types need to be visible to crate B's compilation without re-running
-your language's frontend. This requires serializing your type definitions into the `.rmeta`
-file that rustc stores for compiled crates. The `rustc_metadata` crate handles `.rmeta`
-writing, and hooking into it to add your types is unexplored territory. One workaround:
-always compile your language's types and Rust code in the same session. This limits
-separate compilation but avoids the `.rmeta` problem.
+**Trait coherence:** Rust's orphan rule may reject trait impls for consumer types.
+Whether `override_queries` can bypass this is untested.
 
-**Trait coherence with your language's types:** Rust's orphan rule says you can only implement
-a trait for a type if you own either the trait or the type. When registering trait impls for
-your language's types via the query system, the coherence checker may reject your impl
-because it doesn't recognize your type as "local" to the current crate. Whether and how
-`override_queries` can bypass this is untested.
+**Async/generators:** Significantly more complex MIR. Separate milestone if needed.
 
-**Async and generators:** If your language or any Rust library it calls uses `async fn` or
-generators, the MIR representation is significantly more complex (coroutine state machines).
-The `MirSource` and `Body` for async functions contain additional fields. Scope this as a
-separate milestone if needed.
+**ABI coercion on non-aarch64:** `fn_abi_of_instance` handles target-specific rules,
+but `cast_target_to_llvm_str` may need extension for x86_64 register splitting.
 
-**ABI coercion on non-aarch64 targets:** The `abi_helpers.rs` implementation handles the
-common aarch64 case (small structs coerced to integer scalars). x86_64 has different rules
-(e.g., structs may be split across two registers). The `fn_abi_of_instance` query handles
-this correctly, but `cast_target_to_llvm_str` may need extension for new `CastTarget`
-patterns on other architectures.
+**per_instance_mir query caching:** The query is marked `no_hash` to avoid incremental
+compilation issues. Need to verify this doesn't cause stale results within a session.
 
-**WASM and embedded targets:** The `layout_of` implementation must use `tcx.data_layout()`
-for all target-specific sizes. If this is done correctly from the start, cross-compilation
-to non-native targets should work. Test early on a 32-bit target (e.g., `thumbv7em-none-eabi`)
-to catch any accidental pointer-size assumptions.
+**CGU internalization:** The CGU partitioner may assign Internal linkage to consumer
+function declarations, hiding them from the linker. May need `-C codegen-units=1` or
+`exported_symbols` override. Needs testing.
 
 ---
 
 ## Quick Reference Checklist
 
-Implementation status of each architectural component:
-
 ### Query overrides
-- [x] `layout_of` — non-generic types
-- [x] `layout_of` — generic types (calls tcx for type arg layouts)
-- [x] `mir_built` — extern call stubs (simple + phantom deps)
-- [x] `mir_borrowck` — selective skip for Toylang items
-- [x] `mir_shims` — drop glue for Toylang types
-- [ ] `needs_drop_raw` — drop need detection for your types
+- [x] `layout_of` — non-generic and generic types (0-field opaque layout)
+- [x] `mir_built` — extern call stubs (concrete functions)
+- [x] `mir_borrowck` — selective skip for consumer items
+- [x] `mir_shims` — drop glue for consumer types
+- [ ] `per_instance_mir` — per-instantiation function stubs (needs fork)
+- [ ] `symbol_name` — consumer symbol name mapping (needs fork)
 
 ### External LLVM backend
 - [x] LLVM IR generation for struct-returning functions
-- [x] ABI coercion via `fn_abi_of_instance` (aarch64)
+- [x] ABI coercion via `fn_abi_of_instance`
 - [x] Mangled symbol resolution via `tcx.symbol_name(instance)`
-- [x] CodegenBackend wrapper (`.o` injection into link step)
+- [x] CodegenBackend wrapper (.o injection)
 - [x] FileLoader (stub source injection)
-- [ ] Arithmetic expressions
-- [ ] Field access
-- [ ] Control flow (if/else, loops)
-- [ ] Function calls between Toylang functions
+- [x] Nested struct codegen (recursive alloca + GEP)
+- [x] Accessor function codegen (GEP to field, non-generic)
+- [ ] Generic accessor codegen (needs per_instance_mir)
 
-### Type system integration
-- [x] Layout computation for structs with primitive fields
-- [x] Generic type parameters (Pair<T,U>)
-- [x] Vec<YourStruct> as return type
-- [ ] Trait implementations (Hash, Eq, etc.)
-- [x] Layout uses `tcx.data_layout` throughout (no more hardcoded aarch64 values)
-- [ ] Target-portability tested (x86_64, 32-bit)
+### Stub generation
+- [x] Opaque struct definitions (PhantomData / unit)
+- [x] Wrapper functions with unreachable!() bodies
+- [x] Accessor methods with unreachable!() bodies
+- [x] Extern "C" declarations for accessor symbols (non-generic)
+- [x] Extern "C" declarations for function symbols
 
-### Library split
-- [x] `LangCallbacks` trait with 6 methods: `type_names`, `fn_names`, `generate_stubs`, `monomorphize_type`, `monomorphize_fn`, `generate_and_compile`
-- [x] Vtable + HRTB trampoline machinery for `'tcx` lifetime across globals
-- [x] Workspace: `rustc-lang-facade` (library) + `toylangc` (consumer)
-- [x] Query overrides decoupled from `ToylangRegistry` (call through vtable)
-- [x] `run_compiler<C>(callbacks, rustc_args)` entry point (2-arg API)
+### Type system
+- [x] Primitive field types (i32, i64, f64, bool)
+- [x] Type parameters in generic structs
+- [x] ToyStruct fields (toylang containing toylang)
+- [x] RustGeneric fields in monomorphize_type (Vec<i32>, etc.)
+- [ ] Full T(R) codegen (needs phantom type dep monomorphization)
 
-### Build system
-- [ ] RUSTC_WRAPPER integration
-- [ ] Registry serialization (frontend → driver)
-- [ ] Cargo rerun-if-changed for source files
-- [ ] Incremental compilation support
-- [ ] CI pipeline with nightly update test
+### Module-qualified matching
+- [x] `is_from_lang_stubs` for layout_of, drop_glue
+- [x] `is_from_lang_stubs` for mir_built (functions + accessor methods)
+- [x] `is_from_lang_stubs` for borrowck
 
-### Safety and correctness
-- [x] Drop chain fires for Toylang types
-- [x] MIR validator passes with `-Zvalidate-mir`
-- [ ] Boundary invariant documented and tested
-- [ ] Cycle detection tested (cyclic layout → clear error)
-- [ ] Mutually recursive layout tested (3+ levels deep)
+### Test suite
+- [x] 9 passing integration tests
+- [ ] 17 ignored tests (north star for Milestones 2-6)

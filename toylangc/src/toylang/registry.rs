@@ -15,7 +15,9 @@ pub enum ToyFieldType {
     I64,
     F64,
     Bool,
-    TypeParam(String),   // e.g. "A", "B"
+    TypeParam(String),      // e.g. "A", "B"
+    ToyStruct(String),      // another toylang struct, e.g. "ToyInner"
+    RustGeneric(String, Vec<ToyFieldType>), // e.g. Vec<i32>, HashMap<K,V>
 }
 
 /// A Toylang struct definition.

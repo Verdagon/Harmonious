@@ -1,5 +1,26 @@
-#![allow(unused)]
+//! layout_of query override.
+//!
+//! When rustc needs the size/alignment of a consumer-defined type, this override
+//! intercepts the query and asks the consumer for the field types via
+//! `monomorphize_type`. The consumer returns concrete `Ty<'tcx>` values for each
+//! field, and we compute the C-like struct layout (field offsets with padding).
+//!
+//! IMPORTANT: layout_of is called for EVERY type rustc encounters — including
+//! `*mut Point`, `&Point`, `Option<Point>`, `FnDef(..., [Point])`, etc. We MUST
+//! filter to only `TyKind::Adt` types whose name matches a consumer-registered type.
+//! Intercepting derived types (pointers, references, etc.) corrupts their layouts
+//! and causes ICEs in codegen. This was a hard-won lesson from the early PoC.
+//!
+//! The layout returned here uses `BackendRepr::Memory { sized: true }` which tells
+//! rustc this is an opaque memory blob. Rustc doesn't try to decompose it into
+//! scalar pairs or niches. This is intentional — the consumer controls the layout.
+//! Niche optimization (`largest_niche: None`) is disabled; add it later if needed.
+//!
+//! Target portability: all sizes and alignments come from `tcx.layout_of()` on the
+//! consumer-provided field types. No hardcoded sizes. This was fixed in the
+//! "replace hardcoded aarch64 values" change — see git history.
 
+#![allow(unused)]
 
 use rustc_abi::{
     AbiAndPrefAlign, Align, BackendRepr, FieldIdx, FieldsShape, LayoutData, Size, VariantIdx,
@@ -9,28 +30,36 @@ use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
 use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv, TyKind};
 use std::sync::OnceLock;
 
-// The provider function type for layout_of on nightly-2025-01-15.
+// The provider function type. This must match rustc's Providers::layout_of signature
+// exactly — it changes between nightlies. On nightly-2025-01-15 it uses
+// PseudoCanonicalInput. On other nightlies it may use ParamEnvAnd.
 type LayoutOfFn = for<'tcx> fn(
     TyCtxt<'tcx>,
     PseudoCanonicalInput<'tcx, Ty<'tcx>>,
 ) -> Result<TyAndLayout<'tcx>, &'tcx LayoutError<'tcx>>;
 
+/// Saved default provider. Used to fall through for non-consumer types.
+/// Stored in OnceLock because query providers are function pointers — they
+/// can't capture the original provider as a closure variable.
 static DEFAULT_LAYOUT_OF: OnceLock<LayoutOfFn> = OnceLock::new();
 
 pub fn save_default(f: LayoutOfFn) {
     let _ = DEFAULT_LAYOUT_OF.set(f);
 }
 
+/// The layout_of override. Intercepts consumer-defined types, falls through
+/// to rustc's default for everything else.
 pub fn toy_layout_of<'tcx>(
     tcx: TyCtxt<'tcx>,
     query: PseudoCanonicalInput<'tcx, Ty<'tcx>>,
 ) -> Result<TyAndLayout<'tcx>, &'tcx LayoutError<'tcx>> {
     let ty = query.value;
 
-    // Only intercept ADT types whose name matches a consumer-registered type.
+    // Only intercept ADT types from __lang_stubs whose name matches a consumer type.
+    // Checking the module prevents collisions with user-defined types sharing a name.
     if let TyKind::Adt(adt_def, _) = ty.kind() {
         let name = tcx.item_name(adt_def.did()).to_string();
-        if crate::is_consumer_type(&name) {
+        if crate::is_consumer_type(&name) && crate::is_from_lang_stubs(tcx, adt_def.did()) {
             eprintln!("[toylang] layout_of intercepted for: {:?}", ty);
 
             // Ask the consumer to monomorphize this type — returns concrete field types.
@@ -77,13 +106,15 @@ fn build_layout<'tcx>(
     let align = Align::from_bytes(max_align).unwrap();
     let abi_align = AbiAndPrefAlign::new(align);
 
-    let offsets: IndexVec<FieldIdx, Size> = field_offsets_vec.iter()
-        .map(|&o| Size::from_bytes(o))
-        .collect();
-    let memory_index: IndexVec<FieldIdx, u32> = (0..field_types.len() as u32).collect();
-
+    // Report 0 fields to rustc — the struct is fully opaque. Rustc only needs
+    // the total size and alignment for ABI decisions with BackendRepr::Memory.
+    // Exposing per-field info caused crashes when rustc's ABI code tried to
+    // index into the ADT's fields (which are dummy stubs, not real fields).
     let layout_data = LayoutData {
-        fields: FieldsShape::Arbitrary { offsets, memory_index },
+        fields: FieldsShape::Arbitrary {
+            offsets: IndexVec::new(),
+            memory_index: IndexVec::new(),
+        },
         variants: Variants::Single { index: VariantIdx::from_u32(0) },
         backend_repr: BackendRepr::Memory { sized: true },
         largest_niche: None,

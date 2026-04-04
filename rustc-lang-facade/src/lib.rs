@@ -40,10 +40,6 @@ pub struct MonomorphizeTypeResult<'tcx> {
     /// The library calls tcx.layout_of() on each to compute struct layout.
     /// E.g. for MyStruct<i32>: field_types might be [tcx.types.i32, Vec<i32>].
     pub field_types: Vec<Ty<'tcx>>,
-    /// Rust generic instantiations (types or functions) this type depends on.
-    /// E.g. if the struct contains a Vec<i32> field, the consumer might want
-    /// to trigger monomorphization of Vec<i32>'s drop glue or methods.
-    pub rust_deps: Vec<(DefId, ty::GenericArgsRef<'tcx>)>,
 }
 
 /// Result of monomorphizing a consumer function for a specific set of type args.
@@ -104,24 +100,21 @@ pub trait LangCallbacks: Send + Sync {
         ty: Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx>;
 
-    /// Monomorphize a consumer function for concrete type args.
-    /// Called from the mir_built override when rustc's monomorphizer
-    /// encounters a consumer function.
+    /// Monomorphize a consumer function for a concrete instantiation.
+    /// Called from per_instance_mir when rustc's monomorphizer encounters
+    /// a consumer function instance.
     ///
-    /// This is the hook point for the consumer's own monomorphizer. The flow:
-    /// 1. Rustc's monomorphizer wants MIR for e.g. `wrap<i32>`
-    /// 2. The library's mir_built override calls this method
-    /// 3. The consumer monomorphizes its generic IR for `wrap` with `T = i32`
-    /// 4. During that, the consumer discovers it needs `Vec::push<i32>`
-    /// 5. The consumer picks a symbol name for the monomorphized body
-    /// 6. The consumer returns MonomorphizeFnResult with the symbol + deps
-    /// 7. The library builds a MIR call stub targeting that symbol
-    /// 8. Rustc's monomorphizer sees phantom casts → monomorphizes the deps
+    /// `instance` contains the concrete generic args (e.g., `wrap::<i32>`).
+    /// The consumer uses it to:
+    /// - Compute the extern symbol name (including mangled type args)
+    /// - Query `fn_abi_of_instance` for the correct return ABI
+    /// - Discover Rust-side dependencies
     fn monomorphize_fn<'tcx>(
         &self,
         name: &str,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
+        instance: ty::Instance<'tcx>,
     ) -> MonomorphizeFnResult<'tcx>;
 
     /// Called after rustc's analysis phase completes (after type checking,
@@ -168,6 +161,7 @@ pub(crate) struct CallbackVtable {
         &str,
         TyCtxt<'tcx>,
         LocalDefId,
+        ty::Instance<'tcx>,
     ) -> MonomorphizeFnResult<'tcx>,
 
     pub after_rust_analysis: for<'tcx> fn(
@@ -193,6 +187,14 @@ pub(crate) fn is_consumer_type(name: &str) -> bool {
     CONSUMER_TYPE_NAMES.get().map_or(false, |s| s.contains(name))
 }
 
+/// Check if a DefId is from the __lang_stubs module (the consumer's injected stubs).
+/// This prevents name collisions with user-defined types that happen to share a name.
+/// Uses the def_path to check if any ancestor is the __lang_stubs module.
+pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let path = tcx.def_path_str(def_id);
+    path.starts_with("__lang_stubs::")
+}
+
 /// Check if a function name belongs to the consumer's language.
 pub(crate) fn is_consumer_fn(name: &str) -> bool {
     CONSUMER_FN_NAMES.get().map_or(false, |s| s.contains(name))
@@ -214,10 +216,11 @@ pub(crate) fn call_monomorphize_fn<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
+    instance: ty::Instance<'tcx>,
 ) -> MonomorphizeFnResult<'tcx> {
     let vtable = VTABLE.get().expect("vtable not installed");
     let data = CALLBACKS.get().expect("callbacks not installed");
-    (vtable.monomorphize_fn)(data.as_ref(), name, tcx, def_id)
+    (vtable.monomorphize_fn)(data.as_ref(), name, tcx, def_id, instance)
 }
 
 /// Call the consumer's after_rust_analysis through the vtable.
@@ -252,8 +255,9 @@ fn trampoline_monomorphize_fn<'tcx, C: LangCallbacks + 'static>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
+    instance: ty::Instance<'tcx>,
 ) -> MonomorphizeFnResult<'tcx> {
-    data.downcast_ref::<C>().unwrap().monomorphize_fn(name, tcx, def_id)
+    data.downcast_ref::<C>().unwrap().monomorphize_fn(name, tcx, def_id, instance)
 }
 
 fn trampoline_after_rust_analysis<'tcx, C: LangCallbacks + 'static>(

@@ -97,7 +97,11 @@ The library intercepts five rustc query/hook points:
 
 When rustc needs the size/alignment of your type (e.g. to compute `Vec<YourType>`'s layout), it calls `layout_of`. The library intercepts this and calls your `monomorphize_type`, which returns field types as rustc `Ty` values. The library then computes field offsets, padding, and total size.
 
-**Gotcha:** `layout_of` is called for *every* type rustc encounters — including `*mut YourType`, `&YourType`, `Option<YourType>`, etc. The library filters to only intercept `TyKind::Adt` types matching your registered names. If you match too broadly, you'll corrupt derived type layouts and get ICEs in codegen.
+The layout is fully opaque to rustc: `BackendRepr::Memory { sized: true }` with `FieldsShape::Arbitrary` reporting **0 fields**. Rustc never indexes into the struct's ADT fields — only the total size and alignment matter.
+
+**Gotcha: ADT-only filter.** `layout_of` is called for *every* type rustc encounters — including `*mut YourType`, `&YourType`, `Option<YourType>`, etc. The library filters to only intercept `TyKind::Adt` types matching your registered names. If you match too broadly, you'll corrupt derived type layouts and get ICEs in codegen.
+
+**Gotcha: module check.** The library also verifies that the type's DefId comes from the `__lang_stubs` module (via `is_from_lang_stubs`). Without this, user-defined types that happen to share a name with one of your types will get their layouts overridden, causing crashes in codegen.
 
 ### 2. `mir_built` — MIR body construction
 

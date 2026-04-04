@@ -154,12 +154,14 @@ impl Parser {
 
     fn parse_program(&mut self) -> Result<ToylangRegistry, String> {
         let mut structs: HashMap<String, ToyStruct> = HashMap::new();
+        let mut struct_names: Vec<String> = Vec::new();
         let mut functions: HashMap<String, ToyFunction> = HashMap::new();
 
         loop {
             match self.peek() {
                 Token::Ident(s) if s == "struct" => {
-                    let (name, s) = self.parse_struct()?;
+                    let (name, s) = self.parse_struct(&struct_names)?;
+                    struct_names.push(name.clone());
                     structs.insert(name, s);
                 }
                 Token::Ident(s) if s == "fn" => {
@@ -174,7 +176,7 @@ impl Parser {
         Ok(ToylangRegistry { structs, functions })
     }
 
-    fn parse_struct(&mut self) -> Result<(String, ToyStruct), String> {
+    fn parse_struct(&mut self, struct_names: &[String]) -> Result<(String, ToyStruct), String> {
         // consume "struct"
         self.consume();
         let name = self.expect_ident()?;
@@ -190,10 +192,14 @@ impl Parser {
             self.expect(Token::RAngle)?;
         }
 
+        // Include the current struct name so fields can self-reference
+        let mut all_names: Vec<String> = struct_names.to_vec();
+        all_names.push(name.clone());
+
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-            fields.push(self.parse_field(&type_params)?);
+            fields.push(self.parse_field(&type_params, &all_names)?);
             // optional trailing comma
             if self.peek() == &Token::Comma {
                 self.consume();
@@ -204,14 +210,14 @@ impl Parser {
         Ok((name.clone(), ToyStruct { name, type_params, fields }))
     }
 
-    fn parse_field(&mut self, type_params: &[String]) -> Result<ToyField, String> {
+    fn parse_field(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ToyField, String> {
         let name = self.expect_ident()?;
         self.expect(Token::Colon)?;
-        let rust_type = self.parse_field_type(type_params)?;
+        let rust_type = self.parse_field_type(type_params, struct_names)?;
         Ok(ToyField { name, rust_type })
     }
 
-    fn parse_field_type(&mut self, type_params: &[String]) -> Result<ToyFieldType, String> {
+    fn parse_field_type(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ToyFieldType, String> {
         let s = self.expect_ident()?;
         if type_params.contains(&s) {
             return Ok(ToyFieldType::TypeParam(s));
@@ -221,10 +227,27 @@ impl Parser {
             "i64"  => Ok(ToyFieldType::I64),
             "f64"  => Ok(ToyFieldType::F64),
             "bool" => Ok(ToyFieldType::Bool),
-            other  => Err(format!(
-                "unsupported field type '{}'; expected i32/i64/f64/bool or a type parameter",
-                other
-            )),
+            other  => {
+                // Check for generic type args: Vec<i32>, HashMap<K, V>
+                if self.peek() == &Token::LAngle {
+                    self.consume(); // consume '<'
+                    let mut args = Vec::new();
+                    while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
+                        args.push(self.parse_field_type(type_params, struct_names)?);
+                        if self.peek() == &Token::Comma { self.consume(); }
+                    }
+                    self.expect(Token::RAngle)?;
+                    return Ok(ToyFieldType::RustGeneric(other.to_string(), args));
+                }
+                // Known toylang struct name
+                if struct_names.contains(&other.to_string()) {
+                    return Ok(ToyFieldType::ToyStruct(other.to_string()));
+                }
+                Err(format!(
+                    "unsupported field type '{}'; expected primitive, type param, struct name, or generic type",
+                    other
+                ))
+            }
         }
     }
 

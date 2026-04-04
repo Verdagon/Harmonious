@@ -21,8 +21,10 @@ fn main() {
         let mut args: Vec<String> = std::env::args().collect();
         let mut registry = extract_registry(&mut args);
 
-        let ll_path = std::env::temp_dir().join("toylang_output.ll");
-        let obj_path = std::env::temp_dir().join("toylang_output.o");
+        // lets use tempdir here instead. make sure to print out the temp dir to eprintln
+        let unique_id = std::process::id();
+        let ll_path = std::env::temp_dir().join(format!("toylang_output_{}.ll", unique_id));
+        let obj_path = std::env::temp_dir().join(format!("toylang_output_{}.o", unique_id));
 
         llvm_gen::mark_compiled_functions(&mut registry);
 
@@ -55,6 +57,7 @@ fn extract_registry(args: &mut Vec<String>) -> ToylangRegistry {
                 .unwrap_or_else(|e| panic!("toylang: parse error in {}: {}", path, e));
         }
     }
+    // whats this? we should panic if theres no toylang inputs
     ToylangRegistry {
         structs: Default::default(),
         functions: Default::default(),
