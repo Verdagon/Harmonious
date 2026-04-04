@@ -1,0 +1,47 @@
+thread 'main' panicked at toylangc/src/main.rs:57:37:
+toylang: parse error in /var/folders/vb/44dv9sg95tb36s390y4pv8g80000gn/T/.tmpjzPUMm/input.toylang: expected RBrace, got LParen
+stack backtrace:
+   0:        0x111c0dfb4 - std::backtrace::Backtrace::create::ha41f6c461d34efb3
+   1:        0x10cef334c - <alloc[f1a221af6e361387]::boxed::Box<rustc_driver_impl[35749d289834c7d4]::install_ice_hook::{closure#1}> as core[bbe5874bb0c59dc5]::ops::function::Fn<(&dyn for<'a, 'b> core[bbe5874bb0c59dc5]::ops::function::Fn<(&'a std[47287eb5c919f8eb]::panic::PanicHookInfo<'b>,), Output = ()> + core[bbe5874bb0c59dc5]::marker::Send + core[bbe5874bb0c59dc5]::marker::Sync, &std[47287eb5c919f8eb]::panic::PanicHookInfo)>>::call
+   2:        0x111c23ed8 - std::panicking::rust_panic_with_hook::h70cbb0fe80be1b29
+   3:        0x111c30238 - std::panicking::begin_panic_handler::{{closure}}::hb72bf86ccfc14109
+   4:        0x111c2ff50 - std::sys::backtrace::__rust_end_short_backtrace::hde1304deaa11d9a1
+   5:        0x111c23958 - _rust_begin_unwind
+   6:        0x111e195a8 - core::panicking::panic_fmt::haa5164e851ebc88f
+   7:        0x100ccfb78 - toylangc::extract_registry::{{closure}}::h87adbb6abe398810
+                               at /Users/verdagon/erw/toylangc/src/main.rs:57:37
+   8:        0x100cb2af0 - core::result::Result<T,E>::unwrap_or_else::h60eda6998f74925e
+                               at /Users/verdagon/rust/library/core/src/result.rs:1463:23
+   9:        0x100cb5470 - toylangc::extract_registry::h692d77474fbada0f
+                               at /Users/verdagon/erw/toylangc/src/main.rs:56:20
+  10:        0x100ccf534 - toylangc::main::{{closure}}::h83994d7b04750611
+                               at /Users/verdagon/erw/toylangc/src/main.rs:22:28
+  11:        0x100cf44ac - <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once::h796c5b28c156a4df
+                               at /Users/verdagon/rust/library/core/src/panic/unwind_safe.rs:272:9
+  12:        0x100cca5bc - std::panicking::try::do_call::hcaf4ce6d0365269e
+                               at /Users/verdagon/rust/library/std/src/panicking.rs:584:40
+  13:        0x100cb0180 - ___rust_try
+  14:        0x100cb0000 - std::panicking::try::h9c32f49f689dc7da
+                               at /Users/verdagon/rust/library/std/src/panicking.rs:547:19
+  15:        0x100cb0000 - std::panic::catch_unwind::h9b337338a12b1768
+                               at /Users/verdagon/rust/library/std/src/panic.rs:358:14
+  16:        0x100cb0000 - rustc_driver_impl::catch_fatal_errors::h22f8c46b26aa6c21
+                               at /Users/verdagon/rust/compiler/rustc_driver_impl/src/lib.rs:1284:5
+  17:        0x100cb0118 - rustc_driver_impl::catch_with_exit_code::h0fa98449aba88cd2
+                               at /Users/verdagon/rust/compiler/rustc_driver_impl/src/lib.rs:1296:11
+  18:        0x100cb5278 - toylangc::main::hfd5ffeb1e65b28c9
+                               at /Users/verdagon/erw/toylangc/src/main.rs:20:21
+  19:        0x100cf706c - core::ops::function::FnOnce::call_once::h103355fea7e6ff6b
+                               at /Users/verdagon/rust/library/core/src/ops/function.rs:250:5
+  20:        0x100ce0710 - std::sys::backtrace::__rust_begin_short_backtrace::h11369c72fa65ff80
+                               at /Users/verdagon/rust/library/std/src/sys/backtrace.rs:152:18
+  21:        0x100cbc964 - std::rt::lang_start::{{closure}}::h098aa847c3632ff7
+                               at /Users/verdagon/rust/library/std/src/rt.rs:209:18
+  22:        0x111c2727c - std::rt::lang_start_internal::h6cdd8372858fde23
+  23:        0x100cbc93c - std::rt::lang_start::h030338fff62ce794
+                               at /Users/verdagon/rust/library/std/src/rt.rs:208:5
+  24:        0x100cb5fc8 - _main
+
+
+rustc version: 1.86.0-dev
+platform: aarch64-apple-darwin

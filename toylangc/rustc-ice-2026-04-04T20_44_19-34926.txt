@@ -1,0 +1,79 @@
+thread 'rustc' panicked at toylangc/src/toylang/type_resolve.rs:358:36:
+variable 'true' not in scope during type resolution
+stack backtrace:
+   0:        0x11543dfb4 - std::backtrace::Backtrace::create::ha41f6c461d34efb3
+   1:        0x11072334c - <alloc[f1a221af6e361387]::boxed::Box<rustc_driver_impl[35749d289834c7d4]::install_ice_hook::{closure#1}> as core[bbe5874bb0c59dc5]::ops::function::Fn<(&dyn for<'a, 'b> core[bbe5874bb0c59dc5]::ops::function::Fn<(&'a std[47287eb5c919f8eb]::panic::PanicHookInfo<'b>,), Output = ()> + core[bbe5874bb0c59dc5]::marker::Send + core[bbe5874bb0c59dc5]::marker::Sync, &std[47287eb5c919f8eb]::panic::PanicHookInfo)>>::call
+   2:        0x115453ed8 - std::panicking::rust_panic_with_hook::h70cbb0fe80be1b29
+   3:        0x115460238 - std::panicking::begin_panic_handler::{{closure}}::hb72bf86ccfc14109
+   4:        0x11545ff50 - std::sys::backtrace::__rust_end_short_backtrace::hde1304deaa11d9a1
+   5:        0x115453958 - _rust_begin_unwind
+   6:        0x1156495a8 - core::panicking::panic_fmt::haa5164e851ebc88f
+   7:        0x1044ec158 - toylangc::toylang::type_resolve::resolve_expr::{{closure}}::he4a84730b41ee239
+                               at /Users/verdagon/erw/toylangc/src/toylang/type_resolve.rs:358:36
+   8:        0x104524710 - core::option::Option<T>::unwrap_or_else::h44e8d20d5a0ae486
+                               at /Users/verdagon/rust/library/core/src/option.rs:1023:21
+   9:        0x1045231e4 - toylangc::toylang::type_resolve::resolve_expr::h0e5f9877bb468b92
+                               at /Users/verdagon/erw/toylangc/src/toylang/type_resolve.rs:356:22
+  10:        0x1044ec264 - toylangc::toylang::type_resolve::resolve_expr::{{closure}}::h6c3e2d7d09fc53e0
+                               at /Users/verdagon/erw/toylangc/src/toylang/type_resolve.rs:385:33
+  11:        0x1044fe7e4 - core::iter::adapters::map::map_fold::{{closure}}::hb6d245a4545ec8ad
+                               at /Users/verdagon/rust/library/core/src/iter/adapters/map.rs:88:28
+  12:        0x1044e760c - <core::slice::iter::Iter<T> as core::iter::traits::iterator::Iterator>::fold::h24685b82fa57ce2a
+                               at /Users/verdagon/rust/library/core/src/slice/iter/macros.rs:232:27
+  13:        0x1044fc77c - <core::iter::adapters::map::Map<I,F> as core::iter::traits::iterator::Iterator>::fold::h9ddfa5270c97492f
+                               at /Users/verdagon/rust/library/core/src/iter/adapters/map.rs:128:9
+  14:        0x1044fd678 - core::iter::traits::iterator::Iterator::for_each::h0cee36edd364d1cb
+                               at /Users/verdagon/rust/library/core/src/iter/traits/iterator.rs:800:9
+  15:        0x10451a3dc - alloc::vec::Vec<T,A>::extend_trusted::h2db7e7c36aaee955
+                               at /Users/verdagon/rust/library/alloc/src/vec/mod.rs:3568:17
+  16:        0x104520d58 - <alloc::vec::Vec<T,A> as alloc::vec::spec_extend::SpecExtend<T,I>>::spec_extend::hd9ddfb2bc1fe5dd9
+                               at /Users/verdagon/rust/library/alloc/src/vec/spec_extend.rs:29:9
+  17:        0x1045174e4 - <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter::h4f509b0325b6cf2f
+                               at /Users/verdagon/rust/library/alloc/src/vec/spec_from_iter_nested.rs:62:9
+  18:        0x104521118 - <alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter::hf70829306dfd0bf5
+                               at /Users/verdagon/rust/library/alloc/src/vec/spec_from_iter.rs:34:9
+  19:        0x1045205e8 - <alloc::vec::Vec<T> as core::iter::traits::collect::FromIterator<T>>::from_iter::h92cb647c5805d8cf
+                               at /Users/verdagon/rust/library/alloc/src/vec/mod.rs:3427:9
+  20:        0x1044fd574 - core::iter::traits::iterator::Iterator::collect::hce80b8a1319a12da
+                               at /Users/verdagon/rust/library/core/src/iter/traits/iterator.rs:1971:9
+  21:        0x104523d90 - toylangc::toylang::type_resolve::resolve_expr::h0e5f9877bb468b92
+                               at /Users/verdagon/erw/toylangc/src/toylang/type_resolve.rs:379:58
+  22:        0x1044ebeb8 - toylangc::toylang::type_resolve::resolve_fn_body::{{closure}}::h91e33e94fa9f1478
+                               at /Users/verdagon/erw/toylangc/src/toylang/type_resolve.rs:46:9
+  23:        0x104524d68 - core::option::Option<T>::map::h41707fd5faa47b2d
+                               at /Users/verdagon/rust/library/core/src/option.rs:1119:29
+  24:        0x1045213a8 - toylangc::toylang::type_resolve::resolve_fn_body::h2eac6ee9d32d2372
+                               at /Users/verdagon/erw/toylangc/src/toylang/type_resolve.rs:45:15
+  25:        0x104509c5c - toylangc::llvm_gen::codegen_function::h7aca0889ce5cf219
+                               at /Users/verdagon/erw/toylangc/src/llvm_gen.rs:545:22
+  26:        0x10450f1e4 - toylangc::llvm_gen::generate_with_tcx::hd4c4cf3dd9946201
+                               at /Users/verdagon/erw/toylangc/src/llvm_gen.rs:1173:9
+  27:        0x104514024 - <toylangc::toylang::callbacks_impl::ToylangCallbacks as rustc_lang_facade::LangCallbacks>::generate_and_compile::haecf1096ed716145
+                               at /Users/verdagon/erw/toylangc/src/toylang/callbacks_impl.rs:137:39
+  28:        0x1044fc27c - rustc_lang_facade::trampoline_generate_and_compile::h1b8675d495630d9e
+                               at /Users/verdagon/erw/rustc-lang-facade/src/lib.rs:274:5
+  29:        0x1045b4334 - rustc_lang_facade::call_generate_and_compile::hcf6ad37d2964899e
+                               at /Users/verdagon/erw/rustc-lang-facade/src/lib.rs:239:5
+  30:        0x1045a1c6c - <rustc_lang_facade::codegen_wrapper::LangCodegenBackend as rustc_codegen_ssa::traits::backend::CodegenBackend>::codegen_crate::h6bc9e7331c2cf055
+                               at /Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs:97:49
+  31:        0x110970324 - <rustc_session[1b4de82ec3ccdd5a]::session::Session>::time::<alloc[f1a221af6e361387]::boxed::Box<dyn core[bbe5874bb0c59dc5]::any::Any>, rustc_interface[fe209ed5e0b4a23a]::passes::start_codegen::{closure#0}>
+  32:        0x11096f970 - rustc_interface[fe209ed5e0b4a23a]::passes::start_codegen
+  33:        0x110983a48 - <rustc_interface[fe209ed5e0b4a23a]::queries::Linker>::codegen_and_build_linker
+  34:        0x11074b544 - <rustc_middle[4b0a8a95b59e4e1]::ty::context::TyCtxt>::create_global_ctxt::<core[bbe5874bb0c59dc5]::option::Option<rustc_interface[fe209ed5e0b4a23a]::queries::Linker>, rustc_interface[fe209ed5e0b4a23a]::passes::create_and_enter_global_ctxt<core[bbe5874bb0c59dc5]::option::Option<rustc_interface[fe209ed5e0b4a23a]::queries::Linker>, rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}::{closure#2}>::{closure#2}::{closure#0}>
+  35:        0x1107759b4 - <rustc_interface[fe209ed5e0b4a23a]::passes::create_and_enter_global_ctxt<core[bbe5874bb0c59dc5]::option::Option<rustc_interface[fe209ed5e0b4a23a]::queries::Linker>, rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}::{closure#2}>::{closure#2} as core[bbe5874bb0c59dc5]::ops::function::FnOnce<(&rustc_session[1b4de82ec3ccdd5a]::session::Session, rustc_middle[4b0a8a95b59e4e1]::ty::context::CurrentGcx, &std[47287eb5c919f8eb]::sync::once_lock::OnceLock<rustc_middle[4b0a8a95b59e4e1]::ty::context::GlobalCtxt>, &rustc_data_structures[d6bfbb13a9cb78e7]::sync::worker_local::WorkerLocal<rustc_middle[4b0a8a95b59e4e1]::arena::Arena>, &rustc_data_structures[d6bfbb13a9cb78e7]::sync::worker_local::WorkerLocal<rustc_hir[9459a6e8082a24bb]::Arena>, rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}::{closure#2})>>::call_once::{shim:vtable#0}
+  36:        0x110722fe8 - <alloc[f1a221af6e361387]::boxed::Box<dyn for<'a> core[bbe5874bb0c59dc5]::ops::function::FnOnce<(&'a rustc_session[1b4de82ec3ccdd5a]::session::Session, rustc_middle[4b0a8a95b59e4e1]::ty::context::CurrentGcx, &'a std[47287eb5c919f8eb]::sync::once_lock::OnceLock<rustc_middle[4b0a8a95b59e4e1]::ty::context::GlobalCtxt<'a>>, &'a rustc_data_structures[d6bfbb13a9cb78e7]::sync::worker_local::WorkerLocal<rustc_middle[4b0a8a95b59e4e1]::arena::Arena<'a>>, &'a rustc_data_structures[d6bfbb13a9cb78e7]::sync::worker_local::WorkerLocal<rustc_hir[9459a6e8082a24bb]::Arena<'a>>, rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}::{closure#2}), Output = core[bbe5874bb0c59dc5]::option::Option<rustc_interface[fe209ed5e0b4a23a]::queries::Linker>>> as core[bbe5874bb0c59dc5]::ops::function::FnOnce<(&rustc_session[1b4de82ec3ccdd5a]::session::Session, rustc_middle[4b0a8a95b59e4e1]::ty::context::CurrentGcx, &std[47287eb5c919f8eb]::sync::once_lock::OnceLock<rustc_middle[4b0a8a95b59e4e1]::ty::context::GlobalCtxt>, &rustc_data_structures[d6bfbb13a9cb78e7]::sync::worker_local::WorkerLocal<rustc_middle[4b0a8a95b59e4e1]::arena::Arena>, &rustc_data_structures[d6bfbb13a9cb78e7]::sync::worker_local::WorkerLocal<rustc_hir[9459a6e8082a24bb]::Arena>, rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}::{closure#2})>>::call_once
+  37:        0x110774c98 - rustc_interface[fe209ed5e0b4a23a]::passes::create_and_enter_global_ctxt::<core[bbe5874bb0c59dc5]::option::Option<rustc_interface[fe209ed5e0b4a23a]::queries::Linker>, rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}::{closure#2}>
+  38:        0x110704390 - <scoped_tls[252d469163ee8945]::ScopedKey<rustc_span[c0fb1f4016024779]::SessionGlobals>>::set::<rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_with_globals<rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_pool_with_globals<rustc_interface[fe209ed5e0b4a23a]::interface::run_compiler<(), rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}, ()>
+  39:        0x11070de04 - rustc_span[c0fb1f4016024779]::create_session_globals_then::<(), rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_with_globals<rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_pool_with_globals<rustc_interface[fe209ed5e0b4a23a]::interface::run_compiler<(), rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>
+  40:        0x11078e0e8 - std[47287eb5c919f8eb]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_with_globals<rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_pool_with_globals<rustc_interface[fe209ed5e0b4a23a]::interface::run_compiler<(), rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  41:        0x11070bd18 - <<std[47287eb5c919f8eb]::thread::Builder>::spawn_unchecked_<rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_with_globals<rustc_interface[fe209ed5e0b4a23a]::util::run_in_thread_pool_with_globals<rustc_interface[fe209ed5e0b4a23a]::interface::run_compiler<(), rustc_driver_impl[35749d289834c7d4]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[bbe5874bb0c59dc5]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  42:        0x115435c5c - <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once::hbf865bc1dd2d4139
+  43:        0x115458b94 - std::sys::pal::unix::thread::Thread::new::thread_start::h2d8bda09f29e95e7
+  44:        0x192e9ef94 - __pthread_joiner_wake
+
+
+rustc version: 1.86.0-dev
+platform: aarch64-apple-darwin
+
+query stack during panic:
+end of query stack

@@ -345,7 +345,6 @@ fn main() {
 // --- Group 3: Toylang containing rust type (T(R)) ---
 
 #[test]
-#[ignore] // needs: Vec<i32> as a toylang struct field type
 fn test_t_of_r_vec_field() {
     let output = run_toylang_test(
         r#"
@@ -459,7 +458,6 @@ fn main() {
 // --- Group 5: Rust -> toylang -> rust (R(T(R))) ---
 
 #[test]
-#[ignore] // needs: Vec<i32> as toylang field, Vec<ToyShip> construction
 fn test_r_t_r_vec_of_ship() {
     let output = run_toylang_test(
         r#"
@@ -497,7 +495,6 @@ fn main() {
 // --- Group 6: Toylang -> rust -> toylang (T(R(T))) ---
 
 #[test]
-#[ignore] // needs: Vec<ToyPoint> as toylang field, toylang struct as Vec element
 fn test_t_r_t_construct() {
     let output = run_toylang_test(
         r#"
@@ -637,7 +634,6 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: generic toylang struct instantiated with Vec<i32>
 fn test_tg_of_vec_layout() {
     let output = run_toylang_test(
         r#"
@@ -724,7 +720,6 @@ fn main() {
 // --- Group 11: Deep nesting (4+ levels) ---
 
 #[test]
-#[ignore] // needs: deep nesting of toylang and rust types
 fn test_deep_t_r_t_r() {
     let output = run_toylang_test(
         r#"
@@ -768,7 +763,6 @@ fn main() {
 // --- Group 12: Multiple mixed fields ---
 
 #[test]
-#[ignore] // needs: toylang struct with mixed field types (primitive + rust + toylang)
 fn test_mixed_fields() {
     let output = run_toylang_test(
         r#"
