@@ -1277,7 +1277,35 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: toylang main with struct construction + println
+fn test_toylang_main_with_struct_v2() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn make_point() -> Point {
+    Point { x: 10, y: 20 }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let p = make_point();
+    println!("Point: {} {}", p.x(), p.y());
+    assert_eq!(*p.x(), 10);
+    assert_eq!(*p.y(), 20);
+}
+        "#,
+    );
+    assert!(output.contains("Point: 10 20"));
+}
+
+#[test]
+#[ignore] // needs: toylang println function + direct field access (p.x not p.x())
 fn test_toylang_main_with_struct() {
     let output = run_toylang_test(
         r#"
@@ -1303,7 +1331,42 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: toylang main with Vec operations
+fn test_toylang_main_with_vec_v2() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn make_vec() -> Vec<Point> {
+    let v = Vec::new();
+    v.push(Point { x: 1, y: 2 });
+    v.push(Point { x: 3, y: 4 });
+    v
+}
+
+fn vec_len(v: &Vec<Point>) -> usize {
+    v.len()
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let v = make_vec();
+    let len = vec_len(&v);
+    println!("Vec length: {}", len);
+    assert_eq!(len, 2);
+}
+        "#,
+    );
+    assert!(output.contains("Vec length: 2"));
+}
+
+#[test]
+#[ignore] // needs: toylang println function + direct field access
 fn test_toylang_main_with_vec() {
     let output = run_toylang_test(
         r#"
@@ -1331,7 +1394,37 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: toylang main calling toylang functions
+fn test_toylang_main_calls_toylang_fn_v2() {
+    let output = run_toylang_test(
+        r#"
+struct Counter {
+    value: i32,
+}
+
+fn make_counter() -> Counter {
+    Counter { value: 42 }
+}
+
+fn get_counter() -> Counter {
+    make_counter()
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let c = get_counter();
+    println!("Counter: {}", c.value());
+    assert_eq!(*c.value(), 42);
+}
+        "#,
+    );
+    assert!(output.contains("Counter: 42"));
+}
+
+#[test]
+#[ignore] // needs: toylang println function + direct field access + toylang-owned main
 fn test_toylang_main_calls_toylang_fn() {
     let output = run_toylang_test(
         r#"
