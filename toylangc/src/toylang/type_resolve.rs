@@ -717,7 +717,6 @@ mod tests {
             params: vec![],
             return_ty: Some("i32".to_string()),
             body: Some(FnBody { stmts: vec![], ret: Some(Expr::IntLit(42)) }),
-            external_symbol: None,
         };
         let typed = resolve_fn_body(&reg, &func);
         let ret = typed.ret.unwrap();
@@ -742,7 +741,6 @@ mod tests {
                     ],
                 }),
             }),
-            external_symbol: None,
         };
         let typed = resolve_fn_body(&reg, &func);
         let ret = typed.ret.unwrap();
@@ -777,7 +775,6 @@ mod tests {
                     fields: vec![("value".to_string(), Expr::Var("x".to_string()))],
                 }),
             }),
-            external_symbol: None,
         };
         let typed = resolve_fn_body(&reg, &func);
         let ret = typed.ret.unwrap();
@@ -805,7 +802,6 @@ mod tests {
                     ],
                 }),
             }),
-            external_symbol: None,
         };
         let typed = resolve_fn_body(&reg, &func);
         let ret = typed.ret.unwrap();
@@ -842,7 +838,6 @@ mod tests {
                     fields: vec![("wings".to_string(), Expr::Var("v".to_string()))],
                 }),
             }),
-            external_symbol: None,
         };
         let typed = resolve_fn_body(&reg, &func);
 

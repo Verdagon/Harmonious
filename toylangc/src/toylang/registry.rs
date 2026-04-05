@@ -51,7 +51,4 @@ pub struct ToyFunction {
     pub params: Vec<ToyParam>,
     pub return_ty: Option<String>,
     pub body: Option<crate::toylang::ast::FnBody>,
-    /// If set, this function was compiled by the Toylang LLVM backend.
-    /// The value is the external symbol name (e.g. "__toylang_impl_make_counter").
-    pub external_symbol: Option<String>,
 }

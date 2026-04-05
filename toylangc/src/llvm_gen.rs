@@ -407,8 +407,8 @@ fn codegen_function<'ctx, 'tcx>(
     _name: &str,
     func: &crate::toylang::registry::ToyFunction,
     instance: ty::Instance<'tcx>,
+    symbol: &str,
 ) {
-    let symbol = func.external_symbol.as_ref().unwrap();
     let ret_ty_name = func.return_ty.as_ref().unwrap();
 
     // Run type resolution pass to get typed AST
@@ -656,10 +656,10 @@ fn lower_typed_expr<'ctx>(
             //
             // At LLVM level, we call the function by its mangled symbol.
             // For now, look up the function in the registry to find its extern symbol.
-            let func = ctx.registry.functions.get(name.as_str())
-                .unwrap_or_else(|| panic!("function '{}' not found in registry", name));
-            let extern_sym = func.external_symbol.as_ref()
-                .unwrap_or_else(|| panic!("function '{}' has no external symbol", name));
+            // Compute the extern symbol for this function call.
+            // For now, use the simple __toylang_impl_ prefix.
+            // Generic function calls would need mangled type args — not yet supported.
+            let extern_sym = format!("__toylang_impl_{}", name);
 
             // Declare the function if not already declared
             let ret_inkwell_ty = ctx.resolved_to_inkwell(&expr.ty);
@@ -679,7 +679,7 @@ fn lower_typed_expr<'ctx>(
                 let mut call_params: Vec<BasicMetadataTypeEnum<'ctx>> = vec![ptr_ty.into()];
                 call_params.extend(param_types.iter().cloned());
                 let callee = ctx.declare_external_fn(
-                    extern_sym, &call_params, None, Some((struct_ty, 8)),
+                    &extern_sym, &call_params, None, Some((struct_ty, 8)),
                 );
 
                 let mut call_args: Vec<BasicValueEnum<'ctx>> = vec![alloca.into()];
@@ -693,7 +693,7 @@ fn lower_typed_expr<'ctx>(
                 ExprResult::Ptr(alloca, struct_ty.into())
             } else {
                 let callee = ctx.declare_external_fn(
-                    extern_sym, &param_types, Some(ret_inkwell_ty), None,
+                    &extern_sym, &param_types, Some(ret_inkwell_ty), None,
                 );
                 let call_args: Vec<BasicValueEnum<'ctx>> = args.iter()
                     .map(|a| lower_typed_expr(ctx, a).into_value(&ctx.builder))
@@ -1088,8 +1088,8 @@ pub fn generate_with_tcx<'tcx>(
             }
 
             // Build resolved function with concrete type args substituted
-            let resolved_func = resolve_function_for_instance(toy_fn, &name, &result.extern_symbol, instance, tcx);
-            codegen_function(&mut ctx, &name, &resolved_func, instance);
+            let resolved_func = resolve_function_for_instance(toy_fn, &name, instance, tcx);
+            codegen_function(&mut ctx, &name, &resolved_func, instance, &result.extern_symbol);
         }
     }
 
@@ -1120,15 +1120,11 @@ fn codegen_accessor_inline<'ctx>(
 fn resolve_function_for_instance<'tcx>(
     toy_fn: &crate::toylang::registry::ToyFunction,
     name: &str,
-    extern_symbol: &str,
     instance: ty::Instance<'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> crate::toylang::registry::ToyFunction {
     if toy_fn.type_params.is_empty() {
-        // Concrete function — just set the extern symbol
-        let mut resolved = toy_fn.clone();
-        resolved.external_symbol = Some(extern_symbol.to_string());
-        return resolved;
+        return toy_fn.clone();
     }
 
     // Generic function — substitute type params
@@ -1155,7 +1151,6 @@ fn resolve_function_for_instance<'tcx>(
         }).collect(),
         return_ty: toy_fn.return_ty.as_deref().map(|s| substitute_type_params_str(s, &type_arg_subst)),
         body: toy_fn.body.clone(),
-        external_symbol: Some(extern_symbol.to_string()),
     }
 }
 

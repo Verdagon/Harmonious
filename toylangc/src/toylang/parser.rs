@@ -283,7 +283,7 @@ impl Parser {
         let body = self.parse_fn_body()?;
         // parse_fn_body consumes everything up to and including the closing RBrace
 
-        Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: Some(body), external_symbol: None }))
+        Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: Some(body) }))
     }
 
     fn parse_fn_body(&mut self) -> Result<FnBody, String> {
