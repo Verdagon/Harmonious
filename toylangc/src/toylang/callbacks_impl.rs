@@ -276,22 +276,13 @@ fn collect_rust_deps<'tcx>(
         if let TyKind::Adt(adt_def, args) = fn_sig.output().kind() {
             let struct_name = tcx.item_name(adt_def.did()).to_string();
             if let Some(toy_struct) = registry.structs.get(&struct_name) {
-                // Build subst from ADT's generic args (for generic structs like ToyGenMixed<i32>)
                 let subst: HashMap<&str, Ty<'tcx>> = toy_struct.type_params.iter()
                     .enumerate()
                     .filter_map(|(i, name)| {
                         args.get(i).and_then(|a| a.as_type()).map(|ty| (name.as_str(), ty))
                     })
                     .collect();
-                for field in &toy_struct.fields {
-                    if let ToyFieldType::RustGeneric(type_name, type_args) = &field.rust_type {
-                        if type_name == "Vec" && !type_args.is_empty() {
-                            let resolved = resolve_field_ty(tcx, &type_args[0], &subst);
-                            elem_ty = Some(resolved);
-                            break;
-                        }
-                    }
-                }
+                elem_ty = find_vec_in_fields_recursive(tcx, toy_struct, &subst, registry);
             }
         }
     }
@@ -433,6 +424,42 @@ fn resolve_rust_generic_ty<'tcx>(
     }
 
     Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
+}
+
+/// Recursively search struct fields for a Vec type, resolving type params via subst.
+fn find_vec_in_fields_recursive<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    toy_struct: &crate::toylang::registry::ToyStruct,
+    subst: &HashMap<&str, Ty<'tcx>>,
+    registry: &ToylangRegistry,
+) -> Option<Ty<'tcx>> {
+    for field in &toy_struct.fields {
+        match &field.rust_type {
+            ToyFieldType::RustGeneric(type_name, type_args) if type_name == "Vec" && !type_args.is_empty() => {
+                let resolved = resolve_field_ty(tcx, &type_args[0], subst);
+                return Some(resolved);
+            }
+            ToyFieldType::TypeParam(param_name) => {
+                // Check if the resolved type is a Vec
+                if let Some(&resolved) = subst.get(param_name.as_str()) {
+                    if let TyKind::Adt(adt_def, args) = resolved.kind() {
+                        if Some(adt_def.did()) == tcx.get_diagnostic_item(rustc_span::sym::Vec) {
+                            return Some(args[0].expect_ty());
+                        }
+                    }
+                }
+            }
+            ToyFieldType::ToyStruct(struct_name) => {
+                if let Some(inner) = registry.structs.get(struct_name.as_str()) {
+                    if let Some(ty) = find_vec_in_fields_recursive(tcx, inner, subst, registry) {
+                        return Some(ty);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn find_vec_elem_ty<'tcx>(tcx: TyCtxt<'tcx>, fn_sig: ty::FnSig<'tcx>) -> Option<Ty<'tcx>> {

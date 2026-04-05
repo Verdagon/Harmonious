@@ -530,7 +530,6 @@ fn main() {
 // --- Group 7: Toylang -> toylang -> rust (T(T(R))) ---
 
 #[test]
-#[ignore] // needs: nested toylang structs with rust fields
 fn test_t_t_r_construct() {
     let output = run_toylang_test(
         r#"
@@ -603,7 +602,6 @@ fn main() {
 // --- Group 9: Generic toylang wrapping rust type (T<G=R>) ---
 
 #[test]
-#[ignore] // needs: generic toylang struct instantiated with Vec<i32>
 fn test_tg_of_vec() {
     let output = run_toylang_test(
         r#"
@@ -656,7 +654,6 @@ fn main() {
 // --- Group 10: Generic toylang wrapping toylang type (T<G=T>) ---
 
 #[test]
-#[ignore] // needs: generic toylang struct instantiated with another toylang type
 fn test_tg_of_toypoint() {
     let output = run_toylang_test(
         r#"
@@ -799,7 +796,6 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: generic toylang struct with mixed field types
 fn test_mixed_generic() {
     let output = run_toylang_test(
         r#"

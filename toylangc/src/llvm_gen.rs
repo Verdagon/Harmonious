@@ -1009,10 +1009,35 @@ fn codegen_accessors<'ctx>(
     }
 }
 
+/// Split a string on commas, respecting nested { } braces.
+fn split_respecting_braces(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    parts
+}
+
 /// Parse an LLVM struct type string like "{ i32, i64 }" into an inkwell StructType.
 fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> StructType<'ctx> {
     let inner = s.trim().trim_start_matches('{').trim_end_matches('}').trim();
-    let fields: Vec<BasicTypeEnum<'ctx>> = inner.split(',')
+    // Depth-aware split: don't split on commas inside nested { }
+    let field_strs = split_respecting_braces(inner);
+    let fields: Vec<BasicTypeEnum<'ctx>> = field_strs.iter()
         .map(|f| {
             let f = f.trim();
             match f {
@@ -1095,29 +1120,55 @@ fn parse_generic_type(ty: &str) -> Option<(&str, Vec<&str>)> {
     Some((base, args))
 }
 
-/// Find the Vec element type name from context. Searches recursively into nested structs.
+/// Find the Vec element type name from context. Searches recursively into nested structs,
+/// resolving generic type params from the return type string.
 fn find_vec_elem_name(ret_ty_name: &str, registry: &ToylangRegistry) -> Option<String> {
     // Direct Vec return: "Vec<Point>" → "Point"
     if ret_ty_name.starts_with("Vec<") && ret_ty_name.ends_with('>') {
         return Some(ret_ty_name[4..ret_ty_name.len()-1].to_string());
     }
-    // Struct with Vec field (recursive)
+    // Non-generic struct
     if let Some(s) = registry.structs.get(ret_ty_name) {
-        return find_vec_in_struct_fields(s, registry);
+        return find_vec_in_struct_fields(s, registry, &HashMap::new());
+    }
+    // Generic struct: "ToyWrapper<Vec<i32>>" → parse type args and build subst
+    if let Some((base, type_args)) = parse_generic_type(ret_ty_name) {
+        if let Some(s) = registry.structs.get(base) {
+            let subst: HashMap<&str, &str> = s.type_params.iter()
+                .zip(type_args.iter())
+                .map(|(param, arg)| (param.as_str(), *arg))
+                .collect();
+            return find_vec_in_struct_fields(s, registry, &subst);
+        }
     }
     None
 }
 
 /// Recursively search struct fields for a Vec type, returning its element type name.
-fn find_vec_in_struct_fields(s: &ToyStruct, registry: &ToylangRegistry) -> Option<String> {
+/// `subst` maps type param names to their concrete string representations.
+fn find_vec_in_struct_fields(
+    s: &ToyStruct,
+    registry: &ToylangRegistry,
+    subst: &HashMap<&str, &str>,
+) -> Option<String> {
     for field in &s.fields {
         match &field.rust_type {
             ToyFieldType::RustGeneric(name, args) if name == "Vec" && !args.is_empty() => {
-                return Some(field_type_to_string(&args[0]));
+                // Resolve the element type, substituting type params
+                let elem_str = resolve_field_type_name(&args[0], subst);
+                return Some(elem_str);
+            }
+            ToyFieldType::TypeParam(param_name) => {
+                // Resolve via subst — the concrete type might be a Vec
+                if let Some(&concrete) = subst.get(param_name.as_str()) {
+                    if concrete.starts_with("Vec<") && concrete.ends_with('>') {
+                        return Some(concrete[4..concrete.len()-1].to_string());
+                    }
+                }
             }
             ToyFieldType::ToyStruct(struct_name) => {
                 if let Some(inner) = registry.structs.get(struct_name.as_str()) {
-                    if let Some(elem) = find_vec_in_struct_fields(inner, registry) {
+                    if let Some(elem) = find_vec_in_struct_fields(inner, registry, subst) {
                         return Some(elem);
                     }
                 }
@@ -1126,6 +1177,28 @@ fn find_vec_in_struct_fields(s: &ToyStruct, registry: &ToylangRegistry) -> Optio
         }
     }
     None
+}
+
+/// Resolve a ToyFieldType to a type name string, substituting type params.
+fn resolve_field_type_name(ft: &ToyFieldType, subst: &HashMap<&str, &str>) -> String {
+    match ft {
+        ToyFieldType::I32 => "i32".to_string(),
+        ToyFieldType::I64 => "i64".to_string(),
+        ToyFieldType::F64 => "f64".to_string(),
+        ToyFieldType::Bool => "bool".to_string(),
+        ToyFieldType::TypeParam(name) => {
+            subst.get(name.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| name.clone())
+        }
+        ToyFieldType::ToyStruct(name) => name.clone(),
+        ToyFieldType::RustGeneric(name, args) => {
+            let arg_strs: Vec<String> = args.iter()
+                .map(|a| resolve_field_type_name(a, subst))
+                .collect();
+            format!("{}<{}>", name, arg_strs.join(", "))
+        }
+    }
 }
 
 /// Search function parameters for Vec<T> and return the element type name.
