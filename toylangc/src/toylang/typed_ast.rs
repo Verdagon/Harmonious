@@ -43,6 +43,7 @@ pub enum TypedExprKind {
     },
     FnCall {
         name: String,
+        type_args: Vec<String>,  // e.g. ["i32"] for wrap::<i32>; empty for concrete
         args: Vec<TypedExpr>,
     },
     StaticCall {

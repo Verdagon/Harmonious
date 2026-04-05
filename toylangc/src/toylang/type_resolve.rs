@@ -415,8 +415,12 @@ fn resolve_expr(
                         resolve_expr(a, &expected, scope, registry, vec_inferences)
                     })
                     .collect();
+                // Extract type args in order for symbol mangling
+                let type_args: Vec<String> = func.type_params.iter()
+                    .filter_map(|p| type_arg_subst.get(p).cloned())
+                    .collect();
                 TypedExpr {
-                    kind: TypedExprKind::FnCall { name: name.clone(), args: typed_args },
+                    kind: TypedExprKind::FnCall { name: name.clone(), type_args, args: typed_args },
                     ty: ret_ty,
                 }
             } else {
@@ -436,7 +440,7 @@ fn resolve_expr(
                     })
                     .collect();
                 TypedExpr {
-                    kind: TypedExprKind::FnCall { name: name.clone(), args: typed_args },
+                    kind: TypedExprKind::FnCall { name: name.clone(), type_args: vec![], args: typed_args },
                     ty: ret_ty,
                 }
             }

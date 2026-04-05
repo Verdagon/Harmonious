@@ -114,12 +114,20 @@ impl LangCallbacks for ToylangCallbacks {
         // Compute symbol on the fly. For generic functions, include mangled type args.
         let extern_symbol = compute_fn_symbol(name, tcx, instance);
 
-        // Collect Rust generic dependencies by scanning the AST body.
-        let rust_deps = if let Some(ref fn_body) = toy_fn.body {
+        // Collect ALL dependencies by scanning the AST body:
+        // 1. Rust generic functions (Vec::new, Vec::push, etc.)
+        // 2. Other consumer functions (toylang-to-toylang calls)
+        let mut rust_deps = if let Some(ref fn_body) = toy_fn.body {
             collect_rust_deps(tcx, def_id, fn_body, &self.registry)
         } else {
             vec![]
         };
+
+        // Scan for calls to other consumer functions
+        if let Some(ref fn_body) = toy_fn.body {
+            let toylang_deps = collect_toylang_fn_deps(tcx, fn_body, &self.registry, toy_fn);
+            rust_deps.extend(toylang_deps);
+        }
 
         MonomorphizeFnResult {
             extern_symbol,
@@ -386,6 +394,104 @@ fn find_vec_in_fields_recursive<'tcx>(
                 }
             }
             _ => {}
+        }
+    }
+    None
+}
+
+/// Scan a function body for calls to other toylang functions and return their
+/// DefId + GenericArgs so the monomorphization collector discovers them.
+fn collect_toylang_fn_deps<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &FnBody,
+    registry: &ToylangRegistry,
+    caller_fn: &crate::toylang::registry::ToyFunction,
+) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
+    let mut deps = Vec::new();
+    let mut callee_names = Vec::new();
+
+    // Collect all FnCall names from the body
+    collect_fn_call_names(body, &mut callee_names);
+
+    for callee_name in &callee_names {
+        // Find the callee's DefId in __lang_stubs
+        let callee_def_id = find_stub_fn_def_id(tcx, callee_name);
+        let Some(callee_def_id) = callee_def_id else { continue };
+
+        let callee_fn = match registry.functions.get(callee_name.as_str()) {
+            Some(f) => f,
+            None => continue,
+        };
+
+        if callee_fn.type_params.is_empty() {
+            // Concrete callee — no type args needed
+            let args = tcx.mk_args(&[]);
+            deps.push((callee_def_id, args));
+        }
+        // Generic callees need concrete type args which we can't determine here
+        // (requires type inference from the body context). These calls must go
+        // through Rust — the caller should be concrete and Rust's monomorphizer
+        // discovers the callee through per_instance_mir.
+    }
+
+    deps
+}
+
+/// Recursively collect all FnCall names from a function body.
+fn collect_fn_call_names(body: &FnBody, names: &mut Vec<String>) {
+    for stmt in &body.stmts {
+        match stmt {
+            Stmt::Let { expr, .. } | Stmt::ExprStmt(expr) => {
+                collect_fn_call_names_expr(expr, names);
+            }
+        }
+    }
+    if let Some(ref ret) = body.ret {
+        collect_fn_call_names_expr(ret, names);
+    }
+}
+
+fn collect_fn_call_names_expr(expr: &Expr, names: &mut Vec<String>) {
+    match expr {
+        Expr::FnCall { name, args } => {
+            names.push(name.clone());
+            for arg in args {
+                collect_fn_call_names_expr(arg, names);
+            }
+        }
+        Expr::StructLit { fields, .. } => {
+            for (_, expr) in fields {
+                collect_fn_call_names_expr(expr, names);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_fn_call_names_expr(receiver, names);
+            for arg in args {
+                collect_fn_call_names_expr(arg, names);
+            }
+        }
+        Expr::StaticCall { args, .. } => {
+            for arg in args {
+                collect_fn_call_names_expr(arg, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find a function's DefId in __lang_stubs by name.
+fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id::DefId> {
+    use rustc_hir::def::DefKind;
+    for local_def_id in tcx.hir_crate_items(()).definitions() {
+        let def_id = local_def_id.to_def_id();
+        if !matches!(tcx.def_kind(def_id), DefKind::Fn) {
+            continue;
+        }
+        if tcx.item_name(def_id).as_str() != name {
+            continue;
+        }
+        if rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+            return Some(def_id);
         }
     }
     None

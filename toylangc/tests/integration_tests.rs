@@ -858,6 +858,67 @@ fn main() {
     assert!(output.contains("inner: 42"));
 }
 
+#[test]
+#[ignore] // needs: generic callee dep resolution (type inference during monomorphize_fn)
+fn test_generic_wrap_via_concrete() {
+    let output = run_toylang_test(
+        r#"
+struct Wrapper<T> {
+    inner: T,
+}
+
+fn wrap<T>(x: T) -> Wrapper<T> {
+    Wrapper { inner: x }
+}
+
+fn wrap_i32(x: i32) -> Wrapper<i32> {
+    wrap(x)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let w = wrap_i32(42);
+    println!("inner: {}", w.inner());
+    assert_eq!(*w.inner(), 42);
+}
+        "#,
+    );
+    assert!(output.contains("inner: 42"));
+}
+
+#[test]
+fn test_concrete_calls_concrete() {
+    let output = run_toylang_test(
+        r#"
+struct Counter {
+    value: i32,
+}
+
+fn make_counter() -> Counter {
+    Counter { value: 42 }
+}
+
+fn get_counter() -> Counter {
+    make_counter()
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let c = get_counter();
+    println!("value: {}", c.value());
+    assert_eq!(*c.value(), 42);
+}
+        "#,
+    );
+    assert!(output.contains("value: 42"));
+}
+
 // ============================================================================
 // Group 14: Additional function and struct tests
 // ============================================================================

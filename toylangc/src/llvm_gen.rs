@@ -261,10 +261,17 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         symbol: &str,
         param_types: &[BasicMetadataTypeEnum<'ctx>],
         ret_type: Option<BasicTypeEnum<'ctx>>,
-        is_sret: Option<(StructType<'ctx>, u64)>, // (struct type, align) for sret
+        is_sret: Option<(StructType<'ctx>, u64)>,
     ) -> FunctionValue<'ctx> {
         if let Some(&cached) = self.declared_fns.get(symbol) {
             return cached;
+        }
+
+        // Check if the module already has a function with this name
+        // (e.g., another consumer function already codegenned in this module)
+        if let Some(existing) = self.module.get_function(symbol) {
+            self.declared_fns.insert(symbol.to_string(), existing);
+            return existing;
         }
 
         let fn_type = if let Some(ret) = ret_type {
@@ -648,7 +655,7 @@ fn lower_typed_expr<'ctx>(
             ExprResult::Ptr(alloca, struct_ty.into())
         }
 
-        TypedExprKind::FnCall { name, args } => {
+        TypedExprKind::FnCall { name, type_args, args } => {
             // Call a toylang function by its consumer symbol name.
             // The function must be in the declared_fns (from resolve_vec_symbols or extern decl).
             // For generic functions called from concrete wrappers, the concrete instantiation
@@ -656,10 +663,15 @@ fn lower_typed_expr<'ctx>(
             //
             // At LLVM level, we call the function by its mangled symbol.
             // For now, look up the function in the registry to find its extern symbol.
-            // Compute the extern symbol for this function call.
-            // For now, use the simple __toylang_impl_ prefix.
-            // Generic function calls would need mangled type args — not yet supported.
-            let extern_sym = format!("__toylang_impl_{}", name);
+            // Compute the mangled symbol for the callee.
+            // Concrete: __toylang_impl_bar. Generic: __toylang_impl_wrap__i32.
+            let extern_sym = {
+                let mut sym = format!("__toylang_impl_{}", name);
+                for arg in type_args {
+                    sym.push_str(&format!("__{}", arg));
+                }
+                sym
+            };
 
             // Declare the function if not already declared
             let ret_inkwell_ty = ctx.resolved_to_inkwell(&expr.ty);
@@ -667,31 +679,15 @@ fn lower_typed_expr<'ctx>(
                 .map(|a| ctx.resolved_to_inkwell(&a.ty).into())
                 .collect();
 
-            // Check ABI — might need sret for struct returns
-            let is_struct_ret = matches!(&expr.ty, ResolvedType::Struct { .. });
-            let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
-
-            if is_struct_ret {
-                // sret call: allocate space, pass as first arg
-                let struct_ty = ctx.resolved_to_struct_type(&expr.ty);
-                let alloca = ctx.builder.build_alloca(struct_ty, "call_ret").unwrap();
-
-                let mut call_params: Vec<BasicMetadataTypeEnum<'ctx>> = vec![ptr_ty.into()];
-                call_params.extend(param_types.iter().cloned());
-                let callee = ctx.declare_external_fn(
-                    &extern_sym, &call_params, None, Some((struct_ty, 8)),
-                );
-
-                let mut call_args: Vec<BasicValueEnum<'ctx>> = vec![alloca.into()];
-                for arg in args {
-                    let val = lower_typed_expr(ctx, arg).into_value(&ctx.builder);
-                    call_args.push(val);
-                }
-                let call_args_meta: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
-                    call_args.iter().map(|v| (*v).into()).collect();
-                ctx.builder.build_call(callee, &call_args_meta, "").unwrap();
-                ExprResult::Ptr(alloca, struct_ty.into())
-            } else {
+            // Call the callee. If it's in the same module (another consumer function),
+            // it was codegenned with the correct ABI (direct or sret). We match its
+            // LLVM signature by looking at the existing function in the module.
+            // If not in the module yet, declare it as external.
+            //
+            // For consumer-to-consumer calls, both are in the same .o, so the callee
+            // may already be defined. We call it directly — the callee's codegen
+            // already handled the ABI correctly.
+            {
                 let callee = ctx.declare_external_fn(
                     &extern_sym, &param_types, Some(ret_inkwell_ty), None,
                 );
