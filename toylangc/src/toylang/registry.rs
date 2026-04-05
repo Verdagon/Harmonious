@@ -47,6 +47,7 @@ pub struct ToyParam {
 pub struct ToyFunction {
     #[allow(dead_code)]
     pub name: String,
+    pub type_params: Vec<String>,   // e.g. ["T"]; empty for non-generic functions
     pub params: Vec<ToyParam>,
     pub return_ty: Option<String>,
     pub body: Option<crate::toylang::ast::FnBody>,

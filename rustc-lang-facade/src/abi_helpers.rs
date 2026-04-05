@@ -48,8 +48,15 @@ pub fn coerced_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
 ) -> CoercedReturn {
-    let typing_env = ty::TypingEnv::fully_monomorphized();
     let instance = ty::Instance::mono(tcx, def_id.to_def_id());
+    coerced_return_type_for_instance(tcx, instance)
+}
+
+pub fn coerced_return_type_for_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> CoercedReturn {
+    let typing_env = ty::TypingEnv::fully_monomorphized();
 
     let fn_abi = tcx
         .fn_abi_of_instance(typing_env.as_query_input((instance, ty::List::empty())))

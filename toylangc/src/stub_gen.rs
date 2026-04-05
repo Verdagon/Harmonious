@@ -140,14 +140,19 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         }
     }
 
-    // Generate extern "C" declarations AND public wrapper functions for each
-    // toylang function. The wrapper has an unreachable!() body — mir_built will
-    // intercept it and replace the body with a MIR call stub.
+    // Generate public wrapper functions for ALL toylang functions (with bodies).
+    // For non-generic functions with external_symbol, also emit extern "C" declarations.
+    // The wrapper has an unreachable!() body — per_instance_mir/mir_built intercepts it.
     for (_name, toy_fn) in &registry.functions {
-        if let Some(ref sym) = toy_fn.external_symbol {
-            let fn_ident = format_ident!("{}", sym);
+        if toy_fn.body.is_none() {
+            continue;
+        }
 
-            // Extern declaration (matches Rust ABI — no _deps parameter)
+        // Extern declaration only for concrete (non-generic) functions.
+        // Generic functions go through per_instance_mir (no extern needed).
+        if toy_fn.type_params.is_empty() {
+            let sym = format!("__toylang_impl_{}", _name);
+            let fn_ident = format_ident!("{}", sym);
             let extern_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
                 let pname = format_ident!("{}", p.name);
                 let pty: syn::Type = syn::parse_str(&p.ty)
@@ -164,23 +169,39 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             extern_fns.push(quote! {
                 pub fn #fn_ident(#(#extern_params),*) -> #ret;
             });
+        }
 
-            // Public wrapper function (user-facing signature, no _deps)
-            let wrapper_ident = format_ident!("{}", _name);
-            let user_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
-                let pname = format_ident!("{}", p.name);
-                let pty: syn::Type = syn::parse_str(&p.ty)
-                    .unwrap_or_else(|e| panic!("invalid param type '{}': {}", p.ty, e));
-                quote! { #pname: #pty }
-            }).collect();
+        // Public wrapper function (user-facing signature) — for ALL functions
+        let ret: syn::Type = match toy_fn.return_ty.as_deref() {
+            Some(ty) => syn::parse_str(ty)
+                .unwrap_or_else(|e| panic!("invalid return type '{}': {}", ty, e)),
+            None => parse_quote!(()),
+        };
+        let wrapper_ident = format_ident!("{}", _name);
+        let user_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
+            let pname = format_ident!("{}", p.name);
+            let pty: syn::Type = syn::parse_str(&p.ty)
+                .unwrap_or_else(|e| panic!("invalid param type '{}': {}", p.ty, e));
+            quote! { #pname: #pty }
+        }).collect();
 
-            let wrapper: syn::Item = parse_quote! {
+        let wrapper: syn::Item = if toy_fn.type_params.is_empty() {
+            parse_quote! {
                 pub fn #wrapper_ident(#(#user_params),*) -> #ret {
                     unreachable!()
                 }
-            };
-            wrapper_fns.push(wrapper);
-        }
+            }
+        } else {
+            let fn_type_params: Vec<syn::Ident> = toy_fn.type_params.iter()
+                .map(|p| format_ident!("{}", p))
+                .collect();
+            parse_quote! {
+                pub fn #wrapper_ident<#(#fn_type_params),*>(#(#user_params),*) -> #ret {
+                    unreachable!()
+                }
+            }
+        };
+        wrapper_fns.push(wrapper);
     }
 
     if !extern_fns.is_empty() {

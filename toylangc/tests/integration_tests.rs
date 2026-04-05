@@ -829,7 +829,37 @@ fn main() {
 }
 
 // ============================================================================
-// Group 13: Toylang owns main
+// Group 13: Generic toylang functions
+// ============================================================================
+
+#[test]
+fn test_generic_wrap() {
+    let output = run_toylang_test(
+        r#"
+struct Wrapper<T> {
+    inner: T,
+}
+
+fn wrap<T>(x: T) -> Wrapper<T> {
+    Wrapper { inner: x }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let w = wrap(42i32);
+    println!("inner: {}", w.inner());
+    assert_eq!(*w.inner(), 42);
+}
+        "#,
+    );
+    assert!(output.contains("inner: 42"));
+}
+
+// ============================================================================
+// Group 14: Toylang owns main
 // ============================================================================
 
 #[test]

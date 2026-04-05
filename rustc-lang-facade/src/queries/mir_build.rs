@@ -74,9 +74,15 @@ fn consumer_fn_name(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<String> {
         return None;
     }
     let name = tcx.opt_item_name(def_id.to_def_id())?.to_string();
-    // Regular consumer function
+    // Regular consumer function (non-generic only).
+    // Generic functions are handled by per_instance_mir at monomorphization time.
     if crate::is_consumer_fn(&name) {
-        return Some(name);
+        let generics = tcx.generics_of(def_id.to_def_id());
+        if generics.count() == 0 {
+            return Some(name);
+        }
+        // Generic function — let per_instance_mir handle it
+        return None;
     }
     // Non-generic accessor method on a consumer type.
     // Generic accessor methods use inline Rust pointer math (STOPGAP).

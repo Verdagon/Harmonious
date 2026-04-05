@@ -395,6 +395,54 @@ fn resolve_expr(
             }
         }
 
+        Expr::FnCall { name, args } => {
+            let func = registry.functions.get(name.as_str())
+                .unwrap_or_else(|| panic!("function '{}' not found in registry", name));
+
+            if !func.type_params.is_empty() {
+                // Generic function call — infer type args from expected return type.
+                // Build a substitution map: type param name → concrete type string.
+                let type_arg_subst = infer_type_args_from_expected(
+                    func, expected_ty, registry,
+                );
+                let ret_ty = expected_ty.clone();
+                let typed_args: Vec<TypedExpr> = args.iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let param_ty_str = &func.params[i].ty;
+                        // Substitute type params in param type
+                        let resolved_param_str = substitute_type_params(param_ty_str, &type_arg_subst);
+                        let expected = parse_type_string(&resolved_param_str, registry);
+                        resolve_expr(a, &expected, scope, registry, vec_inferences)
+                    })
+                    .collect();
+                TypedExpr {
+                    kind: TypedExprKind::FnCall { name: name.clone(), args: typed_args },
+                    ty: ret_ty,
+                }
+            } else {
+                // Concrete function call
+                let ret_ty = func.return_ty.as_deref()
+                    .map(|s| parse_type_string(s, registry))
+                    .unwrap_or(ResolvedType::Void);
+                let typed_args: Vec<TypedExpr> = args.iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let expected = if i < func.params.len() {
+                            parse_type_string(&func.params[i].ty, registry)
+                        } else {
+                            ResolvedType::Void
+                        };
+                        resolve_expr(a, &expected, scope, registry, vec_inferences)
+                    })
+                    .collect();
+                TypedExpr {
+                    kind: TypedExprKind::FnCall { name: name.clone(), args: typed_args },
+                    ty: ret_ty,
+                }
+            }
+        }
+
         Expr::StaticCall { ty, method, args } => {
             match (ty.as_str(), method.as_str()) {
                 ("Vec", "new") => {
@@ -481,6 +529,78 @@ fn resolve_stmt(
             TypedStmt::ExprStmt(typed_expr)
         }
     }
+}
+
+// ============================================================================
+// Generic function type arg inference
+// ============================================================================
+
+/// Infer type arg substitutions for a generic function call from the expected return type.
+fn infer_type_args_from_expected(
+    func: &ToyFunction,
+    expected_ty: &ResolvedType,
+    registry: &ToylangRegistry,
+) -> HashMap<String, String> {
+    let mut subst = HashMap::new();
+    let ret_str = match &func.return_ty {
+        Some(s) => s.clone(),
+        None => return subst,
+    };
+
+    // Parse return type to find type param positions: "Wrapper<T>" → ["T"]
+    if let Some(open) = ret_str.find('<') {
+        if ret_str.ends_with('>') {
+            let base = &ret_str[..open];
+            let args_str = &ret_str[open + 1..ret_str.len() - 1];
+            let ret_args: Vec<&str> = split_type_args(args_str);
+
+            // Get the struct's type params to know the mapping
+            if let Some(toy_struct) = registry.structs.get(base) {
+                // The expected_ty has resolved field types — we need the concrete type args.
+                // For Wrapper<T> → Wrapper<i32>: field_types = [I32], type_params = ["T"]
+                if let ResolvedType::Struct { field_types, .. } = expected_ty {
+                    for (i, param_name) in toy_struct.type_params.iter().enumerate() {
+                        if i < field_types.len() {
+                            subst.insert(param_name.clone(), resolved_type_to_string(&field_types[i]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    subst
+}
+
+fn resolved_type_to_string(ty: &ResolvedType) -> String {
+    match ty {
+        ResolvedType::I32 => "i32".to_string(),
+        ResolvedType::I64 => "i64".to_string(),
+        ResolvedType::F64 => "f64".to_string(),
+        ResolvedType::Bool => "bool".to_string(),
+        ResolvedType::Usize => "usize".to_string(),
+        ResolvedType::Void => "()".to_string(),
+        ResolvedType::Struct { name, .. } => name.clone(),
+        ResolvedType::Vec { elem } => format!("Vec<{}>", resolved_type_to_string(elem)),
+        ResolvedType::Ref { inner } => format!("&{}", resolved_type_to_string(inner)),
+    }
+}
+
+fn substitute_type_params(ty_str: &str, subst: &HashMap<String, String>) -> String {
+    if let Some(replacement) = subst.get(ty_str) {
+        return replacement.clone();
+    }
+    if let Some(open) = ty_str.find('<') {
+        if ty_str.ends_with('>') {
+            let base = &ty_str[..open];
+            let args_str = &ty_str[open + 1..ty_str.len() - 1];
+            let args: Vec<&str> = split_type_args(args_str);
+            let resolved: Vec<String> = args.iter()
+                .map(|a| substitute_type_params(a, subst))
+                .collect();
+            return format!("{}<{}>", base, resolved.join(", "));
+        }
+    }
+    ty_str.to_string()
 }
 
 // ============================================================================

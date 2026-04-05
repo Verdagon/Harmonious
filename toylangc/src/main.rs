@@ -26,17 +26,16 @@ fn main() {
         let ll_path = std::env::temp_dir().join(format!("toylang_output_{}.ll", unique_id));
         let obj_path = std::env::temp_dir().join(format!("toylang_output_{}.o", unique_id));
 
-        llvm_gen::mark_compiled_functions(&mut registry);
-
-        let has_external = registry.functions.values().any(|f| f.external_symbol.is_some());
-        if has_external {
+        // Any function with a body might need LLVM codegen (discovered via MonoItems later).
+        let has_functions = registry.functions.values().any(|f| f.body.is_some());
+        if has_functions {
             args.push("-C".to_string());
             args.push("codegen-units=16".to_string());
         }
 
         let toylang_callbacks = toylang::callbacks_impl::ToylangCallbacks {
             registry: Arc::new(registry),
-            llvm_paths: if has_external { Some((ll_path, obj_path)) } else { None },
+            llvm_paths: if has_functions { Some((ll_path, obj_path)) } else { None },
         };
 
         rustc_lang_facade::driver::run_compiler(toylang_callbacks, &args);

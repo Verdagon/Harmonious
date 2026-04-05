@@ -255,6 +255,18 @@ impl Parser {
         // consume "fn"
         self.consume();
         let name = self.expect_ident()?;
+
+        // Optional generic type params: <T, U>
+        let mut type_params = Vec::new();
+        if self.peek() == &Token::LAngle {
+            self.consume();
+            while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
+                type_params.push(self.expect_ident()?);
+                if self.peek() == &Token::Comma { self.consume(); }
+            }
+            self.expect(Token::RAngle)?;
+        }
+
         self.expect(Token::LParen)?;
         let params = self.parse_params()?;
         self.expect(Token::RParen)?;
@@ -271,7 +283,7 @@ impl Parser {
         let body = self.parse_fn_body()?;
         // parse_fn_body consumes everything up to and including the closing RBrace
 
-        Ok((name.clone(), ToyFunction { name, params, return_ty, body: Some(body), external_symbol: None }))
+        Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: Some(body), external_symbol: None }))
     }
 
     fn parse_fn_body(&mut self) -> Result<FnBody, String> {
@@ -376,6 +388,12 @@ impl Parser {
                     }
                     self.expect(Token::RBrace)?;
                     Ok(Expr::StructLit { name, fields })
+                } else if self.peek() == &Token::LParen {
+                    // FnCall: name(args)
+                    self.consume(); // consume '('
+                    let args = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::FnCall { name, args })
                 } else {
                     Ok(Expr::Var(name))
                 }

@@ -27,7 +27,7 @@ use rustc_abi::{
     Variants,
 };
 use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
-use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv, TyKind};
+use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv, TyKind, TypeVisitableExt};
 use std::sync::OnceLock;
 
 // The provider function type. This must match rustc's Providers::layout_of signature
@@ -57,9 +57,11 @@ pub fn toy_layout_of<'tcx>(
 
     // Only intercept ADT types from __lang_stubs whose name matches a consumer type.
     // Checking the module prevents collisions with user-defined types sharing a name.
-    if let TyKind::Adt(adt_def, _) = ty.kind() {
+    if let TyKind::Adt(adt_def, args) = ty.kind() {
         let name = tcx.item_name(adt_def.did()).to_string();
-        if crate::is_consumer_type(&name) && crate::is_from_lang_stubs(tcx, adt_def.did()) {
+        // Only intercept fully monomorphized types (no unresolved type params).
+        let has_params = args.iter().any(|a| a.has_param());
+        if !has_params && crate::is_consumer_type(&name) && crate::is_from_lang_stubs(tcx, adt_def.did()) {
             eprintln!("[toylang] layout_of intercepted for: {:?}", ty);
 
             // Ask the consumer to monomorphize this type — returns concrete field types.

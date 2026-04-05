@@ -25,6 +25,7 @@ use rustc_middle::ty::{self, GenericArg, TyCtxt};
 use crate::toylang::ast::{Expr, FnBody, Stmt};
 use crate::toylang::typed_ast::*;
 use crate::toylang::registry::{ToylangRegistry, ToyFieldType, ToyStruct};
+use rustc_lang_facade::LangCallbacks;
 
 // ============================================================================
 // Codegen context
@@ -419,6 +420,10 @@ fn lower_expr<'ctx>(
         Expr::MethodCall { receiver, method, args } => {
             lower_method_call(ctx, receiver, method, args)
         }
+
+        Expr::FnCall { .. } => {
+            panic!("FnCall should be handled via typed AST path")
+        }
     }
 }
 
@@ -578,11 +583,11 @@ fn coerce_int_to_type<'ctx>(
 // Function codegen
 // ============================================================================
 
-fn codegen_function<'ctx>(
-    ctx: &mut CodegenCtx<'ctx, '_, '_>,
-
+fn codegen_function<'ctx, 'tcx>(
+    ctx: &mut CodegenCtx<'ctx, 'tcx, '_>,
     name: &str,
     func: &crate::toylang::registry::ToyFunction,
+    instance: ty::Instance<'tcx>,
 ) {
     let symbol = func.external_symbol.as_ref().unwrap();
     let ret_ty_name = func.return_ty.as_ref().unwrap();
@@ -591,10 +596,8 @@ fn codegen_function<'ctx>(
     let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func);
     let body = func.body.as_ref().unwrap(); // still needed for body_uses_vec
 
-    // Determine return ABI
-    let fn_def_id = find_fn_def_id(ctx.tcx, name)
-        .unwrap_or_else(|| panic!("function '{}' not found in HIR", name));
-    let coerced = rustc_lang_facade::abi_helpers::coerced_return_type(ctx.tcx, fn_def_id);
+    // Determine return ABI using the concrete Instance (works for both generic and concrete)
+    let coerced = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(ctx.tcx, instance);
 
     // Determine LLVM return type
     let ret_struct_ty = if ret_ty_name.starts_with("Vec<") {
@@ -826,6 +829,67 @@ fn lower_typed_expr<'ctx>(
             ExprResult::Ptr(alloca, struct_ty.into())
         }
 
+        TypedExprKind::FnCall { name, args } => {
+            // Call a toylang function by its consumer symbol name.
+            // The function must be in the declared_fns (from resolve_vec_symbols or extern decl).
+            // For generic functions called from concrete wrappers, the concrete instantiation
+            // is handled by per_instance_mir + symbol_name override.
+            //
+            // At LLVM level, we call the function by its mangled symbol.
+            // For now, look up the function in the registry to find its extern symbol.
+            let func = ctx.registry.functions.get(name.as_str())
+                .unwrap_or_else(|| panic!("function '{}' not found in registry", name));
+            let extern_sym = func.external_symbol.as_ref()
+                .unwrap_or_else(|| panic!("function '{}' has no external symbol", name));
+
+            // Declare the function if not already declared
+            let ret_inkwell_ty = ctx.resolved_to_inkwell(&expr.ty);
+            let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = args.iter()
+                .map(|a| ctx.resolved_to_inkwell(&a.ty).into())
+                .collect();
+
+            // Check ABI — might need sret for struct returns
+            let is_struct_ret = matches!(&expr.ty, ResolvedType::Struct { .. });
+            let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
+
+            if is_struct_ret {
+                // sret call: allocate space, pass as first arg
+                let struct_ty = ctx.resolved_to_struct_type(&expr.ty);
+                let alloca = ctx.builder.build_alloca(struct_ty, "call_ret").unwrap();
+
+                let mut call_params: Vec<BasicMetadataTypeEnum<'ctx>> = vec![ptr_ty.into()];
+                call_params.extend(param_types.iter().cloned());
+                let callee = ctx.declare_external_fn(
+                    extern_sym, &call_params, None, Some((struct_ty, 8)),
+                );
+
+                let mut call_args: Vec<BasicValueEnum<'ctx>> = vec![alloca.into()];
+                for arg in args {
+                    let val = lower_typed_expr(ctx, arg).into_value(&ctx.builder);
+                    call_args.push(val);
+                }
+                let call_args_meta: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+                    call_args.iter().map(|v| (*v).into()).collect();
+                ctx.builder.build_call(callee, &call_args_meta, "").unwrap();
+                ExprResult::Ptr(alloca, struct_ty.into())
+            } else {
+                let callee = ctx.declare_external_fn(
+                    extern_sym, &param_types, Some(ret_inkwell_ty), None,
+                );
+                let call_args: Vec<BasicValueEnum<'ctx>> = args.iter()
+                    .map(|a| lower_typed_expr(ctx, a).into_value(&ctx.builder))
+                    .collect();
+                let call_args_meta: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+                    call_args.iter().map(|v| (*v).into()).collect();
+                let result = ctx.builder.build_call(callee, &call_args_meta, "call")
+                    .unwrap();
+                match result.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
+                    _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                }
+            }
+        }
+
         TypedExprKind::StaticCall { ty, method, args } => {
             match (ty.as_str(), method.as_str()) {
                 ("Vec", "new") => {
@@ -954,60 +1018,6 @@ fn lower_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>,
 // ============================================================================
 // Accessor codegen
 // ============================================================================
-
-fn codegen_accessors<'ctx>(
-    ctx: &mut CodegenCtx<'ctx, '_, '_>,
-
-    discovered_accessors: &[crate::toylang::callbacks_impl::DiscoveredAccessor],
-) {
-    let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
-
-    // Non-generic struct accessors from registry
-    let mut done_syms = std::collections::HashSet::new();
-    for (name, toy_struct) in &ctx.registry.structs {
-        if toy_struct.type_params.is_empty() {
-            let struct_ty = ctx.struct_type(toy_struct);
-            for (i, field) in toy_struct.fields.iter().enumerate() {
-                let sym = format!("__toylang_accessor_{}_{}", name, field.name);
-                if done_syms.insert(sym.clone()) {
-                    let fn_type = ptr_ty.fn_type(&[ptr_ty.into()], false);
-                    let func = ctx.module.add_function(&sym, fn_type, None);
-                    let entry = ctx.context.append_basic_block(func, "entry");
-                    ctx.builder.position_at_end(entry);
-                    let self_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-                    let gep = ctx.builder.build_struct_gep(struct_ty, self_ptr, i as u32, "ptr")
-                        .unwrap();
-                    ctx.builder.build_return(Some(&gep)).unwrap();
-                }
-            }
-        }
-    }
-
-    // Discovered generic accessor instances
-    for acc in discovered_accessors {
-        if done_syms.insert(acc.extern_symbol.clone()) {
-            // Parse the LLVM struct type string to reconstruct the inkwell type
-            // For now, look up the struct from registry and resolve with type args
-            let toy_struct = ctx.registry.structs.get(&acc.struct_name)
-                .unwrap_or_else(|| panic!("struct '{}' not found for accessor", acc.struct_name));
-
-            // Use the pre-computed llvm_struct_ty to determine the struct layout.
-            // Since we have the field index, just build the GEP accessor.
-            // We need the inkwell StructType. Let's reconstruct it from the string.
-            // This is a hack — ideally discovered_accessors would carry the types directly.
-            let struct_ty = parse_struct_type_str(ctx, &acc.llvm_struct_ty);
-
-            let fn_type = ptr_ty.fn_type(&[ptr_ty.into()], false);
-            let func = ctx.module.add_function(&acc.extern_symbol, fn_type, None);
-            let entry = ctx.context.append_basic_block(func, "entry");
-            ctx.builder.position_at_end(entry);
-            let self_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-            let gep = ctx.builder.build_struct_gep(struct_ty, self_ptr, acc.field_index as u32, "ptr")
-                .unwrap();
-            ctx.builder.build_return(Some(&gep)).unwrap();
-        }
-    }
-}
 
 /// Split a string on commas, respecting nested { } braces.
 fn split_respecting_braces(s: &str) -> Vec<&str> {
@@ -1254,71 +1264,150 @@ fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTyp
 // ============================================================================
 
 /// Check if a function is eligible for external LLVM compilation.
-fn is_eligible(
-    _fn_name: &str,
-    func: &crate::toylang::registry::ToyFunction,
-    registry: &ToylangRegistry,
-) -> bool {
-    if func.body.is_none() {
-        return false;
-    }
-    let ret_ty = match &func.return_ty {
-        Some(t) => t,
-        None => return false,
-    };
-    match ret_ty.as_str() {
-        "usize" | "i32" | "i64" | "f64" | "bool" => return true,
-        _ => {}
-    }
-    if registry.structs.contains_key(ret_ty.as_str()) {
-        return true;
-    }
-    if ret_ty.starts_with("Vec<") && ret_ty.ends_with('>') {
-        return true;
-    }
-    if let Some((base, _)) = parse_generic_type(ret_ty) {
-        return registry.structs.contains_key(base);
-    }
-    false
-}
-
-/// Mark functions that were compiled by the LLVM backend by setting their external_symbol.
-pub fn mark_compiled_functions(registry: &mut ToylangRegistry) {
-    let names: Vec<String> = registry.functions.keys().cloned().collect();
-    for name in names {
-        let func = registry.functions.get(&name).unwrap();
-        if is_eligible(&name, func, registry) {
-            let symbol = format!("__toylang_impl_{}", name);
-            registry.functions.get_mut(&name).unwrap().external_symbol = Some(symbol);
-        }
-    }
-}
-
-/// Generate LLVM IR as a string (for writing to .ll file) and return Rust symbols to globalize.
+/// Generate LLVM IR by walking MonoItems to find all consumer instances and codegen them.
+/// Discovery and codegen happen in the same `'tcx` scope so we can use live Instance values.
 pub fn generate_with_tcx<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
-    discovered_accessors: &[crate::toylang::callbacks_impl::DiscoveredAccessor],
+    callbacks: &crate::toylang::callbacks_impl::ToylangCallbacks,
 ) -> (String, Vec<String>) {
     let context = Context::create();
     let mut ctx = CodegenCtx::new(&context, tcx, registry);
+    let pointer_bits = tcx.data_layout.pointer_size.bits();
+    let mut seen_symbols = std::collections::HashSet::new();
 
-    // Codegen each eligible function
-    for (name, func) in &registry.functions {
-        if func.external_symbol.is_none() {
-            continue;
+    let (_, cgus) = tcx.collect_and_partition_mono_items(());
+    for cgu in cgus.iter() {
+        for (&mono_item, _) in cgu.items() {
+            let rustc_middle::mir::mono::MonoItem::Fn(instance) = mono_item else { continue };
+            let def_id = instance.def_id();
+            if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+                continue;
+            }
+            let Some(local_def_id) = def_id.as_local() else { continue };
+
+            // Check if it's an accessor method
+            if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
+                let impl_def_id = assoc_item.container_id(tcx);
+                let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
+                if let ty::TyKind::Adt(adt_def, _) = self_ty.kind() {
+                    let struct_name = tcx.item_name(adt_def.did()).to_string();
+                    if let Some(toy_struct) = registry.structs.get(&struct_name) {
+                        let field_name = tcx.item_name(def_id).to_string();
+                        if let Some(field_index) = toy_struct.fields.iter().position(|f| f.name == field_name) {
+                            let callback_name = format!("{}.{}", struct_name, field_name);
+                            let result = callbacks.monomorphize_fn(&callback_name, tcx, local_def_id, instance);
+                            if seen_symbols.insert(result.extern_symbol.clone()) {
+                                let llvm_struct_ty = crate::toylang::callbacks_impl::compute_llvm_struct_ty(
+                                    tcx, instance, toy_struct, registry, pointer_bits,
+                                );
+                                codegen_accessor_inline(&mut ctx, &result.extern_symbol, &llvm_struct_ty, field_index);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Check if it's a consumer function
+            let name = tcx.item_name(def_id).to_string();
+            let Some(toy_fn) = registry.functions.get(&name) else { continue };
+            let result = callbacks.monomorphize_fn(&name, tcx, local_def_id, instance);
+            if !seen_symbols.insert(result.extern_symbol.clone()) {
+                continue;
+            }
+
+            // Build resolved function with concrete type args substituted
+            let resolved_func = resolve_function_for_instance(toy_fn, &name, &result.extern_symbol, instance, tcx);
+            codegen_function(&mut ctx, &name, &resolved_func, instance);
         }
-        codegen_function(&mut ctx, name, func);
     }
 
-    // Codegen accessor functions
-    codegen_accessors(&mut ctx, discovered_accessors);
-
-    // Extract results
     let rust_symbols = ctx.rust_symbols.clone();
     let ir = ctx.module.print_to_string().to_string();
-
     (ir, rust_symbols)
+}
+
+/// Codegen an accessor function inline (GEP to field offset, return pointer).
+fn codegen_accessor_inline<'ctx>(
+    ctx: &mut CodegenCtx<'ctx, '_, '_>,
+    extern_symbol: &str,
+    llvm_struct_ty_str: &str,
+    field_index: usize,
+) {
+    let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
+    let struct_ty = parse_struct_type_str(ctx, llvm_struct_ty_str);
+    let fn_type = ptr_ty.fn_type(&[ptr_ty.into()], false);
+    let func = ctx.module.add_function(extern_symbol, fn_type, None);
+    let entry = ctx.context.append_basic_block(func, "entry");
+    ctx.builder.position_at_end(entry);
+    let self_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+    let gep = ctx.builder.build_struct_gep(struct_ty, self_ptr, field_index as u32, "ptr").unwrap();
+    ctx.builder.build_return(Some(&gep)).unwrap();
+}
+
+/// Build a resolved ToyFunction with type params substituted for a concrete instance.
+fn resolve_function_for_instance<'tcx>(
+    toy_fn: &crate::toylang::registry::ToyFunction,
+    name: &str,
+    extern_symbol: &str,
+    instance: ty::Instance<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> crate::toylang::registry::ToyFunction {
+    if toy_fn.type_params.is_empty() {
+        // Concrete function — just set the extern symbol
+        let mut resolved = toy_fn.clone();
+        resolved.external_symbol = Some(extern_symbol.to_string());
+        return resolved;
+    }
+
+    // Generic function — substitute type params
+    let mut type_arg_subst = std::collections::HashMap::new();
+    for (i, param_name) in toy_fn.type_params.iter().enumerate() {
+        if let Some(arg) = instance.args.get(i) {
+            if let ty::GenericArgKind::Type(ty) = arg.unpack() {
+                type_arg_subst.insert(
+                    param_name.clone(),
+                    crate::toylang::callbacks_impl::rustc_ty_to_type_string(tcx, ty),
+                );
+            }
+        }
+    }
+
+    crate::toylang::registry::ToyFunction {
+        name: name.to_string(),
+        type_params: vec![],
+        params: toy_fn.params.iter().map(|p| {
+            crate::toylang::registry::ToyParam {
+                name: p.name.clone(),
+                ty: substitute_type_params_str(&p.ty, &type_arg_subst),
+            }
+        }).collect(),
+        return_ty: toy_fn.return_ty.as_deref().map(|s| substitute_type_params_str(s, &type_arg_subst)),
+        body: toy_fn.body.clone(),
+        external_symbol: Some(extern_symbol.to_string()),
+    }
+}
+
+/// Simple string substitution for type param resolution.
+fn substitute_type_params_str(s: &str, subst: &std::collections::HashMap<String, String>) -> String {
+    // Direct match
+    if let Some(replacement) = subst.get(s) {
+        return replacement.clone();
+    }
+    // Generic: "Wrapper<T>" → "Wrapper<i32>"
+    if let Some(open) = s.find('<') {
+        if s.ends_with('>') {
+            let base = &s[..open];
+            let args_str = &s[open + 1..s.len() - 1];
+            let args: Vec<&str> = split_respecting_braces(args_str);
+            let resolved: Vec<String> = args.iter()
+                .map(|a| substitute_type_params_str(a.trim(), subst))
+                .collect();
+            return format!("{}<{}>", base, resolved.join(", "));
+        }
+    }
+    s.to_string()
 }
 
 // --- Public type helpers used by callbacks_impl.rs ---

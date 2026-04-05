@@ -11,6 +11,8 @@ pub enum Expr {
     MethodCall { receiver: Box<Expr>, method: String, args: Vec<Expr> },
     /// `Point { x: 1, y: 2 }` — IDENT "{" field_inits "}"
     StructLit { name: String, fields: Vec<(String, Expr)> },
+    /// `wrap(x)` — IDENT "(" args ")"
+    FnCall { name: String, args: Vec<Expr> },
 }
 
 /// A Toylang statement.

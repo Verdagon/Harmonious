@@ -41,6 +41,10 @@ pub enum TypedExprKind {
         name: String,
         fields: Vec<(String, TypedExpr)>,
     },
+    FnCall {
+        name: String,
+        args: Vec<TypedExpr>,
+    },
     StaticCall {
         ty: String,
         method: String,
