@@ -51,9 +51,9 @@ Fork at `~/rust` on branch `per-instance-mir`. Linked as toolchain `rustc-fork`.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Key insight: steps 5 and 8 are the only places consumer logic runs.
-Step 5 uses normal rustc (no `mir_built` or `borrowck` overrides needed).
-Step 8 discovers and compiles everything in one pass.
+Key insight: consumer logic runs in steps 6 (query providers during
+monomorphization) and 8 (LLVM codegen after monomorphization).
+Step 5 uses normal rustc — no `mir_built` or `borrowck` overrides needed.
 
 ---
 
@@ -84,15 +84,17 @@ Four-patch fork of rustc:
 3. Codegen skip in `rustc_codegen_ssa/src/mono_item.rs` (if Some, skip `codegen_instance`)
 4. Default provider in `rustc_mir_transform/src/shim.rs` (returns None)
 
-The provider calls `monomorphize_fn` to get:
-- The consumer extern symbol for this instance
-- ALL dependencies (Rust functions, Rust types, AND other consumer functions)
+The provider calls `monomorphize_fn` which:
+1. Computes the consumer extern symbol for this instance
+2. Scans the body for Rust deps (Vec::new, Vec::push, etc.)
+3. Runs the type resolver on the body to discover toylang callee deps
+   (including generic callees with inferred type args)
 
-It builds a MIR body that references these deps via ReifyFnPointer casts (for
-functions) and NullaryOp::SizeOf (for types). The collector walks this body,
-discovers the deps, and the fixpoint loop handles cascading.
+It returns ALL deps. The provider builds a MIR body that references them via
+ReifyFnPointer casts (for functions) and NullaryOp::SizeOf (for types). The
+collector walks this body, discovers the deps, and the fixpoint loop cascades.
 
-The body ends with Unreachable — it's never executed. The codegen skip ensures
+The body ends with Unreachable — never executed. The codegen skip ensures
 rustc doesn't emit code for consumer functions. The consumer .o provides definitions.
 
 ### 2.3 symbol_name
@@ -145,13 +147,16 @@ pub fn make_counter() -> Counter { unreachable!() }
 pub fn wrap<T>(x: T) -> Wrapper<T> { unreachable!() }
 ```
 
-**Extern declarations** for non-generic function symbols only:
+**Extern declarations** for non-generic function and accessor symbols:
 ```rust
 extern "C" {
     pub fn __toylang_impl_make_counter() -> Counter;
     fn __toylang_accessor_Counter_value(s: *const Counter) -> *const i32;
 }
 ```
+Note: these extern "C" declarations are a legacy artifact. With `per_instance_mir`
++ `symbol_name`, callers use Rust ABI directly (not C ABI). The declarations
+exist but may be unused — cleanup candidate.
 
 ### 3.2 Module-qualified matching
 
@@ -196,14 +201,20 @@ values are available for ABI queries.
 
 ### 4.3 Dependency discovery via type resolver
 
-`collect_toylang_fn_deps` runs the type resolver on the caller's body to find
-all FnCall nodes with their resolved type args. This unified approach handles:
+`collect_toylang_fn_deps` runs `type_resolve::resolve_fn_body` on the caller's
+body to produce a TypedFnBody, then walks it for FnCall nodes with resolved
+type args. This unified approach handles all cases:
 - Concrete-to-concrete calls (empty type args)
-- Concrete-to-generic calls (type args inferred from context)
-- Generic-to-generic calls (caller's type params substituted first)
+- Concrete-to-generic calls (type args inferred from expected return type)
+- Generic-to-generic calls (caller's type params substituted first via Instance args)
 
 The resolved FnCall type args are converted to rustc `Ty<'tcx>` values and
 used to construct concrete `GenericArgsRef` for the callee Instance.
+
+Note: the type resolver runs twice per function — once during dep discovery
+(in `monomorphize_fn`) and once during LLVM codegen (in `generate_with_tcx`).
+Same function, called at two different times. It's cheap (no LLVM, just string
+matching and scope tracking).
 
 ### 4.4 Inkwell codegen
 
@@ -348,10 +359,13 @@ instances are known. Both concrete and generic functions flow through the same p
 
 ### Why the type resolver drives dependency discovery
 
-`collect_toylang_fn_deps` runs the type resolver on the caller's body to find
-callee FnCall nodes with resolved type args. This is the same type resolver that
-runs during codegen — reused, not duplicated. It handles all cases uniformly:
-return position, let bindings, nested expressions, generic callee inference.
+`collect_toylang_fn_deps` runs `resolve_fn_body` on the caller's body to produce
+a TypedFnBody with all FnCall type args resolved. This handles all callee cases
+uniformly — return position, let bindings, nested expressions. For generic callers,
+type params are substituted from the Instance's args before resolving. The same
+`resolve_fn_body` function also runs during LLVM codegen, keeping both paths
+consistent. Known limitation: generic FnCalls in let bindings without return-type
+context can't infer type args (defaults to i32 for int literals).
 
 ### Why no mir_built or borrowck overrides
 
