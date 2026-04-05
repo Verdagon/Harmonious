@@ -1010,7 +1010,135 @@ fn main() {
 }
 
 // ============================================================================
-// Group 15: Toylang owns main
+// Group 15: Vec with primitives
+// ============================================================================
+
+#[test]
+fn test_vec_i32() {
+    let output = run_toylang_test(
+        r#"
+fn make_vec() -> Vec<i32> {
+    let v = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    v
+}
+
+fn vec_len(v: &Vec<i32>) -> usize {
+    v.len()
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let v = make_vec();
+    let len = vec_len(&v);
+    println!("len: {}", len);
+    assert_eq!(len, 3);
+}
+        "#,
+    );
+    assert!(output.contains("len: 3"));
+}
+
+#[test]
+fn test_single_field_struct() {
+    let output = run_toylang_test(
+        r#"
+struct Wrapper {
+    value: i32,
+}
+
+fn make_wrapper() -> Wrapper {
+    Wrapper { value: 99 }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let w = make_wrapper();
+    println!("value: {}", w.value());
+    assert_eq!(*w.value(), 99);
+}
+        "#,
+    );
+    assert!(output.contains("value: 99"));
+}
+
+#[test]
+fn test_struct_with_vec_and_primitive() {
+    let output = run_toylang_test(
+        r#"
+struct Data {
+    count: i32,
+    items: Vec<i32>,
+}
+
+fn make_data() -> Data {
+    let v = Vec::new();
+    v.push(10);
+    v.push(20);
+    Data { count: 2, items: v }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let d = make_data();
+    println!("count: {} items_len: {}", d.count(), d.items().len());
+    assert_eq!(*d.count(), 2);
+    assert_eq!(d.items().len(), 2);
+}
+        "#,
+    );
+    assert!(output.contains("count: 2 items_len: 2"));
+}
+
+#[test]
+fn test_vec_of_structs_len() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn make_points() -> Vec<Point> {
+    let v = Vec::new();
+    v.push(Point { x: 1, y: 2 });
+    v.push(Point { x: 3, y: 4 });
+    v.push(Point { x: 5, y: 6 });
+    v
+}
+
+fn count_points(v: &Vec<Point>) -> usize {
+    v.len()
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let v = make_points();
+    let n = count_points(&v);
+    println!("count: {}", n);
+    assert_eq!(n, 3);
+}
+        "#,
+    );
+    assert!(output.contains("count: 3"));
+}
+
+// ============================================================================
+// Group 16: Toylang owns main
 // ============================================================================
 
 #[test]
