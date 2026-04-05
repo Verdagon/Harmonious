@@ -1179,6 +1179,10 @@ fn resolve_function_for_instance<'tcx>(
 }
 
 /// Simple string substitution for type param resolution.
+pub fn substitute_type_params_str_pub(s: &str, subst: &std::collections::HashMap<String, String>) -> String {
+    substitute_type_params_str(s, subst)
+}
+
 fn substitute_type_params_str(s: &str, subst: &std::collections::HashMap<String, String>) -> String {
     // Direct match
     if let Some(replacement) = subst.get(s) {

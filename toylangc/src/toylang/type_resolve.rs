@@ -577,7 +577,13 @@ fn infer_type_args_from_expected(
         None => return subst,
     };
 
-    // Parse return type to find type param positions: "Wrapper<T>" → ["T"]
+    // Direct type param: "T" → match against expected type
+    if func.type_params.contains(&ret_str) {
+        subst.insert(ret_str.clone(), resolved_type_to_string(expected_ty));
+        return subst;
+    }
+
+    // Generic struct pattern: "Wrapper<T>" → match struct type params
     if let Some(open) = ret_str.find('<') {
         if ret_str.ends_with('>') {
             let base = &ret_str[..open];

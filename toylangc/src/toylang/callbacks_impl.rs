@@ -125,7 +125,7 @@ impl LangCallbacks for ToylangCallbacks {
 
         // Scan for calls to other consumer functions
         if let Some(ref fn_body) = toy_fn.body {
-            let toylang_deps = collect_toylang_fn_deps(tcx, fn_body, &self.registry, toy_fn);
+            let toylang_deps = collect_toylang_fn_deps(tcx, fn_body, &self.registry, toy_fn, instance);
             rust_deps.extend(toylang_deps);
         }
 
@@ -403,79 +403,136 @@ fn find_vec_in_fields_recursive<'tcx>(
 /// DefId + GenericArgs so the monomorphization collector discovers them.
 fn collect_toylang_fn_deps<'tcx>(
     tcx: TyCtxt<'tcx>,
-    body: &FnBody,
+    _body: &FnBody,
     registry: &ToylangRegistry,
-    _caller_fn: &crate::toylang::registry::ToyFunction,
+    caller_fn: &crate::toylang::registry::ToyFunction,
+    instance: ty::Instance<'tcx>,
 ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
+    // Unified approach: run the type resolver on the caller's body to get
+    // concrete type args for all FnCall nodes, then construct callee Instances.
+
+    // If the caller is generic, substitute type params with concrete args first.
+    let resolved_caller = if !caller_fn.type_params.is_empty() {
+        let mut subst = std::collections::HashMap::new();
+        for (i, param_name) in caller_fn.type_params.iter().enumerate() {
+            if let Some(arg) = instance.args.get(i) {
+                if let ty::GenericArgKind::Type(ty) = arg.unpack() {
+                    subst.insert(param_name.clone(), rustc_ty_to_type_string(tcx, ty));
+                }
+            }
+        }
+        crate::toylang::registry::ToyFunction {
+            name: caller_fn.name.clone(),
+            type_params: vec![],
+            params: caller_fn.params.iter().map(|p| crate::toylang::registry::ToyParam {
+                name: p.name.clone(),
+                ty: crate::llvm_gen::substitute_type_params_str_pub(&p.ty, &subst),
+            }).collect(),
+            return_ty: caller_fn.return_ty.as_deref()
+                .map(|s| crate::llvm_gen::substitute_type_params_str_pub(s, &subst)),
+            body: caller_fn.body.clone(),
+        }
+    } else {
+        caller_fn.clone()
+    };
+
+    // Run type resolver to get typed body with FnCall type_args filled in
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, &resolved_caller);
+
+    // Walk typed body for FnCall nodes and construct deps
     let mut deps = Vec::new();
-    let mut callee_names = Vec::new();
+    let mut fn_calls = Vec::new();
+    walk_typed_body_for_fn_calls(&typed_body, &mut fn_calls);
 
-    // Collect all FnCall names from the body
-    collect_fn_call_names(body, &mut callee_names);
+    for (callee_name, type_args) in &fn_calls {
+        let Some(callee_def_id) = find_stub_fn_def_id(tcx, callee_name) else { continue };
+        if !registry.functions.contains_key(callee_name.as_str()) { continue; }
 
-    for callee_name in &callee_names {
-        // Find the callee's DefId in __lang_stubs
-        let callee_def_id = find_stub_fn_def_id(tcx, callee_name);
-        let Some(callee_def_id) = callee_def_id else { continue };
-
-        let callee_fn = match registry.functions.get(callee_name.as_str()) {
-            Some(f) => f,
-            None => continue,
-        };
-
-        if callee_fn.type_params.is_empty() {
-            // Concrete callee — no type args needed
+        if type_args.is_empty() {
+            // Concrete callee
             let args = tcx.mk_args(&[]);
             deps.push((callee_def_id, args));
+        } else {
+            // Generic callee — convert type_args strings to Ty<'tcx>
+            let ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                .map(|s| ty::GenericArg::from(string_to_rustc_ty(tcx, s)))
+                .collect();
+            let args = tcx.mk_args(&ty_args);
+            deps.push((callee_def_id, args));
         }
-        // Generic callees need concrete type args which we can't determine here
-        // (requires type inference from the body context). These calls must go
-        // through Rust — the caller should be concrete and Rust's monomorphizer
-        // discovers the callee through per_instance_mir.
     }
 
     deps
 }
 
-/// Recursively collect all FnCall names from a function body.
-fn collect_fn_call_names(body: &FnBody, names: &mut Vec<String>) {
+/// Walk a TypedFnBody and collect all FnCall (name, type_args) pairs.
+fn walk_typed_body_for_fn_calls(
+    body: &crate::toylang::typed_ast::TypedFnBody,
+    calls: &mut Vec<(String, Vec<String>)>,
+) {
+    use crate::toylang::typed_ast::*;
     for stmt in &body.stmts {
         match stmt {
-            Stmt::Let { expr, .. } | Stmt::ExprStmt(expr) => {
-                collect_fn_call_names_expr(expr, names);
-            }
+            TypedStmt::Let { expr, .. } => walk_typed_expr_for_fn_calls(expr, calls),
+            TypedStmt::ExprStmt(expr) => walk_typed_expr_for_fn_calls(expr, calls),
         }
     }
     if let Some(ref ret) = body.ret {
-        collect_fn_call_names_expr(ret, names);
+        walk_typed_expr_for_fn_calls(ret, calls);
     }
 }
 
-fn collect_fn_call_names_expr(expr: &Expr, names: &mut Vec<String>) {
-    match expr {
-        Expr::FnCall { name, args } => {
-            names.push(name.clone());
+fn walk_typed_expr_for_fn_calls(
+    expr: &crate::toylang::typed_ast::TypedExpr,
+    calls: &mut Vec<(String, Vec<String>)>,
+) {
+    use crate::toylang::typed_ast::*;
+    match &expr.kind {
+        TypedExprKind::FnCall { name, type_args, args } => {
+            calls.push((name.clone(), type_args.clone()));
             for arg in args {
-                collect_fn_call_names_expr(arg, names);
+                walk_typed_expr_for_fn_calls(arg, calls);
             }
         }
-        Expr::StructLit { fields, .. } => {
+        TypedExprKind::StructLit { fields, .. } => {
             for (_, expr) in fields {
-                collect_fn_call_names_expr(expr, names);
+                walk_typed_expr_for_fn_calls(expr, calls);
             }
         }
-        Expr::MethodCall { receiver, args, .. } => {
-            collect_fn_call_names_expr(receiver, names);
+        TypedExprKind::MethodCall { receiver, args, .. } => {
+            walk_typed_expr_for_fn_calls(receiver, calls);
             for arg in args {
-                collect_fn_call_names_expr(arg, names);
+                walk_typed_expr_for_fn_calls(arg, calls);
             }
         }
-        Expr::StaticCall { args, .. } => {
+        TypedExprKind::BinaryOp { left, right, .. } => {
+            walk_typed_expr_for_fn_calls(left, calls);
+            walk_typed_expr_for_fn_calls(right, calls);
+        }
+        TypedExprKind::StaticCall { args, .. } => {
             for arg in args {
-                collect_fn_call_names_expr(arg, names);
+                walk_typed_expr_for_fn_calls(arg, calls);
             }
         }
-        _ => {}
+        _ => {} // IntLit, BoolLit, Var — no children
+    }
+}
+
+/// Convert a type string to a rustc Ty.
+fn string_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, s: &str) -> Ty<'tcx> {
+    match s {
+        "i32" => tcx.types.i32,
+        "i64" => tcx.types.i64,
+        "f64" => tcx.types.f64,
+        "bool" => tcx.types.bool,
+        "usize" => tcx.types.usize,
+        _ => {
+            // Try local struct
+            if let Some(ty) = crate::oracle::find_local_struct_ty(tcx, s) {
+                return ty;
+            }
+            panic!("string_to_rustc_ty: unsupported type '{}'", s)
+        }
     }
 }
 

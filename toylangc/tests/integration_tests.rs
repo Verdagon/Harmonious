@@ -859,7 +859,6 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: generic callee dep resolution (type inference during monomorphize_fn)
 fn test_generic_wrap_via_concrete() {
     let output = run_toylang_test(
         r#"
@@ -917,6 +916,77 @@ fn main() {
         "#,
     );
     assert!(output.contains("value: 42"));
+}
+
+// ============================================================================
+#[test]
+#[ignore] // needs: struct passthrough ABI fix for generic identity function
+fn test_generic_callee_with_struct() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn identity<T>(x: T) -> T {
+    x
+}
+
+fn identity_point(p: Point) -> Point {
+    identity(p)
+}
+
+fn make_point() -> Point {
+    Point { x: 10, y: 20 }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let p = make_point();
+    let p2 = identity_point(p);
+    println!("x: {} y: {}", p2.x(), p2.y());
+    assert_eq!(*p2.x(), 10);
+    assert_eq!(*p2.y(), 20);
+}
+        "#,
+    );
+    assert!(output.contains("x: 10 y: 20"));
+}
+
+#[test]
+#[ignore] // needs: type inference for generic FnCall in let binding (no expected type context)
+fn test_generic_callee_in_let() {
+    let output = run_toylang_test(
+        r#"
+struct Wrapper<T> {
+    inner: T,
+}
+
+fn wrap<T>(x: T) -> Wrapper<T> {
+    Wrapper { inner: x }
+}
+
+fn use_wrap() -> i32 {
+    let w = wrap(42);
+    42
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let result = use_wrap();
+    println!("result: {}", result);
+    assert_eq!(result, 42);
+}
+        "#,
+    );
+    assert!(output.contains("result: 42"));
 }
 
 // ============================================================================
