@@ -43,8 +43,13 @@ pub enum TypedExprKind {
     },
     FnCall {
         name: String,
-        type_args: Vec<String>,  // e.g. ["i32"] for wrap::<i32>; empty for concrete
+        type_args: Vec<String>,
         args: Vec<TypedExpr>,
+    },
+    BinaryOp {
+        op: crate::toylang::ast::BinOp,
+        left: Box<TypedExpr>,
+        right: Box<TypedExpr>,
     },
     StaticCall {
         ty: String,

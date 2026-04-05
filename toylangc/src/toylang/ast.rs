@@ -1,3 +1,12 @@
+/// Binary operator.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 /// A Toylang expression.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -13,6 +22,8 @@ pub enum Expr {
     StructLit { name: String, fields: Vec<(String, Expr)> },
     /// `wrap(x)` — IDENT "(" args ")"
     FnCall { name: String, args: Vec<Expr> },
+    /// `a + b`, `x * 2`
+    BinaryOp { op: BinOp, left: Box<Expr>, right: Box<Expr> },
 }
 
 /// A Toylang statement.

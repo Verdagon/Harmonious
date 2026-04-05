@@ -339,12 +339,19 @@ fn resolve_expr(
 ) -> TypedExpr {
     match expr {
         Expr::IntLit(n) => {
+            // TODO: Replace this default-to-i32 heuristic with proper backward
+            // type inference (Option 1 from the plan). A pre-scan of the return
+            // expression should propagate the return type backward through
+            // variables to their Let bindings, so `let a = 10` in a function
+            // returning i64 would correctly infer a as i64. For now, default
+            // to i32 (like C's integer literals) and rely on explicit context
+            // from struct fields and return types to override when needed.
             let ty = match expected_ty {
                 ResolvedType::I32 => ResolvedType::I32,
                 ResolvedType::I64 => ResolvedType::I64,
                 ResolvedType::Bool => ResolvedType::Bool,
                 ResolvedType::Usize => ResolvedType::Usize,
-                _ => ResolvedType::I64,
+                _ => ResolvedType::I32, // default to i32 (was i64)
             };
             TypedExpr { kind: TypedExprKind::IntLit(*n), ty }
         }
@@ -443,6 +450,26 @@ fn resolve_expr(
                     kind: TypedExprKind::FnCall { name: name.clone(), type_args: vec![], args: typed_args },
                     ty: ret_ty,
                 }
+            }
+        }
+
+        Expr::BinaryOp { op, left, right } => {
+            // Both operands and result have the same type.
+            // Use expected type, or infer from operands.
+            let operand_ty = if expected_ty != &ResolvedType::Void {
+                expected_ty.clone()
+            } else {
+                ResolvedType::I32 // default for arithmetic
+            };
+            let typed_left = resolve_expr(left, &operand_ty, scope, registry, vec_inferences);
+            let typed_right = resolve_expr(right, &operand_ty, scope, registry, vec_inferences);
+            TypedExpr {
+                kind: TypedExprKind::BinaryOp {
+                    op: *op,
+                    left: Box::new(typed_left),
+                    right: Box::new(typed_right),
+                },
+                ty: operand_ty,
             }
         }
 

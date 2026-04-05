@@ -405,7 +405,7 @@ fn collect_toylang_fn_deps<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &FnBody,
     registry: &ToylangRegistry,
-    caller_fn: &crate::toylang::registry::ToyFunction,
+    _caller_fn: &crate::toylang::registry::ToyFunction,
 ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
     let mut deps = Vec::new();
     let mut callee_names = Vec::new();

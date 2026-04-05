@@ -620,6 +620,34 @@ fn lower_typed_expr<'ctx>(
             ExprResult::Ptr(ptr, ty)
         }
 
+        TypedExprKind::BinaryOp { op, left, right } => {
+            use crate::toylang::ast::BinOp;
+            let lhs = lower_typed_expr(ctx, left).into_value(&ctx.builder);
+            let rhs = lower_typed_expr(ctx, right).into_value(&ctx.builder);
+            let result = match (lhs, rhs) {
+                (BasicValueEnum::IntValue(l), BasicValueEnum::IntValue(r)) => {
+                    let val = match op {
+                        BinOp::Add => ctx.builder.build_int_add(l, r, "add").unwrap(),
+                        BinOp::Sub => ctx.builder.build_int_sub(l, r, "sub").unwrap(),
+                        BinOp::Mul => ctx.builder.build_int_mul(l, r, "mul").unwrap(),
+                        BinOp::Div => ctx.builder.build_int_signed_div(l, r, "div").unwrap(),
+                    };
+                    BasicValueEnum::IntValue(val)
+                }
+                (BasicValueEnum::FloatValue(l), BasicValueEnum::FloatValue(r)) => {
+                    let val = match op {
+                        BinOp::Add => ctx.builder.build_float_add(l, r, "fadd").unwrap(),
+                        BinOp::Sub => ctx.builder.build_float_sub(l, r, "fsub").unwrap(),
+                        BinOp::Mul => ctx.builder.build_float_mul(l, r, "fmul").unwrap(),
+                        BinOp::Div => ctx.builder.build_float_div(l, r, "fdiv").unwrap(),
+                    };
+                    BasicValueEnum::FloatValue(val)
+                }
+                _ => panic!("BinaryOp: mismatched operand types"),
+            };
+            ExprResult::Value(result)
+        }
+
         TypedExprKind::StructLit { name, fields } => {
             let struct_ty = ctx.resolved_to_struct_type(&expr.ty);
             let alloca = ctx.builder.build_alloca(struct_ty, name).unwrap();

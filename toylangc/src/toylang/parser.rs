@@ -1,4 +1,4 @@
-use super::ast::{Expr, FnBody, Stmt};
+use super::ast::{BinOp, Expr, FnBody, Stmt};
 use super::registry::{
     ToyField, ToyFieldType, ToyFunction, ToyParam, ToyStruct, ToylangRegistry,
 };
@@ -22,6 +22,9 @@ enum Token {
     Comma,
     Ampersand,
     Star,
+    Plus,
+    Minus,
+    Slash,
     Arrow,     // ->
     Dot,       // .
     Semicolon, // ;
@@ -50,10 +53,15 @@ fn tokenize(src: &str) -> Vec<Token> {
             continue;
         }
 
-        // Arrow ->
-        if chars[i] == '-' && i + 1 < chars.len() && chars[i + 1] == '>' {
-            tokens.push(Token::Arrow);
-            i += 2;
+        // Arrow -> or Minus -
+        if chars[i] == '-' {
+            if i + 1 < chars.len() && chars[i + 1] == '>' {
+                tokens.push(Token::Arrow);
+                i += 2;
+            } else {
+                tokens.push(Token::Minus);
+                i += 1;
+            }
             continue;
         }
 
@@ -87,6 +95,8 @@ fn tokenize(src: &str) -> Vec<Token> {
             ',' => { tokens.push(Token::Comma); i += 1; }
             '&' => { tokens.push(Token::Ampersand); i += 1; }
             '*' => { tokens.push(Token::Star); i += 1; }
+            '+' => { tokens.push(Token::Plus); i += 1; }
+            '/' => { tokens.push(Token::Slash); i += 1; }
             '.' => { tokens.push(Token::Dot); i += 1; }
             ';' => { tokens.push(Token::Semicolon); i += 1; }
             '=' => { tokens.push(Token::Equals); i += 1; }
@@ -323,12 +333,47 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, String> {
+        self.parse_additive()
+    }
+
+    // Precedence: additive (+, -) < multiplicative (*, /)
+    fn parse_additive(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Token::Plus => BinOp::Add,
+                Token::Minus => BinOp::Sub,
+                _ => break,
+            };
+            self.consume();
+            let right = self.parse_multiplicative()?;
+            left = Expr::BinaryOp { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_postfix()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => BinOp::Mul,
+                Token::Slash => BinOp::Div,
+                _ => break,
+            };
+            self.consume();
+            let right = self.parse_postfix()?;
+            left = Expr::BinaryOp { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expr, String> {
         let mut expr = self.parse_primary()?;
 
         // method call chaining: expr.method(args)
         loop {
             if self.peek() == &Token::Dot {
-                self.consume(); // consume '.'
+                self.consume();
                 let method = self.expect_ident()?;
                 self.expect(Token::LParen)?;
                 let args = self.parse_args()?;
