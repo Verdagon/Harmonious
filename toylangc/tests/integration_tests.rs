@@ -314,7 +314,6 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: bool field type in generic args
 fn test_tg_bool_i32() {
     let output = run_toylang_test(
         r#"
@@ -566,7 +565,6 @@ fn main() {
 // --- Group 8: Rust -> rust -> toylang (R(R(T))) ---
 
 #[test]
-#[ignore] // needs: Vec<Vec<ToyPoint>> construction in toylang
 fn test_r_r_t_vec_of_vec() {
     let output = run_toylang_test(
         r#"

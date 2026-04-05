@@ -35,6 +35,7 @@ pub struct TypedExpr {
 #[derive(Clone, Debug)]
 pub enum TypedExprKind {
     IntLit(i64),
+    BoolLit(bool),
     Var(String),
     StructLit {
         name: String,

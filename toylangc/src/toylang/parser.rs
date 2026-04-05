@@ -340,6 +340,11 @@ impl Parser {
                 self.consume();
                 Ok(Expr::IntLit(n))
             }
+            Token::Ident(name) if name == "true" || name == "false" => {
+                let val = name == "true";
+                self.consume();
+                Ok(Expr::BoolLit(val))
+            }
             Token::Ident(name) => {
                 // peek ahead to distinguish:
                 //   IDENT "::" IDENT "(" -> StaticCall

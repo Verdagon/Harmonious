@@ -188,20 +188,70 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             ToyFieldType::TypeParam(name) => {
                 let idx = type_params.iter().position(|p| p == name)
                     .unwrap_or_else(|| panic!("type param '{}' not found", name));
-                self.primitive_type(type_args[idx])
+                self.type_from_string(type_args[idx])
             }
             other => self.resolve_type(other),
         }
     }
 
-    fn primitive_type(&self, name: &str) -> BasicTypeEnum<'ctx> {
+    /// Resolve a type string (from generic type args) to an inkwell type.
+    /// Handles primitives, struct names, and generic types like Vec<i32>.
+    fn type_from_string(&self, name: &str) -> BasicTypeEnum<'ctx> {
         match name {
             "i32" => self.context.i32_type().into(),
             "i64" => self.context.i64_type().into(),
             "f64" => self.context.f64_type().into(),
             "bool" => self.context.bool_type().into(),
             "usize" => self.usize_type().into(),
-            _ => panic!("unsupported primitive type '{}'", name),
+            _ => {
+                // Check for generic types: Vec<i32>, Pair<i32, i64>
+                if let Some((base, type_args)) = parse_generic_type(name) {
+                    if base == "Vec" {
+                        return self.vec_type().into();
+                    }
+                    if let Some(s) = self.registry.structs.get(base) {
+                        let fields: Vec<BasicTypeEnum<'ctx>> = s.fields.iter()
+                            .map(|f| self.resolve_field_with_args(f, &s.type_params, &type_args))
+                            .collect();
+                        return self.context.struct_type(&fields, false).into();
+                    }
+                }
+                // Check for non-generic struct
+                if let Some(s) = self.registry.structs.get(name) {
+                    return self.struct_type(s).into();
+                }
+                panic!("unsupported type string '{}'", name)
+            }
+        }
+    }
+
+    /// Resolve a type name string to a rustc Ty. Handles primitives, structs, and generics.
+    fn resolve_rust_ty_from_string(&self, name: &str) -> ty::Ty<'tcx> {
+        match name {
+            "i32" => self.tcx.types.i32,
+            "i64" => self.tcx.types.i64,
+            "f64" => self.tcx.types.f64,
+            "bool" => self.tcx.types.bool,
+            _ => {
+                // Try local struct
+                if let Some(ty) = crate::oracle::find_local_struct_ty(self.tcx, name) {
+                    return ty;
+                }
+                // Try generic: "Vec<ToyPoint>"
+                if let Some((base, args)) = parse_generic_type(name) {
+                    if base == "Vec" {
+                        let inner_ty = self.resolve_rust_ty_from_string(args[0]);
+                        let vec_did = self.tcx.get_diagnostic_item(rustc_span::sym::Vec)
+                            .expect("Vec not found");
+                        let new_def_id = crate::oracle::find_vec_method(self.tcx, "new").unwrap();
+                        let global_ty = crate::oracle::extract_global_ty(self.tcx, inner_ty, new_def_id).unwrap();
+                        let adt_def = self.tcx.adt_def(vec_did);
+                        return ty::Ty::new_adt(self.tcx, adt_def,
+                            self.tcx.mk_args(&[GenericArg::from(inner_ty), GenericArg::from(global_ty)]));
+                    }
+                }
+                panic!("resolve_rust_ty_from_string: unsupported type '{}'", name)
+            }
         }
     }
 
@@ -244,16 +294,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
     // --- Vec operation helpers ---
 
     fn resolve_vec_symbols(&mut self, elem_ty_name: &str) -> VecSymbols<'ctx> {
-        let elem_ty = crate::oracle::find_local_struct_ty(self.tcx, elem_ty_name)
-            .or_else(|| {
-                // Try as primitive
-                match elem_ty_name {
-                    "i32" => Some(self.tcx.types.i32),
-                    "i64" => Some(self.tcx.types.i64),
-                    _ => None,
-                }
-            })
-            .unwrap_or_else(|| panic!("element type '{}' not found", elem_ty_name));
+        let elem_ty = self.resolve_rust_ty_from_string(elem_ty_name);
+
 
         let new_def_id = crate::oracle::find_vec_method(self.tcx, "new").unwrap();
         let push_def_id = crate::oracle::find_vec_method(self.tcx, "push").unwrap();
@@ -350,8 +392,12 @@ fn lower_expr<'ctx>(
 ) -> ExprResult<'ctx> {
     match expr {
         Expr::IntLit(n) => {
-            // Default to i64 for now — the consumer knows the expected type from context
             let val = ctx.context.i64_type().const_int(*n as u64, *n < 0);
+            ExprResult::Value(val.into())
+        }
+
+        Expr::BoolLit(b) => {
+            let val = ctx.context.bool_type().const_int(if *b { 1 } else { 0 }, false);
             ExprResult::Value(val.into())
         }
 
@@ -733,6 +779,11 @@ fn lower_typed_expr<'ctx>(
             }
         }
 
+        TypedExprKind::BoolLit(b) => {
+            let val = ctx.context.bool_type().const_int(if *b { 1 } else { 0 }, false);
+            ExprResult::Value(val.into())
+        }
+
         TypedExprKind::Var(name) => {
             let (ptr, ty) = ctx.vars.get(name.as_str())
                 .unwrap_or_else(|| panic!("variable '{}' not in scope", name))
@@ -1044,20 +1095,34 @@ fn parse_generic_type(ty: &str) -> Option<(&str, Vec<&str>)> {
     Some((base, args))
 }
 
-/// Find the Vec element type name from context.
+/// Find the Vec element type name from context. Searches recursively into nested structs.
 fn find_vec_elem_name(ret_ty_name: &str, registry: &ToylangRegistry) -> Option<String> {
     // Direct Vec return: "Vec<Point>" → "Point"
     if ret_ty_name.starts_with("Vec<") && ret_ty_name.ends_with('>') {
         return Some(ret_ty_name[4..ret_ty_name.len()-1].to_string());
     }
-    // Struct with Vec field: look up first Vec field's element type
+    // Struct with Vec field (recursive)
     if let Some(s) = registry.structs.get(ret_ty_name) {
-        for field in &s.fields {
-            if let ToyFieldType::RustGeneric(name, args) = &field.rust_type {
-                if name == "Vec" && !args.is_empty() {
-                    return Some(field_type_to_string(&args[0]));
+        return find_vec_in_struct_fields(s, registry);
+    }
+    None
+}
+
+/// Recursively search struct fields for a Vec type, returning its element type name.
+fn find_vec_in_struct_fields(s: &ToyStruct, registry: &ToylangRegistry) -> Option<String> {
+    for field in &s.fields {
+        match &field.rust_type {
+            ToyFieldType::RustGeneric(name, args) if name == "Vec" && !args.is_empty() => {
+                return Some(field_type_to_string(&args[0]));
+            }
+            ToyFieldType::ToyStruct(struct_name) => {
+                if let Some(inner) = registry.structs.get(struct_name.as_str()) {
+                    if let Some(elem) = find_vec_in_struct_fields(inner, registry) {
+                        return Some(elem);
+                    }
                 }
             }
+            _ => {}
         }
     }
     None

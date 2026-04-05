@@ -268,10 +268,9 @@ fn infer_from_push(
 /// Used for forward-scanning push arguments.
 fn infer_expr_type(expr: &Expr, registry: &ToylangRegistry) -> Option<ResolvedType> {
     match expr {
-        Expr::IntLit(_) => Some(ResolvedType::I32), // default assumption for push args
-        Expr::StructLit { name, .. } => {
-            Some(parse_type_string(name, registry))
-        }
+        Expr::IntLit(_) => Some(ResolvedType::I32),
+        Expr::BoolLit(_) => Some(ResolvedType::Bool),
+        Expr::StructLit { name, .. } => Some(parse_type_string(name, registry)),
         _ => None,
     }
 }
@@ -341,15 +340,18 @@ fn resolve_expr(
 ) -> TypedExpr {
     match expr {
         Expr::IntLit(n) => {
-            // Use expected type from context to determine the int width
             let ty = match expected_ty {
                 ResolvedType::I32 => ResolvedType::I32,
                 ResolvedType::I64 => ResolvedType::I64,
                 ResolvedType::Bool => ResolvedType::Bool,
                 ResolvedType::Usize => ResolvedType::Usize,
-                _ => ResolvedType::I64, // fallback
+                _ => ResolvedType::I64,
             };
             TypedExpr { kind: TypedExprKind::IntLit(*n), ty }
+        }
+
+        Expr::BoolLit(b) => {
+            TypedExpr { kind: TypedExprKind::BoolLit(*b), ty: ResolvedType::Bool }
         }
 
         Expr::Var(name) => {

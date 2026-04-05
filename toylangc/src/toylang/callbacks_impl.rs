@@ -273,14 +273,19 @@ fn collect_rust_deps<'tcx>(
 
     // Second try: if return type is a toylang struct, search its fields for Vec types
     if elem_ty.is_none() {
-        if let TyKind::Adt(adt_def, _) = fn_sig.output().kind() {
+        if let TyKind::Adt(adt_def, args) = fn_sig.output().kind() {
             let struct_name = tcx.item_name(adt_def.did()).to_string();
             if let Some(toy_struct) = registry.structs.get(&struct_name) {
+                // Build subst from ADT's generic args (for generic structs like ToyGenMixed<i32>)
+                let subst: HashMap<&str, Ty<'tcx>> = toy_struct.type_params.iter()
+                    .enumerate()
+                    .filter_map(|(i, name)| {
+                        args.get(i).and_then(|a| a.as_type()).map(|ty| (name.as_str(), ty))
+                    })
+                    .collect();
                 for field in &toy_struct.fields {
                     if let ToyFieldType::RustGeneric(type_name, type_args) = &field.rust_type {
                         if type_name == "Vec" && !type_args.is_empty() {
-                            // Resolve the Vec element type to a rustc Ty
-                            let subst = HashMap::new();
                             let resolved = resolve_field_ty(tcx, &type_args[0], &subst);
                             elem_ty = Some(resolved);
                             break;

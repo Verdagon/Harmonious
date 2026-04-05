@@ -3,6 +3,7 @@
 #[allow(dead_code)]
 pub enum Expr {
     IntLit(i64),
+    BoolLit(bool),
     Var(String),
     /// `Vec::new()` — IDENT "::" IDENT "(" args ")"
     StaticCall { ty: String, method: String, args: Vec<Expr> },
