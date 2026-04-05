@@ -859,7 +859,158 @@ fn main() {
 }
 
 // ============================================================================
-// Group 14: Toylang owns main
+// Group 14: Additional function and struct tests
+// ============================================================================
+
+#[test]
+fn test_multiple_lets() {
+    let output = run_toylang_test(
+        r#"
+struct Counter {
+    value: i32,
+}
+
+fn multi_let() -> Counter {
+    let a = 42;
+    let b = Counter { value: a };
+    b
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let c = multi_let();
+    println!("value: {}", c.value());
+    assert_eq!(*c.value(), 42);
+}
+        "#,
+    );
+    assert!(output.contains("value: 42"));
+}
+
+#[test]
+fn test_var_in_struct_field() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn make_point(x: i32, y: i32) -> Point {
+    Point { x: x, y: y }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let p = make_point(10, 20);
+    println!("x: {} y: {}", p.x(), p.y());
+    assert_eq!(*p.x(), 10);
+    assert_eq!(*p.y(), 20);
+}
+        "#,
+    );
+    assert!(output.contains("x: 10 y: 20"));
+}
+
+#[test]
+fn test_struct_param_passthrough() {
+    let output = run_toylang_test(
+        r#"
+struct Counter {
+    value: i32,
+}
+
+fn make_counter() -> Counter {
+    Counter { value: 42 }
+}
+
+fn identity(c: Counter) -> Counter {
+    c
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let c = make_counter();
+    let c2 = identity(c);
+    println!("value: {}", c2.value());
+    assert_eq!(*c2.value(), 42);
+}
+        "#,
+    );
+    assert!(output.contains("value: 42"));
+}
+
+#[test]
+fn test_large_struct() {
+    let output = run_toylang_test(
+        r#"
+struct Big {
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+    e: i32,
+    f: i32,
+}
+
+fn make_big() -> Big {
+    Big { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let b = make_big();
+    println!("a={} f={}", b.a(), b.f());
+    assert_eq!(*b.a(), 1);
+    assert_eq!(*b.f(), 6);
+}
+        "#,
+    );
+    assert!(output.contains("a=1 f=6"));
+}
+
+#[test]
+fn test_generic_with_i64() {
+    let output = run_toylang_test(
+        r#"
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn make_pair() -> Pair<i64, i64> {
+    Pair { first: 100, second: 200 }
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let p = make_pair();
+    println!("first: {} second: {}", p.first(), p.second());
+    assert_eq!(*p.first(), 100i64);
+    assert_eq!(*p.second(), 200i64);
+}
+        "#,
+    );
+    assert!(output.contains("first: 100 second: 200"));
+}
+
+// ============================================================================
+// Group 15: Toylang owns main
 // ============================================================================
 
 #[test]

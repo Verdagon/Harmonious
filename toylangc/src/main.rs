@@ -19,7 +19,7 @@ fn main() {
 
     let exit_code = rustc_driver::catch_with_exit_code(|| {
         let mut args: Vec<String> = std::env::args().collect();
-        let mut registry = extract_registry(&mut args);
+        let registry = extract_registry(&mut args);
 
         // lets use tempdir here instead. make sure to print out the temp dir to eprintln
         let unique_id = std::process::id();

@@ -15,11 +15,9 @@ use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::builder::Builder;
 use inkwell::types::{BasicType, BasicTypeEnum, StructType, BasicMetadataTypeEnum, IntType};
-use inkwell::values::{BasicValueEnum, PointerValue, FunctionValue, BasicValue, IntValue, CallSiteValue};
+use inkwell::values::{BasicValueEnum, PointerValue, FunctionValue};
 use inkwell::AddressSpace;
 
-use rustc_hir::def::DefKind;
-use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::{self, GenericArg, TyCtxt};
 
 use crate::toylang::ast::{Expr, FnBody, Stmt};
@@ -108,7 +106,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 self.context.struct_type(&fields, false).into()
             }
             ResolvedType::Vec { .. } => self.vec_type().into(),
-            ResolvedType::Ref { inner } => {
+            ResolvedType::Ref { inner: _ } => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
         }
@@ -294,7 +292,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
 
     // --- Vec operation helpers ---
 
-    fn resolve_vec_symbols(&mut self, elem_ty_name: &str) -> VecSymbols<'ctx> {
+    fn resolve_vec_symbols(&mut self, elem_ty_name: &str) {
         let elem_ty = self.resolve_rust_ty_from_string(elem_ty_name);
 
 
@@ -318,7 +316,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         let usize_ty = self.usize_type();
 
         // Declare Vec::new (sret)
-        let new_fn = self.declare_external_fn(
+        let _new_fn = self.declare_external_fn(
             &new_sym,
             &[ptr_ty.into()],
             None,
@@ -326,7 +324,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         );
 
         // Declare Vec::push
-        let push_fn = self.declare_external_fn(
+        let _push_fn = self.declare_external_fn(
             &push_sym,
             &[ptr_ty.into(), ptr_ty.into()],
             None,
@@ -334,22 +332,15 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         );
 
         // Declare Vec::len
-        let len_fn = self.declare_external_fn(
+        let _len_fn = self.declare_external_fn(
             &len_sym,
             &[ptr_ty.into()],
             Some(usize_ty.into()),
             None,
         );
 
-        VecSymbols { new_fn, push_fn, len_fn, vec_ty }
+        // The symbols are now cached in declared_fns; no return value needed.
     }
-}
-
-struct VecSymbols<'ctx> {
-    new_fn: FunctionValue<'ctx>,
-    push_fn: FunctionValue<'ctx>,
-    len_fn: FunctionValue<'ctx>,
-    vec_ty: StructType<'ctx>,
 }
 
 // ============================================================================
@@ -386,178 +377,6 @@ impl<'ctx> ExprResult<'ctx> {
     }
 }
 
-fn lower_expr<'ctx>(
-    ctx: &mut CodegenCtx<'ctx, '_, '_>,
-
-    expr: &Expr,
-) -> ExprResult<'ctx> {
-    match expr {
-        Expr::IntLit(n) => {
-            let val = ctx.context.i64_type().const_int(*n as u64, *n < 0);
-            ExprResult::Value(val.into())
-        }
-
-        Expr::BoolLit(b) => {
-            let val = ctx.context.bool_type().const_int(if *b { 1 } else { 0 }, false);
-            ExprResult::Value(val.into())
-        }
-
-        Expr::Var(name) => {
-            let (ptr, ty) = ctx.vars.get(name.as_str())
-                .unwrap_or_else(|| panic!("variable '{}' not in scope", name))
-                .clone();
-            ExprResult::Ptr(ptr, ty)
-        }
-
-        Expr::StructLit { name, fields } => {
-            lower_struct_lit(ctx, name, fields)
-        }
-
-        Expr::StaticCall { ty, method, args } => {
-            lower_static_call(ctx, ty, method, args)
-        }
-
-        Expr::MethodCall { receiver, method, args } => {
-            lower_method_call(ctx, receiver, method, args)
-        }
-
-        Expr::FnCall { .. } => {
-            panic!("FnCall should be handled via typed AST path")
-        }
-    }
-}
-
-fn lower_struct_lit<'ctx>(
-    ctx: &mut CodegenCtx<'ctx, '_, '_>,
-
-    struct_name: &str,
-    fields: &[(String, Expr)],
-) -> ExprResult<'ctx> {
-    let toy_struct = ctx.registry.structs.get(struct_name)
-        .unwrap_or_else(|| panic!("struct '{}' not found", struct_name));
-    let struct_ty = ctx.struct_type(toy_struct);
-
-    let alloca = ctx.builder.build_alloca(struct_ty, struct_name).unwrap();
-
-    for (field_name, field_expr) in fields {
-        let field_idx = toy_struct.fields.iter()
-            .position(|f| f.name == *field_name)
-            .unwrap_or_else(|| panic!("field '{}' not found in '{}'", field_name, struct_name));
-
-        let field_ty = ctx.resolve_type(&toy_struct.fields[field_idx].rust_type);
-        let gep = ctx.builder.build_struct_gep(struct_ty, alloca, field_idx as u32, field_name)
-            .unwrap();
-
-        let val = lower_expr(ctx, field_expr);
-
-        // If the field is a large type (struct, Vec), copy memory instead of store
-        match &toy_struct.fields[field_idx].rust_type {
-            ToyFieldType::ToyStruct(_) | ToyFieldType::RustGeneric(_, _) => {
-                let src_ptr = val.into_ptr(&ctx.builder, field_ty, "src");
-                // Use size_of from the type — inkwell provides this
-                let size_val = field_ty.size_of().unwrap();
-                ctx.builder.build_memcpy(
-                    gep, 8, src_ptr, 8,
-                    size_val,
-                ).unwrap();
-            }
-            _ => {
-                // Primitive field — coerce int literal to correct width
-                let coerced = coerce_int_to_type(ctx, val.into_value(&ctx.builder), field_ty);
-                ctx.builder.build_store(gep, coerced).unwrap();
-            }
-        }
-    }
-
-    ExprResult::Ptr(alloca, struct_ty.into())
-}
-
-fn lower_static_call<'ctx>(
-    ctx: &mut CodegenCtx<'ctx, '_, '_>,
-
-    ty_name: &str,
-    method: &str,
-    _args: &[Expr],
-) -> ExprResult<'ctx> {
-    match (ty_name, method) {
-        ("Vec", "new") => {
-            // Find what Vec element type this is for by looking at how the variable is used.
-            // For now, discover from the function's context — the Vec symbols are resolved
-            // when we first encounter Vec operations in a function.
-            // The alloca is created by the let binding; Vec::new stores into it.
-            let vec_ty = ctx.vec_type();
-            let alloca = ctx.builder.build_alloca(vec_ty, "vec_new").unwrap();
-
-            // We need the Vec symbols — they should have been resolved at function entry.
-            // For now, find them from declared functions.
-            let new_fn = ctx.declared_fns.iter()
-                .find(|(name, _)| name.contains("Vec") && name.contains("new"))
-                .map(|(_, f)| *f)
-                .expect("Vec::new not declared — call resolve_vec_symbols first");
-
-            ctx.builder.build_call(new_fn, &[alloca.into()], "").unwrap();
-            ExprResult::Ptr(alloca, vec_ty.into())
-        }
-        _ => panic!("unsupported static call: {}::{}", ty_name, method),
-    }
-}
-
-fn lower_method_call<'ctx>(
-    ctx: &mut CodegenCtx<'ctx, '_, '_>,
-
-    receiver: &Expr,
-    method: &str,
-    args: &[Expr],
-) -> ExprResult<'ctx> {
-    let recv = lower_expr(ctx, receiver);
-
-    match method {
-        "push" => {
-            let recv_ptr = match recv {
-                ExprResult::Ptr(ptr, _) => ptr,
-                _ => panic!("push receiver must be a pointer"),
-            };
-
-            let arg_result = lower_expr(ctx, &args[0]);
-            let arg_ty = match &arg_result {
-                ExprResult::Value(v) => v.get_type(),
-                ExprResult::Ptr(_, ty) => *ty,
-            };
-            let arg_ptr = arg_result.into_ptr(&ctx.builder, arg_ty, "push_arg");
-
-            let push_fn = ctx.declared_fns.iter()
-                .find(|(name, _)| name.contains("push"))
-                .map(|(_, f)| *f)
-                .expect("Vec::push not declared");
-
-            ctx.builder.build_call(push_fn, &[recv_ptr.into(), arg_ptr.into()], "").unwrap();
-            ExprResult::Value(ctx.context.i32_type().const_zero().into()) // void-like
-        }
-
-        "len" => {
-            let recv_ptr = match recv {
-                ExprResult::Ptr(ptr, _) => ptr,
-                _ => panic!("len receiver must be a pointer"),
-            };
-
-            let len_fn = ctx.declared_fns.iter()
-                .find(|(name, _)| name.contains("len"))
-                .map(|(_, f)| *f)
-                .expect("Vec::len not declared");
-
-            let call_site = ctx.builder.build_call(len_fn, &[recv_ptr.into()], "len").unwrap();
-            let result = match call_site.try_as_basic_value() {
-                inkwell::values::ValueKind::Basic(val) => val,
-                _ => panic!("len should return a basic value"),
-            };
-
-            ExprResult::Value(result)
-        }
-
-        _ => panic!("unsupported method call: .{}", method),
-    }
-}
-
 /// Coerce an i64 literal to the correct field width (i32, i1, etc.)
 fn coerce_int_to_type<'ctx>(
     ctx: &CodegenCtx<'ctx, '_, '_>,
@@ -585,7 +404,7 @@ fn coerce_int_to_type<'ctx>(
 
 fn codegen_function<'ctx, 'tcx>(
     ctx: &mut CodegenCtx<'ctx, 'tcx, '_>,
-    name: &str,
+    _name: &str,
     func: &crate::toylang::registry::ToyFunction,
     instance: ty::Instance<'tcx>,
 ) {
@@ -890,7 +709,7 @@ fn lower_typed_expr<'ctx>(
             }
         }
 
-        TypedExprKind::StaticCall { ty, method, args } => {
+        TypedExprKind::StaticCall { ty, method, args: _ } => {
             match (ty.as_str(), method.as_str()) {
                 ("Vec", "new") => {
                     let vec_ty = ctx.vec_type();
@@ -992,29 +811,6 @@ fn lower_typed_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>, stmt: &TypedStmt) 
     }
 }
 
-fn lower_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>,
- stmt: &Stmt) {
-    match stmt {
-        Stmt::Let { name, expr } => {
-            let result = lower_expr(ctx, expr);
-            match result {
-                ExprResult::Ptr(ptr, ty) => {
-                    ctx.vars.insert(name.clone(), (ptr, ty));
-                }
-                ExprResult::Value(val) => {
-                    let ty = val.get_type();
-                    let alloca = ctx.builder.build_alloca(ty, name).unwrap();
-                    ctx.builder.build_store(alloca, val).unwrap();
-                    ctx.vars.insert(name.clone(), (alloca, ty));
-                }
-            }
-        }
-        Stmt::ExprStmt(expr) => {
-            let _ = lower_expr(ctx, expr);
-        }
-    }
-}
-
 // ============================================================================
 // Accessor codegen
 // ============================================================================
@@ -1073,17 +869,6 @@ fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> Struc
 // ============================================================================
 // Helpers (kept from old llvm_gen.rs)
 // ============================================================================
-
-fn find_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
-    for local_def_id in tcx.hir_crate_items(()).definitions() {
-        if matches!(tcx.def_kind(local_def_id), DefKind::Fn) {
-            if tcx.item_name(local_def_id.to_def_id()).as_str() == name {
-                return Some(local_def_id);
-            }
-        }
-    }
-    None
-}
 
 fn resolve_rust_symbol<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -1220,21 +1005,6 @@ fn find_vec_elem_from_params(func: &crate::toylang::registry::ToyFunction) -> Op
         }
     }
     None
-}
-
-fn field_type_to_string(ft: &ToyFieldType) -> String {
-    match ft {
-        ToyFieldType::I32 => "i32".to_string(),
-        ToyFieldType::I64 => "i64".to_string(),
-        ToyFieldType::F64 => "f64".to_string(),
-        ToyFieldType::Bool => "bool".to_string(),
-        ToyFieldType::TypeParam(s) => s.clone(),
-        ToyFieldType::ToyStruct(s) => s.clone(),
-        ToyFieldType::RustGeneric(name, args) => {
-            let arg_strs: Vec<String> = args.iter().map(field_type_to_string).collect();
-            format!("{}<{}>", name, arg_strs.join(", "))
-        }
-    }
 }
 
 fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTypeEnum<'ctx> {

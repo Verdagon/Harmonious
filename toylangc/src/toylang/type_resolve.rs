@@ -170,9 +170,8 @@ fn resolve_field_type(
         ToyFieldType::F64 => ResolvedType::F64,
         ToyFieldType::Bool => ResolvedType::Bool,
         ToyFieldType::TypeParam(name) => {
-            subst.get(name.as_str())
-                .unwrap_or_else(|| panic!("unresolved type param '{}'", name))
-                .clone()
+            (*subst.get(name.as_str())
+                .unwrap_or_else(|| panic!("unresolved type param '{}'", name)))
                 .clone()
         }
         ToyFieldType::ToyStruct(name) => {
@@ -300,8 +299,8 @@ fn infer_from_struct_lit(
 ) -> Option<ResolvedType> {
     if let Expr::StructLit { name, fields } = expr {
         if let ResolvedType::Struct { field_types, .. } = expected_ty {
-            if let Some(toy_struct) = registry.structs.get(name.as_str()) {
-                for (i, (field_name, field_expr)) in fields.iter().enumerate() {
+            if let Some(_toy_struct) = registry.structs.get(name.as_str()) {
+                for (i, (_field_name, field_expr)) in fields.iter().enumerate() {
                     if let Expr::Var(v) = field_expr {
                         if v == var_name {
                             // This variable is assigned to this struct field
@@ -443,7 +442,7 @@ fn resolve_expr(
             }
         }
 
-        Expr::StaticCall { ty, method, args } => {
+        Expr::StaticCall { ty, method, args: _ } => {
             match (ty.as_str(), method.as_str()) {
                 ("Vec", "new") => {
                     // Vec element type comes from expected_ty or inference
@@ -505,7 +504,7 @@ fn resolve_expr(
 fn resolve_stmt(
     stmt: &Stmt,
     scope: &mut HashMap<String, ResolvedType>,
-    ret_ty: &ResolvedType,
+    _ret_ty: &ResolvedType,
     registry: &ToylangRegistry,
     vec_inferences: &HashMap<String, ResolvedType>,
 ) -> TypedStmt {
@@ -552,7 +551,7 @@ fn infer_type_args_from_expected(
         if ret_str.ends_with('>') {
             let base = &ret_str[..open];
             let args_str = &ret_str[open + 1..ret_str.len() - 1];
-            let ret_args: Vec<&str> = split_type_args(args_str);
+            let _ret_args: Vec<&str> = split_type_args(args_str);
 
             // Get the struct's type params to know the mapping
             if let Some(toy_struct) = registry.structs.get(base) {

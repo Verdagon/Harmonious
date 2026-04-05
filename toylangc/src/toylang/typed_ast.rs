@@ -48,6 +48,7 @@ pub enum TypedExprKind {
     StaticCall {
         ty: String,
         method: String,
+        #[allow(dead_code)]
         args: Vec<TypedExpr>,
     },
     MethodCall {

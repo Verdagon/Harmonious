@@ -27,32 +27,6 @@ fn field_type_to_syn(ft: &ToyFieldType) -> syn::Type {
     }
 }
 
-/// Generate a Rust expression that computes the byte offset of field `field_idx`
-/// in a C-style (repr(C)) struct layout, given field types as syn types.
-/// Returns a TokenStream that evaluates to `usize`.
-///
-/// STOPGAP: This is used for generic struct accessors because mir_built fires once
-/// per definition (not per instantiation), so we can't route generic accessors through
-/// the extern call pipeline. The rustc fork (per_instance_mir) will replace this.
-fn c_layout_offset_expr(fields: &[syn::Type], field_idx: usize) -> TokenStream {
-    if field_idx == 0 {
-        return quote! { 0usize };
-    }
-    let mut tokens = quote! { 0usize };
-    for i in 0..field_idx {
-        let prev_ty = &fields[i];
-        let next_ty = &fields[i + 1];
-        tokens = quote! {
-            {
-                let offset = #tokens + std::mem::size_of::<#prev_ty>();
-                let align = std::mem::align_of::<#next_ty>();
-                (offset + align - 1) & !(align - 1)
-            }
-        };
-    }
-    tokens
-}
-
 pub fn generate(registry: &ToylangRegistry) -> String {
     let mut items: Vec<syn::Item> = Vec::new();
     let mut extern_fns: Vec<TokenStream> = Vec::new();
@@ -80,41 +54,24 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         };
         items.push(syn::Item::Struct(item));
 
-        // Collect syn types for all fields (used by generic offset computation)
-        let field_syn_types: Vec<syn::Type> = toy_struct.fields.iter()
-            .map(|f| field_type_to_syn(&f.rust_type))
-            .collect();
-
         let mut accessor_methods: Vec<TokenStream> = Vec::new();
 
-        for (field_idx, field) in toy_struct.fields.iter().enumerate() {
+        for field in &toy_struct.fields {
             let field_ident = format_ident!("{}", field.name);
             let field_ty = field_type_to_syn(&field.rust_type);
 
-            if !is_generic {
-                // Non-generic: unreachable!() body intercepted by mir_built → extern call
-                accessor_methods.push(quote! {
-                    pub fn #field_ident(&self) -> &#field_ty {
-                        unreachable!()
-                    }
-                });
+            // unreachable!() body — per_instance_mir handles all accessor instances.
+            accessor_methods.push(quote! {
+                pub fn #field_ident(&self) -> &#field_ty {
+                    unreachable!()
+                }
+            });
 
+            // Extern declaration only for non-generic (mir_built intercepts these)
+            if !is_generic {
                 let accessor_sym = format_ident!("__toylang_accessor_{}_{}", name, field.name);
                 extern_fns.push(quote! {
                     fn #accessor_sym(s: *const #ident) -> *const #field_ty;
-                });
-            } else {
-                // Generic: inline Rust pointer math (STOPGAP until per_instance_mir fork).
-                // Rustc monomorphizes this for each instantiation, computing correct offsets.
-                let offset_expr = c_layout_offset_expr(&field_syn_types, field_idx);
-                accessor_methods.push(quote! {
-                    pub fn #field_ident(&self) -> &#field_ty {
-                        unsafe {
-                            let base = self as *const Self as *const u8;
-                            let offset = #offset_expr;
-                            &*(base.add(offset) as *const #field_ty)
-                        }
-                    }
                 });
             }
         }
