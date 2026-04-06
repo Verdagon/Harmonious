@@ -376,7 +376,98 @@ a significant simplification: 2 query overrides removed, ~350 lines deleted,
 
 ---
 
-## Part 8: Session Handoff
+## Part 8: Callback Timeline and State Access
+
+Every callback from rustc into consumer code, in execution order:
+
+### Phase 1: Stub injection (before rustc parsing)
+
+**`FileLoader::read_file("__lang_stubs.rs")`** → calls `generate_stubs()`
+- Reads: registry (struct names, function signatures, type params)
+- Produces: Rust source code string
+- No TyCtxt available yet
+
+Stubs are needed so Rust code can reference toylang types and functions during
+type checking. They contain only the public API — struct names, function
+signatures, generic params. Bodies are `unreachable!()`.
+
+**Stubs are only needed in one direction:** when Rust code references toylang
+items. In the other direction (toylang referencing Rust), toylang discovers
+Rust types by querying TyCtxt — no stubs needed.
+
+**The toylang parser runs before rustc** (in `main.rs`). It produces the
+registry, which `generate_stubs` reads. A future improvement: split into a
+lightweight pre-scan (just names/signatures for stubs) and full parse + type
+check (in `after_rust_analysis` where TyCtxt is available).
+
+### Phase 2: Type checking (during analysis)
+
+**`after_rust_analysis(tcx)`** → currently a no-op.
+
+This is where toylang's type checker should eventually run — verifying toylang
+code against Rust's type system (types exist, method signatures match, trait
+bounds satisfied). Full TyCtxt is available.
+
+Currently, toylang generics are like C++ templates: unchecked until instantiated.
+A generic function with errors is only caught at monomorphization/codegen time
+via panics, not at type-check time with error messages.
+
+### Phase 3: Monomorphization (fixpoint loop inside codegen_crate)
+
+These fire repeatedly as the collector discovers new items:
+
+**`layout_of(Ty<'tcx>)`** → calls `monomorphize_type(name, tcx, ty)`
+- Reads: registry (struct field types, type params)
+- Queries tcx: `layout_of` on each field type (recursive back into rustc)
+- Returns: concrete field types → library computes C-style layout
+
+**`per_instance_mir(Instance<'tcx>)`** → calls `monomorphize_fn(name, tcx, def_id, instance)`
+- Reads: registry (function body AST, type params, return type)
+- Runs: `collect_rust_deps` (scans AST for Vec ops, queries tcx for mangled symbols)
+- Runs: `collect_toylang_fn_deps` (runs type resolver on body, walks typed AST for
+  FnCall nodes, queries tcx for callee DefIds + constructs concrete GenericArgs)
+- Returns: extern symbol + all deps → library builds stub MIR for collector
+
+**`symbol_name(Instance<'tcx>)`** → calls `monomorphize_fn(name, tcx, def_id, instance)`
+- Same callback as per_instance_mir — recomputes the same extern symbol
+- Returns: symbol string only (deps ignored by caller)
+
+**`mir_shims(InstanceKind::DropGlue)`** → `build_drop_call_body`
+- Reads: just the type name (not registry)
+- Queries tcx: `find_extern_fn` for `__toylang_drop_{name}`
+- Returns: MIR body calling the drop function
+
+### Phase 4: LLVM codegen (after monomorphization settles)
+
+**`generate_and_compile(tcx)`** → `generate_with_tcx(tcx, registry, callbacks)`
+- Queries tcx: `collect_and_partition_mono_items` (discovers all consumer instances)
+- For each consumer instance:
+  - Calls `monomorphize_fn` again (to get extern symbol — third time)
+  - Runs type resolver again (same `resolve_fn_body` — second time)
+  - Queries tcx: `fn_abi_of_instance` (for ABI coercion)
+  - Builds inkwell LLVM IR
+- Produces: .o file → injected into link step via CodegenBackend wrapper
+
+### Redundant work (known issue)
+
+`monomorphize_fn` is called 3 times per consumer function instance:
+1. From `per_instance_mir` (dep discovery + symbol)
+2. From `symbol_name` (symbol only)
+3. From `generate_and_compile` (symbol + type resolver for codegen)
+
+Each call recomputes the extern symbol and (for calls 1 and 3) runs the full
+type resolver on the body. This is correct but wasteful.
+
+**Fix:** Cache the result in `ToylangCallbacks` using a
+`Mutex<HashMap<String, MonomorphizedResult>>` keyed by extern symbol (which is
+lifetime-free). `per_instance_mir` populates it on first call. `symbol_name`
+reads the cached symbol. `generate_and_compile` reads the cached TypedFnBody.
+Can't key by `Instance<'tcx>` directly (has lifetime), but the extern symbol
+string is unique per Instance and owned.
+
+---
+
+## Part 9: Session Handoff
 
 ### What was accomplished
 
