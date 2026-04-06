@@ -15,7 +15,7 @@ use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::builder::Builder;
 use inkwell::types::{BasicType, BasicTypeEnum, StructType, BasicMetadataTypeEnum, IntType};
-use inkwell::values::{BasicValueEnum, PointerValue, FunctionValue};
+use inkwell::values::{BasicValue, BasicValueEnum, PointerValue, FunctionValue};
 use inkwell::AddressSpace;
 
 use rustc_middle::ty::{self, GenericArg, TyCtxt};
@@ -24,6 +24,19 @@ use crate::toylang::ast::{Expr, FnBody, Stmt};
 use crate::toylang::typed_ast::*;
 use crate::toylang::registry::{ToylangRegistry, ToyFieldType, ToyStruct};
 use rustc_lang_facade::LangCallbacks;
+
+/// Convert BasicTypeEnum to AnyTypeEnum (inkwell doesn't impl From directly).
+fn basic_type_to_any<'ctx>(ty: BasicTypeEnum<'ctx>) -> inkwell::types::AnyTypeEnum<'ctx> {
+    match ty {
+        BasicTypeEnum::ArrayType(t) => t.into(),
+        BasicTypeEnum::FloatType(t) => t.into(),
+        BasicTypeEnum::IntType(t) => t.into(),
+        BasicTypeEnum::PointerType(t) => t.into(),
+        BasicTypeEnum::StructType(t) => t.into(),
+        BasicTypeEnum::VectorType(t) => t.into(),
+        BasicTypeEnum::ScalableVectorType(t) => t.into(),
+    }
+}
 
 // ============================================================================
 // Codegen context
@@ -36,7 +49,6 @@ struct CodegenCtx<'ctx, 'tcx, 'reg> {
     tcx: TyCtxt<'tcx>,
     registry: &'reg ToylangRegistry,
     pointer_bits: u64,
-    pointer_size: u64,
     pointer_align: u64,
     /// Variables in scope: name → (alloca pointer, type)
     vars: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
@@ -72,7 +84,6 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             tcx,
             registry,
             pointer_bits: dl.pointer_size.bits(),
-            pointer_size: dl.pointer_size.bytes(),
             pointer_align: dl.pointer_align.abi.bytes(),
             vars: HashMap::new(),
             rust_symbols: Vec::new(),
@@ -105,7 +116,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                     .collect();
                 self.context.struct_type(&fields, false).into()
             }
-            ResolvedType::Vec { .. } => self.vec_type().into(),
+            ResolvedType::Vec { .. } => self.rust_ty_to_llvm_opaque(ty).0,
             ResolvedType::Ref { inner: _ } => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
@@ -121,8 +132,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                     .collect();
                 self.context.struct_type(&fields, false)
             }
-            ResolvedType::Vec { .. } => self.vec_type(),
-            _ => panic!("expected struct/vec type, got {:?}", ty),
+            ResolvedType::Vec { .. } => panic!("Vec is opaque — use rust_ty_to_llvm_opaque, not struct GEP"),
+            _ => panic!("expected struct type, got {:?}", ty),
         }
     }
 
@@ -142,7 +153,11 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             }
             ToyFieldType::RustGeneric(type_name, _) => {
                 match type_name.as_str() {
-                    "Vec" => self.vec_type().into(),
+                    "Vec" => {
+                        // All Vec<T> have identical layout, element type irrelevant
+                        let resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+                        self.rust_ty_to_llvm_opaque(&resolved).0
+                    }
                     other => panic!("unsupported Rust generic type '{}'", other),
                 }
             }
@@ -156,10 +171,131 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         self.context.struct_type(&fields, false)
     }
 
-    fn vec_type(&self) -> StructType<'ctx> {
-        // Vec is 3 pointers: { iN, iN, iN }
-        let ptr_ty = self.usize_type();
-        self.context.struct_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false)
+    /// Build an inkwell StructType for a concrete struct instantiation.
+    /// Uses the instance's generic args to substitute type params in field types.
+    fn struct_type_for_instance(
+        &self,
+        toy_struct: &ToyStruct,
+        instance: ty::Instance<'tcx>,
+    ) -> StructType<'ctx> {
+        if toy_struct.type_params.is_empty() {
+            return self.struct_type(toy_struct);
+        }
+
+        // Get concrete type args from the accessor's self type
+        let sig = self.tcx.fn_sig(instance.def_id()).instantiate(self.tcx, instance.args);
+        let sig = self.tcx.normalize_erasing_late_bound_regions(
+            ty::TypingEnv::fully_monomorphized(), sig,
+        );
+        let self_ref_ty = sig.inputs()[0]; // &Self
+        let ty::TyKind::Ref(_, self_ty, _) = self_ref_ty.kind() else {
+            return self.struct_type(toy_struct);
+        };
+        let ty::TyKind::Adt(_, args) = self_ty.kind() else {
+            return self.struct_type(toy_struct);
+        };
+
+        // Build type param → concrete type string map
+        let mut subst: HashMap<&str, &str> = HashMap::new();
+        let type_arg_strings: Vec<String> = toy_struct.type_params.iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let concrete_ty = args[i].expect_ty();
+                crate::toylang::callbacks_impl::rustc_ty_to_type_string(self.tcx, concrete_ty)
+            })
+            .collect();
+        for (i, param_name) in toy_struct.type_params.iter().enumerate() {
+            subst.insert(param_name.as_str(), type_arg_strings[i].as_str());
+        }
+
+        // Resolve each field type with substitution
+        let fields: Vec<BasicTypeEnum<'ctx>> = toy_struct.fields.iter()
+            .map(|f| self.resolve_field_type_with_subst(&f.rust_type, &subst))
+            .collect();
+        self.context.struct_type(&fields, false)
+    }
+
+    /// Resolve a ToyFieldType with type param substitution, returning an inkwell type.
+    fn resolve_field_type_with_subst(
+        &self,
+        ft: &ToyFieldType,
+        subst: &HashMap<&str, &str>,
+    ) -> BasicTypeEnum<'ctx> {
+        match ft {
+            ToyFieldType::TypeParam(name) => {
+                let concrete = subst.get(name.as_str())
+                    .unwrap_or_else(|| panic!("TypeParam '{}' not in subst", name));
+                self.type_from_string(concrete)
+            }
+            _ => self.resolve_type(ft),
+        }
+    }
+
+    /// Convert a ResolvedType to a rustc Ty<'tcx>.
+    /// Generalizes resolve_rust_ty_from_string to work on the typed AST directly.
+    fn resolved_type_to_rustc_ty(&self, resolved: &ResolvedType) -> ty::Ty<'tcx> {
+        match resolved {
+            ResolvedType::I32 => self.tcx.types.i32,
+            ResolvedType::I64 => self.tcx.types.i64,
+            ResolvedType::F64 => self.tcx.types.f64,
+            ResolvedType::Bool => self.tcx.types.bool,
+            ResolvedType::Usize => self.tcx.types.usize,
+            ResolvedType::Void => self.tcx.types.unit,
+            ResolvedType::Struct { name, type_args, .. } => {
+                if type_args.is_empty() {
+                    // Non-generic struct — bare ADT with no args
+                    crate::oracle::find_local_struct_ty(self.tcx, name)
+                        .unwrap_or_else(|| panic!("struct '{}' not found in rustc", name))
+                } else {
+                    // Generic struct — construct ADT with concrete type args
+                    let adt_def_id = crate::oracle::find_local_struct_def_id(self.tcx, name)
+                        .unwrap_or_else(|| panic!("struct '{}' not found in rustc", name));
+                    let adt_def = self.tcx.adt_def(adt_def_id);
+                    let args: Vec<GenericArg<'tcx>> = type_args.iter()
+                        .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
+                        .collect();
+                    ty::Ty::new_adt(self.tcx, adt_def, self.tcx.mk_args(&args))
+                }
+            }
+            ResolvedType::Vec { elem } => {
+                let elem_ty = self.resolved_type_to_rustc_ty(elem);
+                let vec_did = self.tcx.get_diagnostic_item(rustc_span::sym::Vec).unwrap();
+                let new_def_id = crate::oracle::find_vec_method(self.tcx, "new").unwrap();
+                let global_ty = crate::oracle::extract_global_ty(self.tcx, elem_ty, new_def_id).unwrap();
+                let adt_def = self.tcx.adt_def(vec_did);
+                ty::Ty::new_adt(self.tcx, adt_def,
+                    self.tcx.mk_args(&[GenericArg::from(elem_ty), GenericArg::from(global_ty)]))
+            }
+            ResolvedType::Ref { inner } => {
+                let inner_ty = self.resolved_type_to_rustc_ty(inner);
+                ty::Ty::new_imm_ref(self.tcx, self.tcx.lifetimes.re_erased, inner_ty)
+            }
+        }
+    }
+
+    /// Query rustc's layout_of for a Rust type, returning an opaque [N x i8] LLVM type
+    /// and alignment. Used for Rust types (Vec, etc.) that toylang treats as opaque blobs.
+    fn rust_ty_to_llvm_opaque(&self, resolved: &ResolvedType) -> (BasicTypeEnum<'ctx>, u64) {
+        let ty = self.resolved_type_to_rustc_ty(resolved);
+        let layout = self.tcx.layout_of(
+            rustc_middle::ty::PseudoCanonicalInput {
+                value: ty,
+                typing_env: rustc_middle::ty::TypingEnv::fully_monomorphized(),
+            }
+        ).expect("layout_of failed");
+        let size = layout.layout.size().bytes() as u32;
+        let align = layout.layout.align().abi.bytes();
+        let array_ty = self.context.i8_type().array_type(size);
+        (array_ty.into(), align)
+    }
+
+    /// Allocate stack space for an opaque Rust type with correct alignment.
+    fn alloca_opaque_rust_ty(&self, resolved: &ResolvedType, name: &str) -> PointerValue<'ctx> {
+        let (llvm_ty, align) = self.rust_ty_to_llvm_opaque(resolved);
+        let alloca = self.builder.build_alloca(llvm_ty, name).unwrap();
+        alloca.as_instruction_value().unwrap()
+            .set_alignment(align as u32).unwrap();
+        alloca
     }
 
     fn struct_type_for_ret(&self, ret_ty_name: &str) -> Option<StructType<'ctx>> {
@@ -206,7 +342,9 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 // Check for generic types: Vec<i32>, Pair<i32, i64>
                 if let Some((base, type_args)) = parse_generic_type(name) {
                     if base == "Vec" {
-                        return self.vec_type().into();
+                        // All Vec<T> have identical layout, element type irrelevant
+                        let resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+                        return self.rust_ty_to_llvm_opaque(&resolved).0;
                     }
                     if let Some(s) = self.registry.structs.get(base) {
                         let fields: Vec<BasicTypeEnum<'ctx>> = s.fields.iter()
@@ -261,7 +399,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         symbol: &str,
         param_types: &[BasicMetadataTypeEnum<'ctx>],
         ret_type: Option<BasicTypeEnum<'ctx>>,
-        is_sret: Option<(StructType<'ctx>, u64)>,
+        is_sret: Option<(BasicTypeEnum<'ctx>, u64)>,
     ) -> FunctionValue<'ctx> {
         if let Some(&cached) = self.declared_fns.get(symbol) {
             return cached;
@@ -282,13 +420,14 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
 
         let func = self.module.add_function(symbol, fn_type, Some(inkwell::module::Linkage::External));
 
-        if let Some((_sret_ty, _align)) = is_sret {
+        if let Some((sret_ty, _align)) = is_sret {
             // sret attribute on first parameter
+            let any_ty = basic_type_to_any(sret_ty);
             func.add_attribute(
                 inkwell::attributes::AttributeLoc::Param(0),
                 self.context.create_type_attribute(
                     inkwell::attributes::Attribute::get_named_enum_kind_id("sret"),
-                    _sret_ty.into(),
+                    any_ty,
                 ),
             );
         }
@@ -318,7 +457,9 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
 
         self.rust_symbols.extend([new_sym.clone(), push_sym.clone(), len_sym.clone()]);
 
-        let vec_ty = self.vec_type();
+        // All Vec<T> have identical layout
+        let vec_resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+        let (vec_opaque_ty, vec_align) = self.rust_ty_to_llvm_opaque(&vec_resolved);
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let usize_ty = self.usize_type();
 
@@ -327,7 +468,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             &new_sym,
             &[ptr_ty.into()],
             None,
-            Some((vec_ty, self.pointer_align)),
+            Some((vec_opaque_ty, vec_align)),
         );
 
         // Declare Vec::push
@@ -425,11 +566,13 @@ fn codegen_function<'ctx, 'tcx>(
     // Determine return ABI using the concrete Instance (works for both generic and concrete)
     let coerced = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(ctx.tcx, instance);
 
-    // Determine LLVM return type
-    let ret_struct_ty = if ret_ty_name.starts_with("Vec<") {
-        Some(ctx.vec_type())
+    // Determine LLVM return type for complex types (structs and opaque Rust types)
+    let ret_complex_ty: Option<BasicTypeEnum<'ctx>> = if ret_ty_name.starts_with("Vec<") {
+        // Vec is opaque — use layout_of to get [N x i8]
+        let vec_resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+        Some(ctx.rust_ty_to_llvm_opaque(&vec_resolved).0)
     } else {
-        ctx.struct_type_for_ret(ret_ty_name)
+        ctx.struct_type_for_ret(ret_ty_name).map(|t| t.into())
     };
 
     let is_sret = matches!(coerced, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
@@ -495,7 +638,7 @@ fn codegen_function<'ctx, 'tcx>(
             rustc_lang_facade::abi_helpers::CoercedReturn::Direct(coerced_str) => {
                 Some(parse_coerced_type(ctx, coerced_str))
             }
-            _ => ret_struct_ty.map(|t| t.into()),
+            _ => ret_complex_ty.map(|t| t.into()),
         }
     };
 
@@ -508,12 +651,13 @@ fn codegen_function<'ctx, 'tcx>(
 
     // Add sret attribute if needed
     if is_sret {
-        if let Some(sty) = ret_struct_ty {
+        if let Some(sty) = ret_complex_ty {
+            let any_ty = basic_type_to_any(sty);
             function.add_attribute(
                 inkwell::attributes::AttributeLoc::Param(0),
                 ctx.context.create_type_attribute(
                     inkwell::attributes::Attribute::get_named_enum_kind_id("sret"),
-                    sty.into(),
+                    any_ty,
                 ),
             );
         }
@@ -543,32 +687,24 @@ fn codegen_function<'ctx, 'tcx>(
         let result = lower_typed_expr(ctx, ret_expr);
 
         if is_sret {
-            // Store into sret pointer
+            // Store into sret pointer (handles both structs and opaque Rust types like Vec)
             let sret_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
-            let result_ty = ret_struct_ty.unwrap().into();
+            let result_ty = ret_complex_ty.unwrap();
             let src_ptr = result.into_ptr(&ctx.builder, result_ty, "ret_src");
-            let size = ret_struct_ty.unwrap().size_of().unwrap();
+            // Compute memcpy size from the LLVM type
+            let size = match result_ty {
+                BasicTypeEnum::ArrayType(arr) => arr.size_of().unwrap(),
+                BasicTypeEnum::StructType(st) => st.size_of().unwrap(),
+                _ => panic!("unexpected sret type: {:?}", result_ty),
+            };
             ctx.builder.build_memcpy(
                 sret_ptr, ctx.pointer_align as u32,
                 src_ptr, ctx.pointer_align as u32,
                 size,
             ).unwrap();
             ctx.builder.build_return(None).unwrap();
-        } else if ret_ty_name.starts_with("Vec<") {
-            // Vec return — also sret (always)
-            let sret_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
-            let vec_ty: BasicTypeEnum = ctx.vec_type().into();
-            let src_ptr = result.into_ptr(&ctx.builder, vec_ty, "ret_src");
-            let vec_size = ctx.usize_type()
-                .const_int(ctx.pointer_size * 3, false);
-            ctx.builder.build_memcpy(
-                sret_ptr, ctx.pointer_align as u32,
-                src_ptr, ctx.pointer_align as u32,
-                vec_size,
-            ).unwrap();
-            ctx.builder.build_return(None).unwrap();
         } else if llvm_ret_type.is_some() {
-            if let Some(sty) = ret_struct_ty {
+            if let Some(sty) = ret_complex_ty {
                 // Struct return — load from memory as the coerced type
                 let src_ptr = result.into_ptr(&ctx.builder, sty.into(), "ret_coerce");
                 let coerced_val = ctx.builder.build_load(
@@ -736,8 +872,8 @@ fn lower_typed_expr<'ctx>(
         TypedExprKind::StaticCall { ty, method, args: _ } => {
             match (ty.as_str(), method.as_str()) {
                 ("Vec", "new") => {
-                    let vec_ty = ctx.vec_type();
-                    let alloca = ctx.builder.build_alloca(vec_ty, "vec_new").unwrap();
+                    let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "vec_new");
+                    let vec_llvm_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
 
                     let new_fn = ctx.declared_fns.iter()
                         .find(|(name, _)| name.contains("new"))
@@ -745,7 +881,7 @@ fn lower_typed_expr<'ctx>(
                         .expect("Vec::new not declared");
 
                     ctx.builder.build_call(new_fn, &[alloca.into()], "").unwrap();
-                    ExprResult::Ptr(alloca, vec_ty.into())
+                    ExprResult::Ptr(alloca, vec_llvm_ty)
                 }
                 _ => panic!("unsupported static call: {}::{}", ty, method),
             }
@@ -846,8 +982,8 @@ fn split_respecting_braces(s: &str) -> Vec<&str> {
     let mut start = 0;
     for (i, c) in s.char_indices() {
         match c {
-            '{' => depth += 1,
-            '}' => depth -= 1,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(s[start..i].trim());
                 start = i + 1;
@@ -875,6 +1011,17 @@ fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> Struc
                 "i64" => ctx.context.i64_type().into(),
                 "double" => ctx.context.f64_type().into(),
                 "i1" => ctx.context.bool_type().into(),
+                _ if f.starts_with("[") && f.ends_with("]") => {
+                    // Array type like "[24 x i8]"
+                    let inner = &f[1..f.len()-1].trim(); // "24 x i8"
+                    let parts: Vec<&str> = inner.split(" x ").collect();
+                    let count: u32 = parts[0].trim().parse().unwrap();
+                    let elem = parts[1].trim();
+                    match elem {
+                        "i8" => ctx.context.i8_type().array_type(count).into(),
+                        _ => panic!("unsupported array element type in struct string: '{}'", elem),
+                    }
+                }
                 _ if f.starts_with("{ ") || f.starts_with("{") => {
                     // Nested struct — recurse
                     parse_struct_type_str(ctx, f).into()
@@ -1067,7 +1214,6 @@ pub fn generate_with_tcx<'tcx>(
 ) -> (String, Vec<String>) {
     let context = Context::create();
     let mut ctx = CodegenCtx::new(&context, tcx, registry);
-    let pointer_bits = tcx.data_layout.pointer_size.bits();
     let mut seen_symbols = std::collections::HashSet::new();
 
     let (_, cgus) = tcx.collect_and_partition_mono_items(());
@@ -1092,10 +1238,8 @@ pub fn generate_with_tcx<'tcx>(
                             let callback_name = format!("{}.{}", struct_name, field_name);
                             let result = callbacks.monomorphize_fn(&callback_name, tcx, local_def_id, instance);
                             if seen_symbols.insert(result.extern_symbol.clone()) {
-                                let llvm_struct_ty = crate::toylang::callbacks_impl::compute_llvm_struct_ty(
-                                    tcx, instance, toy_struct, registry, pointer_bits,
-                                );
-                                codegen_accessor_inline(&mut ctx, &result.extern_symbol, &llvm_struct_ty, field_index);
+                                let struct_ty = ctx.struct_type_for_instance(toy_struct, instance);
+                                codegen_accessor_inline(&mut ctx, &result.extern_symbol, struct_ty, field_index);
                             }
                         }
                     }
@@ -1126,11 +1270,10 @@ pub fn generate_with_tcx<'tcx>(
 fn codegen_accessor_inline<'ctx>(
     ctx: &mut CodegenCtx<'ctx, '_, '_>,
     extern_symbol: &str,
-    llvm_struct_ty_str: &str,
+    struct_ty: StructType<'ctx>,
     field_index: usize,
 ) {
     let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
-    let struct_ty = parse_struct_type_str(ctx, llvm_struct_ty_str);
     let fn_type = ptr_ty.fn_type(&[ptr_ty.into()], false);
     let func = ctx.module.add_function(extern_symbol, fn_type, None);
     let entry = ctx.context.append_basic_block(func, "entry");
@@ -1203,84 +1346,3 @@ fn substitute_type_params_str(s: &str, subst: &std::collections::HashMap<String,
     s.to_string()
 }
 
-// --- Public type helpers used by callbacks_impl.rs ---
-
-pub fn llvm_struct_type_full_pub(s: &ToyStruct, registry: &ToylangRegistry, pointer_bits: u64) -> String {
-    let fields: Vec<String> = s.fields.iter()
-        .map(|f| field_type_to_llvm_str(&f.rust_type, registry, pointer_bits))
-        .collect();
-    format!("{{ {} }}", fields.join(", "))
-}
-
-pub fn rust_ty_to_llvm_str<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: ty::Ty<'tcx>,
-    registry: &ToylangRegistry,
-    pointer_bits: u64,
-) -> String {
-    match ty.kind() {
-        ty::TyKind::Int(ty::IntTy::I32) => "i32".to_string(),
-        ty::TyKind::Int(ty::IntTy::I64) => "i64".to_string(),
-        ty::TyKind::Float(ty::FloatTy::F64) => "double".to_string(),
-        ty::TyKind::Bool => "i1".to_string(),
-        ty::TyKind::Adt(adt_def, args) => {
-            let name = tcx.item_name(adt_def.did()).to_string();
-            if let Some(toy_struct) = registry.structs.get(name.as_str()) {
-                if toy_struct.type_params.is_empty() {
-                    llvm_struct_type_full_pub(toy_struct, registry, pointer_bits)
-                } else {
-                    let mut subst = HashMap::new();
-                    for (i, param_name) in toy_struct.type_params.iter().enumerate() {
-                        let inner_ty = args[i].expect_ty();
-                        subst.insert(param_name.clone(), rust_ty_to_llvm_str(tcx, inner_ty, registry, pointer_bits));
-                    }
-                    let fields: Vec<String> = toy_struct.fields.iter()
-                        .map(|f| resolve_field_type_with_subst(&f.rust_type, registry, pointer_bits, &subst))
-                        .collect();
-                    format!("{{ {} }}", fields.join(", "))
-                }
-            } else {
-                let ptr_ty = format!("i{}", pointer_bits);
-                format!("{{ {0}, {0}, {0} }}", ptr_ty)
-            }
-        }
-        _ => panic!("rust_ty_to_llvm_str: unsupported type {:?}", ty),
-    }
-}
-
-pub fn resolve_field_type_with_subst(
-    ft: &ToyFieldType,
-    registry: &ToylangRegistry,
-    pointer_bits: u64,
-    subst: &HashMap<String, String>,
-) -> String {
-    match ft {
-        ToyFieldType::TypeParam(name) => {
-            subst.get(name).unwrap_or_else(|| panic!("TypeParam '{}' not in subst", name)).clone()
-        }
-        _ => field_type_to_llvm_str(ft, registry, pointer_bits),
-    }
-}
-
-fn field_type_to_llvm_str(ft: &ToyFieldType, registry: &ToylangRegistry, pointer_bits: u64) -> String {
-    match ft {
-        ToyFieldType::I32 => "i32".to_string(),
-        ToyFieldType::I64 => "i64".to_string(),
-        ToyFieldType::F64 => "double".to_string(),
-        ToyFieldType::Bool => "i1".to_string(),
-        ToyFieldType::TypeParam(_) => panic!("TypeParam not resolved"),
-        ToyFieldType::ToyStruct(name) => {
-            let s = registry.structs.get(name.as_str()).unwrap();
-            llvm_struct_type_full_pub(s, registry, pointer_bits)
-        }
-        ToyFieldType::RustGeneric(type_name, _) => {
-            match type_name.as_str() {
-                "Vec" => {
-                    let ptr_ty = format!("i{}", pointer_bits);
-                    format!("{{ {0}, {0}, {0} }}", ptr_ty)
-                }
-                other => panic!("unsupported Rust generic '{}'", other),
-            }
-        }
-    }
-}

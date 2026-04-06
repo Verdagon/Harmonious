@@ -11,17 +11,22 @@ use rustc_span::sym;
 
 /// Walk local HIR definitions to find a struct named `name`.
 /// Returns the Ty<'tcx> for it (no generic args).
-pub fn find_local_struct_ty<'tcx>(tcx: TyCtxt<'tcx>, name: &str) -> Option<ty::Ty<'tcx>> {
+pub fn find_local_struct_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
     for local_def_id in tcx.hir_crate_items(()).definitions() {
         let def_id = local_def_id.to_def_id();
         if tcx.def_kind(def_id) == DefKind::Struct {
             if tcx.item_name(def_id).as_str() == name {
-                let adt_def = tcx.adt_def(def_id);
-                return Some(ty::Ty::new_adt(tcx, adt_def, ty::List::empty()));
+                return Some(def_id);
             }
         }
     }
     None
+}
+
+pub fn find_local_struct_ty<'tcx>(tcx: TyCtxt<'tcx>, name: &str) -> Option<ty::Ty<'tcx>> {
+    let def_id = find_local_struct_def_id(tcx, name)?;
+    let adt_def = tcx.adt_def(def_id);
+    Some(ty::Ty::new_adt(tcx, adt_def, ty::List::empty()))
 }
 
 /// Find a named method in Vec's inherent impls.

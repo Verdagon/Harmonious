@@ -151,46 +151,6 @@ impl LangCallbacks for ToylangCallbacks {
     }
 }
 
-/// Compute the LLVM struct type for an accessor's concrete self type.
-pub fn compute_llvm_struct_ty<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: ty::Instance<'tcx>,
-    toy_struct: &crate::toylang::registry::ToyStruct,
-    registry: &ToylangRegistry,
-    pointer_bits: u64,
-) -> String {
-    // Get the concrete self type from the instance's generic args
-    let sig = tcx.fn_sig(instance.def_id()).instantiate(tcx, instance.args);
-    let sig = tcx.normalize_erasing_late_bound_regions(
-        ty::TypingEnv::fully_monomorphized(), sig,
-    );
-    let self_ref_ty = sig.inputs()[0]; // &Self
-
-    if let TyKind::Ref(_, self_ty, _) = self_ref_ty.kind() {
-        if let TyKind::Adt(_, args) = self_ty.kind() {
-            if !args.is_empty() && !toy_struct.type_params.is_empty() {
-                // Generic struct — resolve type params to LLVM types
-                let mut subst = std::collections::HashMap::new();
-                for (i, param_name) in toy_struct.type_params.iter().enumerate() {
-                    let concrete_ty = args[i].expect_ty();
-                    let llvm_ty = crate::llvm_gen::rust_ty_to_llvm_str(
-                        tcx, concrete_ty, registry, pointer_bits,
-                    );
-                    subst.insert(param_name.clone(), llvm_ty);
-                }
-                let fields: Vec<String> = toy_struct.fields.iter()
-                    .map(|f| crate::llvm_gen::resolve_field_type_with_subst(
-                        &f.rust_type, registry, pointer_bits, &subst,
-                    ))
-                    .collect();
-                return format!("{{ {} }}", fields.join(", "));
-            }
-        }
-    }
-
-    // Non-generic fallback
-    crate::llvm_gen::llvm_struct_type_full_pub(toy_struct, registry, pointer_bits)
-}
 
 // ============================================================================
 // Toylang-specific helpers (moved from queries/mir_build.rs)

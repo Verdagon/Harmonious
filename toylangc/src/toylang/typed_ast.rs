@@ -14,6 +14,8 @@ pub enum ResolvedType {
     Usize,
     Struct {
         name: String,
+        /// Concrete type args (e.g. [I64, I64] for Pair<i64, i64>). Empty for non-generic structs.
+        type_args: Vec<ResolvedType>,
         /// Resolved field types (TypeParams substituted with concrete types).
         field_types: Vec<ResolvedType>,
     },

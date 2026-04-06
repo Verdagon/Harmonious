@@ -115,6 +115,7 @@ pub fn parse_type_string(s: &str, registry: &ToylangRegistry) -> ResolvedType {
                     .collect();
                 return ResolvedType::Struct {
                     name: base.to_string(),
+                    type_args: resolved_args,
                     field_types,
                 };
             }
@@ -128,6 +129,7 @@ pub fn parse_type_string(s: &str, registry: &ToylangRegistry) -> ResolvedType {
             .collect();
         return ResolvedType::Struct {
             name: s.to_string(),
+            type_args: vec![],
             field_types,
         };
     }
@@ -705,7 +707,7 @@ mod tests {
     fn test_parse_struct() {
         let reg = make_registry();
         let ty = parse_type_string("Counter", &reg);
-        assert!(matches!(ty, ResolvedType::Struct { ref name, ref field_types }
+        assert!(matches!(ty, ResolvedType::Struct { ref name, ref field_types, .. }
             if name == "Counter" && field_types == &[ResolvedType::I32]));
     }
 
@@ -714,7 +716,7 @@ mod tests {
         let reg = make_registry();
         let ty = parse_type_string("Pair<i32, i64>", &reg);
         match ty {
-            ResolvedType::Struct { name, field_types } => {
+            ResolvedType::Struct { name, field_types, .. } => {
                 assert_eq!(name, "Pair");
                 assert_eq!(field_types, vec![ResolvedType::I32, ResolvedType::I64]);
             }
@@ -751,6 +753,7 @@ mod tests {
         let reg = make_registry();
         let func = ToyFunction {
             name: "f".to_string(),
+            type_params: vec![],
             params: vec![],
             return_ty: Some("i32".to_string()),
             body: Some(FnBody { stmts: vec![], ret: Some(Expr::IntLit(42)) }),
@@ -766,6 +769,7 @@ mod tests {
         let reg = make_registry();
         let func = ToyFunction {
             name: "f".to_string(),
+            type_params: vec![],
             params: vec![],
             return_ty: Some("Pair<i32, i64>".to_string()),
             body: Some(FnBody {
@@ -783,7 +787,7 @@ mod tests {
         let ret = typed.ret.unwrap();
         // The struct should be resolved as Pair with [I32, I64]
         match &ret.ty {
-            ResolvedType::Struct { name, field_types } => {
+            ResolvedType::Struct { name, field_types, .. } => {
                 assert_eq!(name, "Pair");
                 assert_eq!(field_types, &[ResolvedType::I32, ResolvedType::I64]);
             }
@@ -803,6 +807,7 @@ mod tests {
         let reg = make_registry();
         let func = ToyFunction {
             name: "f".to_string(),
+            type_params: vec![],
             params: vec![ToyParam { name: "x".to_string(), ty: "i32".to_string() }],
             return_ty: Some("Counter".to_string()),
             body: Some(FnBody {
@@ -825,6 +830,7 @@ mod tests {
         let reg = make_registry();
         let func = ToyFunction {
             name: "f".to_string(),
+            type_params: vec![],
             params: vec![],
             return_ty: Some("ToyOuter".to_string()),
             body: Some(FnBody {
@@ -856,6 +862,7 @@ mod tests {
         let reg = make_registry();
         let func = ToyFunction {
             name: "f".to_string(),
+            type_params: vec![],
             params: vec![],
             return_ty: Some("ToyShip".to_string()),
             body: Some(FnBody {
