@@ -30,6 +30,7 @@ enum Token {
     Semicolon, // ;
     Equals,    // =
     IntLit(i64),
+    StringLit(String),
     Eof,
 }
 
@@ -69,6 +70,19 @@ fn tokenize(src: &str) -> Vec<Token> {
         if chars[i] == ':' && i + 1 < chars.len() && chars[i + 1] == ':' {
             tokens.push(Token::DoubleColon);
             i += 2;
+            continue;
+        }
+
+        // String literals
+        if chars[i] == '"' {
+            i += 1; // skip opening quote
+            let start = i;
+            while i < chars.len() && chars[i] != '"' {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            if i < chars.len() { i += 1; } // skip closing quote
+            tokens.push(Token::StringLit(s));
             continue;
         }
 
@@ -370,19 +384,28 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr, String> {
         let mut expr = self.parse_primary()?;
 
-        // method call chaining: expr.method(args)
+        // postfix chaining: expr.method(args) or expr.field
         loop {
             if self.peek() == &Token::Dot {
                 self.consume();
-                let method = self.expect_ident()?;
-                self.expect(Token::LParen)?;
-                let args = self.parse_args()?;
-                self.expect(Token::RParen)?;
-                expr = Expr::MethodCall {
-                    receiver: Box::new(expr),
-                    method,
-                    args,
-                };
+                let ident = self.expect_ident()?;
+                if self.peek() == &Token::LParen {
+                    // Method call: expr.method(args)
+                    self.consume(); // consume '('
+                    let args = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    expr = Expr::MethodCall {
+                        receiver: Box::new(expr),
+                        method: ident,
+                        args,
+                    };
+                } else {
+                    // Field access: expr.field
+                    expr = Expr::FieldAccess {
+                        receiver: Box::new(expr),
+                        field: ident,
+                    };
+                }
             } else {
                 break;
             }
@@ -393,6 +416,11 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
+            Token::StringLit(s) => {
+                let s = s.clone();
+                self.consume();
+                Ok(Expr::StringLit(s))
+            }
             Token::IntLit(n) => {
                 self.consume();
                 Ok(Expr::IntLit(n))

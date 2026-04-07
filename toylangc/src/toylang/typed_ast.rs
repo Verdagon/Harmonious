@@ -25,6 +25,7 @@ pub enum ResolvedType {
     Ref {
         inner: Box<ResolvedType>,
     },
+    Str,
 }
 
 /// A typed expression — every node knows its concrete type.
@@ -64,6 +65,11 @@ pub enum TypedExprKind {
         method: String,
         args: Vec<TypedExpr>,
     },
+    FieldAccess {
+        receiver: Box<TypedExpr>,
+        field: String,
+    },
+    StringLit(String),
 }
 
 #[derive(Clone, Debug)]

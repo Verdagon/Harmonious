@@ -14,6 +14,16 @@ use super::typed_ast::*;
 // ============================================================================
 
 /// Resolve all types in a function body, producing a TypedFnBody.
+/// Resolve just the return type of a function without resolving the full body.
+pub fn resolve_return_type(
+    registry: &ToylangRegistry,
+    func: &ToyFunction,
+) -> ResolvedType {
+    func.return_ty.as_deref()
+        .map(|s| parse_type_string(s, registry))
+        .unwrap_or(ResolvedType::Void)
+}
+
 pub fn resolve_fn_body(
     registry: &ToylangRegistry,
     func: &ToyFunction,
@@ -362,6 +372,11 @@ fn resolve_expr(
             TypedExpr { kind: TypedExprKind::BoolLit(*b), ty: ResolvedType::Bool }
         }
 
+        Expr::StringLit(s) => TypedExpr {
+            kind: TypedExprKind::StringLit(s.clone()),
+            ty: ResolvedType::Str,
+        },
+
         Expr::Var(name) => {
             let ty = scope.get(name.as_str())
                 .cloned()
@@ -400,6 +415,20 @@ fn resolve_expr(
             TypedExpr {
                 kind: TypedExprKind::StructLit { name: name.clone(), fields: typed_fields },
                 ty: resolved_ty,
+            }
+        }
+
+        Expr::FnCall { name, args } if name == "println" => {
+            let typed_args: Vec<TypedExpr> = args.iter()
+                .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry, vec_inferences))
+                .collect();
+            TypedExpr {
+                kind: TypedExprKind::FnCall {
+                    name: "println".into(),
+                    type_args: vec![],
+                    args: typed_args,
+                },
+                ty: ResolvedType::Void,
             }
         }
 
@@ -494,6 +523,26 @@ fn resolve_expr(
                     }
                 }
                 _ => panic!("unsupported static call: {}::{}", ty, method),
+            }
+        }
+
+        Expr::FieldAccess { receiver, field } => {
+            let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry, vec_inferences);
+            let ResolvedType::Struct { name: struct_name, field_types, .. } = &typed_recv.ty else {
+                panic!("field access on non-struct type: {:?}", typed_recv.ty);
+            };
+            let toy_struct = registry.structs.get(struct_name.as_str())
+                .expect("struct not found in registry");
+            let field_idx = toy_struct.fields.iter()
+                .position(|f| f.name == *field)
+                .unwrap_or_else(|| panic!("field '{}' not found in '{}'", field, struct_name));
+            let field_ty = field_types[field_idx].clone();
+            TypedExpr {
+                kind: TypedExprKind::FieldAccess {
+                    receiver: Box::new(typed_recv),
+                    field: field.clone(),
+                },
+                ty: field_ty,
             }
         }
 
@@ -620,6 +669,7 @@ fn resolved_type_to_string(ty: &ResolvedType) -> String {
         ResolvedType::Struct { name, .. } => name.clone(),
         ResolvedType::Vec { elem } => format!("Vec<{}>", resolved_type_to_string(elem)),
         ResolvedType::Ref { inner } => format!("&{}", resolved_type_to_string(inner)),
+        ResolvedType::Str => "str".to_string(),
     }
 }
 

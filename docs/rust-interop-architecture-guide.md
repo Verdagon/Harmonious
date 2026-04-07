@@ -1,9 +1,10 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 40 integration tests passing. Minimal rustc fork with
-> `per_instance_mir` query. Inkwell LLVM backend with type annotation pass.
-> Unified MonoItems discovery. Generic functions, inter-toylang calls, arithmetic.
-> 4 query providers. Zero compiler warnings.
+> **Current status:** 45 integration tests passing, 2 ignored. Minimal rustc fork
+> with `per_instance_mir` query. Inkwell LLVM backend with type annotation pass.
+> Unified MonoItems discovery. Generic functions, inter-toylang calls, arithmetic,
+> direct field access, `println` built-in, toylang-owned main, internal/extern
+> ABI split. 4 query providers. Zero compiler warnings.
 
 ## Overview
 
@@ -106,8 +107,10 @@ Calls `monomorphize_fn` to get the extern symbol. Examples:
 - Generic: `__toylang_impl_wrap__i32`
 - Accessor: `__toylang_accessor_Pair_first__i32__i32`
 
-Callers in rustc-compiled code emit direct calls to these symbols. The consumer .o
-provides the definitions. Zero overhead — no wrappers, no trampolines.
+Callers in rustc-compiled code emit direct calls to these `__toylang_impl_` symbols.
+The consumer .o provides thin extern wrappers at these symbols, which delegate to
+`__toylang_internal_` functions with a simple predictable ABI (see 4.5).
+Toylang-to-toylang calls bypass the wrappers and call internal symbols directly.
 
 ### 2.4 mir_shims (drop glue)
 
@@ -182,11 +185,13 @@ consumer instances in a single pass. No pre-marking, no `external_symbol` on the
 registry, no `is_eligible`. MonoItems is the single source of truth.
 
 For each consumer MonoItem:
-- **Accessor methods:** GEP to field offset, return pointer
-- **Functions (concrete + generic):** Full body codegen via inkwell
+- **Accessor methods:** GEP to field offset, return pointer (single pass)
+- **Functions (concrete + generic):** Two-pass codegen:
+  1. `codegen_internal_function` — body lowering with simple internal ABI
+  2. `codegen_extern_wrapper` — thin Rust ABI adapter calling the internal function
 
 Discovery and codegen happen in the same `'tcx` scope, so live `Instance<'tcx>`
-values are available for ABI queries.
+values are available for ABI queries in the extern wrapper pass.
 
 ### 4.2 Type annotation pass
 
@@ -222,10 +227,13 @@ The backend uses inkwell (LLVM C API bindings, pinned to pre-2024-edition commit
 for compatibility with rustc 1.86). Expression lowering handles:
 
 - `IntLit` / `BoolLit` → inkwell const_int
+- `StringLit` → `build_global_string_ptr` (pointer to constant string data)
 - `Var` → load from alloca
 - `StructLit` → alloca + GEP + store per field
+- `FieldAccess` → GEP into struct + load (primitives) or return ptr (complex types)
 - `BinaryOp` → build_int_add/sub/mul/div or float equivalents
-- `FnCall` → declare extern + call (symbol computed from type_args)
+- `FnCall` → call via `__toylang_internal_` symbol (internal ABI)
+- `FnCall` (println) → format string → `printf` call with type-appropriate specifiers
 - `StaticCall` (Vec::new) → sret call to Rust mangled symbol
 - `MethodCall` (push/len) → call to Rust mangled symbol
 
@@ -233,19 +241,63 @@ Rust types (Vec, etc.) use opaque `[N x i8]` byte arrays — size and alignment
 queried from `tcx.layout_of`. Toylang structs use real LLVM struct types with
 GEP-based field access. See Part 10 for the full design rationale.
 
-### 4.5 ABI handling
+### 4.5 Internal/extern ABI split
 
-`coerced_return_type_for_instance` queries `fn_abi_of_instance` with the concrete
-Instance to determine:
-- `PassMode::Direct` / `PassMode::Cast` → return coerced type in registers
-- `PassMode::Indirect` (sret) → first param is output pointer, return void
+Each toylang function generates **two** LLVM functions:
 
-Reference params (`&Vec<T>`) are loaded from their alloca before passing to
-method calls (pointer-to-value, not pointer-to-pointer).
+1. **Internal** (`__toylang_internal_{name}`) — simple, predictable ABI:
+   - Primitives (i32, i64, f64, bool, usize): returned directly
+   - Void: void return
+   - Structs/Vec: always sret (ptr first param, void return)
+
+2. **Extern wrapper** (`__toylang_impl_{name}`) — thin wrapper matching Rust ABI:
+   - Calls the internal function
+   - Adapts the return value to match `coerced_return_type_for_instance`
+
+`codegen_internal_function` takes no `Instance` parameter — ABI decisions are
+made purely from `ResolvedType` via `is_internal_sret()`. This means the internal
+ABI is predictable at any call site without seeing the callee's definition,
+eliminating ordering dependencies between functions.
+
+`codegen_extern_wrapper` takes an `Instance` for `coerced_return_type_for_instance`.
+It handles four cases:
+- **Both sret** (Rust indirect + internal sret): pass sret pointer through
+- **Internal sret, Rust direct** (coerced): alloca tmp, call internal, load as coerced type
+- **Both direct** (primitives): forward call + `coerce_int_to_type` (handles i1→i8 for bool)
+- **Void**: forward call
+
+`generate_with_tcx` runs two passes: internal functions first, then extern wrappers.
+
+Toylang-to-toylang `FnCall` uses `__toylang_internal_` symbols directly. For struct
+returns, the FnCall arm allocates an sret alloca and returns `ExprResult::Ptr`.
+
+### 4.6 Toylang-owned main
+
+When toylang defines `fn main()`, the stub wrapper is renamed to `__toylang_main`
+to avoid conflicting with Rust's `main`. The mapping flows through:
+
+- `fn_names()` includes both `"main"` and `"__toylang_main"`
+- `monomorphize_fn` maps `"__toylang_main"` → `"main"` for registry lookup
+- `compute_fn_symbol` uses registry name → extern symbol `__toylang_impl_main`
+- `generate_with_tcx` maps back similarly
+- Rust test code: `fn main() { __toylang_main(); }`
+
+### 4.7 println built-in
+
+`println` is a toylang built-in that compiles to C `printf`. Parsed as a normal
+`FnCall` with a `StringLit` first arg. The type resolver has a guarded match arm
+(`name == "println"`) that resolves args without looking up the registry.
+
+At codegen time, `{}` placeholders are replaced with type-appropriate printf
+specifiers (`%d`, `%ld`, `%zu`, `%f`) based on the resolved arg types. A `\n`
+is always appended (like Rust's `println!`). Bool args are zero-extended from
+i1 to i32 for printf compatibility.
+
+`println` is skipped during dep discovery (not in registry → `continue`).
 
 ---
 
-## Part 5: What Works (40 tests)
+## Part 5: What Works (45 tests)
 
 ### Struct types
 - Simple structs (`Counter { value: i32 }`)
@@ -276,7 +328,17 @@ method calls (pointer-to-value, not pointer-to-pointer).
 - Inter-toylang function calls (concrete-to-concrete)
 - Generic callee calls (concrete calling generic, type args inferred)
 - Arithmetic expressions (+, -, *, / with precedence)
-- Boolean literals
+- Boolean literals and bool return values
+- String literals (for println format strings)
+- Direct field access (`p.x`)
+- `println` built-in (compiles to C printf)
+- Toylang-owned main (`fn main()` in toylang, called via `__toylang_main`)
+
+### ABI
+- Internal/extern ABI split (internal: predictable, extern: matches Rust)
+- Struct returns via sret (internal always, extern per `coerced_return_type_for_instance`)
+- Bool i1↔i8 coercion handled by `coerce_int_to_type`
+- Struct ABI coercion (e.g. single-field struct → register return)
 
 ### Vec operations
 - Vec<primitive> and Vec<struct>
@@ -315,12 +377,12 @@ method calls (pointer-to-value, not pointer-to-pointer).
 
 | File | Purpose |
 |------|---------|
-| `llvm_gen.rs` | Inkwell LLVM backend: MonoItems walk, codegen, accessor GEPs |
+| `llvm_gen.rs` | Inkwell LLVM backend: MonoItems walk, internal/extern codegen, accessor GEPs |
 | `stub_gen.rs` | Generates `__lang_stubs.rs` (opaque structs, wrappers, externs) |
 | `oracle.rs` | TyCtxt query helpers (find_local_struct_ty, find_vec_method, etc.) |
 | `main.rs` | CLI entry point, registry setup, rustc invocation |
-| `toylang/ast.rs` | Untyped AST (Expr, Stmt, FnBody, BinOp) |
-| `toylang/typed_ast.rs` | Typed AST (TypedExpr with ResolvedType) |
+| `toylang/ast.rs` | Untyped AST (Expr incl. FieldAccess/StringLit, Stmt, FnBody, BinOp) |
+| `toylang/typed_ast.rs` | Typed AST (TypedExpr with ResolvedType incl. Str) |
 | `toylang/type_resolve.rs` | Type annotation pass (10 unit tests) |
 | `toylang/parser.rs` | Toylang parser (structs, functions, expressions) |
 | `toylang/registry.rs` | Data structures (ToyStruct, ToyFunction, ToyFieldType) |
@@ -476,9 +538,9 @@ string is unique per Instance and owned.
 ### What was accomplished
 
 Started with 5 tests passing (string-based LLVM backend, no fork, manual
-`mark_compiled_functions`). Ended with 40 tests passing.
+`mark_compiled_functions`). Now at 45 tests passing.
 
-**Major architectural changes:**
+**Major architectural changes (sessions 1-2):**
 1. Minimal rustc fork with `per_instance_mir` query (4 patches, ~11 lines)
 2. Full inkwell rewrite of LLVM backend (string IR → builder API)
 3. Type annotation pass (`type_resolve.rs` + `typed_ast.rs`)
@@ -490,39 +552,41 @@ Started with 5 tests passing (string-based LLVM backend, no fork, manual
 9. Generic toylang functions (`fn wrap<T>`)
 10. Arithmetic expressions (+, -, *, / with precedence)
 
+**Session 3 additions (40 → 45 tests):**
+11. Direct field access (`p.x`) — FieldAccess AST node, GEP codegen
+12. `println` built-in — StringLit token/AST, printf codegen with type specifiers
+13. Toylang-owned main — `__toylang_main` stub rename, fn_names mapping
+14. Internal/extern ABI split — `codegen_internal_function` + `codegen_extern_wrapper`,
+    eliminates ABI mismatch for toylang-to-toylang calls
+15. Vec dep discovery from function body (for void main functions using Vec)
+
 **Query surface reduced from 6 providers to 4:**
 - Removed: `mir_built`, `mir_borrowck`
 - Kept: `layout_of`, `mir_shims`, `per_instance_mir`, `symbol_name`
 
-### What remains (5 ignored tests)
+### What remains (2 ignored tests)
 
 | Test | Blocker |
 |------|---------|
-| `test_toylang_main_with_struct` | Needs `println` function + direct field access (`p.x`) |
-| `test_toylang_main_with_vec` | Same: `println` + field access |
-| `test_toylang_main_calls_toylang_fn` | Same: `println` + field access + toylang-owned main |
 | `test_generic_callee_in_let` | Needs forward type inference for let bindings |
 | `test_generic_callee_with_struct` | Struct passthrough ABI for generic identity function |
 
 ### Recommended next steps
 
-1. **Direct field access** (`p.x` instead of `p.x()`) — new AST node `FieldAccess`,
-   parser change, GEP in inkwell. ~30 min. Unblocks 3 aspirational tests.
-
-2. **Comparison operators + if/else** — `==`, `<`, `>` tokens + `if expr { } else { }`
+1. **Comparison operators + if/else** — `==`, `<`, `>` tokens + `if expr { } else { }`
    AST + conditional branches in inkwell. Makes toylang do real logic.
 
-3. **Loops** (`while`) — back-edge branches in inkwell. With arithmetic + comparisons
+2. **Loops** (`while`) — back-edge branches in inkwell. With arithmetic + comparisons
    + loops, toylang is Turing-complete.
 
-4. **Forward type inference** — pre-scan return expression to propagate expected types
-   backward to let bindings. Replaces the i32 default heuristic.
+3. **Forward type inference** — pre-scan return expression to propagate expected types
+   backward to let bindings. Replaces the i32 default heuristic. Unblocks
+   `test_generic_callee_in_let`.
 
-5. **`println` from toylang** — string literals + calling C printf or Rust IO.
-   Unblocks 3 aspirational tests.
-
-6. **Trait implementations** — `impl Trait for ConsumerType` in stubs. The
+4. **Trait implementations** — `impl Trait for ConsumerType` in stubs. The
    `per_instance_mir` foundation supports it. Biggest remaining architectural feature.
+
+5. **Eliminate Vec-specific logic** — see Part 10.4 roadmap.
 
 ### Building the forked toolchain
 
@@ -547,7 +611,7 @@ cargo +rustc-fork test -p toylangc --test integration_tests
 ### Running tests
 
 ```bash
-# All non-ignored tests (should be 40 passed, 0 failed):
+# All non-ignored tests (should be 45 passed, 0 failed, 2 ignored):
 cargo +rustc-fork test -p toylangc --test integration_tests
 
 # Including ignored (shows what still needs work):

@@ -1375,7 +1375,129 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: toylang println function + direct field access (p.x not p.x())
+fn test_field_access_returns_value() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn get_x() -> i32 {
+    let p = Point { x: 10, y: 20 };
+    p.x
+}
+
+fn get_y() -> i32 {
+    let p = Point { x: 10, y: 20 };
+    p.y
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let x = get_x();
+    let y = get_y();
+    println!("x={} y={}", x, y);
+    assert_eq!(x, 10);
+    assert_eq!(y, 20);
+}
+        "#,
+    );
+    assert!(output.contains("x=10 y=20"));
+}
+
+#[test]
+fn test_bool_return() {
+    let output = run_toylang_test(
+        r#"
+fn always_true() -> bool {
+    true
+}
+
+fn always_false() -> bool {
+    false
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    assert!(always_true());
+    assert!(!always_false());
+    println!("bool: {} {}", always_true(), always_false());
+}
+        "#,
+    );
+    assert!(output.contains("bool: true false"));
+}
+
+#[test]
+fn test_toylang_to_toylang_struct_param() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn get_x(p: Point) -> i32 {
+    p.x
+}
+
+fn main() {
+    let p = Point { x: 42, y: 99 };
+    println("{}", get_x(p));
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    __toylang_main();
+}
+        "#,
+    );
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_toylang_to_toylang_large_struct_param() {
+    let output = run_toylang_test(
+        r#"
+struct Quad {
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+}
+
+fn sum_quad(q: Quad) -> i32 {
+    q.a + q.b + q.c + q.d
+}
+
+fn main() {
+    let q = Quad { a: 10, b: 20, c: 30, d: 40 };
+    println("{}", sum_quad(q));
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    __toylang_main();
+}
+        "#,
+    );
+    assert!(output.contains("100"));
+}
+
+#[test]
 fn test_toylang_main_with_struct() {
     let output = run_toylang_test(
         r#"
@@ -1391,9 +1513,10 @@ fn main() {
         "#,
         r#"
 mod __lang_stubs;
+use __lang_stubs::*;
 
 fn main() {
-    unreachable!()
+    __toylang_main();
 }
         "#,
     );
@@ -1436,7 +1559,6 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: toylang println function + direct field access
 fn test_toylang_main_with_vec() {
     let output = run_toylang_test(
         r#"
@@ -1454,9 +1576,10 @@ fn main() {
         "#,
         r#"
 mod __lang_stubs;
+use __lang_stubs::*;
 
 fn main() {
-    unreachable!()
+    __toylang_main();
 }
         "#,
     );
@@ -1494,7 +1617,6 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: toylang println function + direct field access + toylang-owned main
 fn test_toylang_main_calls_toylang_fn() {
     let output = run_toylang_test(
         r#"
@@ -1513,9 +1635,10 @@ fn main() {
         "#,
         r#"
 mod __lang_stubs;
+use __lang_stubs::*;
 
 fn main() {
-    unreachable!()
+    __toylang_main();
 }
         "#,
     );

@@ -117,6 +117,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 self.context.struct_type(&fields, false).into()
             }
             ResolvedType::Vec { .. } => self.rust_ty_to_llvm_opaque(ty).0,
+            ResolvedType::Str => self.context.ptr_type(AddressSpace::default()).into(),
             ResolvedType::Ref { inner: _ } => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
@@ -270,6 +271,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 let inner_ty = self.resolved_type_to_rustc_ty(inner);
                 ty::Ty::new_imm_ref(self.tcx, self.tcx.lifetimes.re_erased, inner_ty)
             }
+            ResolvedType::Str => panic!("Str type should not need rustc Ty conversion"),
         }
     }
 
@@ -550,42 +552,52 @@ fn coerce_int_to_type<'ctx>(
 // Function codegen
 // ============================================================================
 
-fn codegen_function<'ctx, 'tcx>(
+/// Whether a ResolvedType uses sret under the internal ABI.
+fn is_internal_sret(ty: &ResolvedType) -> bool {
+    matches!(ty, ResolvedType::Struct { .. } | ResolvedType::Vec { .. })
+}
+
+/// Codegen a toylang function body with the simple internal ABI.
+/// Structs/Vec always use sret (ptr first param, void return).
+/// Primitives return directly. No Rust ABI coercion.
+fn codegen_internal_function<'ctx, 'tcx>(
     ctx: &mut CodegenCtx<'ctx, 'tcx, '_>,
-    _name: &str,
     func: &crate::toylang::registry::ToyFunction,
-    instance: ty::Instance<'tcx>,
-    symbol: &str,
+    internal_symbol: &str,
 ) {
-    let ret_ty_name = func.return_ty.as_ref().unwrap();
+    let ret_ty_name_owned;
+    let ret_ty_name: &str = match func.return_ty.as_deref() {
+        Some(s) => { ret_ty_name_owned = s.to_string(); &ret_ty_name_owned }
+        None => "void",
+    };
 
     // Run type resolution pass to get typed AST
     let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func);
-    let body = func.body.as_ref().unwrap(); // still needed for body_uses_vec
-
-    // Determine return ABI using the concrete Instance (works for both generic and concrete)
-    let coerced = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(ctx.tcx, instance);
-
-    // Determine LLVM return type for complex types (structs and opaque Rust types)
-    let ret_complex_ty: Option<BasicTypeEnum<'ctx>> = if ret_ty_name.starts_with("Vec<") {
-        // Vec is opaque — use layout_of to get [N x i8]
-        let vec_resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
-        Some(ctx.rust_ty_to_llvm_opaque(&vec_resolved).0)
-    } else {
-        ctx.struct_type_for_ret(ret_ty_name).map(|t| t.into())
-    };
-
-    let is_sret = matches!(coerced, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
+    let body = func.body.as_ref().unwrap();
 
     // Resolve Vec symbols if needed
     let uses_vec = body_uses_vec(body);
     if uses_vec {
         let elem_name = find_vec_elem_name(ret_ty_name, ctx.registry)
-            .or_else(|| find_vec_elem_from_params(func));
+            .or_else(|| find_vec_elem_from_params(func))
+            .or_else(|| find_vec_elem_from_body(body));
         if let Some(elem) = elem_name {
             ctx.resolve_vec_symbols(&elem);
         }
     }
+
+    // Determine internal return type from the typed AST
+    let ret_resolved = typed_body.ret.as_ref()
+        .map(|e| e.ty.clone())
+        .unwrap_or(ResolvedType::Void);
+    let internal_sret = is_internal_sret(&ret_resolved);
+
+    // The LLVM type for the sret value (struct or opaque Vec)
+    let ret_llvm_ty: Option<BasicTypeEnum<'ctx>> = if internal_sret {
+        Some(ctx.resolved_to_inkwell(&ret_resolved))
+    } else {
+        None
+    };
 
     // Build function signature
     let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
@@ -594,8 +606,8 @@ fn codegen_function<'ctx, 'tcx>(
     let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
     let mut param_names: Vec<String> = Vec::new();
 
-    // sret pointer as first param
-    if is_sret {
+    // sret pointer as first param for struct/vec returns
+    if internal_sret {
         param_types.push(ptr_ty.into());
         param_names.push("retval".to_string());
     }
@@ -620,20 +632,151 @@ fn codegen_function<'ctx, 'tcx>(
         param_names.push(p.name.clone());
     }
 
-    // Determine LLVM return type
-    let llvm_ret_type: Option<BasicTypeEnum<'ctx>> = if is_sret {
-        None // void return
-    } else if ret_ty_name.as_str() == "usize" || ret_ty_name.as_str() == "i32" || ret_ty_name.as_str() == "i64" {
-        Some(match ret_ty_name.as_str() {
+    // LLVM return type: void for sret/void, direct type for primitives
+    let llvm_ret_type: Option<BasicTypeEnum<'ctx>> = if internal_sret || ret_resolved == ResolvedType::Void {
+        None
+    } else {
+        Some(ctx.resolved_to_inkwell(&ret_resolved))
+    };
+
+    let fn_type = match llvm_ret_type {
+        Some(ret) => ret.fn_type(&param_types, false),
+        None => ctx.context.void_type().fn_type(&param_types, false),
+    };
+
+    // Use existing declaration if forward-declared by a caller's FnCall arm
+    let function = if let Some(existing) = ctx.module.get_function(internal_symbol) {
+        existing
+    } else {
+        ctx.module.add_function(internal_symbol, fn_type, None)
+    };
+
+    let entry = ctx.context.append_basic_block(function, "entry");
+    ctx.builder.position_at_end(entry);
+
+    // Bind parameters to variables
+    ctx.vars.clear();
+    let param_offset = if internal_sret { 1 } else { 0 };
+    for (i, p) in func.params.iter().enumerate() {
+        let param_val = function.get_nth_param((i + param_offset) as u32).unwrap();
+        let param_ty = param_val.get_type();
+        let alloca = ctx.builder.build_alloca(param_ty, &p.name).unwrap();
+        ctx.builder.build_store(alloca, param_val).unwrap();
+        ctx.vars.insert(p.name.clone(), (alloca, param_ty));
+    }
+
+    // Lower body statements
+    for stmt in &typed_body.stmts {
+        lower_typed_stmt(ctx, stmt);
+    }
+
+    // Lower return expression
+    if let Some(ref ret_expr) = typed_body.ret {
+        let result = lower_typed_expr(ctx, ret_expr);
+
+        if internal_sret {
+            // Store into sret pointer
+            let sret_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+            let sret_ty = ret_llvm_ty.unwrap();
+            let src_ptr = result.into_ptr(&ctx.builder, sret_ty, "ret_src");
+            let size = match sret_ty {
+                BasicTypeEnum::ArrayType(arr) => arr.size_of().unwrap(),
+                BasicTypeEnum::StructType(st) => st.size_of().unwrap(),
+                _ => panic!("unexpected sret type: {:?}", sret_ty),
+            };
+            ctx.builder.build_memcpy(
+                sret_ptr, ctx.pointer_align as u32,
+                src_ptr, ctx.pointer_align as u32,
+                size,
+            ).unwrap();
+            ctx.builder.build_return(None).unwrap();
+        } else if llvm_ret_type.is_some() {
+            // Primitive return
+            let val = result.into_value(&ctx.builder);
+            ctx.builder.build_return(Some(&val)).unwrap();
+        } else {
+            ctx.builder.build_return(None).unwrap();
+        }
+    } else {
+        ctx.builder.build_return(None).unwrap();
+    }
+}
+
+/// Codegen a thin extern wrapper that matches Rust ABI and delegates to the internal function.
+fn codegen_extern_wrapper<'ctx, 'tcx>(
+    ctx: &mut CodegenCtx<'ctx, 'tcx, '_>,
+    func: &crate::toylang::registry::ToyFunction,
+    instance: ty::Instance<'tcx>,
+    extern_symbol: &str,
+    internal_symbol: &str,
+) {
+    let ret_ty_name_owned;
+    let ret_ty_name: &str = match func.return_ty.as_deref() {
+        Some(s) => { ret_ty_name_owned = s.to_string(); &ret_ty_name_owned }
+        None => "void",
+    };
+
+    // Resolve the return type for internal ABI decisions
+    let ret_resolved = crate::toylang::type_resolve::resolve_return_type(ctx.registry, func);
+    let internal_sret = is_internal_sret(&ret_resolved);
+
+    // Query Rust ABI for the extern wrapper's return convention
+    let coerced = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(ctx.tcx, instance);
+
+    // Determine LLVM return type for complex types (structs and opaque Rust types)
+    let ret_complex_ty: Option<BasicTypeEnum<'ctx>> = if ret_ty_name.starts_with("Vec<") {
+        let vec_resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+        Some(ctx.rust_ty_to_llvm_opaque(&vec_resolved).0)
+    } else {
+        ctx.struct_type_for_ret(ret_ty_name).map(|t| t.into())
+    };
+
+    let rust_sret = matches!(coerced, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
+
+    // Build extern wrapper signature (matching Rust ABI)
+    let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
+    let usize_ty = ctx.usize_type();
+
+    let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+    if rust_sret {
+        param_types.push(ptr_ty.into());
+    }
+    for p in &func.params {
+        let ty = match p.ty.as_str() {
+            "i32" => ctx.context.i32_type().into(),
+            "i64" => ctx.context.i64_type().into(),
+            "f64" => ctx.context.f64_type().into(),
+            "bool" => ctx.context.bool_type().into(),
+            "usize" => usize_ty.into(),
+            other if other.starts_with("&Vec<") => BasicMetadataTypeEnum::from(ptr_ty),
+            other if other.starts_with("&") => BasicMetadataTypeEnum::from(ptr_ty),
+            other if ctx.registry.structs.contains_key(other) => {
+                let s = &ctx.registry.structs[other];
+                ctx.struct_type(s).into()
+            }
+            other => panic!("unsupported param type '{}'", other),
+        };
+        param_types.push(ty);
+    }
+
+    // Determine Rust ABI LLVM return type
+    let rust_ret_type: Option<BasicTypeEnum<'ctx>> = if rust_sret {
+        None
+    } else if ret_ty_name == "void" {
+        None
+    } else if ret_ty_name == "usize" || ret_ty_name == "i32" || ret_ty_name == "i64"
+           || ret_ty_name == "f64" || ret_ty_name == "bool" {
+        Some(match ret_ty_name {
             "usize" => usize_ty.into(),
             "i32" => ctx.context.i32_type().into(),
             "i64" => ctx.context.i64_type().into(),
+            "f64" => ctx.context.f64_type().into(),
+            "bool" => ctx.context.bool_type().into(),
             _ => unreachable!(),
         })
     } else if ret_ty_name.starts_with("Vec<") {
-        None // Vec returns via sret always
+        None
     } else {
-        // Struct return — may be coerced
         match &coerced {
             rustc_lang_facade::abi_helpers::CoercedReturn::Direct(coerced_str) => {
                 Some(parse_coerced_type(ctx, coerced_str))
@@ -642,15 +785,15 @@ fn codegen_function<'ctx, 'tcx>(
         }
     };
 
-    let fn_type = match llvm_ret_type {
+    let fn_type = match rust_ret_type {
         Some(ret) => ret.fn_type(&param_types, false),
         None => ctx.context.void_type().fn_type(&param_types, false),
     };
 
-    let function = ctx.module.add_function(symbol, fn_type, None);
+    let function = ctx.module.add_function(extern_symbol, fn_type, None);
 
-    // Add sret attribute if needed
-    if is_sret {
+    // Add sret attribute if Rust ABI uses sret
+    if rust_sret {
         if let Some(sty) = ret_complex_ty {
             let any_ty = basic_type_to_any(sty);
             function.add_attribute(
@@ -666,62 +809,60 @@ fn codegen_function<'ctx, 'tcx>(
     let entry = ctx.context.append_basic_block(function, "entry");
     ctx.builder.position_at_end(entry);
 
-    // Bind parameters to variables
-    ctx.vars.clear();
-    let param_offset = if is_sret { 1 } else { 0 };
-    for (i, p) in func.params.iter().enumerate() {
-        let param_val = function.get_nth_param((i + param_offset) as u32).unwrap();
-        let param_ty = param_val.get_type();
-        let alloca = ctx.builder.build_alloca(param_ty, &p.name).unwrap();
-        ctx.builder.build_store(alloca, param_val).unwrap();
-        ctx.vars.insert(p.name.clone(), (alloca, param_ty));
-    }
+    // Get the internal function (must already be defined)
+    let internal_fn = ctx.module.get_function(internal_symbol)
+        .unwrap_or_else(|| panic!("internal function '{}' not found", internal_symbol));
 
-    // Lower body statements (using typed AST)
-    for stmt in &typed_body.stmts {
-        lower_typed_stmt(ctx, stmt);
-    }
+    // Build call args: forward params (with sret adaptation)
+    let rust_param_offset = if rust_sret { 1 } else { 0 };
+    let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
 
-    // Lower return expression (using typed AST)
-    if let Some(ref ret_expr) = typed_body.ret {
-        let result = lower_typed_expr(ctx, ret_expr);
-
-        if is_sret {
-            // Store into sret pointer (handles both structs and opaque Rust types like Vec)
+    if internal_sret {
+        if rust_sret {
+            // Both use sret — pass Rust's sret pointer directly to internal
             let sret_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
-            let result_ty = ret_complex_ty.unwrap();
-            let src_ptr = result.into_ptr(&ctx.builder, result_ty, "ret_src");
-            // Compute memcpy size from the LLVM type
-            let size = match result_ty {
-                BasicTypeEnum::ArrayType(arr) => arr.size_of().unwrap(),
-                BasicTypeEnum::StructType(st) => st.size_of().unwrap(),
-                _ => panic!("unexpected sret type: {:?}", result_ty),
-            };
-            ctx.builder.build_memcpy(
-                sret_ptr, ctx.pointer_align as u32,
-                src_ptr, ctx.pointer_align as u32,
-                size,
-            ).unwrap();
-            ctx.builder.build_return(None).unwrap();
-        } else if llvm_ret_type.is_some() {
-            if let Some(sty) = ret_complex_ty {
-                // Struct return — load from memory as the coerced type
-                let src_ptr = result.into_ptr(&ctx.builder, sty.into(), "ret_coerce");
-                let coerced_val = ctx.builder.build_load(
-                    llvm_ret_type.unwrap(), src_ptr, "coerced_ret",
-                ).unwrap();
-                ctx.builder.build_return(Some(&coerced_val)).unwrap();
-            } else {
-                // Primitive return
-                let val = result.into_value(&ctx.builder);
-                let coerced = coerce_int_to_type(ctx, val, llvm_ret_type.unwrap());
+            call_args.push(sret_ptr.into());
+        } else {
+            // Internal uses sret but Rust returns directly — alloca a tmp
+            let ret_ty = ctx.resolved_to_inkwell(&ret_resolved);
+            let tmp = ctx.builder.build_alloca(ret_ty, "wrapper_sret").unwrap();
+            call_args.push(tmp.into());
+        }
+    }
+
+    // Forward real params
+    for i in 0..func.params.len() {
+        let param = function.get_nth_param((i + rust_param_offset) as u32).unwrap();
+        call_args.push(param.into());
+    }
+
+    let call_site = ctx.builder.build_call(internal_fn, &call_args, "wrapper_call").unwrap();
+
+    // Handle return value adaptation
+    if ret_resolved == ResolvedType::Void {
+        ctx.builder.build_return(None).unwrap();
+    } else if rust_sret {
+        // Rust uses sret — internal already wrote to the sret pointer
+        ctx.builder.build_return(None).unwrap();
+    } else if internal_sret {
+        // Internal used sret, but Rust expects a direct return (coerced)
+        // The tmp alloca has the result — load as the Rust-expected type
+        let tmp = call_args[0].into_pointer_value();
+        let coerced_val = ctx.builder.build_load(
+            rust_ret_type.unwrap(), tmp, "coerced_ret",
+        ).unwrap();
+        ctx.builder.build_return(Some(&coerced_val)).unwrap();
+    } else {
+        // Both return directly — forward the internal function's return value
+        match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(val) => {
+                let coerced = coerce_int_to_type(ctx, val, rust_ret_type.unwrap());
                 ctx.builder.build_return(Some(&coerced)).unwrap();
             }
-        } else {
-            ctx.builder.build_return(None).unwrap();
+            _ => {
+                ctx.builder.build_return(None).unwrap();
+            }
         }
-    } else {
-        ctx.builder.build_return(None).unwrap();
     }
 }
 
@@ -819,49 +960,120 @@ fn lower_typed_expr<'ctx>(
             ExprResult::Ptr(alloca, struct_ty.into())
         }
 
+        TypedExprKind::FnCall { name, args, .. } if name == "println" => {
+            // Build printf format string from the first arg (must be StringLit)
+            let TypedExprKind::StringLit(fmt) = &args[0].kind else {
+                panic!("println first arg must be string literal");
+            };
+
+            // Replace {} with type-appropriate printf specifiers
+            let mut printf_fmt = String::new();
+            let mut arg_idx = 1usize;
+            let mut chars = fmt.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '{' && chars.peek() == Some(&'}') {
+                    chars.next(); // consume '}'
+                    let spec = match &args[arg_idx].ty {
+                        ResolvedType::I32 | ResolvedType::Bool => "%d",
+                        ResolvedType::I64 => "%ld",
+                        ResolvedType::Usize => "%zu",
+                        ResolvedType::F64 => "%f",
+                        other => panic!("println: unsupported type {:?} for format arg", other),
+                    };
+                    printf_fmt.push_str(spec);
+                    arg_idx += 1;
+                } else {
+                    printf_fmt.push(c);
+                }
+            }
+            printf_fmt.push('\n');
+
+            // Create global string constant for format
+            let fmt_ptr = ctx.builder.build_global_string_ptr(&printf_fmt, "println_fmt")
+                .unwrap()
+                .as_pointer_value();
+
+            // Declare printf (variadic, C linkage)
+            let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
+            let printf_ty = ctx.context.i32_type().fn_type(&[ptr_ty.into()], true);
+            let printf_fn = ctx.module.get_function("printf").unwrap_or_else(|| {
+                ctx.module.add_function("printf", printf_ty, Some(inkwell::module::Linkage::External))
+            });
+
+            // Build call args: format string + each value arg
+            let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![fmt_ptr.into()];
+            for arg_expr in &args[1..] {
+                let val = lower_typed_expr(ctx, arg_expr).into_value(&ctx.builder);
+                // Coerce bool (i1) to i32 for printf
+                let coerced = if arg_expr.ty == ResolvedType::Bool {
+                    ctx.builder.build_int_z_extend(
+                        val.into_int_value(),
+                        ctx.context.i32_type(), "bool_to_i32").unwrap().into()
+                } else {
+                    val
+                };
+                call_args.push(coerced.into());
+            }
+
+            ctx.builder.build_call(printf_fn, &call_args, "printf_ret").unwrap();
+            ExprResult::Value(ctx.context.i32_type().const_zero().into())
+        }
+
         TypedExprKind::FnCall { name, type_args, args } => {
-            // Call a toylang function by its consumer symbol name.
-            // The function must be in the declared_fns (from resolve_vec_symbols or extern decl).
-            // For generic functions called from concrete wrappers, the concrete instantiation
-            // is handled by per_instance_mir + symbol_name override.
-            //
-            // At LLVM level, we call the function by its mangled symbol.
-            // For now, look up the function in the registry to find its extern symbol.
-            // Compute the mangled symbol for the callee.
-            // Concrete: __toylang_impl_bar. Generic: __toylang_impl_wrap__i32.
-            let extern_sym = {
-                let mut sym = format!("__toylang_impl_{}", name);
+            // Call a toylang function via its internal symbol (simple, predictable ABI).
+            let internal_sym = {
+                let mut sym = format!("__toylang_internal_{}", name);
                 for arg in type_args {
                     sym.push_str(&format!("__{}", arg));
                 }
                 sym
             };
 
-            // Declare the function if not already declared
-            let ret_inkwell_ty = ctx.resolved_to_inkwell(&expr.ty);
-            let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = args.iter()
-                .map(|a| ctx.resolved_to_inkwell(&a.ty).into())
-                .collect();
+            let callee_sret = is_internal_sret(&expr.ty);
 
-            // Call the callee. If it's in the same module (another consumer function),
-            // it was codegenned with the correct ABI (direct or sret). We match its
-            // LLVM signature by looking at the existing function in the module.
-            // If not in the module yet, declare it as external.
-            //
-            // For consumer-to-consumer calls, both are in the same .o, so the callee
-            // may already be defined. We call it directly — the callee's codegen
-            // already handled the ABI correctly.
-            {
-                let callee = ctx.declare_external_fn(
-                    &extern_sym, &param_types, Some(ret_inkwell_ty), None,
-                );
-                let call_args: Vec<BasicValueEnum<'ctx>> = args.iter()
-                    .map(|a| lower_typed_expr(ctx, a).into_value(&ctx.builder))
-                    .collect();
-                let call_args_meta: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
-                    call_args.iter().map(|v| (*v).into()).collect();
-                let result = ctx.builder.build_call(callee, &call_args_meta, "call")
-                    .unwrap();
+            // Build param types for the internal function declaration
+            let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+            if callee_sret {
+                param_types.push(ctx.context.ptr_type(AddressSpace::default()).into());
+            }
+            for a in args {
+                param_types.push(ctx.resolved_to_inkwell(&a.ty).into());
+            }
+
+            // Internal ABI return type: void for sret, direct for primitives
+            let internal_ret_type: Option<BasicTypeEnum<'ctx>> = if callee_sret {
+                None
+            } else {
+                Some(ctx.resolved_to_inkwell(&expr.ty))
+            };
+
+            let callee = ctx.declare_external_fn(
+                &internal_sym, &param_types, internal_ret_type, None,
+            );
+
+            // Build call args
+            let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
+
+            if callee_sret {
+                // Allocate space for the result and pass as sret pointer
+                let ret_ty = ctx.resolved_to_inkwell(&expr.ty);
+                let alloca = ctx.builder.build_alloca(ret_ty, "fncall_sret").unwrap();
+                call_args.push(alloca.into());
+
+                for a in args {
+                    let val = lower_typed_expr(ctx, a).into_value(&ctx.builder);
+                    call_args.push(val.into());
+                }
+
+                ctx.builder.build_call(callee, &call_args, "").unwrap();
+                ExprResult::Ptr(alloca, ret_ty)
+            } else {
+                for a in args {
+                    let val = lower_typed_expr(ctx, a).into_value(&ctx.builder);
+                    call_args.push(val.into());
+                }
+
+                let result = ctx.builder.build_call(callee, &call_args, "call").unwrap();
                 match result.try_as_basic_value() {
                     inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
                     _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
@@ -884,6 +1096,40 @@ fn lower_typed_expr<'ctx>(
                     ExprResult::Ptr(alloca, vec_llvm_ty)
                 }
                 _ => panic!("unsupported static call: {}::{}", ty, method),
+            }
+        }
+
+        TypedExprKind::StringLit(s) => {
+            let ptr = ctx.builder.build_global_string_ptr(s, "str_lit")
+                .unwrap()
+                .as_pointer_value();
+            ExprResult::Value(ptr.into())
+        }
+
+        TypedExprKind::FieldAccess { receiver, field } => {
+            let recv_result = lower_typed_expr(ctx, receiver);
+            let ResolvedType::Struct { name: struct_name, .. } = &receiver.ty else {
+                panic!("field access on non-struct");
+            };
+            let toy_struct = ctx.registry.structs.get(struct_name.as_str()).unwrap();
+            let field_idx = toy_struct.fields.iter()
+                .position(|f| f.name == *field)
+                .unwrap() as u32;
+            let struct_ty = ctx.resolved_to_struct_type(&receiver.ty);
+            let struct_ptr = recv_result.into_ptr(&ctx.builder,
+                struct_ty.as_basic_type_enum(), "fa_recv");
+            let gep = ctx.builder.build_struct_gep(struct_ty, struct_ptr, field_idx, field).unwrap();
+            match &expr.ty {
+                ResolvedType::Struct { .. } | ResolvedType::Vec { .. } => {
+                    // Complex types — return pointer to the field
+                    ExprResult::Ptr(gep, ctx.resolved_to_inkwell(&expr.ty))
+                }
+                _ => {
+                    // Primitives — load the value
+                    let val = ctx.builder.build_load(
+                        ctx.resolved_to_inkwell(&expr.ty), gep, field).unwrap();
+                    ExprResult::Value(val)
+                }
             }
         }
 
@@ -1077,6 +1323,41 @@ fn expr_uses_vec(expr: &Expr) -> bool {
     }
 }
 
+/// Find the Vec element type from push calls in the body (e.g. v.push(Point{...}) → "Point").
+pub fn find_vec_elem_from_body(body: &FnBody) -> Option<String> {
+    for stmt in &body.stmts {
+        let expr = match stmt {
+            Stmt::Let { expr, .. } => expr,
+            Stmt::ExprStmt(expr) => expr,
+        };
+        if let Some(name) = find_vec_elem_from_expr(expr) {
+            return Some(name);
+        }
+    }
+    if let Some(ref ret) = body.ret {
+        if let Some(name) = find_vec_elem_from_expr(ret) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn find_vec_elem_from_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::MethodCall { method, args, receiver, .. } if method == "push" => {
+            // Check the pushed argument for a struct literal
+            if let Some(arg) = args.first() {
+                if let Expr::StructLit { name, .. } = arg {
+                    return Some(name.clone());
+                }
+            }
+            find_vec_elem_from_expr(receiver)
+        }
+        Expr::MethodCall { receiver, .. } => find_vec_elem_from_expr(receiver),
+        _ => None,
+    }
+}
+
 fn parse_generic_type(ty: &str) -> Option<(&str, Vec<&str>)> {
     let open = ty.find('<')?;
     if !ty.ends_with('>') { return None; }
@@ -1216,6 +1497,14 @@ pub fn generate_with_tcx<'tcx>(
     let mut ctx = CodegenCtx::new(&context, tcx, registry);
     let mut seen_symbols = std::collections::HashSet::new();
 
+    // Collect all toylang mono items (accessors and functions) first, then codegen.
+    struct FnItem<'tcx> {
+        resolved_func: crate::toylang::registry::ToyFunction,
+        instance: ty::Instance<'tcx>,
+        extern_symbol: String,
+    }
+    let mut fn_items: Vec<FnItem<'tcx>> = Vec::new();
+
     let (_, cgus) = tcx.collect_and_partition_mono_items(());
     for cgu in cgus.iter() {
         for (&mono_item, _) in cgu.items() {
@@ -1249,16 +1538,36 @@ pub fn generate_with_tcx<'tcx>(
 
             // Check if it's a consumer function
             let name = tcx.item_name(def_id).to_string();
-            let Some(toy_fn) = registry.functions.get(&name) else { continue };
+            // __toylang_main wrapper maps back to "main" in the registry
+            let registry_name = if name == "__toylang_main" { "main".to_string() } else { name.clone() };
+            let Some(toy_fn) = registry.functions.get(&registry_name) else { continue };
             let result = callbacks.monomorphize_fn(&name, tcx, local_def_id, instance);
             if !seen_symbols.insert(result.extern_symbol.clone()) {
                 continue;
             }
 
             // Build resolved function with concrete type args substituted
-            let resolved_func = resolve_function_for_instance(toy_fn, &name, instance, tcx);
-            codegen_function(&mut ctx, &name, &resolved_func, instance, &result.extern_symbol);
+            let resolved_func = resolve_function_for_instance(toy_fn, &registry_name, instance, tcx);
+            fn_items.push(FnItem {
+                resolved_func,
+                instance,
+                extern_symbol: result.extern_symbol,
+            });
         }
+    }
+
+    // Two-pass codegen: internal functions first, then extern wrappers.
+    // Internal functions use a simple ABI (structs always sret, primitives direct).
+    // Extern wrappers adapt to Rust ABI and delegate to the internal function.
+    // No ordering dependency between internal functions since the internal ABI
+    // is predictable from ResolvedType alone.
+    for item in &fn_items {
+        let internal_symbol = item.extern_symbol.replace("__toylang_impl_", "__toylang_internal_");
+        codegen_internal_function(&mut ctx, &item.resolved_func, &internal_symbol);
+    }
+    for item in &fn_items {
+        let internal_symbol = item.extern_symbol.replace("__toylang_impl_", "__toylang_internal_");
+        codegen_extern_wrapper(&mut ctx, &item.resolved_func, item.instance, &item.extern_symbol, &internal_symbol);
     }
 
     let rust_symbols = ctx.rust_symbols.clone();

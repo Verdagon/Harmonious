@@ -30,7 +30,12 @@ impl LangCallbacks for ToylangCallbacks {
     }
 
     fn fn_names(&self) -> std::collections::HashSet<String> {
-        self.registry.functions.keys().cloned().collect()
+        let mut names: std::collections::HashSet<String> = self.registry.functions.keys().cloned().collect();
+        // The "main" wrapper is renamed to "__toylang_main" to avoid conflict with Rust's main
+        if names.contains("main") {
+            names.insert("__toylang_main".to_string());
+        }
+        names
     }
 
     fn after_rust_analysis<'tcx>(&self, _tcx: TyCtxt<'tcx>) {
@@ -108,11 +113,13 @@ impl LangCallbacks for ToylangCallbacks {
             };
         }
 
-        let toy_fn = self.registry.functions.get(name)
-            .unwrap_or_else(|| panic!("[toylang] monomorphize_fn: function '{}' not in registry", name));
+        // __toylang_main wrapper maps back to "main" in the registry
+        let registry_name = if name == "__toylang_main" { "main" } else { name };
+        let toy_fn = self.registry.functions.get(registry_name)
+            .unwrap_or_else(|| panic!("[toylang] monomorphize_fn: function '{}' not in registry", registry_name));
 
         // Compute symbol on the fly. For generic functions, include mangled type args.
-        let extern_symbol = compute_fn_symbol(name, tcx, instance);
+        let extern_symbol = compute_fn_symbol(registry_name, tcx, instance);
 
         // Collect ALL dependencies by scanning the AST body:
         // 1. Rust generic functions (Vec::new, Vec::push, etc.)
@@ -184,6 +191,13 @@ fn collect_rust_deps<'tcx>(
         }
     }
 
+    // Third try: scan the body for Vec push calls with struct literal args
+    if elem_ty.is_none() {
+        if let Some(struct_name) = crate::llvm_gen::find_vec_elem_from_body(fn_body) {
+            elem_ty = crate::oracle::find_local_struct_ty(tcx, &struct_name);
+        }
+    }
+
     let elem_ty = match elem_ty {
         Some(t) => t,
         None => return vec![],
@@ -249,6 +263,14 @@ fn scan_expr_vec_ops(expr: &Expr, new: &mut bool, push: &mut bool, len: &mut boo
         }
         Expr::MethodCall { receiver, .. } => {
             scan_expr_vec_ops(receiver, new, push, len);
+        }
+        Expr::FieldAccess { receiver, .. } => {
+            scan_expr_vec_ops(receiver, new, push, len);
+        }
+        Expr::FnCall { args, .. } => {
+            for arg in args {
+                scan_expr_vec_ops(arg, new, push, len);
+            }
         }
         _ => {}
     }
@@ -464,6 +486,9 @@ fn walk_typed_expr_for_fn_calls(
             for arg in args {
                 walk_typed_expr_for_fn_calls(arg, calls);
             }
+        }
+        TypedExprKind::FieldAccess { receiver, .. } => {
+            walk_typed_expr_for_fn_calls(receiver, calls);
         }
         TypedExprKind::BinaryOp { left, right, .. } => {
             walk_typed_expr_for_fn_calls(left, calls);

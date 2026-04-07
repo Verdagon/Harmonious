@@ -134,7 +134,8 @@ pub fn generate(registry: &ToylangRegistry) -> String {
                 .unwrap_or_else(|e| panic!("invalid return type '{}': {}", ty, e)),
             None => parse_quote!(()),
         };
-        let wrapper_ident = format_ident!("{}", _name);
+        let wrapper_name = if _name == "main" { "__toylang_main" } else { _name.as_str() };
+        let wrapper_ident = format_ident!("{}", wrapper_name);
         let user_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
             let pname = format_ident!("{}", p.name);
             let pty: syn::Type = syn::parse_str(&p.ty)
