@@ -197,7 +197,7 @@ struct Point {
 }
 
 fn make_vec() -> Vec<Point> {
-    let v = Vec::new();
+    let v = Vec::new<Point>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     v
@@ -352,7 +352,7 @@ struct ToyShip {
 }
 
 fn make_ship() -> ToyShip {
-    let v = Vec::new();
+    let v = Vec::new<i32>();
     v.push(1);
     v.push(2);
     ToyShip { wings: v }
@@ -465,8 +465,8 @@ struct ToyShip {
 }
 
 fn make_fleet() -> Vec<ToyShip> {
-    let fleet = Vec::new();
-    let v = Vec::new();
+    let fleet = Vec::new<ToyShip>();
+    let v = Vec::new<i32>();
     v.push(10);
     fleet.push(ToyShip { wings: v });
     fleet
@@ -507,7 +507,7 @@ struct ToyFleet {
 }
 
 fn make_fleet() -> ToyFleet {
-    let v = Vec::new();
+    let v = Vec::new<ToyPoint>();
     v.push(ToyPoint { x: 1, y: 2 });
     v.push(ToyPoint { x: 3, y: 4 });
     ToyFleet { ships: v }
@@ -542,7 +542,7 @@ struct ToyShip {
 }
 
 fn make_ship() -> ToyShip {
-    let v = Vec::new();
+    let v = Vec::new<i32>();
     v.push(100);
     ToyShip { engine: ToyEngine { parts: v } }
 }
@@ -573,9 +573,9 @@ struct ToyPoint {
 }
 
 fn make_nested() -> Vec<Vec<ToyPoint>> {
-    let inner = Vec::new();
+    let inner = Vec::new<ToyPoint>();
     inner.push(ToyPoint { x: 1, y: 2 });
-    let outer = Vec::new();
+    let outer = Vec::new<Vec<ToyPoint>>();
     outer.push(inner);
     outer
 }
@@ -610,7 +610,7 @@ struct ToyWrapper<T> {
 }
 
 fn wrap_vec() -> ToyWrapper<Vec<i32>> {
-    let v = Vec::new();
+    let v = Vec::new<i32>();
     v.push(42);
     ToyWrapper { inner: v }
 }
@@ -727,11 +727,11 @@ struct ToyBranch {
 }
 
 fn make_tree() -> Vec<ToyBranch> {
-    let leaves = Vec::new();
+    let leaves = Vec::new<ToyLeaf>();
     leaves.push(ToyLeaf { value: 1 });
     leaves.push(ToyLeaf { value: 2 });
     let branch = ToyBranch { leaves: leaves };
-    let tree = Vec::new();
+    let tree = Vec::new<ToyBranch>();
     tree.push(branch);
     tree
 }
@@ -773,7 +773,7 @@ struct ToyMixed {
 }
 
 fn make_mixed() -> ToyMixed {
-    let v = Vec::new();
+    let v = Vec::new<i32>();
     v.push(10);
     ToyMixed { a: 1, b: v, c: ToyPoint { x: 2, y: 3 } }
 }
@@ -806,7 +806,7 @@ struct ToyGenMixed<T> {
 }
 
 fn make_mixed() -> ToyGenMixed<i32> {
-    let v = Vec::new();
+    let v = Vec::new<i32>();
     v.push(10);
     v.push(20);
     ToyGenMixed { a: 42, b: v, c: 99 }
@@ -849,7 +849,7 @@ mod __lang_stubs;
 use __lang_stubs::*;
 
 fn main() {
-    let w = wrap(42i32);
+    let w = wrap::<i32>(42);
     println!("inner: {}", w.inner());
     assert_eq!(*w.inner(), 42);
 }
@@ -871,7 +871,7 @@ fn wrap<T>(x: T) -> Wrapper<T> {
 }
 
 fn wrap_i32(x: i32) -> Wrapper<i32> {
-    wrap(x)
+    wrap<i32>(x)
 }
         "#,
         r#"
@@ -933,7 +933,7 @@ fn identity<T>(x: T) -> T {
 }
 
 fn identity_point(p: Point) -> Point {
-    identity(p)
+    identity<Point>(p)
 }
 
 fn make_point() -> Point {
@@ -969,7 +969,7 @@ fn wrap<T>(x: T) -> Wrapper<T> {
 }
 
 fn use_wrap() -> i32 {
-    let w = wrap(42);
+    let w = wrap<i32>(42);
     42
 }
         "#,
@@ -1199,7 +1199,7 @@ fn test_vec_i32() {
     let output = run_toylang_test(
         r#"
 fn make_vec() -> Vec<i32> {
-    let v = Vec::new();
+    let v = Vec::new<i32>();
     v.push(10);
     v.push(20);
     v.push(30);
@@ -1261,7 +1261,7 @@ struct Data {
 }
 
 fn make_data() -> Data {
-    let v = Vec::new();
+    let v = Vec::new<i32>();
     v.push(10);
     v.push(20);
     Data { count: 2, items: v }
@@ -1292,7 +1292,7 @@ struct Point {
 }
 
 fn make_points() -> Vec<Point> {
-    let v = Vec::new();
+    let v = Vec::new<Point>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     v.push(Point { x: 5, y: 6 });
@@ -1531,7 +1531,7 @@ struct Point {
 }
 
 fn make_vec() -> Vec<Point> {
-    let v = Vec::new();
+    let v = Vec::new<Point>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     v
@@ -1566,7 +1566,7 @@ struct Point {
 }
 
 fn main() {
-    let v = Vec::new();
+    let v = Vec::new<Point>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     println("Vec length: {}", v.len());
@@ -1672,7 +1672,7 @@ fn new_point() -> Point {
 fn make_vec() -> Vec<Point> {
     let fresh = renew();
     let also_new = new_point();
-    let v = Vec::new();
+    let v = Vec::new<Point>();
     v.push(fresh);
     v.push(also_new);
     v
@@ -1711,7 +1711,7 @@ fn make_point() -> Point {
 }
 
 fn main() {
-    let v = Vec::new();
+    let v = Vec::new<Point>();
     v.push(make_point());
     println("len: {}", v.len());
 }
@@ -1765,13 +1765,11 @@ fn main() { println!("{}", foo()); }
 #[test]
 fn test_int_literal_infers_i64_from_return_type() {
     // The value 3000000000 exceeds i32 max (2147483647) but fits in i64.
-    // If the literal is typed as i32, it wraps/truncates to a wrong value.
-    // After fix: backward type inference from return type → let binding → literal.
+    // Integer literals get their type from the expected context (here: return type).
     let output = run_toylang_test(
         r#"
 fn big() -> i64 {
-    let x = 3000000000;
-    x
+    3000000000
 }
         "#,
         r#"

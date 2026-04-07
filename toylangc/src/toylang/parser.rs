@@ -439,13 +439,18 @@ impl Parser {
                 self.consume(); // consume the ident
 
                 if self.peek() == &Token::DoubleColon {
-                    // StaticCall: Ty::method(args)
+                    // StaticCall: Ty::method<type_args>(args)
                     self.consume(); // consume '::'
                     let method = self.expect_ident()?;
+                    let type_args = if self.peek() == &Token::LAngle {
+                        self.parse_type_arg_list()?
+                    } else {
+                        vec![]
+                    };
                     self.expect(Token::LParen)?;
                     let args = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    Ok(Expr::StaticCall { ty: name, method, args })
+                    Ok(Expr::StaticCall { ty: name, method, type_args, args })
                 } else if self.peek() == &Token::LBrace {
                     // StructLit: Name { field: expr, ... }
                     self.consume(); // consume '{'
@@ -461,18 +466,39 @@ impl Parser {
                     }
                     self.expect(Token::RBrace)?;
                     Ok(Expr::StructLit { name, fields })
+                } else if self.peek() == &Token::LAngle {
+                    // FnCall with type args: name<T1, T2>(args)
+                    let type_args = self.parse_type_arg_list()?;
+                    self.expect(Token::LParen)?;
+                    let args = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::FnCall { name, type_args, args })
                 } else if self.peek() == &Token::LParen {
                     // FnCall: name(args)
                     self.consume(); // consume '('
                     let args = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    Ok(Expr::FnCall { name, args })
+                    Ok(Expr::FnCall { name, type_args: vec![], args })
                 } else {
                     Ok(Expr::Var(name))
                 }
             }
             t => Err(format!("expected expression, got {:?}", t)),
         }
+    }
+
+    /// Parse `<T1, T2>` type argument list. Consumes the `<` and `>`.
+    fn parse_type_arg_list(&mut self) -> Result<Vec<String>, String> {
+        self.expect(Token::LAngle)?;
+        let mut type_args = Vec::new();
+        while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
+            type_args.push(self.parse_type_str()?);
+            if self.peek() == &Token::Comma {
+                self.consume();
+            }
+        }
+        self.expect(Token::RAngle)?;
+        Ok(type_args)
     }
 
     fn parse_args(&mut self) -> Result<Vec<Expr>, String> {

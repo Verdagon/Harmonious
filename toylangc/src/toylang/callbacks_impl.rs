@@ -169,14 +169,21 @@ fn collect_rust_deps<'tcx>(
     def_id: LocalDefId,
     fn_body: &FnBody,
     registry: &ToylangRegistry,
-    toy_fn: &crate::toylang::registry::ToyFunction,
+    _toy_fn: &crate::toylang::registry::ToyFunction,
 ) -> Vec<(DefId, ty::GenericArgsRef<'tcx>)> {
     let fn_sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
 
-    // First try: find Vec element type from the function signature
-    let mut elem_ty = find_vec_elem_ty(tcx, fn_sig);
+    // Find Vec element type. With explicit type args, the primary source is
+    // Vec::new<ElemType>() in the body. Fall back to signature for functions
+    // that return Vec or take Vec params.
+    let mut elem_ty = find_vec_elem_from_explicit_type_args(fn_body, tcx);
 
-    // Second try: if return type is a toylang struct, search its fields for Vec types
+    // Fall back to function signature (return type or params with Vec<T>)
+    if elem_ty.is_none() {
+        elem_ty = find_vec_elem_ty(tcx, fn_sig);
+    }
+
+    // Fall back to struct fields in return type
     if elem_ty.is_none() {
         if let TyKind::Adt(adt_def, args) = fn_sig.output().kind() {
             let struct_name = tcx.item_name(adt_def.did()).to_string();
@@ -189,22 +196,6 @@ fn collect_rust_deps<'tcx>(
                     .collect();
                 elem_ty = find_vec_in_fields_recursive(tcx, toy_struct, &subst, registry);
             }
-        }
-    }
-
-    // Third try: scan the untyped body for Vec push calls with struct literal args
-    if elem_ty.is_none() {
-        if let Some(struct_name) = crate::llvm_gen::find_vec_elem_from_body(fn_body) {
-            elem_ty = crate::oracle::find_local_struct_ty(tcx, &struct_name);
-        }
-    }
-
-    // Fourth try: scan the typed body for push call argument types
-    if elem_ty.is_none() {
-        if let Some(struct_name) = crate::llvm_gen::find_vec_elem_from_typed_body(
-            &crate::toylang::type_resolve::resolve_fn_body(registry, toy_fn),
-        ) {
-            elem_ty = crate::oracle::find_local_struct_ty(tcx, &struct_name);
         }
     }
 
@@ -255,6 +246,39 @@ fn collect_rust_deps<'tcx>(
     }
 
     deps
+}
+
+/// Find Vec element type from explicit type args on Vec::new<ElemType>() in the body.
+fn find_vec_elem_from_explicit_type_args<'tcx>(
+    body: &FnBody,
+    tcx: TyCtxt<'tcx>,
+) -> Option<Ty<'tcx>> {
+    fn scan_expr<'tcx>(expr: &Expr, tcx: TyCtxt<'tcx>) -> Option<Ty<'tcx>> {
+        match expr {
+            Expr::StaticCall { ty, method, type_args, .. }
+                if ty == "Vec" && method == "new" && !type_args.is_empty() =>
+            {
+                Some(string_to_rustc_ty(tcx, &type_args[0]))
+            }
+            Expr::MethodCall { receiver, .. } => scan_expr(receiver, tcx),
+            Expr::FnCall { args, .. } => {
+                for a in args { if let Some(t) = scan_expr(a, tcx) { return Some(t); } }
+                None
+            }
+            _ => None,
+        }
+    }
+    for stmt in &body.stmts {
+        let expr = match stmt {
+            Stmt::Let { expr, .. } => expr,
+            Stmt::ExprStmt(expr) => expr,
+        };
+        if let Some(ty) = scan_expr(expr, tcx) { return Some(ty); }
+    }
+    if let Some(ref ret) = body.ret {
+        if let Some(ty) = scan_expr(ret, tcx) { return Some(ty); }
+    }
+    None
 }
 
 fn scan_body_vec_ops(body: &FnBody, new: &mut bool, push: &mut bool, len: &mut bool) {

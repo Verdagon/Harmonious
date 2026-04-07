@@ -582,10 +582,11 @@ fn codegen_internal_function<'ctx, 'tcx>(
     // Resolve Vec symbols if needed
     let uses_vec = body_uses_vec(body);
     if uses_vec {
-        let elem_name = find_vec_elem_name(ret_ty_name, ctx.registry)
-            .or_else(|| find_vec_elem_from_params(func))
-            .or_else(|| find_vec_elem_from_body(body))
-            .or_else(|| find_vec_elem_from_typed_body(&typed_body));
+        // Get Vec element type from explicit type args (Vec::new<Point>()),
+        // function return type, or params
+        let elem_name = find_vec_elem_from_explicit_ast(body)
+            .or_else(|| find_vec_elem_name(ret_ty_name, ctx.registry))
+            .or_else(|| find_vec_elem_from_params(func));
         match elem_name {
             Some(elem) => ctx.resolve_vec_symbols(&elem),
             None => panic!("function uses Vec but could not determine element type"),
@@ -1357,81 +1358,32 @@ fn expr_uses_vec(expr: &Expr) -> bool {
     }
 }
 
-/// Find the Vec element type from push calls in the body (e.g. v.push(Point{...}) → "Point").
-pub fn find_vec_elem_from_body(body: &FnBody) -> Option<String> {
-    for stmt in &body.stmts {
-        let expr = match stmt {
-            Stmt::Let { expr, .. } => expr,
-            Stmt::ExprStmt(expr) => expr,
-        };
-        if let Some(name) = find_vec_elem_from_expr(expr) {
-            return Some(name);
-        }
-    }
-    if let Some(ref ret) = body.ret {
-        if let Some(name) = find_vec_elem_from_expr(ret) {
-            return Some(name);
-        }
-    }
-    None
-}
-
-fn find_vec_elem_from_expr(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::MethodCall { method, args, receiver, .. } if method == "push" => {
-            // Check the pushed argument for a struct literal
-            if let Some(arg) = args.first() {
-                if let Expr::StructLit { name, .. } = arg {
-                    return Some(name.clone());
-                }
+/// Find the Vec element type from explicit type args on Vec::new<ElemType>() in the body.
+fn find_vec_elem_from_explicit_ast(body: &FnBody) -> Option<String> {
+    fn scan_expr(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::StaticCall { ty, method, type_args, .. }
+                if ty == "Vec" && method == "new" && !type_args.is_empty() =>
+            {
+                Some(type_args[0].clone())
             }
-            find_vec_elem_from_expr(receiver)
-        }
-        Expr::MethodCall { receiver, .. } => find_vec_elem_from_expr(receiver),
-        _ => None,
-    }
-}
-
-/// Find the Vec element type from the typed body by scanning push call argument types.
-/// Unlike find_vec_elem_from_body (which only matches struct literals), this works
-/// for any expression since the typed AST has resolved types on every node.
-pub fn find_vec_elem_from_typed_body(typed_body: &crate::toylang::typed_ast::TypedFnBody) -> Option<String> {
-    use crate::toylang::typed_ast::*;
-    fn scan_typed_expr(expr: &TypedExpr) -> Option<String> {
-        match &expr.kind {
-            TypedExprKind::MethodCall { method, args, receiver, .. } if method == "push" => {
-                if let Some(arg) = args.first() {
-                    if let ResolvedType::Struct { name, .. } = &arg.ty {
-                        return Some(name.clone());
-                    }
-                }
-                scan_typed_expr(receiver)
-            }
-            TypedExprKind::MethodCall { receiver, .. } => scan_typed_expr(receiver),
-            TypedExprKind::FnCall { args, .. } => {
-                for arg in args {
-                    if let Some(name) = scan_typed_expr(arg) {
-                        return Some(name);
-                    }
-                }
+            Expr::MethodCall { receiver, .. } => scan_expr(receiver),
+            Expr::FnCall { args, .. } => {
+                for a in args { if let Some(n) = scan_expr(a) { return Some(n); } }
                 None
             }
             _ => None,
         }
     }
-    for stmt in &typed_body.stmts {
+    for stmt in &body.stmts {
         let expr = match stmt {
-            TypedStmt::Let { expr, .. } => expr,
-            TypedStmt::ExprStmt(expr) => expr,
+            Stmt::Let { expr, .. } => expr,
+            Stmt::ExprStmt(expr) => expr,
         };
-        if let Some(name) = scan_typed_expr(expr) {
-            return Some(name);
-        }
+        if let Some(name) = scan_expr(expr) { return Some(name); }
     }
-    if let Some(ref ret) = typed_body.ret {
-        if let Some(name) = scan_typed_expr(ret) {
-            return Some(name);
-        }
+    if let Some(ref ret) = body.ret {
+        if let Some(name) = scan_expr(ret) { return Some(name); }
     }
     None
 }

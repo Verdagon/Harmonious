@@ -1,10 +1,11 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 45 integration tests passing, 2 ignored. Minimal rustc fork
+> **Current status:** 53 integration tests passing, 0 ignored. Minimal rustc fork
 > with `per_instance_mir` query. Inkwell LLVM backend with type annotation pass.
-> Unified MonoItems discovery. Generic functions, inter-toylang calls, arithmetic,
-> direct field access, `println` built-in, toylang-owned main, internal/extern
-> ABI split. 4 query providers. Zero compiler warnings.
+> Unified MonoItems discovery. Generic functions with explicit type args,
+> inter-toylang calls, arithmetic, direct field access, `println` built-in,
+> toylang-owned main, internal/extern ABI split with full param+return coercion.
+> 4 query providers. Zero compiler warnings. No type inference machinery.
 
 ## Overview
 
@@ -198,23 +199,33 @@ values are available for ABI queries in the extern wrapper pass.
 `type_resolve.rs` produces a `TypedFnBody` where every expression carries a
 `ResolvedType`. This runs before LLVM codegen and handles:
 
-- **IntLit:** Correct width from context (i32 default, overridden by field types)
+- **IntLit:** Correct width from context (i32 default, overridden by field types,
+  return types, and param types)
 - **Generic type params:** Substituted with concrete types from Instance args
-- **Vec element types:** Inferred from forward usage (push args, struct fields)
-- **FnCall type args:** Inferred from expected return type (for generic callees)
+- **Vec element types:** Read from explicit type args on `Vec::new<Point>()`
+- **FnCall type args:** Read from explicit type args on `wrap<i32>(42)` — no inference
 - **BinaryOp:** Both operands share the expected type
+
+**No inference machinery.** All generic type args must be provided explicitly at
+call sites. Vec element types must be specified on `Vec::new<T>()`. Integer
+literals default to i32 unless the immediate context provides an expected type
+(return position, struct field, function parameter).
 
 ### 4.3 Dependency discovery via type resolver
 
 `collect_toylang_fn_deps` runs `type_resolve::resolve_fn_body` on the caller's
-body to produce a TypedFnBody, then walks it for FnCall nodes with resolved
+body to produce a TypedFnBody, then walks it for FnCall nodes with explicit
 type args. This unified approach handles all cases:
 - Concrete-to-concrete calls (empty type args)
-- Concrete-to-generic calls (type args inferred from expected return type)
+- Concrete-to-generic calls (type args provided explicitly at call site)
 - Generic-to-generic calls (caller's type params substituted first via Instance args)
 
-The resolved FnCall type args are converted to rustc `Ty<'tcx>` values and
+The explicit FnCall type args are converted to rustc `Ty<'tcx>` values and
 used to construct concrete `GenericArgsRef` for the callee Instance.
+
+Vec element types for `collect_rust_deps` are discovered by scanning the AST
+for `Vec::new<ElemType>()` calls — the explicit type arg provides the element
+type directly with no inference needed.
 
 Note: the type resolver runs twice per function — once during dep discovery
 (in `monomorphize_fn`) and once during LLVM codegen (in `generate_with_tcx`).
@@ -321,7 +332,7 @@ i1 to i32 for printf compatibility.
 
 ---
 
-## Part 5: What Works (45 tests)
+## Part 5: What Works (53 tests)
 
 ### Struct types
 - Simple structs (`Counter { value: i32 }`)
@@ -347,22 +358,24 @@ i1 to i32 for printf compatibility.
 
 ### Function features
 - Multiple parameters
-- Struct parameters (passthrough)
+- Struct parameters (passthrough, including through generic functions)
 - Multiple let bindings with variable reuse
 - Inter-toylang function calls (concrete-to-concrete)
-- Generic callee calls (concrete calling generic, type args inferred)
+- Generic callee calls with explicit type args (`wrap<i32>(42)`)
 - Arithmetic expressions (+, -, *, / with precedence)
 - Boolean literals and bool return values
 - String literals (for println format strings)
 - Direct field access (`p.x`)
 - `println` built-in (compiles to C printf)
 - Toylang-owned main (`fn main()` in toylang, called via `__toylang_main`)
+- Explicit Vec element types (`Vec::new<Point>()`)
 
 ### ABI
 - Internal/extern ABI split (internal: predictable, extern: matches Rust)
 - Struct returns via sret (internal always, extern per `coerced_return_type_for_instance`)
+- Struct param coercion (extern per `coerced_param_types_for_instance`)
 - Bool i1↔i8 coercion handled by `coerce_int_to_type`
-- Struct ABI coercion (e.g. single-field struct → register return)
+- Struct ABI coercion (e.g. `{ i32, i32 }` → `i64` on aarch64, both params and returns)
 
 ### Vec operations
 - Vec<primitive> and Vec<struct>
@@ -454,8 +467,23 @@ a TypedFnBody with all FnCall type args resolved. This handles all callee cases
 uniformly — return position, let bindings, nested expressions. For generic callers,
 type params are substituted from the Instance's args before resolving. The same
 `resolve_fn_body` function also runs during LLVM codegen, keeping both paths
-consistent. Known limitation: generic FnCalls in let bindings without return-type
-context can't infer type args (defaults to i32 for int literals).
+consistent.
+
+### Why explicit type args instead of inference
+
+Type inference was attempted (inferring generic type params from expected return
+type and from argument types) but caused cascading problems:
+- Backward propagation from return types to let bindings broke generic functions
+  (tried to parse unresolved type params as concrete types)
+- Vec element type inference required a fragile 4-tier heuristic chain
+  (signature → struct fields → push struct literals → typed body scan)
+- The heuristics failed on `v.push(make_point())` because push args that were
+  function calls (not struct literals) weren't recognized
+
+Requiring explicit type args (`wrap<i32>(42)`, `Vec::new<Point>()`) eliminated
+all inference machinery (~150 lines) and made the compiler simpler and more
+predictable. This is appropriate for a proof-of-concept; inference can be
+re-added later if needed.
 
 ### Why no mir_built or borrowck overrides
 
@@ -562,7 +590,7 @@ string is unique per Instance and owned.
 ### What was accomplished
 
 Started with 5 tests passing (string-based LLVM backend, no fork, manual
-`mark_compiled_functions`). Now at 45 tests passing.
+`mark_compiled_functions`). Now at 53 tests passing, 0 ignored.
 
 **Major architectural changes (sessions 1-2):**
 1. Minimal rustc fork with `per_instance_mir` query (4 patches, ~11 lines)
@@ -576,24 +604,25 @@ Started with 5 tests passing (string-based LLVM backend, no fork, manual
 9. Generic toylang functions (`fn wrap<T>`)
 10. Arithmetic expressions (+, -, *, / with precedence)
 
-**Session 3 additions (40 → 45 tests):**
+**Session 3 additions (40 → 53 tests):**
 11. Direct field access (`p.x`) — FieldAccess AST node, GEP codegen
 12. `println` built-in — StringLit token/AST, printf codegen with type specifiers
 13. Toylang-owned main — `__toylang_main` stub rename, fn_names mapping
 14. Internal/extern ABI split — `codegen_internal_function` + `codegen_extern_wrapper`,
     eliminates ABI mismatch for toylang-to-toylang calls
-15. Vec dep discovery from function body (for void main functions using Vec)
+15. Full param+return ABI coercion — `coerced_param_types_for_instance` from fn_abi
+16. Removed all type inference — explicit type args on generic calls (`wrap<i32>(42)`)
+    and Vec creation (`Vec::new<Point>()`)
+17. Bug fixes — exact Vec method lookup, lexer rejects unknown chars, panic on
+    missing --toylang-input
 
 **Query surface reduced from 6 providers to 4:**
 - Removed: `mir_built`, `mir_borrowck`
 - Kept: `layout_of`, `mir_shims`, `per_instance_mir`, `symbol_name`
 
-### What remains (2 ignored tests)
+### What remains (0 ignored tests)
 
-| Test | Blocker |
-|------|---------|
-| `test_generic_callee_in_let` | Needs forward type inference for let bindings |
-| `test_generic_callee_with_struct` | Struct passthrough ABI for generic identity function |
+All 53 tests pass. No known blockers.
 
 ### Recommended next steps
 
@@ -603,14 +632,20 @@ Started with 5 tests passing (string-based LLVM backend, no fork, manual
 2. **Loops** (`while`) — back-edge branches in inkwell. With arithmetic + comparisons
    + loops, toylang is Turing-complete.
 
-3. **Forward type inference** — pre-scan return expression to propagate expected types
-   backward to let bindings. Replaces the i32 default heuristic. Unblocks
-   `test_generic_callee_in_let`.
-
-4. **Trait implementations** — `impl Trait for ConsumerType` in stubs. The
+3. **Trait implementations** — `impl Trait for ConsumerType` in stubs. The
    `per_instance_mir` foundation supports it. Biggest remaining architectural feature.
 
-5. **Eliminate Vec-specific logic** — see Part 10.4 roadmap.
+4. **Eliminate Vec-specific logic** — see Part 10.4 roadmap.
+
+### Known technical debt
+
+- **String-based type resolution** duplicated in 6+ places (type_from_string,
+  resolve_rust_ty_from_string, parse_coerced_type, etc.) — each slightly different
+- **println hardcoding** — special-cased by name in type resolver and codegen
+- **Ref param redundant conversion** in extern wrapper — `fn_abi` reports `i64` for
+  pointers, internal expects `ptr`, bitcast-via-memory fires unnecessarily (LLVM
+  optimizes it away)
+- **Vec-specific code** (~200 lines) — hardcoded push/len/new handling throughout
 
 ### Building the forked toolchain
 
@@ -635,7 +670,7 @@ cargo +rustc-fork test -p toylangc --test integration_tests
 ### Running tests
 
 ```bash
-# All non-ignored tests (should be 45 passed, 0 failed, 2 ignored):
+# All tests (should be 53 passed, 0 failed, 0 ignored):
 cargo +rustc-fork test -p toylangc --test integration_tests
 
 # Including ignored (shows what still needs work):

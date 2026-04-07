@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use super::ast::{Expr, FnBody, Stmt};
+use super::ast::{Expr, Stmt};
+#[cfg(test)]
+use super::ast::FnBody;
 use super::registry::{ToylangRegistry, ToyFieldType, ToyFunction};
 use super::typed_ast::*;
 
@@ -41,24 +43,14 @@ pub fn resolve_fn_body(
         scope.insert(p.name.clone(), ty);
     }
 
-    // Pre-scan: infer Vec element types for let bindings from forward usage.
-    // For `let v = Vec::new(); v.push(x); ToyShip { wings: v }`,
-    // we need to know Vec<what> at the point of Vec::new().
-    let vec_inferences = infer_vec_types(body, &ret_ty, registry);
-
-    // Pre-scan: propagate return type backward to let bindings.
-    // For `fn big() -> i64 { let x = 10; x }`, the return expr is Var("x"),
-    // so x should inherit the expected type i64.
-    let let_type_hints = infer_let_types_from_return(body, &ret_ty);
-
     // Resolve statements
     let stmts: Vec<TypedStmt> = body.stmts.iter()
-        .map(|stmt| resolve_stmt(stmt, &mut scope, &ret_ty, registry, &vec_inferences, &let_type_hints))
+        .map(|stmt| resolve_stmt(stmt, &mut scope, &ret_ty, registry))
         .collect();
 
     // Resolve return expression
     let ret = body.ret.as_ref().map(|expr| {
-        resolve_expr(expr, &ret_ty, &scope, registry, &vec_inferences)
+        resolve_expr(expr, &ret_ty, &scope, registry)
     });
 
     TypedFnBody { stmts, ret }
@@ -207,162 +199,6 @@ fn resolve_field_type(
 }
 
 // ============================================================================
-// Vec type inference (forward scan)
-// ============================================================================
-
-/// Pre-scan the function body to infer Vec element types for let bindings.
-/// Returns a map: variable name → Vec element ResolvedType.
-/// Propagate the return type backward to let bindings.
-/// If the return expression is `Var("x")`, then `let x = ...` should use the return type
-/// as its expected type. This enables `let x = 3000000000` in a fn returning i64
-/// to correctly infer x as i64.
-fn infer_let_types_from_return(
-    body: &FnBody,
-    ret_ty: &ResolvedType,
-) -> HashMap<String, ResolvedType> {
-    let mut hints = HashMap::new();
-    if *ret_ty == ResolvedType::Void {
-        return hints;
-    }
-    // If the return expression is a simple variable, propagate the return type to it
-    if let Some(Expr::Var(name)) = &body.ret {
-        hints.insert(name.clone(), ret_ty.clone());
-    }
-    hints
-}
-
-fn infer_vec_types(
-    body: &FnBody,
-    ret_ty: &ResolvedType,
-    registry: &ToylangRegistry,
-) -> HashMap<String, ResolvedType> {
-    let mut inferences: HashMap<String, ResolvedType> = HashMap::new();
-
-    // Find all let bindings that are Vec::new()
-    let vec_vars: Vec<String> = body.stmts.iter()
-        .filter_map(|stmt| {
-            if let Stmt::Let { name, expr } = stmt {
-                if is_vec_new(expr) {
-                    return Some(name.clone());
-                }
-            }
-            None
-        })
-        .collect();
-
-    for var_name in &vec_vars {
-        // Strategy 1: look for push calls to infer from argument type
-        if let Some(elem_ty) = infer_from_push(body, var_name, registry) {
-            inferences.insert(var_name.clone(), elem_ty);
-            continue;
-        }
-
-        // Strategy 2: look for usage in struct literal to infer from field type
-        if let Some(elem_ty) = infer_from_struct_field(body, var_name, ret_ty, registry) {
-            inferences.insert(var_name.clone(), elem_ty);
-            continue;
-        }
-
-        // Strategy 3: infer from function return type
-        if let ResolvedType::Vec { elem } = ret_ty {
-            inferences.insert(var_name.clone(), *elem.clone());
-            continue;
-        }
-    }
-
-    inferences
-}
-
-fn is_vec_new(expr: &Expr) -> bool {
-    matches!(expr, Expr::StaticCall { ty, method, .. } if ty == "Vec" && method == "new")
-}
-
-/// Look for `var_name.push(expr)` and infer Vec element type from the push argument.
-fn infer_from_push(
-    body: &FnBody,
-    var_name: &str,
-    registry: &ToylangRegistry,
-) -> Option<ResolvedType> {
-    for stmt in &body.stmts {
-        if let Stmt::ExprStmt(Expr::MethodCall { receiver, method, args, .. })
-            | Stmt::Let { expr: Expr::MethodCall { receiver, method, args, .. }, .. } = stmt
-        {
-            if method == "push" {
-                if let Expr::Var(recv_name) = receiver.as_ref() {
-                    if recv_name == var_name && !args.is_empty() {
-                        return infer_expr_type(&args[0], registry);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Infer the type of an expression from its shape (without full type resolution).
-/// Used for forward-scanning push arguments.
-fn infer_expr_type(expr: &Expr, registry: &ToylangRegistry) -> Option<ResolvedType> {
-    match expr {
-        Expr::IntLit(_) => Some(ResolvedType::I32),
-        Expr::BoolLit(_) => Some(ResolvedType::Bool),
-        Expr::StructLit { name, .. } => Some(parse_type_string(name, registry)),
-        _ => None,
-    }
-}
-
-/// Look for `StructName { ..., field: var_name, ... }` and infer Vec element type
-/// from the struct field's declared type.
-fn infer_from_struct_field(
-    body: &FnBody,
-    var_name: &str,
-    ret_ty: &ResolvedType,
-    registry: &ToylangRegistry,
-) -> Option<ResolvedType> {
-    // Check the return expression
-    if let Some(ref ret_expr) = body.ret {
-        if let Some(ty) = infer_from_struct_lit(ret_expr, var_name, ret_ty, registry) {
-            return Some(ty);
-        }
-    }
-    None
-}
-
-fn infer_from_struct_lit(
-    expr: &Expr,
-    var_name: &str,
-    expected_ty: &ResolvedType,
-    registry: &ToylangRegistry,
-) -> Option<ResolvedType> {
-    if let Expr::StructLit { name, fields } = expr {
-        if let ResolvedType::Struct { field_types, .. } = expected_ty {
-            if let Some(_toy_struct) = registry.structs.get(name.as_str()) {
-                for (i, (_field_name, field_expr)) in fields.iter().enumerate() {
-                    if let Expr::Var(v) = field_expr {
-                        if v == var_name {
-                            // This variable is assigned to this struct field
-                            if i < field_types.len() {
-                                if let ResolvedType::Vec { elem } = &field_types[i] {
-                                    return Some(*elem.clone());
-                                }
-                            }
-                        }
-                    }
-                    // Recurse into nested struct literals
-                    if let Some(ty) = infer_from_struct_lit(
-                        field_expr, var_name,
-                        field_types.get(i).unwrap_or(&ResolvedType::Void),
-                        registry,
-                    ) {
-                        return Some(ty);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-// ============================================================================
 // Expression resolution
 // ============================================================================
 
@@ -371,7 +207,6 @@ fn resolve_expr(
     expected_ty: &ResolvedType,
     scope: &HashMap<String, ResolvedType>,
     registry: &ToylangRegistry,
-    vec_inferences: &HashMap<String, ResolvedType>,
 ) -> TypedExpr {
     match expr {
         Expr::IntLit(n) => {
@@ -431,7 +266,7 @@ fn resolve_expr(
                         .position(|f| f.name == *field_name)
                         .unwrap_or_else(|| panic!("field '{}' not found in '{}'", field_name, name));
                     let expected = &field_types[field_idx];
-                    let typed = resolve_expr(field_expr, expected, scope, registry, vec_inferences);
+                    let typed = resolve_expr(field_expr, expected, scope, registry);
                     (field_name.clone(), typed)
                 })
                 .collect();
@@ -442,9 +277,9 @@ fn resolve_expr(
             }
         }
 
-        Expr::FnCall { name, args } if name == "println" => {
+        Expr::FnCall { name, type_args: _, args } if name == "println" => {
             let typed_args: Vec<TypedExpr> = args.iter()
-                .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry, vec_inferences))
+                .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry))
                 .collect();
             TypedExpr {
                 kind: TypedExprKind::FnCall {
@@ -456,39 +291,24 @@ fn resolve_expr(
             }
         }
 
-        Expr::FnCall { name, args } => {
+        Expr::FnCall { name, type_args, args } => {
             let func = registry.functions.get(name.as_str())
                 .unwrap_or_else(|| panic!("function '{}' not found in registry", name));
 
             if !func.type_params.is_empty() {
-                // Generic function call — infer type args.
-                // First try: from expected return type (e.g. return position).
-                let mut type_arg_subst = infer_type_args_from_expected(
-                    func, expected_ty, registry,
-                );
+                // Generic function call — type args must be provided explicitly
+                assert_eq!(type_args.len(), func.type_params.len(),
+                    "function '{}' requires {} type args, got {}",
+                    name, func.type_params.len(), type_args.len());
 
-                // Second try: from argument types (e.g. let w = wrap(42)).
-                // Resolve args with Void expected, then match against param patterns.
-                let all_resolved = func.type_params.iter().all(|p| type_arg_subst.contains_key(p));
-                if !all_resolved {
-                    let pre_resolved_args: Vec<TypedExpr> = args.iter()
-                        .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry, vec_inferences))
-                        .collect();
-                    for (i, param) in func.params.iter().enumerate() {
-                        if i < pre_resolved_args.len() {
-                            infer_type_params_from_arg(
-                                &param.ty, &pre_resolved_args[i].ty,
-                                &func.type_params, &mut type_arg_subst,
-                            );
-                        }
-                    }
-                }
+                // Build substitution map directly from explicit type args
+                let type_arg_subst: HashMap<String, String> = func.type_params.iter()
+                    .zip(type_args.iter())
+                    .map(|(param, arg)| (param.clone(), arg.clone()))
+                    .collect();
 
-                // Compute return type from substitution (not just expected_ty,
-                // which may be Void for let bindings)
-                let ret_ty = if expected_ty != &ResolvedType::Void {
-                    expected_ty.clone()
-                } else if let Some(ret_str) = &func.return_ty {
+                // Compute return type from substitution
+                let ret_ty = if let Some(ret_str) = &func.return_ty {
                     let resolved_ret_str = substitute_type_params(ret_str, &type_arg_subst);
                     parse_type_string(&resolved_ret_str, registry)
                 } else {
@@ -499,18 +319,18 @@ fn resolve_expr(
                     .enumerate()
                     .map(|(i, a)| {
                         let param_ty_str = &func.params[i].ty;
-                        // Substitute type params in param type
                         let resolved_param_str = substitute_type_params(param_ty_str, &type_arg_subst);
                         let expected = parse_type_string(&resolved_param_str, registry);
-                        resolve_expr(a, &expected, scope, registry, vec_inferences)
+                        resolve_expr(a, &expected, scope, registry)
                     })
                     .collect();
-                // Extract type args in order for symbol mangling
-                let type_args: Vec<String> = func.type_params.iter()
-                    .filter_map(|p| type_arg_subst.get(p).cloned())
-                    .collect();
+
                 TypedExpr {
-                    kind: TypedExprKind::FnCall { name: name.clone(), type_args, args: typed_args },
+                    kind: TypedExprKind::FnCall {
+                        name: name.clone(),
+                        type_args: type_args.clone(),
+                        args: typed_args,
+                    },
                     ty: ret_ty,
                 }
             } else {
@@ -526,7 +346,7 @@ fn resolve_expr(
                         } else {
                             ResolvedType::Void
                         };
-                        resolve_expr(a, &expected, scope, registry, vec_inferences)
+                        resolve_expr(a, &expected, scope, registry)
                     })
                     .collect();
                 TypedExpr {
@@ -544,8 +364,8 @@ fn resolve_expr(
             } else {
                 ResolvedType::I32 // default for arithmetic
             };
-            let typed_left = resolve_expr(left, &operand_ty, scope, registry, vec_inferences);
-            let typed_right = resolve_expr(right, &operand_ty, scope, registry, vec_inferences);
+            let typed_left = resolve_expr(left, &operand_ty, scope, registry);
+            let typed_right = resolve_expr(right, &operand_ty, scope, registry);
             TypedExpr {
                 kind: TypedExprKind::BinaryOp {
                     op: *op,
@@ -556,14 +376,13 @@ fn resolve_expr(
             }
         }
 
-        Expr::StaticCall { ty, method, args: _ } => {
+        Expr::StaticCall { ty, method, type_args, args: _ } => {
             match (ty.as_str(), method.as_str()) {
                 ("Vec", "new") => {
-                    // Vec element type comes from expected_ty or inference
-                    let elem_ty = match expected_ty {
-                        ResolvedType::Vec { elem } => *elem.clone(),
-                        _ => ResolvedType::Void, // will be refined
-                    };
+                    // Vec element type must be provided explicitly: Vec::new<Point>()
+                    assert!(!type_args.is_empty(),
+                        "Vec::new requires explicit element type: Vec::new<Point>()");
+                    let elem_ty = parse_type_string(&type_args[0], registry);
                     let vec_ty = ResolvedType::Vec { elem: Box::new(elem_ty) };
                     TypedExpr {
                         kind: TypedExprKind::StaticCall {
@@ -579,7 +398,7 @@ fn resolve_expr(
         }
 
         Expr::FieldAccess { receiver, field } => {
-            let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry, vec_inferences);
+            let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry);
             let ResolvedType::Struct { name: struct_name, field_types, .. } = &typed_recv.ty else {
                 panic!("field access on non-struct type: {:?}", typed_recv.ty);
             };
@@ -599,7 +418,7 @@ fn resolve_expr(
         }
 
         Expr::MethodCall { receiver, method, args } => {
-            let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry, vec_inferences);
+            let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry);
 
             match method.as_str() {
                 "push" => {
@@ -608,7 +427,7 @@ fn resolve_expr(
                         _ => panic!("push on non-Vec type: {:?}", typed_recv.ty),
                     };
                     let typed_args: Vec<TypedExpr> = args.iter()
-                        .map(|a| resolve_expr(a, &elem_ty, scope, registry, vec_inferences))
+                        .map(|a| resolve_expr(a, &elem_ty, scope, registry))
                         .collect();
                     TypedExpr {
                         kind: TypedExprKind::MethodCall {
@@ -640,108 +459,17 @@ fn resolve_stmt(
     scope: &mut HashMap<String, ResolvedType>,
     _ret_ty: &ResolvedType,
     registry: &ToylangRegistry,
-    vec_inferences: &HashMap<String, ResolvedType>,
-    let_type_hints: &HashMap<String, ResolvedType>,
 ) -> TypedStmt {
     match stmt {
         Stmt::Let { name, expr } => {
-            // For Vec::new(), use the inferred element type
-            let expected = if is_vec_new(expr) {
-                vec_inferences.get(name.as_str())
-                    .map(|elem| ResolvedType::Vec { elem: Box::new(elem.clone()) })
-                    .unwrap_or(ResolvedType::Void)
-            } else if let Some(hint) = let_type_hints.get(name.as_str()) {
-                hint.clone()
-            } else {
-                ResolvedType::Void
-            };
-
-            let typed_expr = resolve_expr(expr, &expected, scope, registry, vec_inferences);
+            let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry);
             scope.insert(name.clone(), typed_expr.ty.clone());
             TypedStmt::Let { name: name.clone(), expr: typed_expr }
         }
         Stmt::ExprStmt(expr) => {
-            let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry, vec_inferences);
+            let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry);
             TypedStmt::ExprStmt(typed_expr)
         }
-    }
-}
-
-// ============================================================================
-// Generic function type arg inference
-// ============================================================================
-
-/// Infer type arg substitutions for a generic function call from the expected return type.
-fn infer_type_args_from_expected(
-    func: &ToyFunction,
-    expected_ty: &ResolvedType,
-    registry: &ToylangRegistry,
-) -> HashMap<String, String> {
-    let mut subst = HashMap::new();
-    let ret_str = match &func.return_ty {
-        Some(s) => s.clone(),
-        None => return subst,
-    };
-
-    // Direct type param: "T" → match against expected type
-    if func.type_params.contains(&ret_str) {
-        subst.insert(ret_str.clone(), resolved_type_to_string(expected_ty));
-        return subst;
-    }
-
-    // Generic struct pattern: "Wrapper<T>" → match struct type params
-    if let Some(open) = ret_str.find('<') {
-        if ret_str.ends_with('>') {
-            let base = &ret_str[..open];
-            let args_str = &ret_str[open + 1..ret_str.len() - 1];
-            let _ret_args: Vec<&str> = split_type_args(args_str);
-
-            // Get the struct's type params to know the mapping
-            if let Some(toy_struct) = registry.structs.get(base) {
-                // The expected_ty has resolved field types — we need the concrete type args.
-                // For Wrapper<T> → Wrapper<i32>: field_types = [I32], type_params = ["T"]
-                if let ResolvedType::Struct { field_types, .. } = expected_ty {
-                    for (i, param_name) in toy_struct.type_params.iter().enumerate() {
-                        if i < field_types.len() {
-                            subst.insert(param_name.clone(), resolved_type_to_string(&field_types[i]));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    subst
-}
-
-/// Infer type param bindings by matching a resolved argument type against a param type pattern.
-/// For `wrap(42)` with param `x: T`, if arg resolves to i32, then T = i32.
-fn infer_type_params_from_arg(
-    param_ty_str: &str,
-    arg_ty: &ResolvedType,
-    type_params: &[String],
-    subst: &mut HashMap<String, String>,
-) {
-    // Direct type param: param is "T" and T is a type param
-    if type_params.contains(&param_ty_str.to_string()) && !subst.contains_key(param_ty_str) {
-        if arg_ty != &ResolvedType::Void {
-            subst.insert(param_ty_str.to_string(), resolved_type_to_string(arg_ty));
-        }
-    }
-    // TODO: handle generic patterns like "Vec<T>" if needed
-}
-
-fn resolved_type_to_string(ty: &ResolvedType) -> String {
-    match ty {
-        ResolvedType::I32 => "i32".to_string(),
-        ResolvedType::I64 => "i64".to_string(),
-        ResolvedType::F64 => "f64".to_string(),
-        ResolvedType::Bool => "bool".to_string(),
-        ResolvedType::Usize => "usize".to_string(),
-        ResolvedType::Void => "()".to_string(),
-        ResolvedType::Struct { name, .. } => name.clone(),
-        ResolvedType::Vec { elem } => format!("Vec<{}>", resolved_type_to_string(elem)),
-        ResolvedType::Ref { inner } => format!("&{}", resolved_type_to_string(inner)),
-        ResolvedType::Str => "str".to_string(),
     }
 }
 
@@ -991,7 +719,7 @@ mod tests {
                 stmts: vec![
                     Stmt::Let {
                         name: "v".to_string(),
-                        expr: Expr::StaticCall { ty: "Vec".to_string(), method: "new".to_string(), args: vec![] },
+                        expr: Expr::StaticCall { ty: "Vec".to_string(), method: "new".to_string(), type_args: vec!["i32".to_string()], args: vec![] },
                     },
                     Stmt::ExprStmt(Expr::MethodCall {
                         receiver: Box::new(Expr::Var("v".to_string())),
