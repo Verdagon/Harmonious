@@ -121,7 +121,7 @@ fn tokenize(src: &str) -> Vec<Token> {
                 }
                 tokens.push(Token::Ident(chars[start..i].iter().collect()));
             }
-            _ => { i += 1; } // skip unknown chars
+            c => panic!("toylang: unexpected character '{}' in source", c),
         }
     }
 

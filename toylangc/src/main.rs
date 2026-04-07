@@ -56,11 +56,7 @@ fn extract_registry(args: &mut Vec<String>) -> ToylangRegistry {
                 .unwrap_or_else(|e| panic!("toylang: parse error in {}: {}", path, e));
         }
     }
-    // whats this? we should panic if theres no toylang inputs
-    ToylangRegistry {
-        structs: Default::default(),
-        functions: Default::default(),
-    }
+    panic!("toylang: missing --toylang-input argument")
 }
 
 fn find_sysroot_tool(tool_name: &str) -> PathBuf {

@@ -46,9 +46,14 @@ pub fn resolve_fn_body(
     // we need to know Vec<what> at the point of Vec::new().
     let vec_inferences = infer_vec_types(body, &ret_ty, registry);
 
+    // Pre-scan: propagate return type backward to let bindings.
+    // For `fn big() -> i64 { let x = 10; x }`, the return expr is Var("x"),
+    // so x should inherit the expected type i64.
+    let let_type_hints = infer_let_types_from_return(body, &ret_ty);
+
     // Resolve statements
     let stmts: Vec<TypedStmt> = body.stmts.iter()
-        .map(|stmt| resolve_stmt(stmt, &mut scope, &ret_ty, registry, &vec_inferences))
+        .map(|stmt| resolve_stmt(stmt, &mut scope, &ret_ty, registry, &vec_inferences, &let_type_hints))
         .collect();
 
     // Resolve return expression
@@ -207,6 +212,25 @@ fn resolve_field_type(
 
 /// Pre-scan the function body to infer Vec element types for let bindings.
 /// Returns a map: variable name → Vec element ResolvedType.
+/// Propagate the return type backward to let bindings.
+/// If the return expression is `Var("x")`, then `let x = ...` should use the return type
+/// as its expected type. This enables `let x = 3000000000` in a fn returning i64
+/// to correctly infer x as i64.
+fn infer_let_types_from_return(
+    body: &FnBody,
+    ret_ty: &ResolvedType,
+) -> HashMap<String, ResolvedType> {
+    let mut hints = HashMap::new();
+    if *ret_ty == ResolvedType::Void {
+        return hints;
+    }
+    // If the return expression is a simple variable, propagate the return type to it
+    if let Some(Expr::Var(name)) = &body.ret {
+        hints.insert(name.clone(), ret_ty.clone());
+    }
+    hints
+}
+
 fn infer_vec_types(
     body: &FnBody,
     ret_ty: &ResolvedType,
@@ -617,6 +641,7 @@ fn resolve_stmt(
     _ret_ty: &ResolvedType,
     registry: &ToylangRegistry,
     vec_inferences: &HashMap<String, ResolvedType>,
+    let_type_hints: &HashMap<String, ResolvedType>,
 ) -> TypedStmt {
     match stmt {
         Stmt::Let { name, expr } => {
@@ -625,6 +650,8 @@ fn resolve_stmt(
                 vec_inferences.get(name.as_str())
                     .map(|elem| ResolvedType::Vec { elem: Box::new(elem.clone()) })
                     .unwrap_or(ResolvedType::Void)
+            } else if let Some(hint) = let_type_hints.get(name.as_str()) {
+                hint.clone()
             } else {
                 ResolvedType::Void
             };

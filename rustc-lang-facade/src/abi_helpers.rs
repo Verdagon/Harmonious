@@ -62,6 +62,7 @@ pub fn coerced_return_type_for_instance<'tcx>(
         .fn_abi_of_instance(typing_env.as_query_input((instance, ty::List::empty())))
         .expect("fn_abi_of_instance failed");
 
+
     match &fn_abi.ret.mode {
         PassMode::Ignore => CoercedReturn::Void,
         PassMode::Direct(_) => {
@@ -80,6 +81,56 @@ pub fn coerced_return_type_for_instance<'tcx>(
         }
         PassMode::Indirect { .. } => CoercedReturn::Indirect,
     }
+}
+
+/// Describes how a function parameter should be represented in LLVM IR.
+pub enum CoercedParam {
+    /// Passed as the given LLVM type string (e.g. "i64" for a coerced struct,
+    /// "i32" for a scalar). The consumer must convert to the internal type if different.
+    Direct(String),
+    /// Passed by pointer (large structs). The consumer loads from the pointer.
+    /// Panics on on_stack=true (byval) until we have a test case for it.
+    Indirect,
+    /// ZST — not present in the LLVM signature.
+    Ignore,
+}
+
+/// Query rustc for the ABI-coerced LLVM parameter types of a function.
+///
+/// Returns one `CoercedParam` per declared parameter (NOT including sret).
+/// The consumer's extern wrapper uses this to build a signature matching Rust's ABI,
+/// then converts each param to the internal function's expected type.
+pub fn coerced_param_types_for_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> Vec<CoercedParam> {
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    let fn_abi = tcx
+        .fn_abi_of_instance(typing_env.as_query_input((instance, ty::List::empty())))
+        .expect("fn_abi_of_instance failed");
+
+    fn_abi.args.iter().map(|arg| {
+        match &arg.mode {
+            PassMode::Ignore => CoercedParam::Ignore,
+            PassMode::Direct(_) | PassMode::Pair(_, _) => {
+                // Note: for pointer params (&Vec<T>), this produces "i64" on 64-bit,
+                // but the internal function expects ptr. The bitcast-via-memory in the
+                // wrapper handles this correctly (same 8 bytes). LLVM's mem2reg eliminates
+                // the redundant alloca. Future optimization: check arg.layout.backend_repr
+                // for Scalar(Pointer) and produce "ptr" instead.
+                CoercedParam::Direct(format!("i{}", arg.layout.size.bits()))
+            }
+            PassMode::Cast { cast, .. } => {
+                CoercedParam::Direct(cast_target_to_llvm_str(cast))
+            }
+            PassMode::Indirect { on_stack, .. } => {
+                assert!(!on_stack,
+                    "PassMode::Indirect with on_stack=true (byval) not yet supported \
+                     — need a test case on a platform that uses it (e.g. 32-bit x86)");
+                CoercedParam::Indirect
+            }
+        }
+    }).collect()
 }
 
 fn cast_target_to_llvm_str(cast: &CastTarget) -> String {

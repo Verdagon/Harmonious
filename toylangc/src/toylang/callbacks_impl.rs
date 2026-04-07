@@ -125,7 +125,7 @@ impl LangCallbacks for ToylangCallbacks {
         // 1. Rust generic functions (Vec::new, Vec::push, etc.)
         // 2. Other consumer functions (toylang-to-toylang calls)
         let mut rust_deps = if let Some(ref fn_body) = toy_fn.body {
-            collect_rust_deps(tcx, def_id, fn_body, &self.registry)
+            collect_rust_deps(tcx, def_id, fn_body, &self.registry, toy_fn)
         } else {
             vec![]
         };
@@ -169,6 +169,7 @@ fn collect_rust_deps<'tcx>(
     def_id: LocalDefId,
     fn_body: &FnBody,
     registry: &ToylangRegistry,
+    toy_fn: &crate::toylang::registry::ToyFunction,
 ) -> Vec<(DefId, ty::GenericArgsRef<'tcx>)> {
     let fn_sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
 
@@ -191,16 +192,35 @@ fn collect_rust_deps<'tcx>(
         }
     }
 
-    // Third try: scan the body for Vec push calls with struct literal args
+    // Third try: scan the untyped body for Vec push calls with struct literal args
     if elem_ty.is_none() {
         if let Some(struct_name) = crate::llvm_gen::find_vec_elem_from_body(fn_body) {
             elem_ty = crate::oracle::find_local_struct_ty(tcx, &struct_name);
         }
     }
 
+    // Fourth try: scan the typed body for push call argument types
+    if elem_ty.is_none() {
+        if let Some(struct_name) = crate::llvm_gen::find_vec_elem_from_typed_body(
+            &crate::toylang::type_resolve::resolve_fn_body(registry, toy_fn),
+        ) {
+            elem_ty = crate::oracle::find_local_struct_ty(tcx, &struct_name);
+        }
+    }
+
     let elem_ty = match elem_ty {
         Some(t) => t,
-        None => return vec![],
+        None => {
+            let mut needs_new = false;
+            let mut needs_push = false;
+            let mut needs_len = false;
+            scan_body_vec_ops(fn_body, &mut needs_new, &mut needs_push, &mut needs_len);
+            if needs_new || needs_push {
+                panic!("function uses Vec but could not determine element type");
+            }
+            // Only len on a passed-in Vec ref — no elem type needed for deps
+            return vec![];
+        }
     };
 
     let mut deps = Vec::new();

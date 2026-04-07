@@ -259,12 +259,36 @@ made purely from `ResolvedType` via `is_internal_sret()`. This means the interna
 ABI is predictable at any call site without seeing the callee's definition,
 eliminating ordering dependencies between functions.
 
-`codegen_extern_wrapper` takes an `Instance` for `coerced_return_type_for_instance`.
-It handles four cases:
+`codegen_extern_wrapper` takes an `Instance` for ABI queries. It queries
+`fn_abi_of_instance` for both return and parameter ABI info:
+
+**Return adaptation** (4 cases):
 - **Both sret** (Rust indirect + internal sret): pass sret pointer through
 - **Internal sret, Rust direct** (coerced): alloca tmp, call internal, load as coerced type
 - **Both direct** (primitives): forward call + `coerce_int_to_type` (handles i1→i8 for bool)
 - **Void**: forward call
+
+**Parameter adaptation** (`coerced_param_types_for_instance` from `abi_helpers.rs`):
+- Each param's Rust ABI type is derived from `fn_abi.args[i].mode`
+- If Rust ABI type matches internal type: pass through directly
+- If different (e.g. Rust passes `i64` for a `{ i32, i32 }` struct): bitcast via
+  memory (alloca rust type, store, load as internal type)
+- `PassMode::Indirect` (large structs by pointer): load from pointer for internal
+- `PassMode::Ignore` (ZSTs): skipped in LLVM signature
+
+Empirical findings on aarch64 for param `PassMode`:
+- `Point { i32, i32 }` → `Cast` to `i64` (8-byte integer register)
+- `Counter { i32 }` → `Cast` to `i32` (4-byte integer register)
+- `&Vec<T>` → `Direct` with `Scalar(Pointer)`, size=64 bits
+- Primitives (i32, bool, etc.) → `Direct` with matching scalar size
+
+**Known limitation — ref param redundant conversion:** For reference params
+(`&Vec<T>`, `&T`), `fn_abi` reports `Direct` with size=64, which we convert to
+`CoercedParam::Direct("i64")`. The internal function expects `ptr`. Since
+`i64 != ptr` in LLVM type comparison, the bitcast-via-memory path fires
+(alloca i64, store, load as ptr). This is correct but unnecessary — LLVM's
+mem2reg pass eliminates the redundant alloca. A future optimization: detect
+`Scalar(Pointer(...))` in `backend_repr` and emit `ptr` instead of `i64`.
 
 `generate_with_tcx` runs two passes: internal functions first, then extern wrappers.
 

@@ -56,6 +56,8 @@ struct CodegenCtx<'ctx, 'tcx, 'reg> {
     rust_symbols: Vec<String>,
     /// Declared external functions (cached by symbol name)
     declared_fns: HashMap<String, FunctionValue<'ctx>>,
+    /// Vec method functions keyed by method name ("new", "push", "len")
+    vec_fns: HashMap<String, FunctionValue<'ctx>>,
 }
 
 impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
@@ -88,6 +90,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             vars: HashMap::new(),
             rust_symbols: Vec::new(),
             declared_fns: HashMap::new(),
+            vec_fns: HashMap::new(),
         }
     }
 
@@ -466,30 +469,31 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         let usize_ty = self.usize_type();
 
         // Declare Vec::new (sret)
-        let _new_fn = self.declare_external_fn(
+        let new_fn = self.declare_external_fn(
             &new_sym,
             &[ptr_ty.into()],
             None,
             Some((vec_opaque_ty, vec_align)),
         );
+        self.vec_fns.insert("new".to_string(), new_fn);
 
         // Declare Vec::push
-        let _push_fn = self.declare_external_fn(
+        let push_fn = self.declare_external_fn(
             &push_sym,
             &[ptr_ty.into(), ptr_ty.into()],
             None,
             None,
         );
+        self.vec_fns.insert("push".to_string(), push_fn);
 
         // Declare Vec::len
-        let _len_fn = self.declare_external_fn(
+        let len_fn = self.declare_external_fn(
             &len_sym,
             &[ptr_ty.into()],
             Some(usize_ty.into()),
             None,
         );
-
-        // The symbols are now cached in declared_fns; no return value needed.
+        self.vec_fns.insert("len".to_string(), len_fn);
     }
 }
 
@@ -580,9 +584,11 @@ fn codegen_internal_function<'ctx, 'tcx>(
     if uses_vec {
         let elem_name = find_vec_elem_name(ret_ty_name, ctx.registry)
             .or_else(|| find_vec_elem_from_params(func))
-            .or_else(|| find_vec_elem_from_body(body));
-        if let Some(elem) = elem_name {
-            ctx.resolve_vec_symbols(&elem);
+            .or_else(|| find_vec_elem_from_body(body))
+            .or_else(|| find_vec_elem_from_typed_body(&typed_body));
+        match elem_name {
+            Some(elem) => ctx.resolve_vec_symbols(&elem),
+            None => panic!("function uses Vec but could not determine element type"),
         }
     }
 
@@ -733,6 +739,19 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
 
     let rust_sret = matches!(coerced, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
 
+    // Query Rust ABI for parameter types
+    let coerced_params = rustc_lang_facade::abi_helpers::coerced_param_types_for_instance(ctx.tcx, instance);
+    assert_eq!(coerced_params.len(), func.params.len(),
+        "fn_abi.args length mismatch for {}", extern_symbol);
+
+    // Resolve internal types for each param (what the internal function expects)
+    let internal_param_types: Vec<BasicTypeEnum<'ctx>> = func.params.iter()
+        .map(|p| {
+            let resolved = crate::toylang::type_resolve::parse_type_string(&p.ty, ctx.registry);
+            ctx.resolved_to_inkwell(&resolved)
+        })
+        .collect();
+
     // Build extern wrapper signature (matching Rust ABI)
     let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
     let usize_ty = ctx.usize_type();
@@ -741,22 +760,16 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     if rust_sret {
         param_types.push(ptr_ty.into());
     }
-    for p in &func.params {
-        let ty = match p.ty.as_str() {
-            "i32" => ctx.context.i32_type().into(),
-            "i64" => ctx.context.i64_type().into(),
-            "f64" => ctx.context.f64_type().into(),
-            "bool" => ctx.context.bool_type().into(),
-            "usize" => usize_ty.into(),
-            other if other.starts_with("&Vec<") => BasicMetadataTypeEnum::from(ptr_ty),
-            other if other.starts_with("&") => BasicMetadataTypeEnum::from(ptr_ty),
-            other if ctx.registry.structs.contains_key(other) => {
-                let s = &ctx.registry.structs[other];
-                ctx.struct_type(s).into()
+    for coerced in &coerced_params {
+        match coerced {
+            rustc_lang_facade::abi_helpers::CoercedParam::Ignore => {}
+            rustc_lang_facade::abi_helpers::CoercedParam::Direct(ty_str) => {
+                param_types.push(parse_coerced_type(ctx, ty_str).into());
             }
-            other => panic!("unsupported param type '{}'", other),
-        };
-        param_types.push(ty);
+            rustc_lang_facade::abi_helpers::CoercedParam::Indirect => {
+                param_types.push(ptr_ty.into());
+            }
+        }
     }
 
     // Determine Rust ABI LLVM return type
@@ -830,10 +843,37 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
         }
     }
 
-    // Forward real params
-    for i in 0..func.params.len() {
-        let param = function.get_nth_param((i + rust_param_offset) as u32).unwrap();
-        call_args.push(param.into());
+    // Forward real params, converting from Rust ABI to internal ABI where needed
+    let mut rust_llvm_idx = rust_param_offset;
+    for (i, coerced) in coerced_params.iter().enumerate() {
+        match coerced {
+            rustc_lang_facade::abi_helpers::CoercedParam::Ignore => continue,
+            rustc_lang_facade::abi_helpers::CoercedParam::Direct(ty_str) => {
+                let param = function.get_nth_param(rust_llvm_idx as u32).unwrap();
+                rust_llvm_idx += 1;
+                let rust_abi_ty = parse_coerced_type(ctx, ty_str);
+                let internal_ty = internal_param_types[i];
+                if rust_abi_ty == internal_ty {
+                    // Same type (primitives) — pass through
+                    call_args.push(param.into());
+                } else {
+                    // Type mismatch (e.g. Rust passes i64 for { i32, i32 }) —
+                    // bitcast via memory: alloca rust type, store, load as internal type
+                    let alloca = ctx.builder.build_alloca(rust_abi_ty, "param_coerce").unwrap();
+                    ctx.builder.build_store(alloca, param).unwrap();
+                    let converted = ctx.builder.build_load(internal_ty, alloca, "converted").unwrap();
+                    call_args.push(converted.into());
+                }
+            }
+            rustc_lang_facade::abi_helpers::CoercedParam::Indirect => {
+                // Rust passes by pointer — load value for internal (which takes by value)
+                let ptr = function.get_nth_param(rust_llvm_idx as u32).unwrap().into_pointer_value();
+                rust_llvm_idx += 1;
+                let internal_ty = internal_param_types[i];
+                let loaded = ctx.builder.build_load(internal_ty, ptr, "deref_param").unwrap();
+                call_args.push(loaded.into());
+            }
+        }
     }
 
     let call_site = ctx.builder.build_call(internal_fn, &call_args, "wrapper_call").unwrap();
@@ -1087,9 +1127,7 @@ fn lower_typed_expr<'ctx>(
                     let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "vec_new");
                     let vec_llvm_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
 
-                    let new_fn = ctx.declared_fns.iter()
-                        .find(|(name, _)| name.contains("new"))
-                        .map(|(_, f)| *f)
+                    let new_fn = *ctx.vec_fns.get("new")
                         .expect("Vec::new not declared");
 
                     ctx.builder.build_call(new_fn, &[alloca.into()], "").unwrap();
@@ -1166,9 +1204,7 @@ fn lower_typed_expr<'ctx>(
                     let arg_ty = ctx.resolved_to_inkwell(&args[0].ty);
                     let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "push_arg");
 
-                    let push_fn = ctx.declared_fns.iter()
-                        .find(|(name, _)| name.contains("push"))
-                        .map(|(_, f)| *f)
+                    let push_fn = *ctx.vec_fns.get("push")
                         .expect("Vec::push not declared");
 
                     ctx.builder.build_call(push_fn, &[recv_ptr.into(), arg_ptr.into()], "").unwrap();
@@ -1176,9 +1212,7 @@ fn lower_typed_expr<'ctx>(
                 }
 
                 "len" => {
-                    let len_fn = ctx.declared_fns.iter()
-                        .find(|(name, _)| name.contains("len"))
-                        .map(|(_, f)| *f)
+                    let len_fn = *ctx.vec_fns.get("len")
                         .expect("Vec::len not declared");
 
                     let call_site = ctx.builder.build_call(len_fn, &[recv_ptr.into()], "len").unwrap();
@@ -1356,6 +1390,50 @@ fn find_vec_elem_from_expr(expr: &Expr) -> Option<String> {
         Expr::MethodCall { receiver, .. } => find_vec_elem_from_expr(receiver),
         _ => None,
     }
+}
+
+/// Find the Vec element type from the typed body by scanning push call argument types.
+/// Unlike find_vec_elem_from_body (which only matches struct literals), this works
+/// for any expression since the typed AST has resolved types on every node.
+pub fn find_vec_elem_from_typed_body(typed_body: &crate::toylang::typed_ast::TypedFnBody) -> Option<String> {
+    use crate::toylang::typed_ast::*;
+    fn scan_typed_expr(expr: &TypedExpr) -> Option<String> {
+        match &expr.kind {
+            TypedExprKind::MethodCall { method, args, receiver, .. } if method == "push" => {
+                if let Some(arg) = args.first() {
+                    if let ResolvedType::Struct { name, .. } = &arg.ty {
+                        return Some(name.clone());
+                    }
+                }
+                scan_typed_expr(receiver)
+            }
+            TypedExprKind::MethodCall { receiver, .. } => scan_typed_expr(receiver),
+            TypedExprKind::FnCall { args, .. } => {
+                for arg in args {
+                    if let Some(name) = scan_typed_expr(arg) {
+                        return Some(name);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    for stmt in &typed_body.stmts {
+        let expr = match stmt {
+            TypedStmt::Let { expr, .. } => expr,
+            TypedStmt::ExprStmt(expr) => expr,
+        };
+        if let Some(name) = scan_typed_expr(expr) {
+            return Some(name);
+        }
+    }
+    if let Some(ref ret) = typed_body.ret {
+        if let Some(name) = scan_typed_expr(ret) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn parse_generic_type(ty: &str) -> Option<(&str, Vec<&str>)> {

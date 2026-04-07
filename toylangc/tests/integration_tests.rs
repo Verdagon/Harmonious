@@ -920,7 +920,6 @@ fn main() {
 
 // ============================================================================
 #[test]
-#[ignore] // needs: struct passthrough ABI fix for generic identity function
 fn test_generic_callee_with_struct() {
     let output = run_toylang_test(
         r#"
@@ -1642,4 +1641,149 @@ fn main() {
         "#,
     );
     assert!(output.contains("Counter: 42"));
+}
+
+// ============================================================================
+// Bug-exposing tests — these test known fragile patterns
+// ============================================================================
+
+#[test]
+fn test_vec_method_lookup_is_exact() {
+    // This test verifies that Vec::new/push/len are found by exact symbol matching,
+    // not substring matching. The function "renew" contains "new" in its name.
+    // With contains()-based matching, if "renew" is found first in the HashMap,
+    // it would be used instead of Vec::new, causing a type mismatch or crash.
+    // HashMap ordering is nondeterministic, so this may pass intermittently.
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn renew() -> Point {
+    Point { x: 99, y: 88 }
+}
+
+fn new_point() -> Point {
+    Point { x: 1, y: 2 }
+}
+
+fn make_vec() -> Vec<Point> {
+    let fresh = renew();
+    let also_new = new_point();
+    let v = Vec::new();
+    v.push(fresh);
+    v.push(also_new);
+    v
+}
+
+fn vec_len(v: &Vec<Point>) -> usize {
+    v.len()
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let v = make_vec();
+    let n = vec_len(&v);
+    println!("len: {}", n);
+    assert_eq!(n, 2);
+}
+        "#,
+    );
+    assert!(output.contains("len: 2"));
+}
+
+#[test]
+fn test_vec_push_fn_call_result() {
+    let output = run_toylang_test(
+        r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn make_point() -> Point {
+    Point { x: 5, y: 6 }
+}
+
+fn main() {
+    let v = Vec::new();
+    v.push(make_point());
+    println("len: {}", v.len());
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    __toylang_main();
+}
+        "#,
+    );
+    assert!(output.contains("len: 1"));
+}
+
+#[test]
+fn test_lexer_rejects_unknown_chars() {
+    // The @ should cause a compilation error.
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+
+    std::fs::write(&toylang_path, r#"
+fn foo() -> i32 {
+    @42
+}
+    "#).unwrap();
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { println!("{}", foo()); }
+    "#).unwrap();
+
+    let compile = Command::new(toylangc_bin())
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .args(&[
+            "--edition", "2021",
+            "--toylang-input", toylang_path.to_str().unwrap(),
+            rust_path.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run toylangc");
+
+    assert!(!compile.status.success(),
+        "compilation should have failed due to unknown character @, but succeeded");
+}
+
+#[test]
+fn test_int_literal_infers_i64_from_return_type() {
+    // The value 3000000000 exceeds i32 max (2147483647) but fits in i64.
+    // If the literal is typed as i32, it wraps/truncates to a wrong value.
+    // After fix: backward type inference from return type → let binding → literal.
+    let output = run_toylang_test(
+        r#"
+fn big() -> i64 {
+    let x = 3000000000;
+    x
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+fn main() {
+    let v = big();
+    println!("big: {}", v);
+    assert_eq!(v, 3000000000i64);
+}
+        "#,
+    );
+    assert!(output.contains("big: 3000000000"));
 }
