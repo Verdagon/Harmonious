@@ -437,12 +437,40 @@ fn resolve_expr(
                 .unwrap_or_else(|| panic!("function '{}' not found in registry", name));
 
             if !func.type_params.is_empty() {
-                // Generic function call — infer type args from expected return type.
-                // Build a substitution map: type param name → concrete type string.
-                let type_arg_subst = infer_type_args_from_expected(
+                // Generic function call — infer type args.
+                // First try: from expected return type (e.g. return position).
+                let mut type_arg_subst = infer_type_args_from_expected(
                     func, expected_ty, registry,
                 );
-                let ret_ty = expected_ty.clone();
+
+                // Second try: from argument types (e.g. let w = wrap(42)).
+                // Resolve args with Void expected, then match against param patterns.
+                let all_resolved = func.type_params.iter().all(|p| type_arg_subst.contains_key(p));
+                if !all_resolved {
+                    let pre_resolved_args: Vec<TypedExpr> = args.iter()
+                        .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry, vec_inferences))
+                        .collect();
+                    for (i, param) in func.params.iter().enumerate() {
+                        if i < pre_resolved_args.len() {
+                            infer_type_params_from_arg(
+                                &param.ty, &pre_resolved_args[i].ty,
+                                &func.type_params, &mut type_arg_subst,
+                            );
+                        }
+                    }
+                }
+
+                // Compute return type from substitution (not just expected_ty,
+                // which may be Void for let bindings)
+                let ret_ty = if expected_ty != &ResolvedType::Void {
+                    expected_ty.clone()
+                } else if let Some(ret_str) = &func.return_ty {
+                    let resolved_ret_str = substitute_type_params(ret_str, &type_arg_subst);
+                    parse_type_string(&resolved_ret_str, registry)
+                } else {
+                    ResolvedType::Void
+                };
+
                 let typed_args: Vec<TypedExpr> = args.iter()
                     .enumerate()
                     .map(|(i, a)| {
@@ -656,6 +684,23 @@ fn infer_type_args_from_expected(
         }
     }
     subst
+}
+
+/// Infer type param bindings by matching a resolved argument type against a param type pattern.
+/// For `wrap(42)` with param `x: T`, if arg resolves to i32, then T = i32.
+fn infer_type_params_from_arg(
+    param_ty_str: &str,
+    arg_ty: &ResolvedType,
+    type_params: &[String],
+    subst: &mut HashMap<String, String>,
+) {
+    // Direct type param: param is "T" and T is a type param
+    if type_params.contains(&param_ty_str.to_string()) && !subst.contains_key(param_ty_str) {
+        if arg_ty != &ResolvedType::Void {
+            subst.insert(param_ty_str.to_string(), resolved_type_to_string(arg_ty));
+        }
+    }
+    // TODO: handle generic patterns like "Vec<T>" if needed
 }
 
 fn resolved_type_to_string(ty: &ResolvedType) -> String {

@@ -958,7 +958,6 @@ fn main() {
 }
 
 #[test]
-#[ignore] // needs: type inference for generic FnCall in let binding (no expected type context)
 fn test_generic_callee_in_let() {
     let output = run_toylang_test(
         r#"
