@@ -72,9 +72,14 @@ pub fn coerced_return_type_for_instance<'tcx>(
             CoercedReturn::Direct(format!("i{}", size.bits()))
         }
         PassMode::Pair(_, _) => {
-            // ScalarPair — two values. For simplicity, treat as the natural type.
-            // This case is rare for extern functions.
-            CoercedReturn::Direct(format!("i{}", fn_abi.ret.layout.size.bits()))
+            // ScalarPair — two values returned in registers.
+            if let rustc_abi::BackendRepr::ScalarPair(s1, s2) = fn_abi.ret.layout.backend_repr {
+                let a_str = primitive_to_llvm_str(s1.primitive());
+                let b_str = primitive_to_llvm_str(s2.primitive());
+                CoercedReturn::Direct(format!("{{ {}, {} }}", a_str, b_str))
+            } else {
+                CoercedReturn::Direct(format!("i{}", fn_abi.ret.layout.size.bits()))
+            }
         }
         PassMode::Cast { cast, .. } => {
             CoercedReturn::Direct(cast_target_to_llvm_str(cast))
@@ -88,8 +93,7 @@ pub enum CoercedParam {
     /// Passed as the given LLVM type string (e.g. "i64" for a coerced struct,
     /// "i32" for a scalar). The consumer must convert to the internal type if different.
     Direct(String),
-    /// Passed by pointer (large structs). The consumer loads from the pointer.
-    /// Panics on on_stack=true (byval) until we have a test case for it.
+    /// Passed by pointer (large structs, or byval on 32-bit x86).
     Indirect,
     /// ZST — not present in the LLVM signature.
     Ignore,
@@ -112,7 +116,7 @@ pub fn coerced_param_types_for_instance<'tcx>(
     fn_abi.args.iter().map(|arg| {
         match &arg.mode {
             PassMode::Ignore => CoercedParam::Ignore,
-            PassMode::Direct(_) | PassMode::Pair(_, _) => {
+            PassMode::Direct(_) => {
                 // Check if this is a pointer type (e.g. &Vec<T>, &T)
                 if let rustc_abi::BackendRepr::Scalar(scalar) = arg.layout.backend_repr {
                     if matches!(scalar.primitive(), rustc_abi::Primitive::Pointer(_)) {
@@ -121,15 +125,20 @@ pub fn coerced_param_types_for_instance<'tcx>(
                 }
                 CoercedParam::Direct(format!("i{}", arg.layout.size.bits()))
             }
+            PassMode::Pair(_, _) => {
+                // ScalarPair — two values passed in registers.
+                if let rustc_abi::BackendRepr::ScalarPair(s1, s2) = arg.layout.backend_repr {
+                    let a_str = primitive_to_llvm_str(s1.primitive());
+                    let b_str = primitive_to_llvm_str(s2.primitive());
+                    CoercedParam::Direct(format!("{{ {}, {} }}", a_str, b_str))
+                } else {
+                    CoercedParam::Direct(format!("i{}", arg.layout.size.bits()))
+                }
+            }
             PassMode::Cast { cast, .. } => {
                 CoercedParam::Direct(cast_target_to_llvm_str(cast))
             }
-            PassMode::Indirect { on_stack, .. } => {
-                assert!(!on_stack,
-                    "PassMode::Indirect with on_stack=true (byval) not yet supported \
-                     — need a test case on a platform that uses it (e.g. 32-bit x86)");
-                CoercedParam::Indirect
-            }
+            PassMode::Indirect { .. } => CoercedParam::Indirect,
         }
     }).collect()
 }
@@ -159,6 +168,17 @@ fn cast_target_to_llvm_str(cast: &CastTarget) -> String {
             parts.push(unit_str.clone());
         }
         format!("{{ {} }}", parts.join(", "))
+    }
+}
+
+fn primitive_to_llvm_str(prim: rustc_abi::Primitive) -> String {
+    match prim {
+        rustc_abi::Primitive::Int(int, _signed) => format!("i{}", int.size().bits()),
+        rustc_abi::Primitive::Float(rustc_abi::Float::F16) => "half".to_string(),
+        rustc_abi::Primitive::Float(rustc_abi::Float::F32) => "float".to_string(),
+        rustc_abi::Primitive::Float(rustc_abi::Float::F64) => "double".to_string(),
+        rustc_abi::Primitive::Float(rustc_abi::Float::F128) => "fp128".to_string(),
+        rustc_abi::Primitive::Pointer(_) => "ptr".to_string(),
     }
 }
 

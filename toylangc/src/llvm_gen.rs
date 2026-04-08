@@ -154,7 +154,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
     fn struct_type(&self, s: &ToyStruct) -> StructType<'ctx> {
         let fields: Vec<BasicTypeEnum<'ctx>> = s.fields.iter()
             .map(|f| {
-                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&f.rust_type, self.registry);
+                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&f.rust_type, self.registry)
+                    .expect("struct field resolution should succeed (already validated)");
                 self.resolved_to_inkwell(&resolved)
             })
             .collect();
@@ -198,7 +199,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         let fields: Vec<BasicTypeEnum<'ctx>> = toy_struct.fields.iter()
             .map(|f| {
                 let resolved = crate::toylang::type_resolve::substitute_type_params(&f.rust_type, &subst);
-                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&resolved, self.registry);
+                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&resolved, self.registry)
+                    .expect("struct field resolution should succeed (already validated)");
                 self.resolved_to_inkwell(&resolved)
             })
             .collect();
@@ -501,7 +503,8 @@ fn codegen_internal_function<'ctx, 'tcx>(
     let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> ResolvedType {
         crate::oracle::rust_method_return_type(ctx.tcx, type_name, method, type_args)
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret);
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret)
+        .expect("type resolution should succeed (already validated)");
 
     // Resolve any Rust method symbols used in this function by walking the typed body
     resolve_rust_methods_from_typed_body(ctx, &typed_body);
@@ -534,7 +537,8 @@ fn codegen_internal_function<'ctx, 'tcx>(
 
     // Real parameters
     for p in &func.params {
-        let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry);
+        let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry)
+            .expect("param type resolution should succeed (already validated)");
         let ty: BasicMetadataTypeEnum<'ctx> = ctx.resolved_to_inkwell(&resolved).into();
         param_types.push(ty);
         param_names.push(p.name.clone());
@@ -619,8 +623,10 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     internal_symbol: &str,
 ) {
     // Resolve the return type for internal ABI decisions
-    let ret_resolved = crate::toylang::type_resolve::resolve_return_type(ctx.registry, func);
-    let ret_resolved = crate::toylang::type_resolve::resolve_struct_fields(&ret_resolved, ctx.registry);
+    let ret_resolved = crate::toylang::type_resolve::resolve_return_type(ctx.registry, func)
+        .expect("return type resolution should succeed (already validated)");
+    let ret_resolved = crate::toylang::type_resolve::resolve_struct_fields(&ret_resolved, ctx.registry)
+        .expect("return type struct resolution should succeed (already validated)");
     let internal_sret = is_internal_sret(&ret_resolved);
 
     // Query Rust ABI for the extern wrapper's return convention
@@ -643,7 +649,8 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     // Resolve internal types for each param (what the internal function expects)
     let internal_param_types: Vec<BasicTypeEnum<'ctx>> = func.params.iter()
         .map(|p| {
-            let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry);
+            let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry)
+                .expect("param type resolution should succeed (already validated)");
             ctx.resolved_to_inkwell(&resolved)
         })
         .collect();
@@ -1169,38 +1176,9 @@ fn split_respecting_braces(s: &str) -> Vec<&str> {
 /// Parse an LLVM struct type string like "{ i32, i64 }" into an inkwell StructType.
 fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> StructType<'ctx> {
     let inner = s.trim().trim_start_matches('{').trim_end_matches('}').trim();
-    // Depth-aware split: don't split on commas inside nested { }
     let field_strs = split_respecting_braces(inner);
     let fields: Vec<BasicTypeEnum<'ctx>> = field_strs.iter()
-        .map(|f| {
-            let f = f.trim();
-            match f {
-                "i32" => ctx.context.i32_type().into(),
-                "i64" => ctx.context.i64_type().into(),
-                "double" => ctx.context.f64_type().into(),
-                "i1" => ctx.context.bool_type().into(),
-                _ if f.starts_with("[") && f.ends_with("]") => {
-                    // Array type like "[24 x i8]"
-                    let inner = &f[1..f.len()-1].trim(); // "24 x i8"
-                    let parts: Vec<&str> = inner.split(" x ").collect();
-                    let count: u32 = parts[0].trim().parse().unwrap();
-                    let elem = parts[1].trim();
-                    match elem {
-                        "i8" => ctx.context.i8_type().array_type(count).into(),
-                        _ => panic!("unsupported array element type in struct string: '{}'", elem),
-                    }
-                }
-                _ if f.starts_with("{ ") || f.starts_with("{") => {
-                    // Nested struct — recurse
-                    parse_struct_type_str(ctx, f).into()
-                }
-                _ if f.starts_with("i") => {
-                    let bits: u32 = f[1..].parse().unwrap_or_else(|_| panic!("bad int type: {}", f));
-                    ctx.int_type(bits).into()
-                }
-                _ => panic!("unsupported type in struct string: '{}'", f),
-            }
-        })
+        .map(|f| parse_coerced_type(ctx, f.trim()))
         .collect();
     ctx.context.struct_type(&fields, false)
 }
@@ -1253,6 +1231,9 @@ fn resolve_rust_symbol<'tcx>(
 fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTypeEnum<'ctx> {
     if s == "ptr" {
         return ctx.context.ptr_type(AddressSpace::default()).into();
+    }
+    if s == "double" {
+        return ctx.context.f64_type().into();
     }
     if s.starts_with("i") {
         let bits: u32 = s[1..].parse().unwrap_or_else(|_| panic!("bad coerced type: {}", s));
@@ -1421,7 +1402,9 @@ fn resolve_function_for_instance<'tcx>(
         return_ty: toy_fn.return_ty.as_ref().map(|rt| {
             crate::toylang::type_resolve::substitute_type_params(rt, &type_arg_subst)
         }),
-        body: toy_fn.body.clone(),
+        body: toy_fn.body.as_ref().map(|b| {
+            crate::toylang::type_resolve::substitute_type_params_in_body(b, &type_arg_subst)
+        }),
     }
 }
 

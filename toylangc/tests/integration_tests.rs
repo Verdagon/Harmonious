@@ -169,7 +169,7 @@ struct Pair<A, B> {
 }
 
 fn make_pair() -> Pair<i32, i32> {
-    Pair { first: 10, second: 20 }
+    Pair<i32, i32> { first: 10, second: 20 }
 }
         "#,
         r#"
@@ -298,7 +298,7 @@ struct Pair<A, B> {
 }
 
 fn make_pair() -> Pair<i32, i64> {
-    Pair { first: 10, second: 2000000000000 }
+    Pair<i32, i64> { first: 10, second: 2000000000000 }
 }
         "#,
         r#"
@@ -326,7 +326,7 @@ struct Pair<A, B> {
 }
 
 fn make_pair() -> Pair<bool, i32> {
-    Pair { first: true, second: 99 }
+    Pair<bool, i32> { first: true, second: 99 }
 }
         "#,
         r#"
@@ -635,7 +635,7 @@ struct ToyWrapper<T> {
 fn wrap_vec() -> ToyWrapper<Vec<i32, Global>> {
     let v = Vec::new<i32, Global>();
     v.push(42);
-    ToyWrapper { inner: v }
+    ToyWrapper<Vec<i32, Global>> { inner: v }
 }
         "#,
         r#"
@@ -691,7 +691,7 @@ struct ToyWrapper<T> {
 }
 
 fn wrap_point() -> ToyWrapper<ToyPoint> {
-    ToyWrapper { inner: ToyPoint { x: 5, y: 6 } }
+    ToyWrapper<ToyPoint> { inner: ToyPoint { x: 5, y: 6 } }
 }
         "#,
         r#"
@@ -841,7 +841,7 @@ fn make_mixed() -> ToyGenMixed<i32> {
     let v = Vec::new<i32, Global>();
     v.push(10);
     v.push(20);
-    ToyGenMixed { a: 42, b: v, c: 99 }
+    ToyGenMixed<i32> { a: 42, b: v, c: 99 }
 }
         "#,
         r#"
@@ -874,7 +874,7 @@ struct Wrapper<T> {
 }
 
 fn wrap<T>(x: T) -> Wrapper<T> {
-    Wrapper { inner: x }
+    Wrapper<T> { inner: x }
 }
         "#,
         r#"
@@ -900,7 +900,7 @@ struct Wrapper<T> {
 }
 
 fn wrap<T>(x: T) -> Wrapper<T> {
-    Wrapper { inner: x }
+    Wrapper<T> { inner: x }
 }
 
 fn wrap_i32(x: i32) -> Wrapper<i32> {
@@ -998,7 +998,7 @@ struct Wrapper<T> {
 }
 
 fn wrap<T>(x: T) -> Wrapper<T> {
-    Wrapper { inner: x }
+    Wrapper<T> { inner: x }
 }
 
 fn use_wrap() -> i32 {
@@ -1153,7 +1153,7 @@ struct Pair<A, B> {
 }
 
 fn make_pair() -> Pair<i64, i64> {
-    Pair { first: 100, second: 200 }
+    Pair<i64, i64> { first: 100i64, second: 200i64 }
 }
         "#,
         r#"

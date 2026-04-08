@@ -1,9 +1,10 @@
 # Known Technical Debt
 
-> Last updated: session 5 (55 tests passing, 0 ignored)
+> Last updated: session 6 (55 tests passing, 0 ignored)
 >
 > Items 1–9 from the original list are resolved. Item 10 (panics) expanded
 > into a broader set of issues discovered during a fresh codebase scan.
+> Items 15–18 added from a second scan focusing on string-based lookups.
 
 ---
 
@@ -255,6 +256,97 @@ borrow checker constraints. O(n²) copies for n structs.
 
 The clone count is bounded by the number of top-level definitions, which is
 small. Could refactor with indices or split borrows if performance matters.
+
+---
+
+## 15. String-Based StaticCall and MethodCall Names
+
+### Problem
+
+`StaticCall { ty: String, method: String }` and `MethodCall { method: String }`
+keep the type and method names as plain strings in both the untyped and typed AST.
+The type name (e.g. `"Vec"`) is never resolved to a `ResolvedType` or `DefId` at
+the AST level — it stays a string that gets looked up by name later in codegen
+via `find_rust_type_def_id`. Similarly the method name is a string matched by
+`find_inherent_method`.
+
+### Fix Options
+
+**Option A: Resolve to DefId during type resolution.** The type resolver already
+has access to `rust_method_ret` (which calls into oracle). Add a callback to
+resolve type+method to a `DefId` pair during type resolution, and store that in
+the typed AST instead of strings.
+
+**Option B: Keep strings but validate early.** During type resolution, validate
+that the type and method exist (via the existing callbacks) and panic/error if
+not. Strings stay in the AST but are guaranteed valid. Lower risk than Option A.
+
+---
+
+## 16. Hand-Rolled Symbol Mangling
+
+### Problem
+
+`compute_fn_symbol` in `callbacks_impl.rs` and `resolved_type_to_mangled_name`
+in `llvm_gen.rs` build mangled symbols by hand with string formatting (e.g.
+`__toylang_impl_wrap__i32`). This works for toylang-defined functions but is
+fragile — it doesn't use rustc's `tcx.symbol_name()` and could produce
+collisions or non-demanglable names for complex types.
+
+### Fix Options
+
+**Option A: Use `tcx.symbol_name()` for toylang functions.** Build a proper
+`Instance` for each toylang function and use rustc's mangling. Requires toylang
+functions to have valid `DefId`s (they already do via stubs).
+
+**Option B: Keep hand-rolled but harden.** Cover all `ResolvedType` variants
+exhaustively (already done for `mangle_ty_for_symbol` after tech debt #3 fix).
+Accept that the scheme diverges from rustc's mangling. Acceptable for a POC.
+
+---
+
+## 17. Struct/Type Lookups by Name String
+
+### Problem
+
+Throughout the codebase, structs and types are looked up via
+`registry.structs.get(name)` and `find_rust_type_def_id(tcx, name)` using string
+names. A production compiler would resolve names to `DefId`s or indices early
+(during parsing or type resolution) and carry those forward, avoiding repeated
+string lookups and potential name collisions.
+
+### Fix Options
+
+**Option A: Resolve to indices during parsing.** Parser assigns each struct a
+numeric ID. All references use the ID instead of the name string. Registry
+becomes index-based.
+
+**Option B: Resolve to DefId during type resolution.** After stub generation,
+each toylang struct has a `DefId`. The type resolver stores `DefId`s alongside
+names in `ResolvedType::Struct` / `ResolvedType::RustType`. Downstream code
+uses the `DefId` directly.
+
+---
+
+## 18. `find_rust_type_def_id` Hardcoded Diagnostic Items
+
+### Problem
+
+In `oracle.rs:192-201`, only `"Vec"` is mapped to a rustc diagnostic item. All
+other Rust type names fall through to `find_local_struct_def_id`, which does a
+linear scan of local definitions by name string. This is fragile: it won't find
+types from external crates (unless re-exported locally), can't handle module
+paths, and could match the wrong type on name collisions.
+
+### Fix Options
+
+**Option A: Expand the diagnostic item map.** Add entries for commonly used Rust
+types (`String`, `HashMap`, `Option`, `Box`, etc.). Each maps to its well-known
+`rustc_diagnostic_item` symbol.
+
+**Option B: Use `tcx.resolve_path()` or equivalent.** Instead of matching names,
+resolve the full path (e.g. `std::collections::HashMap`) through rustc's name
+resolution. Requires toylang to specify full paths for Rust types.
 
 ---
 

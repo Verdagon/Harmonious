@@ -53,7 +53,7 @@ fn extract_registry(args: &mut Vec<String>) -> ToylangRegistry {
             let src = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("toylang: cannot read {}: {}", path, e));
             return crate::toylang::parser::parse(&src)
-                .unwrap_or_else(|e| panic!("toylang: parse error in {}: {}", path, e));
+                .unwrap_or_else(|e| panic!("toylang: parse error in {}: {:?}", path, e));
         }
     }
     panic!("toylang: missing --toylang-input argument")

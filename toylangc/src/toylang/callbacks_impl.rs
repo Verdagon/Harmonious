@@ -40,8 +40,65 @@ impl LangCallbacks for ToylangCallbacks {
         names
     }
 
-    fn after_rust_analysis<'tcx>(&self, _tcx: TyCtxt<'tcx>) {
-        // TODO: toylang type checking against Rust types
+    fn after_rust_analysis<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+        let mut errors: Vec<String> = Vec::new();
+
+        // Check 1: Every toylang struct is visible to rustc
+        for (name, _) in &self.registry.structs {
+            if crate::oracle::find_local_struct_def_id(tcx, name).is_none() {
+                errors.push(format!("struct '{}' not found in rustc (stub generation may have failed)", name));
+            }
+        }
+
+        // Check 2: Every toylang function with a body has a stub
+        for (name, func) in &self.registry.functions {
+            if func.body.is_none() { continue; }
+            let stub_name = if name == "main" { crate::oracle::TOYLANG_MAIN } else { name.as_str() };
+            if find_stub_fn_def_id(tcx, stub_name).is_none() {
+                errors.push(format!("function '{}' has no stub in __lang_stubs (expected '{}')", name, stub_name));
+            }
+        }
+
+        // Check 3: Rust types referenced in field types exist
+        for (struct_name, toy_struct) in &self.registry.structs {
+            for field in &toy_struct.fields {
+                for rust_name in collect_rust_type_names(&field.rust_type) {
+                    if crate::oracle::find_rust_type_def_id(tcx, &rust_name).is_none() {
+                        errors.push(format!(
+                            "struct '{}' field '{}': Rust type '{}' not found",
+                            struct_name, field.name, rust_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Check 4: Extern functions exist in Rust
+        for (name, func) in &self.registry.functions {
+            if func.body.is_some() { continue; }
+            if crate::oracle::find_extern_fn_def_id(tcx, name).is_none() {
+                errors.push(format!("extern function '{}' not found in Rust code", name));
+            }
+        }
+
+        // Check 5: Type-resolve non-generic function bodies
+        for (name, func) in &self.registry.functions {
+            if func.body.is_none() || !func.type_params.is_empty() { continue; }
+            let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
+                crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
+            };
+            if let Err(e) = crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret) {
+                errors.push(format!("function '{}': {:?}", name, e));
+            }
+        }
+
+        if !errors.is_empty() {
+            eprintln!("[toylang] validation failed with {} error(s):", errors.len());
+            for e in &errors {
+                eprintln!("  - {}", e);
+            }
+            panic!("[toylang] aborting due to validation errors");
+        }
     }
 
     fn generate_stubs(&self) -> String {
@@ -209,7 +266,9 @@ fn collect_toylang_fn_deps<'tcx>(
             }).collect(),
             return_ty: caller_fn.return_ty.as_ref()
                 .map(|rt| crate::toylang::type_resolve::substitute_type_params(rt, &subst)),
-            body: caller_fn.body.clone(),
+            body: caller_fn.body.as_ref().map(|b| {
+                crate::toylang::type_resolve::substitute_type_params_in_body(b, &subst)
+            }),
         }
     } else {
         caller_fn.clone()
@@ -219,7 +278,8 @@ fn collect_toylang_fn_deps<'tcx>(
     let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
         crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, &resolved_caller, &rust_method_ret);
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, &resolved_caller, &rust_method_ret)
+        .expect("type resolution should succeed (already validated)");
 
     // Walk typed body for both toylang FnCall deps and Rust method deps
     let mut deps = Vec::new();
@@ -239,7 +299,7 @@ fn collect_toylang_fn_deps<'tcx>(
                 deps.push((callee_def_id, args));
             } else {
                 let ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-                    .map(|rt| ty::GenericArg::from(resolved_to_rustc_ty(tcx, rt)))
+                    .map(|rt| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(tcx, rt)))
                     .collect();
                 let args = tcx.mk_args(&ty_args);
                 deps.push((callee_def_id, args));
@@ -261,7 +321,7 @@ fn collect_toylang_fn_deps<'tcx>(
 
         // Build generic args: convert ResolvedType type_args to rustc Ty (all explicit)
         let all_ty_args: Vec<ty::GenericArg<'tcx>> = dep.type_args.iter()
-            .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+            .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(tcx, ta)))
             .collect();
         let expected_count = tcx.generics_of(method_def_id).count();
         let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
@@ -358,11 +418,6 @@ fn walk_typed_expr_for_deps(
     }
 }
 
-/// Convert a ResolvedType to a rustc Ty.
-fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::typed_ast::ResolvedType) -> Ty<'tcx> {
-    crate::oracle::resolved_to_rustc_ty(tcx, resolved)
-}
-
 /// Convert a type string to a rustc Ty.
 /// Find a function's DefId in __lang_stubs by name.
 fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id::DefId> {
@@ -380,6 +435,24 @@ fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id
         }
     }
     None
+}
+
+/// Recursively collect all RustType names referenced in a ResolvedType.
+fn collect_rust_type_names(ty: &crate::toylang::typed_ast::ResolvedType) -> Vec<String> {
+    use crate::toylang::typed_ast::ResolvedType;
+    let mut names = Vec::new();
+    match ty {
+        ResolvedType::RustType { name, type_args } => {
+            names.push(name.clone());
+            for ta in type_args { names.extend(collect_rust_type_names(ta)); }
+        }
+        ResolvedType::StructRef { type_args, .. } | ResolvedType::Struct { type_args, .. } => {
+            for ta in type_args { names.extend(collect_rust_type_names(ta)); }
+        }
+        ResolvedType::Ref { inner } => { names.extend(collect_rust_type_names(inner)); }
+        _ => {}
+    }
+    names
 }
 
 /// Compute the extern symbol for a consumer function instance.
@@ -415,7 +488,15 @@ fn mangle_ty_for_symbol<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
                 format!("{}_{}", name, arg_strs.join("_"))
             }
         }
-        _ => format!("{:?}", ty),
+        TyKind::Str => "str".to_string(),
+        TyKind::Ref(_, inner_ty, _) => format!("ref_{}", mangle_ty_for_symbol(tcx, *inner_ty)),
+        TyKind::RawPtr(inner_ty, _) => format!("ptr_{}", mangle_ty_for_symbol(tcx, *inner_ty)),
+        TyKind::Slice(elem_ty) => format!("slice_{}", mangle_ty_for_symbol(tcx, *elem_ty)),
+        TyKind::Tuple(tys) => {
+            let parts: Vec<String> = tys.iter().map(|t| mangle_ty_for_symbol(tcx, t)).collect();
+            format!("tuple_{}", parts.join("_"))
+        }
+        _ => panic!("mangle_ty_for_symbol: unsupported type {:?}", ty),
     }
 }
 

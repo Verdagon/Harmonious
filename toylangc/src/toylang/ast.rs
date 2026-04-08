@@ -11,7 +11,7 @@ pub enum BinOp {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum Expr {
-    IntLit(i64),
+    IntLit(i64, crate::toylang::typed_ast::ResolvedType),
     BoolLit(bool),
     StringLit(String),
     Var(String),
@@ -21,8 +21,8 @@ pub enum Expr {
     MethodCall { receiver: Box<Expr>, method: String, args: Vec<Expr> },
     /// `p.x` — expr "." IDENT
     FieldAccess { receiver: Box<Expr>, field: String },
-    /// `Point { x: 1, y: 2 }` — IDENT "{" field_inits "}"
-    StructLit { name: String, fields: Vec<(String, Expr)> },
+    /// `Point { x: 1, y: 2 }` or `Pair<i32, i64> { first: 1, second: 2i64 }`
+    StructLit { name: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, fields: Vec<(String, Expr)> },
     /// `wrap<i32>(x)` — IDENT "<" type_args ">" "(" args ")"
     FnCall { name: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, args: Vec<Expr> },
     /// `a + b`, `x * 2`

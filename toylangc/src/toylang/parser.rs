@@ -6,6 +6,21 @@ use super::typed_ast::ResolvedType;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq)]
+pub enum ParseError {
+    UnknownIntSuffix { suffix: String },
+    UnexpectedCharacter { ch: char },
+    UnexpectedToken { expected: String, got: String },
+    UnexpectedTopLevelToken { got: String },
+    ExpectedExpression { got: String },
+    ExpectedType { got: String },
+    ExpectedPointerQualifier { got: String },
+}
+
+// ---------------------------------------------------------------------------
 // Lexer
 // ---------------------------------------------------------------------------
 
@@ -30,12 +45,12 @@ enum Token {
     Dot,       // .
     Semicolon, // ;
     Equals,    // =
-    IntLit(i64),
+    IntLit(i64, ResolvedType),
     StringLit(String),
     Eof,
 }
 
-fn tokenize(src: &str) -> Vec<Token> {
+fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
@@ -87,14 +102,37 @@ fn tokenize(src: &str) -> Vec<Token> {
             continue;
         }
 
-        // Digit sequences
+        // Digit sequences with optional type suffix (i32, i64, usize)
         if chars[i].is_ascii_digit() {
             let start = i;
             while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
             }
             let s: String = chars[start..i].iter().collect();
-            tokens.push(Token::IntLit(s.parse::<i64>().unwrap()));
+            let value: i64 = s.parse().unwrap();
+            // Check for type suffix
+            if i < chars.len() && (chars[i] == 'i' || chars[i] == 'u') {
+                let suf_start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let suffix: String = chars[suf_start..i].iter().collect();
+                let ty = match suffix.as_str() {
+                    "i32" => ResolvedType::I32,
+                    "i64" => ResolvedType::I64,
+                    "usize" => ResolvedType::Usize,
+                    _ => return Err(ParseError::UnknownIntSuffix { suffix }),
+                };
+                tokens.push(Token::IntLit(value, ty));
+            } else {
+                // No suffix: default to i32 unless value overflows
+                let ty = if value > i32::MAX as i64 || value < i32::MIN as i64 {
+                    ResolvedType::I64
+                } else {
+                    ResolvedType::I32
+                };
+                tokens.push(Token::IntLit(value, ty));
+            }
             continue;
         }
 
@@ -122,12 +160,12 @@ fn tokenize(src: &str) -> Vec<Token> {
                 }
                 tokens.push(Token::Ident(chars[start..i].iter().collect()));
             }
-            c => panic!("toylang: unexpected character '{}' in source", c),
+            c => return Err(ParseError::UnexpectedCharacter { ch: c }),
         }
     }
 
     tokens.push(Token::Eof);
-    tokens
+    Ok(tokens)
 }
 
 // ---------------------------------------------------------------------------
@@ -137,14 +175,11 @@ fn tokenize(src: &str) -> Vec<Token> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
-    /// Struct names accumulated during parsing, available to expression parsing
-    /// for type argument resolution.
-    struct_names: Vec<String>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, struct_names: Vec::new() }
+        Self { tokens, pos: 0 }
     }
 
     fn peek(&self) -> &Token {
@@ -164,26 +199,27 @@ impl Parser {
         t
     }
 
-    fn expect_ident(&mut self) -> Result<String, String> {
+    fn expect_ident(&mut self) -> Result<String, ParseError> {
         match self.consume() {
             Token::Ident(s) => Ok(s),
-            t => Err(format!("expected identifier, got {:?}", t)),
+            t => Err(ParseError::UnexpectedToken { expected: "identifier".to_string(), got: format!("{:?}", t) }),
         }
     }
 
-    fn expect(&mut self, expected: Token) -> Result<(), String> {
+    fn expect(&mut self, expected: Token) -> Result<(), ParseError> {
         let t = self.consume();
         if t == expected {
             Ok(())
         } else {
-            Err(format!("expected {:?}, got {:?}", expected, t))
+            Err(ParseError::UnexpectedToken { expected: format!("{:?}", expected), got: format!("{:?}", t) })
         }
     }
 
-    fn parse_program(&mut self) -> Result<ToylangRegistry, String> {
+    fn parse_program(&mut self) -> Result<ToylangRegistry, ParseError> {
         let mut structs: HashMap<String, ToyStruct> = HashMap::new();
         let mut functions: HashMap<String, ToyFunction> = HashMap::new();
         let mut imports: Vec<String> = Vec::new();
+        let mut struct_names: Vec<String> = Vec::new();
 
         loop {
             match self.peek() {
@@ -197,24 +233,23 @@ impl Parser {
                     imports.push(path_segments.join("::"));
                 }
                 Token::Ident(s) if s == "struct" => {
-                    let (name, s) = self.parse_struct(&self.struct_names.clone())?;
-                    self.struct_names.push(name.clone());
+                    let (name, s) = self.parse_struct(&struct_names)?;
+                    struct_names.push(name.clone());
                     structs.insert(name, s);
                 }
                 Token::Ident(s) if s == "fn" => {
-                    let sn = self.struct_names.clone();
-                    let (name, f) = self.parse_fn(&sn)?;
+                    let (name, f) = self.parse_fn(&struct_names)?;
                     functions.insert(name, f);
                 }
                 Token::Eof => break,
-                t => return Err(format!("unexpected token {:?} at top level", t)),
+                t => return Err(ParseError::UnexpectedTopLevelToken { got: format!("{:?}", t) }),
             }
         }
 
         Ok(ToylangRegistry { structs, functions, imports })
     }
 
-    fn parse_struct(&mut self, struct_names: &[String]) -> Result<(String, ToyStruct), String> {
+    fn parse_struct(&mut self, struct_names: &[String]) -> Result<(String, ToyStruct), ParseError> {
         // consume "struct"
         self.consume();
         let name = self.expect_ident()?;
@@ -248,14 +283,14 @@ impl Parser {
         Ok((name.clone(), ToyStruct { name, type_params, fields }))
     }
 
-    fn parse_field(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ToyField, String> {
+    fn parse_field(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ToyField, ParseError> {
         let name = self.expect_ident()?;
         self.expect(Token::Colon)?;
         let rust_type = self.parse_type(type_params, struct_names)?;
         Ok(ToyField { name, rust_type })
     }
 
-    fn parse_fn(&mut self, struct_names: &[String]) -> Result<(String, ToyFunction), String> {
+    fn parse_fn(&mut self, struct_names: &[String]) -> Result<(String, ToyFunction), ParseError> {
         // consume "fn"
         self.consume();
         let name = self.expect_ident()?;
@@ -285,14 +320,14 @@ impl Parser {
         // Body-less declarations (extern functions) have no braces
         if self.peek() == &Token::LBrace {
             self.expect(Token::LBrace)?;
-            let body = self.parse_fn_body()?;
+            let body = self.parse_fn_body(&type_params, struct_names)?;
             Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: Some(body) }))
         } else {
             Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: None }))
         }
     }
 
-    fn parse_fn_body(&mut self) -> Result<FnBody, String> {
+    fn parse_fn_body(&mut self, type_params: &[String], struct_names: &[String]) -> Result<FnBody, ParseError> {
         let mut stmts = Vec::new();
 
         loop {
@@ -308,7 +343,7 @@ impl Parser {
                     self.consume(); // consume "let"
                     let var_name = self.expect_ident()?;
                     self.expect(Token::Equals)?;
-                    let expr = self.parse_expr()?;
+                    let expr = self.parse_expr(type_params, struct_names)?;
                     self.expect(Token::Semicolon)?;
                     stmts.push(Stmt::Let { name: var_name, expr });
                     continue;
@@ -316,7 +351,7 @@ impl Parser {
             }
 
             // Expression — either trailing return or stmt followed by ';'
-            let expr = self.parse_expr()?;
+            let expr = self.parse_expr(type_params, struct_names)?;
             if self.peek() == &Token::Semicolon {
                 self.consume(); // consume ';'
                 stmts.push(Stmt::ExprStmt(expr));
@@ -328,13 +363,13 @@ impl Parser {
         }
     }
 
-    fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_additive()
+    fn parse_expr(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
+        self.parse_additive(type_params, struct_names)
     }
 
     // Precedence: additive (+, -) < multiplicative (*, /)
-    fn parse_additive(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_multiplicative()?;
+    fn parse_additive(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
+        let mut left = self.parse_multiplicative(type_params, struct_names)?;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
@@ -342,14 +377,14 @@ impl Parser {
                 _ => break,
             };
             self.consume();
-            let right = self.parse_multiplicative()?;
+            let right = self.parse_multiplicative(type_params, struct_names)?;
             left = Expr::BinaryOp { op, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
     }
 
-    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_postfix()?;
+    fn parse_multiplicative(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
+        let mut left = self.parse_postfix(type_params, struct_names)?;
         loop {
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
@@ -357,14 +392,14 @@ impl Parser {
                 _ => break,
             };
             self.consume();
-            let right = self.parse_postfix()?;
+            let right = self.parse_postfix(type_params, struct_names)?;
             left = Expr::BinaryOp { op, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
     }
 
-    fn parse_postfix(&mut self) -> Result<Expr, String> {
-        let mut expr = self.parse_primary()?;
+    fn parse_postfix(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_primary(type_params, struct_names)?;
 
         // postfix chaining: expr.method(args) or expr.field
         loop {
@@ -374,7 +409,7 @@ impl Parser {
                 if self.peek() == &Token::LParen {
                     // Method call: expr.method(args)
                     self.consume(); // consume '('
-                    let args = self.parse_args()?;
+                    let args = self.parse_args(type_params, struct_names)?;
                     self.expect(Token::RParen)?;
                     expr = Expr::MethodCall {
                         receiver: Box::new(expr),
@@ -396,16 +431,18 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
         match self.peek().clone() {
             Token::StringLit(s) => {
                 let s = s.clone();
                 self.consume();
                 Ok(Expr::StringLit(s))
             }
-            Token::IntLit(n) => {
+            Token::IntLit(n, ty) => {
+                let n = n;
+                let ty = ty.clone();
                 self.consume();
-                Ok(Expr::IntLit(n))
+                Ok(Expr::IntLit(n, ty))
             }
             Token::Ident(name) if name == "true" || name == "false" => {
                 let val = name == "true";
@@ -424,60 +461,70 @@ impl Parser {
                     // StaticCall: Ty::method<type_args>(args)
                     self.consume(); // consume '::'
                     let method = self.expect_ident()?;
-                    let sn = self.struct_names.clone();
                     let type_args = if self.peek() == &Token::LAngle {
-                        self.parse_type_arg_list(&sn)?
+                        self.parse_type_arg_list(type_params, struct_names)?
                     } else {
                         vec![]
                     };
                     self.expect(Token::LParen)?;
-                    let args = self.parse_args()?;
+                    let args = self.parse_args(type_params, struct_names)?;
                     self.expect(Token::RParen)?;
                     Ok(Expr::StaticCall { ty: name, method, type_args, args })
                 } else if self.peek() == &Token::LBrace {
                     // StructLit: Name { field: expr, ... }
-                    self.consume(); // consume '{'
-                    let mut fields = Vec::new();
-                    while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
-                        let field_name = self.expect_ident()?;
-                        self.expect(Token::Colon)?;
-                        let field_expr = self.parse_expr()?;
-                        fields.push((field_name, field_expr));
-                        if self.peek() == &Token::Comma {
-                            self.consume();
-                        }
-                    }
-                    self.expect(Token::RBrace)?;
-                    Ok(Expr::StructLit { name, fields })
+                    let fields = self.parse_struct_lit_fields(type_params, struct_names)?;
+                    Ok(Expr::StructLit { name, type_args: vec![], fields })
                 } else if self.peek() == &Token::LAngle {
-                    // FnCall with type args: name<T1, T2>(args)
-                    let sn = self.struct_names.clone();
-                    let type_args = self.parse_type_arg_list(&sn)?;
-                    self.expect(Token::LParen)?;
-                    let args = self.parse_args()?;
-                    self.expect(Token::RParen)?;
-                    Ok(Expr::FnCall { name, type_args, args })
+                    // Could be FnCall with type args or generic StructLit
+                    let type_args = self.parse_type_arg_list(type_params, struct_names)?;
+                    if self.peek() == &Token::LBrace && struct_names.contains(&name) {
+                        // Generic StructLit: Name<T1, T2> { field: expr, ... }
+                        let fields = self.parse_struct_lit_fields(type_params, struct_names)?;
+                        Ok(Expr::StructLit { name, type_args, fields })
+                    } else {
+                        // FnCall with type args: name<T1, T2>(args)
+                        self.expect(Token::LParen)?;
+                        let args = self.parse_args(type_params, struct_names)?;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::FnCall { name, type_args, args })
+                    }
                 } else if self.peek() == &Token::LParen {
                     // FnCall: name(args)
                     self.consume(); // consume '('
-                    let args = self.parse_args()?;
+                    let args = self.parse_args(type_params, struct_names)?;
                     self.expect(Token::RParen)?;
                     Ok(Expr::FnCall { name, type_args: vec![], args })
                 } else {
                     Ok(Expr::Var(name))
                 }
             }
-            t => Err(format!("expected expression, got {:?}", t)),
+            t => Err(ParseError::ExpectedExpression { got: format!("{:?}", t) }),
         }
     }
 
+    /// Parse `{ field: expr, ... }` struct literal fields. Consumes the braces.
+    fn parse_struct_lit_fields(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<(String, Expr)>, ParseError> {
+        self.expect(Token::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            let field_name = self.expect_ident()?;
+            self.expect(Token::Colon)?;
+            let field_expr = self.parse_expr(type_params, struct_names)?;
+            fields.push((field_name, field_expr));
+            if self.peek() == &Token::Comma {
+                self.consume();
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(fields)
+    }
+
     /// Parse `<T1, T2>` type argument list. Consumes the `<` and `>`.
-    fn parse_type_arg_list(&mut self, struct_names: &[String]) -> Result<Vec<ResolvedType>, String> {
+    fn parse_type_arg_list(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<ResolvedType>, ParseError> {
         self.expect(Token::LAngle)?;
         let mut type_args = Vec::new();
         while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
-            // In expression context, no type params are in scope
-            type_args.push(self.parse_type(&[], struct_names)?);
+            type_args.push(self.parse_type(type_params, struct_names)?);
             if self.peek() == &Token::Comma {
                 self.consume();
             }
@@ -486,10 +533,10 @@ impl Parser {
         Ok(type_args)
     }
 
-    fn parse_args(&mut self) -> Result<Vec<Expr>, String> {
+    fn parse_args(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
         while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
-            args.push(self.parse_expr()?);
+            args.push(self.parse_expr(type_params, struct_names)?);
             if self.peek() == &Token::Comma {
                 self.consume();
             }
@@ -497,7 +544,7 @@ impl Parser {
         Ok(args)
     }
 
-    fn parse_params(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<ToyParam>, String> {
+    fn parse_params(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<ToyParam>, ParseError> {
         let mut params = Vec::new();
         while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
             let name = self.expect_ident()?;
@@ -512,7 +559,7 @@ impl Parser {
     }
 
     /// Parse a type expression and return a ResolvedType.
-    fn parse_type(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ResolvedType, String> {
+    fn parse_type(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ResolvedType, ParseError> {
         match self.peek().clone() {
             Token::Ampersand => {
                 self.consume();
@@ -529,7 +576,7 @@ impl Parser {
                 self.consume();
                 let qualifier = self.expect_ident()?;
                 if qualifier != "const" && qualifier != "mut" {
-                    return Err(format!("expected 'const' or 'mut' after '*', got '{}'", qualifier));
+                    return Err(ParseError::ExpectedPointerQualifier { got: qualifier });
                 }
                 let inner = self.parse_type(type_params, struct_names)?;
                 Ok(ResolvedType::Ref { inner: Box::new(inner) })
@@ -571,7 +618,7 @@ impl Parser {
                     _ => Ok(ResolvedType::RustType { name: s, type_args: vec![] }),
                 }
             }
-            t => Err(format!("expected type, got {:?}", t)),
+            t => Err(ParseError::ExpectedType { got: format!("{:?}", t) }),
         }
     }
 }
@@ -580,6 +627,58 @@ impl Parser {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn parse(src: &str) -> Result<ToylangRegistry, String> {
-    Parser::new(tokenize(src)).parse_program()
+pub fn parse(src: &str) -> Result<ToylangRegistry, ParseError> {
+    Parser::new(tokenize(src)?).parse_program()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_unknown_int_suffix() {
+        let result = parse("fn f() -> i32 { 42i16 }");
+        let Err(ParseError::UnknownIntSuffix { suffix }) = result else { panic!("expected UnknownIntSuffix") };
+        assert_eq!(suffix, "i16");
+    }
+
+    #[test]
+    fn test_parse_unexpected_character() {
+        let result = parse("fn f() { @}");
+        let Err(ParseError::UnexpectedCharacter { ch }) = result else { panic!("expected UnexpectedCharacter") };
+        assert_eq!(ch, '@');
+    }
+
+    #[test]
+    fn test_parse_unexpected_token() {
+        // Missing colon between param name and type
+        let result = parse("fn f(x i32) { 42 }");
+        let Err(ParseError::UnexpectedToken { expected, .. }) = result else { panic!("expected UnexpectedToken") };
+        assert_eq!(expected, "Colon");
+    }
+
+    #[test]
+    fn test_parse_unexpected_top_level_token() {
+        let result = parse("let x = 42;");
+        assert!(matches!(result, Err(ParseError::UnexpectedTopLevelToken { .. })));
+    }
+
+    #[test]
+    fn test_parse_expected_expression() {
+        let result = parse("fn f() { let x = ; }");
+        assert!(matches!(result, Err(ParseError::ExpectedExpression { .. })));
+    }
+
+    #[test]
+    fn test_parse_expected_type() {
+        let result = parse("fn f(x: ) -> i32 { 42 }");
+        assert!(matches!(result, Err(ParseError::ExpectedType { .. })));
+    }
+
+    #[test]
+    fn test_parse_expected_pointer_qualifier() {
+        let result = parse("fn f(x: *wrong i32) { }");
+        let Err(ParseError::ExpectedPointerQualifier { got }) = result else { panic!("expected ExpectedPointerQualifier") };
+        assert_eq!(got, "wrong");
+    }
 }
