@@ -1,7 +1,8 @@
 use super::ast::{BinOp, Expr, FnBody, Stmt};
 use super::registry::{
-    ToyField, ToyFieldType, ToyFunction, ToyParam, ToyStruct, ToylangRegistry,
+    ToyField, ToyFunction, ToyParam, ToyStruct, ToylangRegistry,
 };
+use super::typed_ast::ResolvedType;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -136,11 +137,14 @@ fn tokenize(src: &str) -> Vec<Token> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Struct names accumulated during parsing, available to expression parsing
+    /// for type argument resolution.
+    struct_names: Vec<String>,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, struct_names: Vec::new() }
     }
 
     fn peek(&self) -> &Token {
@@ -178,7 +182,6 @@ impl Parser {
 
     fn parse_program(&mut self) -> Result<ToylangRegistry, String> {
         let mut structs: HashMap<String, ToyStruct> = HashMap::new();
-        let mut struct_names: Vec<String> = Vec::new();
         let mut functions: HashMap<String, ToyFunction> = HashMap::new();
         let mut imports: Vec<String> = Vec::new();
 
@@ -194,12 +197,13 @@ impl Parser {
                     imports.push(path_segments.join("::"));
                 }
                 Token::Ident(s) if s == "struct" => {
-                    let (name, s) = self.parse_struct(&struct_names)?;
-                    struct_names.push(name.clone());
+                    let (name, s) = self.parse_struct(&self.struct_names.clone())?;
+                    self.struct_names.push(name.clone());
                     structs.insert(name, s);
                 }
                 Token::Ident(s) if s == "fn" => {
-                    let (name, f) = self.parse_fn()?;
+                    let sn = self.struct_names.clone();
+                    let (name, f) = self.parse_fn(&sn)?;
                     functions.insert(name, f);
                 }
                 Token::Eof => break,
@@ -247,43 +251,11 @@ impl Parser {
     fn parse_field(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ToyField, String> {
         let name = self.expect_ident()?;
         self.expect(Token::Colon)?;
-        let rust_type = self.parse_field_type(type_params, struct_names)?;
+        let rust_type = self.parse_type(type_params, struct_names)?;
         Ok(ToyField { name, rust_type })
     }
 
-    fn parse_field_type(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ToyFieldType, String> {
-        let s = self.expect_ident()?;
-        if type_params.contains(&s) {
-            return Ok(ToyFieldType::TypeParam(s));
-        }
-        match s.as_str() {
-            "i32"  => Ok(ToyFieldType::I32),
-            "i64"  => Ok(ToyFieldType::I64),
-            "f64"  => Ok(ToyFieldType::F64),
-            "bool" => Ok(ToyFieldType::Bool),
-            other  => {
-                // Check for generic type args: Vec<i32>, HashMap<K, V>
-                if self.peek() == &Token::LAngle {
-                    self.consume(); // consume '<'
-                    let mut args = Vec::new();
-                    while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
-                        args.push(self.parse_field_type(type_params, struct_names)?);
-                        if self.peek() == &Token::Comma { self.consume(); }
-                    }
-                    self.expect(Token::RAngle)?;
-                    return Ok(ToyFieldType::RustGeneric(other.to_string(), args));
-                }
-                // Known toylang struct name
-                if struct_names.contains(&other.to_string()) {
-                    return Ok(ToyFieldType::ToyStruct(other.to_string()));
-                }
-                // Unknown name — treat as an opaque Rust type (e.g. Global)
-                Ok(ToyFieldType::RustGeneric(other.to_string(), vec![]))
-            }
-        }
-    }
-
-    fn parse_fn(&mut self) -> Result<(String, ToyFunction), String> {
+    fn parse_fn(&mut self, struct_names: &[String]) -> Result<(String, ToyFunction), String> {
         // consume "fn"
         self.consume();
         let name = self.expect_ident()?;
@@ -300,22 +272,24 @@ impl Parser {
         }
 
         self.expect(Token::LParen)?;
-        let params = self.parse_params()?;
+        let params = self.parse_params(&type_params, struct_names)?;
         self.expect(Token::RParen)?;
 
         let return_ty = if self.peek() == &Token::Arrow {
             self.consume();
-            Some(self.parse_type_str()?)
+            Some(self.parse_type(&type_params, struct_names)?)
         } else {
             None
         };
 
-        // parse function body
-        self.expect(Token::LBrace)?;
-        let body = self.parse_fn_body()?;
-        // parse_fn_body consumes everything up to and including the closing RBrace
-
-        Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: Some(body) }))
+        // Body-less declarations (extern functions) have no braces
+        if self.peek() == &Token::LBrace {
+            self.expect(Token::LBrace)?;
+            let body = self.parse_fn_body()?;
+            Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: Some(body) }))
+        } else {
+            Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: None }))
+        }
     }
 
     fn parse_fn_body(&mut self) -> Result<FnBody, String> {
@@ -450,8 +424,9 @@ impl Parser {
                     // StaticCall: Ty::method<type_args>(args)
                     self.consume(); // consume '::'
                     let method = self.expect_ident()?;
+                    let sn = self.struct_names.clone();
                     let type_args = if self.peek() == &Token::LAngle {
-                        self.parse_type_arg_list()?
+                        self.parse_type_arg_list(&sn)?
                     } else {
                         vec![]
                     };
@@ -476,7 +451,8 @@ impl Parser {
                     Ok(Expr::StructLit { name, fields })
                 } else if self.peek() == &Token::LAngle {
                     // FnCall with type args: name<T1, T2>(args)
-                    let type_args = self.parse_type_arg_list()?;
+                    let sn = self.struct_names.clone();
+                    let type_args = self.parse_type_arg_list(&sn)?;
                     self.expect(Token::LParen)?;
                     let args = self.parse_args()?;
                     self.expect(Token::RParen)?;
@@ -496,11 +472,12 @@ impl Parser {
     }
 
     /// Parse `<T1, T2>` type argument list. Consumes the `<` and `>`.
-    fn parse_type_arg_list(&mut self) -> Result<Vec<String>, String> {
+    fn parse_type_arg_list(&mut self, struct_names: &[String]) -> Result<Vec<ResolvedType>, String> {
         self.expect(Token::LAngle)?;
         let mut type_args = Vec::new();
         while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
-            type_args.push(self.parse_type_str()?);
+            // In expression context, no type params are in scope
+            type_args.push(self.parse_type(&[], struct_names)?);
             if self.peek() == &Token::Comma {
                 self.consume();
             }
@@ -520,12 +497,12 @@ impl Parser {
         Ok(args)
     }
 
-    fn parse_params(&mut self) -> Result<Vec<ToyParam>, String> {
+    fn parse_params(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<ToyParam>, String> {
         let mut params = Vec::new();
         while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
             let name = self.expect_ident()?;
             self.expect(Token::Colon)?;
-            let ty = self.parse_type_str()?;
+            let ty = self.parse_type(type_params, struct_names)?;
             params.push(ToyParam { name, ty });
             if self.peek() == &Token::Comma {
                 self.consume();
@@ -534,24 +511,19 @@ impl Parser {
         Ok(params)
     }
 
-    /// Parse a type expression and return it as a string.
-    fn parse_type_str(&mut self) -> Result<String, String> {
+    /// Parse a type expression and return a ResolvedType.
+    fn parse_type(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ResolvedType, String> {
         match self.peek().clone() {
             Token::Ampersand => {
                 self.consume();
-                // optional "mut"
-                let prefix = if let Token::Ident(s) = self.peek() {
+                // optional "mut" (treated same as immutable ref for now)
+                if let Token::Ident(s) = self.peek() {
                     if s == "mut" {
                         self.consume();
-                        "&mut ".to_string()
-                    } else {
-                        "&".to_string()
                     }
-                } else {
-                    "&".to_string()
-                };
-                let inner = self.parse_type_str()?;
-                Ok(format!("{}{}", prefix, inner))
+                }
+                let inner = self.parse_type(type_params, struct_names)?;
+                Ok(ResolvedType::Ref { inner: Box::new(inner) })
             }
             Token::Star => {
                 self.consume();
@@ -559,25 +531,44 @@ impl Parser {
                 if qualifier != "const" && qualifier != "mut" {
                     return Err(format!("expected 'const' or 'mut' after '*', got '{}'", qualifier));
                 }
-                let inner = self.parse_type_str()?;
-                Ok(format!("*{} {}", qualifier, inner))
+                let inner = self.parse_type(type_params, struct_names)?;
+                Ok(ResolvedType::Ref { inner: Box::new(inner) })
             }
             Token::Ident(s) => {
                 let s = s.clone();
                 self.consume();
+
+                // Check for generic args: Vec<i32>, Pair<i32, i64>
                 if self.peek() == &Token::LAngle {
                     self.consume();
                     let mut args = Vec::new();
                     while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
-                        args.push(self.parse_type_str()?);
+                        args.push(self.parse_type(type_params, struct_names)?);
                         if self.peek() == &Token::Comma {
                             self.consume();
                         }
                     }
                     self.expect(Token::RAngle)?;
-                    Ok(format!("{}<{}>", s, args.join(", ")))
-                } else {
-                    Ok(s)
+
+                    return if struct_names.contains(&s) {
+                        Ok(ResolvedType::StructRef { name: s, type_args: args })
+                    } else {
+                        Ok(ResolvedType::RustType { name: s, type_args: args })
+                    };
+                }
+
+                // Non-generic names
+                match s.as_str() {
+                    "i32"   => Ok(ResolvedType::I32),
+                    "i64"   => Ok(ResolvedType::I64),
+                    "f64"   => Ok(ResolvedType::F64),
+                    "bool"  => Ok(ResolvedType::Bool),
+                    "usize" => Ok(ResolvedType::Usize),
+                    _ if type_params.contains(&s) => Ok(ResolvedType::TypeParam(s)),
+                    _ if struct_names.contains(&s) => Ok(ResolvedType::StructRef {
+                        name: s, type_args: vec![],
+                    }),
+                    _ => Ok(ResolvedType::RustType { name: s, type_args: vec![] }),
                 }
             }
             t => Err(format!("expected type, got {:?}", t)),

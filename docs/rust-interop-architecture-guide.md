@@ -1,12 +1,14 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 53 integration tests passing, 0 ignored. Minimal rustc fork
+> **Current status:** 55 integration tests passing, 0 ignored. Minimal rustc fork
 > with `per_instance_mir` query. Inkwell LLVM backend with type annotation pass.
 > Unified MonoItems discovery. Generic functions with explicit type args,
-> inter-toylang calls, arithmetic, direct field access, `println` built-in,
+> inter-toylang calls, arithmetic, direct field access, extern function calls,
 > toylang-owned main, internal/extern ABI split with full param+return coercion.
 > 4 query providers. Zero compiler warnings. No type inference machinery.
-> Generalized Rust type support (no Vec-specific code in the main pipeline).
+> Generalized Rust type support — method signatures and return types queried
+> from rustc via `fn_abi_of_instance` and `fn_sig`. Unified type representation
+> (`ResolvedType` everywhere — no string-based type resolution, no `ToyFieldType`).
 > `use` imports for Rust types. Explicit type args everywhere including allocators.
 
 ## Overview
@@ -344,9 +346,34 @@ i1 to i32 for printf compatibility.
 
 `println` is skipped during dep discovery (not in registry → `continue`).
 
+### 4.8 `use` imports
+
+Toylang supports `use` statements for importing Rust types:
+```
+use std::alloc::Global
+```
+
+**Pipeline:** The parser recognizes `use` at the top level, stores the full path
+(e.g., `"std::alloc::Global"`) in `registry.imports`. The stub generator emits
+`pub use std::alloc::Global;` in `__lang_stubs.rs`. Rustc compiles this as a
+normal `pub use` re-export.
+
+**Type resolution:** `find_rust_type_def_id` falls back to `find_local_struct_def_id`,
+which now also searches module children via `find_reexported_type` using
+`tcx.module_children_local()`. Re-exported types appear as children of the
+`__lang_stubs` module and are found by name.
+
+**Feature gates:** Some Rust types require unstable feature gates (e.g.,
+`std::alloc::Global` requires `#![feature(allocator_api)]`). These must be
+added to the Rust crate root by the consumer, not in the stubs (inner attributes
+only work at the crate root).
+
+**No new lexer tokens needed.** `use` tokenizes as an `Ident`, `::` already
+exists as `DoubleColon`.
+
 ---
 
-## Part 5: What Works (53 tests)
+## Part 5: What Works (55 tests)
 
 ### Struct types
 - Simple structs (`Counter { value: i32 }`)
@@ -378,9 +405,9 @@ i1 to i32 for printf compatibility.
 - Generic callee calls with explicit type args (`wrap<i32>(42)`)
 - Arithmetic expressions (+, -, *, / with precedence)
 - Boolean literals and bool return values
-- String literals (for println format strings)
+- String literals
 - Direct field access (`p.x`)
-- `println` built-in (compiles to C printf)
+- Extern function calls (body-less `fn` declarations call real Rust functions)
 - Toylang-owned main (`fn main()` in toylang, called via `__toylang_main`)
 - Explicit type args everywhere (`Vec::new<Point, Global>()`)
 - `use` imports (`use std::alloc::Global`)
@@ -394,7 +421,8 @@ i1 to i32 for printf compatibility.
 
 ### Rust type operations (generalized, not Vec-specific)
 - Vec<primitive> and Vec<struct> (with explicit allocator: `Vec<i32, Global>`)
-- Inherent methods: new, push, len (via `find_inherent_method`)
+- Inherent methods: any method works (new, push, len, capacity, etc.) — signatures
+  queried from rustc via `fn_abi_of_instance` and `fn_sig`, no hardcoded table
 - Rust types as struct fields
 - Nested Vec (Vec<Vec<T, Global>, Global>)
 
@@ -422,7 +450,7 @@ i1 to i32 for printf compatibility.
 | `queries/symbol_name.rs` | symbol_name override |
 | `queries/drop_glue.rs` | Drop glue (mir_shims) override |
 | `queries/mod.rs` | Query override installation (4 providers) |
-| `abi_helpers.rs` | `coerced_return_type_for_instance`, `CoercedReturn` enum |
+| `abi_helpers.rs` | `coerced_return_type_for_instance`, `coerced_param_types_for_instance`, `CoercedReturn`/`CoercedParam` enums |
 | `mir_helpers.rs` | `build_drop_call_body` for drop glue MIR |
 | `codegen_wrapper.rs` | `LangCodegenBackend` wrapper, .o injection |
 | `driver.rs` | `run_compiler` entry point |
@@ -434,13 +462,13 @@ i1 to i32 for printf compatibility.
 |------|---------|
 | `llvm_gen.rs` | Inkwell LLVM backend: MonoItems walk, internal/extern codegen, accessor GEPs, Rust method resolution |
 | `stub_gen.rs` | Generates `__lang_stubs.rs` (opaque structs, wrappers, externs, `pub use` re-exports) |
-| `oracle.rs` | TyCtxt query helpers (find_inherent_method, find_rust_type_def_id, find_reexported_type) |
+| `oracle.rs` | TyCtxt query helpers, `resolved_to_rustc_ty`, `rustc_ty_to_resolved_type`, `rust_method_return_type`, `TOYLANG_MAIN` constant |
 | `main.rs` | CLI entry point, registry setup, rustc invocation |
 | `toylang/ast.rs` | Untyped AST (Expr incl. FieldAccess/StringLit, Stmt, FnBody, BinOp) |
-| `toylang/typed_ast.rs` | Typed AST (TypedExpr with ResolvedType incl. Str) |
-| `toylang/type_resolve.rs` | Type annotation pass (10 unit tests) |
-| `toylang/parser.rs` | Toylang parser (structs, functions, expressions) |
-| `toylang/registry.rs` | Data structures (ToyStruct, ToyFunction, ToyFieldType) |
+| `toylang/typed_ast.rs` | `ResolvedType` enum (unified type representation: TypeParam, StructRef, Struct, RustType, primitives, Ref, Str) |
+| `toylang/type_resolve.rs` | Type annotation pass, `resolve_struct_fields`, `substitute_type_params` (10 unit tests) |
+| `toylang/parser.rs` | Toylang parser — produces `ResolvedType` directly (no string types) |
+| `toylang/registry.rs` | Data structures (ToyStruct, ToyFunction, ToyParam — all use ResolvedType) |
 | `toylang/callbacks_impl.rs` | `LangCallbacks` impl, dep discovery, MonoItems helpers |
 
 ### rustc fork (`~/rust` branch `per-instance-mir`)
@@ -737,9 +765,11 @@ cargo +rustc-fork test -p toylangc --bin toylangc -- type_resolve
   sees Rust type internals. Size and alignment come from `tcx.layout_of`.
 - This split is permanent. Neither side needs to know the other's layout.
 
-`resolved_type_to_rustc_ty` in `llvm_gen.rs` converts any `ResolvedType` to a
+`resolved_to_rustc_ty` in `oracle.rs` converts any `ResolvedType` to a
 rustc `Ty<'tcx>`, enabling `layout_of` queries for any type. `rust_ty_to_llvm_opaque`
-wraps this to produce the `[N x i8]` LLVM type + alignment.
+in `llvm_gen.rs` wraps this to produce the `[N x i8]` LLVM type + alignment.
+The inverse `rustc_ty_to_resolved_type` converts rustc types back to `ResolvedType`
+for use in type substitution.
 
 ### 10.2 Cross-boundary field access via getters only
 
@@ -784,8 +814,17 @@ The original roadmap had 4 moves. All are now complete:
 6. All type args explicit (`Vec<Point, Global>`) — no default filling.
 7. `ResolvedType::Vec` replaced with general `ResolvedType::RustType`.
 
-**Remaining non-general code (small, isolated):**
-- Method signature heuristic in `get_or_resolve_rust_method` (method name →
-  LLVM signature). Replace with `fn_abi_of_instance` for full generality.
-- Hardcoded `rust_method_ret` closures. Replace with `tcx.fn_sig()` queries.
-- Three dummy `Vec<I32, Global>` constructions for layout queries.
+**Additional (session 5):**
+8. Method signature heuristic replaced with `fn_abi_of_instance` queries —
+   any Rust method works without hardcoded match arms.
+9. `rust_method_ret` closures replaced with `tcx.fn_sig()` queries via
+   `oracle::rust_method_return_type`.
+10. `println` builtin replaced with general extern function calling mechanism.
+11. Unified type representation: `ToyFieldType` deleted, all types use
+    `ResolvedType`. Parser produces structured types directly. `StructRef`
+    vs `Struct` prevents silent unresolved struct bugs.
+12. `__toylang_main` constant centralized, `resolved_to_rustc_ty` deduplicated,
+    dummy Vec constructions extracted, ref param ABI fix (`Scalar(Pointer)` → `ptr`).
+
+**No remaining non-general code.** All method signatures, return types, and
+type resolution are queried from rustc or resolved from structured types.

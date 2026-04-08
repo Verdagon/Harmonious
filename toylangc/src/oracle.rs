@@ -1,5 +1,8 @@
 // Type oracle — resolves Rust generic API signatures by querying TyCtxt directly.
 
+/// The stub wrapper name for toylang's `main` function, avoiding conflict with Rust's `main`.
+pub const TOYLANG_MAIN: &str = "__toylang_main";
+
 extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
@@ -50,12 +53,6 @@ fn find_reexported_type(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
     None
 }
 
-pub fn find_local_struct_ty<'tcx>(tcx: TyCtxt<'tcx>, name: &str) -> Option<ty::Ty<'tcx>> {
-    let def_id = find_local_struct_def_id(tcx, name)?;
-    let adt_def = tcx.adt_def(def_id);
-    Some(ty::Ty::new_adt(tcx, adt_def, ty::List::empty()))
-}
-
 /// Find a named method in a type's inherent impls.
 pub fn find_inherent_method(tcx: TyCtxt<'_>, type_def_id: DefId, method: &str) -> Option<DefId> {
     for &impl_id in tcx.inherent_impls(type_def_id) {
@@ -70,6 +67,128 @@ pub fn find_inherent_method(tcx: TyCtxt<'_>, type_def_id: DefId, method: &str) -
 
 /// Look up a Rust type's DefId by name.
 /// Checks well-known diagnostic items first, then falls back to local/re-exported items.
+/// Convert a `ResolvedType` to a rustc `Ty<'tcx>`. Used for layout_of queries
+/// and dependency resolution.
+pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::typed_ast::ResolvedType) -> ty::Ty<'tcx> {
+    use crate::toylang::typed_ast::ResolvedType;
+    match resolved {
+        ResolvedType::I32 => tcx.types.i32,
+        ResolvedType::I64 => tcx.types.i64,
+        ResolvedType::F64 => tcx.types.f64,
+        ResolvedType::Bool => tcx.types.bool,
+        ResolvedType::Usize => tcx.types.usize,
+        ResolvedType::Void => tcx.types.unit,
+        ResolvedType::StructRef { name, type_args }
+        | ResolvedType::Struct { name, type_args, .. } => {
+            let def_id = find_local_struct_def_id(tcx, name)
+                .unwrap_or_else(|| panic!("struct '{}' not found", name));
+            let adt_def = tcx.adt_def(def_id);
+            let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+                .collect();
+            ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
+        }
+        ResolvedType::RustType { name, type_args } => {
+            let def_id = find_rust_type_def_id(tcx, name)
+                .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
+            let adt_def = tcx.adt_def(def_id);
+            let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+                .collect();
+            ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
+        }
+        ResolvedType::Ref { inner } => {
+            let inner_ty = resolved_to_rustc_ty(tcx, inner);
+            ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty)
+        }
+        ResolvedType::Str => panic!("Str type should not need rustc Ty conversion"),
+        ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before rustc Ty conversion", name),
+    }
+}
+
+/// Convert a rustc `Ty<'tcx>` to a `ResolvedType`. Inverse of `resolved_to_rustc_ty`.
+pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> crate::toylang::typed_ast::ResolvedType {
+    use crate::toylang::typed_ast::ResolvedType;
+    use rustc_middle::ty::TyKind;
+    match ty.kind() {
+        TyKind::Int(int_ty) => match int_ty {
+            ty::IntTy::I32 => ResolvedType::I32,
+            ty::IntTy::I64 => ResolvedType::I64,
+            other => panic!("unsupported int type {:?}", other),
+        },
+        TyKind::Uint(uint_ty) => match uint_ty {
+            ty::UintTy::Usize => ResolvedType::Usize,
+            other => panic!("unsupported uint type {:?}", other),
+        },
+        TyKind::Float(float_ty) => match float_ty {
+            ty::FloatTy::F64 => ResolvedType::F64,
+            other => panic!("unsupported float type {:?}", other),
+        },
+        TyKind::Bool => ResolvedType::Bool,
+        TyKind::Tuple(tys) if tys.is_empty() => ResolvedType::Void,
+        TyKind::Ref(_, inner, _) => ResolvedType::Ref {
+            inner: Box::new(rustc_ty_to_resolved_type(tcx, *inner)),
+        },
+        TyKind::Adt(adt_def, args) => {
+            let name = tcx.item_name(adt_def.did()).to_string();
+            let type_args: Vec<ResolvedType> = args.iter()
+                .filter_map(|a| match a.unpack() {
+                    ty::GenericArgKind::Type(t) => Some(rustc_ty_to_resolved_type(tcx, t)),
+                    _ => None,
+                })
+                .collect();
+            // Check if this is a toylang struct
+            if find_local_struct_def_id(tcx, &name).map_or(false, |id| id == adt_def.did()) {
+                ResolvedType::StructRef { name, type_args }
+            } else {
+                ResolvedType::RustType { name, type_args }
+            }
+        }
+        _ => panic!("rustc_ty_to_resolved_type: unsupported type {:?}", ty),
+    }
+}
+
+/// Query rustc for a Rust method's return type, converting to ResolvedType.
+pub fn rust_method_return_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    type_name: &str,
+    method_name: &str,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> crate::toylang::typed_ast::ResolvedType {
+    let type_def_id = find_rust_type_def_id(tcx, type_name)
+        .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
+    let method_def_id = find_inherent_method(tcx, type_def_id, method_name)
+        .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
+
+    // Build generic args from type_args
+    let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+        .collect();
+    let expected_count = tcx.generics_of(method_def_id).count();
+    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+
+    // Query fn_sig and extract return type
+    let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
+    let sig = tcx.normalize_erasing_late_bound_regions(
+        ty::TypingEnv::fully_monomorphized(), sig,
+    );
+    rustc_ty_to_resolved_type(tcx, sig.output())
+}
+
+/// Find an extern (non-toylang) function by name among local definitions.
+/// Excludes functions in __lang_stubs (those are toylang wrappers).
+pub fn find_extern_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
+    for local_def_id in tcx.hir_crate_items(()).definitions() {
+        let def_id = local_def_id.to_def_id();
+        if tcx.def_kind(def_id) != DefKind::Fn { continue; }
+        if tcx.item_name(def_id).as_str() != name { continue; }
+        if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+            return Some(def_id);
+        }
+    }
+    None
+}
+
 pub fn find_rust_type_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
     // Well-known types via diagnostic items
     let diag = match name {

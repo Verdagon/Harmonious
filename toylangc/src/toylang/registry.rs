@@ -1,23 +1,11 @@
 use std::collections::HashMap;
+use crate::toylang::typed_ast::ResolvedType;
 
 /// A Toylang struct field.
 #[derive(Clone, Debug)]
 pub struct ToyField {
     pub name: String,
-    /// The Rust type of this field, as a string that rustc can resolve.
-    /// For now we only support primitive Rust types.
-    pub rust_type: ToyFieldType,
-}
-
-#[derive(Clone, Debug)]
-pub enum ToyFieldType {
-    I32,
-    I64,
-    F64,
-    Bool,
-    TypeParam(String),      // e.g. "A", "B"
-    ToyStruct(String),      // another toylang struct, e.g. "ToyInner"
-    RustGeneric(String, Vec<ToyFieldType>), // e.g. Vec<i32>, HashMap<K,V>
+    pub rust_type: ResolvedType,
 }
 
 /// A Toylang struct definition.
@@ -37,12 +25,11 @@ pub struct ToylangRegistry {
     pub imports: Vec<String>,
 }
 
-
 /// A parsed parameter in a Toylang function signature.
 #[derive(Clone, Debug)]
 pub struct ToyParam {
     pub name: String,
-    pub ty: String,
+    pub ty: ResolvedType,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +38,6 @@ pub struct ToyFunction {
     pub name: String,
     pub type_params: Vec<String>,   // e.g. ["T"]; empty for non-generic functions
     pub params: Vec<ToyParam>,
-    pub return_ty: Option<String>,
+    pub return_ty: Option<ResolvedType>,
     pub body: Option<crate::toylang::ast::FnBody>,
 }

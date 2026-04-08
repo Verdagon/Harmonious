@@ -1479,6 +1479,8 @@ fn main() {
 fn test_toylang_to_toylang_struct_param() {
     let output = run_toylang_test(
         r#"
+fn println_int(x: i32)
+
 struct Point {
     x: i32,
     y: i32,
@@ -1490,12 +1492,14 @@ fn get_x(p: Point) -> i32 {
 
 fn main() {
     let p = Point { x: 42, y: 99 };
-    println("{}", get_x(p));
+    println_int(get_x(p));
 }
         "#,
         r#"
 mod __lang_stubs;
 use __lang_stubs::*;
+
+pub fn println_int(x: i32) { println!("{}", x); }
 
 fn main() {
     __toylang_main();
@@ -1509,6 +1513,8 @@ fn main() {
 fn test_toylang_to_toylang_large_struct_param() {
     let output = run_toylang_test(
         r#"
+fn println_int(x: i32)
+
 struct Quad {
     a: i32,
     b: i32,
@@ -1522,12 +1528,14 @@ fn sum_quad(q: Quad) -> i32 {
 
 fn main() {
     let q = Quad { a: 10, b: 20, c: 30, d: 40 };
-    println("{}", sum_quad(q));
+    println_int(sum_quad(q));
 }
         "#,
         r#"
 mod __lang_stubs;
 use __lang_stubs::*;
+
+pub fn println_int(x: i32) { println!("{}", x); }
 
 fn main() {
     __toylang_main();
@@ -1541,6 +1549,9 @@ fn main() {
 fn test_toylang_main_with_struct() {
     let output = run_toylang_test(
         r#"
+fn print_int(x: i32)
+fn println_int(x: i32)
+
 struct Point {
     x: i32,
     y: i32,
@@ -1548,19 +1559,25 @@ struct Point {
 
 fn main() {
     let p = Point { x: 10, y: 20 };
-    println("Point: {} {}", p.x, p.y);
+    print_int(p.x);
+    print_int(p.y);
+    println_int(0);
 }
         "#,
         r#"
 mod __lang_stubs;
 use __lang_stubs::*;
 
+pub fn print_int(x: i32) { print!("{} ", x); }
+pub fn println_int(x: i32) { println!("{}", x); }
+
 fn main() {
     __toylang_main();
 }
         "#,
     );
-    assert!(output.contains("Point: 10 20"));
+    assert!(output.contains("10"));
+    assert!(output.contains("20"));
 }
 
 #[test]
@@ -1607,6 +1624,8 @@ fn test_toylang_main_with_vec() {
         r#"
 use std::alloc::Global
 
+fn println_usize(x: usize)
+
 struct Point {
     x: i32,
     y: i32,
@@ -1616,7 +1635,7 @@ fn main() {
     let v = Vec::new<Point, Global>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
-    println("Vec length: {}", v.len());
+    println_usize(v.len());
 }
         "#,
         r#"
@@ -1624,12 +1643,14 @@ fn main() {
 mod __lang_stubs;
 use __lang_stubs::*;
 
+pub fn println_usize(x: usize) { println!("{}", x); }
+
 fn main() {
     __toylang_main();
 }
         "#,
     );
-    assert!(output.contains("Vec length: 2"));
+    assert!(output.contains("2"));
 }
 
 #[test]
@@ -1666,6 +1687,8 @@ fn main() {
 fn test_toylang_main_calls_toylang_fn() {
     let output = run_toylang_test(
         r#"
+fn println_int(x: i32)
+
 struct Counter {
     value: i32,
 }
@@ -1676,19 +1699,21 @@ fn make_counter() -> Counter {
 
 fn main() {
     let c = make_counter();
-    println("Counter: {}", c.value);
+    println_int(c.value);
 }
         "#,
         r#"
 mod __lang_stubs;
 use __lang_stubs::*;
 
+pub fn println_int(x: i32) { println!("{}", x); }
+
 fn main() {
     __toylang_main();
 }
         "#,
     );
-    assert!(output.contains("Counter: 42"));
+    assert!(output.contains("42"));
 }
 
 // ============================================================================
@@ -1754,6 +1779,8 @@ fn test_vec_push_fn_call_result() {
         r#"
 use std::alloc::Global
 
+fn println_usize(x: usize)
+
 struct Point {
     x: i32,
     y: i32,
@@ -1766,7 +1793,7 @@ fn make_point() -> Point {
 fn main() {
     let v = Vec::new<Point, Global>();
     v.push(make_point());
-    println("len: {}", v.len());
+    println_usize(v.len());
 }
         "#,
         r#"
@@ -1774,12 +1801,14 @@ fn main() {
 mod __lang_stubs;
 use __lang_stubs::*;
 
+pub fn println_usize(x: usize) { println!("{}", x); }
+
 fn main() {
     __toylang_main();
 }
         "#,
     );
-    assert!(output.contains("len: 1"));
+    assert!(output.contains("1"));
 }
 
 #[test]
@@ -1838,4 +1867,67 @@ fn main() {
         "#,
     );
     assert!(output.contains("big: 3000000000"));
+}
+
+#[test]
+fn test_extern_fn_call() {
+    let output = run_toylang_test(
+        r#"
+fn println_int(x: i32)
+fn println_bool(x: bool)
+
+fn do_print() {
+    println_int(42);
+    println_bool(true);
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+pub fn println_int(x: i32) { println!("{}", x); }
+pub fn println_bool(x: bool) { println!("{}", x); }
+
+fn main() {
+    do_print();
+}
+        "#,
+    );
+    assert!(output.contains("42"));
+    assert!(output.contains("true"));
+}
+
+#[test]
+fn test_vec_capacity() {
+    // capacity() was previously impossible — it required a new hardcoded match arm.
+    // Now it works automatically via fn_abi_of_instance.
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    println_usize(v.capacity());
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+
+pub fn println_usize(x: usize) { println!("{}", x); }
+
+fn main() {
+    __toylang_main();
+}
+        "#,
+    );
+    // Vec capacity after 3 pushes is implementation-defined but >= 3
+    let cap: usize = output.trim().parse().expect("output should be a number");
+    assert!(cap >= 3, "capacity should be >= 3, got {}", cap);
 }

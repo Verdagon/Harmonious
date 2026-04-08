@@ -2,28 +2,38 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse_quote;
 
-use crate::toylang::registry::{ToylangRegistry, ToyFieldType};
+use crate::toylang::registry::ToylangRegistry;
+use crate::toylang::typed_ast::ResolvedType;
 
-/// Convert a ToyFieldType to a syn::Type for use in Rust stub code.
-fn field_type_to_syn(ft: &ToyFieldType) -> syn::Type {
-    match ft {
-        ToyFieldType::I32 => parse_quote!(i32),
-        ToyFieldType::I64 => parse_quote!(i64),
-        ToyFieldType::F64 => parse_quote!(f64),
-        ToyFieldType::Bool => parse_quote!(bool),
-        ToyFieldType::TypeParam(p) => {
-            let p_ident = format_ident!("{}", p);
-            parse_quote!(#p_ident)
-        }
-        ToyFieldType::ToyStruct(name) => {
+/// Convert a ResolvedType to a syn::Type for use in Rust stub code.
+fn resolved_type_to_syn(ty: &ResolvedType) -> syn::Type {
+    match ty {
+        ResolvedType::I32 => parse_quote!(i32),
+        ResolvedType::I64 => parse_quote!(i64),
+        ResolvedType::F64 => parse_quote!(f64),
+        ResolvedType::Bool => parse_quote!(bool),
+        ResolvedType::Usize => parse_quote!(usize),
+        ResolvedType::Void => parse_quote!(()),
+        ResolvedType::TypeParam(name) => {
             let ident = format_ident!("{}", name);
             parse_quote!(#ident)
         }
-        ToyFieldType::RustGeneric(name, args) => {
+        ResolvedType::StructRef { name, type_args }
+        | ResolvedType::Struct { name, type_args, .. }
+        | ResolvedType::RustType { name, type_args } => {
             let ident = format_ident!("{}", name);
-            let arg_types: Vec<syn::Type> = args.iter().map(|a| field_type_to_syn(a)).collect();
-            parse_quote!(#ident<#(#arg_types),*>)
+            if type_args.is_empty() {
+                parse_quote!(#ident)
+            } else {
+                let args: Vec<syn::Type> = type_args.iter().map(resolved_type_to_syn).collect();
+                parse_quote!(#ident<#(#args),*>)
+            }
         }
+        ResolvedType::Ref { inner } => {
+            let inner_ty = resolved_type_to_syn(inner);
+            parse_quote!(&#inner_ty)
+        }
+        ResolvedType::Str => parse_quote!(&str),
     }
 }
 
@@ -65,7 +75,7 @@ pub fn generate(registry: &ToylangRegistry) -> String {
 
         for field in &toy_struct.fields {
             let field_ident = format_ident!("{}", field.name);
-            let field_ty = field_type_to_syn(&field.rust_type);
+            let field_ty = resolved_type_to_syn(&field.rust_type);
 
             // unreachable!() body — per_instance_mir handles all accessor instances.
             accessor_methods.push(quote! {
@@ -119,14 +129,12 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             let fn_ident = format_ident!("{}", sym);
             let extern_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
                 let pname = format_ident!("{}", p.name);
-                let pty: syn::Type = syn::parse_str(&p.ty)
-                    .unwrap_or_else(|e| panic!("invalid param type '{}': {}", p.ty, e));
+                let pty = resolved_type_to_syn(&p.ty);
                 quote! { #pname: #pty }
             }).collect();
 
-            let ret: syn::Type = match toy_fn.return_ty.as_deref() {
-                Some(ty) => syn::parse_str(ty)
-                    .unwrap_or_else(|e| panic!("invalid return type '{}': {}", ty, e)),
+            let ret: syn::Type = match &toy_fn.return_ty {
+                Some(ty) => resolved_type_to_syn(ty),
                 None => parse_quote!(()),
             };
 
@@ -136,17 +144,15 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         }
 
         // Public wrapper function (user-facing signature) — for ALL functions
-        let ret: syn::Type = match toy_fn.return_ty.as_deref() {
-            Some(ty) => syn::parse_str(ty)
-                .unwrap_or_else(|e| panic!("invalid return type '{}': {}", ty, e)),
+        let ret: syn::Type = match &toy_fn.return_ty {
+            Some(ty) => resolved_type_to_syn(ty),
             None => parse_quote!(()),
         };
-        let wrapper_name = if _name == "main" { "__toylang_main" } else { _name.as_str() };
+        let wrapper_name = if _name == "main" { crate::oracle::TOYLANG_MAIN } else { _name.as_str() };
         let wrapper_ident = format_ident!("{}", wrapper_name);
         let user_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
             let pname = format_ident!("{}", p.name);
-            let pty: syn::Type = syn::parse_str(&p.ty)
-                .unwrap_or_else(|e| panic!("invalid param type '{}': {}", p.ty, e));
+            let pty = resolved_type_to_syn(&p.ty);
             quote! { #pname: #pty }
         }).collect();
 

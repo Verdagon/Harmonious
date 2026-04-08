@@ -3,7 +3,10 @@
 //! Produced by the type resolution pass (`type_resolve.rs`) from the untyped
 //! AST (`ast.rs`). Consumed by the LLVM backend (`llvm_gen.rs`).
 
-/// A concrete, fully-resolved type. No TypeParam, no unresolved generics.
+/// A type representation used throughout the compiler.
+/// Most variants are fully resolved. `TypeParam` appears only in the registry
+/// for uninstantiated generic function params/return types and struct fields.
+/// After type resolution, the typed AST never contains `TypeParam`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResolvedType {
     I32,
@@ -12,6 +15,17 @@ pub enum ResolvedType {
     Bool,
     Void,
     Usize,
+    /// Unresolved type parameter (e.g. "T"). Only in registry, never in typed AST.
+    TypeParam(String),
+    /// Reference to a struct by name — field layout not yet resolved.
+    /// Produced by the parser and stored in the registry. The type resolver
+    /// converts these to `Struct` by looking up fields.
+    StructRef {
+        name: String,
+        type_args: Vec<ResolvedType>,
+    },
+    /// Fully resolved struct with known field types. Only the type resolver
+    /// and codegen should use this variant.
     Struct {
         name: String,
         /// Concrete type args (e.g. [I64, I64] for Pair<i64, i64>). Empty for non-generic structs.
@@ -47,7 +61,7 @@ pub enum TypedExprKind {
     },
     FnCall {
         name: String,
-        type_args: Vec<String>,
+        type_args: Vec<ResolvedType>,
         args: Vec<TypedExpr>,
     },
     BinaryOp {

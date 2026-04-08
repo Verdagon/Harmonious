@@ -113,11 +113,12 @@ pub fn coerced_param_types_for_instance<'tcx>(
         match &arg.mode {
             PassMode::Ignore => CoercedParam::Ignore,
             PassMode::Direct(_) | PassMode::Pair(_, _) => {
-                // Note: for pointer params (&Vec<T>), this produces "i64" on 64-bit,
-                // but the internal function expects ptr. The bitcast-via-memory in the
-                // wrapper handles this correctly (same 8 bytes). LLVM's mem2reg eliminates
-                // the redundant alloca. Future optimization: check arg.layout.backend_repr
-                // for Scalar(Pointer) and produce "ptr" instead.
+                // Check if this is a pointer type (e.g. &Vec<T>, &T)
+                if let rustc_abi::BackendRepr::Scalar(scalar) = arg.layout.backend_repr {
+                    if matches!(scalar.primitive(), rustc_abi::Primitive::Pointer(_)) {
+                        return CoercedParam::Direct("ptr".to_string());
+                    }
+                }
                 CoercedParam::Direct(format!("i{}", arg.layout.size.bits()))
             }
             PassMode::Cast { cast, .. } => {

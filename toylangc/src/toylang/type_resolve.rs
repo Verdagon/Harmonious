@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use super::ast::{Expr, Stmt};
 #[cfg(test)]
 use super::ast::FnBody;
-use super::registry::{ToylangRegistry, ToyFieldType, ToyFunction};
+use super::registry::{ToylangRegistry, ToyFunction};
 use super::typed_ast::*;
 
 // ============================================================================
@@ -21,8 +21,8 @@ pub fn resolve_return_type(
     registry: &ToylangRegistry,
     func: &ToyFunction,
 ) -> ResolvedType {
-    func.return_ty.as_deref()
-        .map(|s| parse_type_string(s, registry))
+    func.return_ty.as_ref()
+        .map(|rt| resolve_struct_fields(rt, registry))
         .unwrap_or(ResolvedType::Void)
 }
 
@@ -32,16 +32,15 @@ pub fn resolve_fn_body(
     rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> ResolvedType,
 ) -> TypedFnBody {
     let body = func.body.as_ref().expect("function has no body");
-    let ret_ty = func.return_ty.as_deref()
-        .map(|s| parse_type_string(s, registry))
+    let ret_ty = func.return_ty.as_ref()
+        .map(|rt| resolve_struct_fields(rt, registry))
         .unwrap_or(ResolvedType::Void);
 
     let mut scope: HashMap<String, ResolvedType> = HashMap::new();
 
-    // Add function parameters to scope
+    // Add function parameters to scope (resolve StructRef → Struct)
     for p in &func.params {
-        let ty = parse_type_string(&p.ty, registry);
-        scope.insert(p.name.clone(), ty);
+        scope.insert(p.name.clone(), resolve_struct_fields(&p.ty, registry));
     }
 
     // Resolve statements
@@ -63,139 +62,73 @@ pub fn resolve_fn_body(
 
 /// Parse a type string like "i32", "Pair<i32, i64>", "Vec<Point>", "&Vec<Point>"
 /// into a ResolvedType. Uses the registry to resolve struct names.
-pub fn parse_type_string(s: &str, registry: &ToylangRegistry) -> ResolvedType {
-    let s = s.trim();
-
-    // Reference types
-    if s.starts_with("&mut ") {
-        return ResolvedType::Ref {
-            inner: Box::new(parse_type_string(&s[5..], registry)),
-        };
-    }
-    if s.starts_with("&") {
-        return ResolvedType::Ref {
-            inner: Box::new(parse_type_string(&s[1..], registry)),
-        };
-    }
-
-    // Pointer types (treat as ref for now)
-    if s.starts_with("*const ") || s.starts_with("*mut ") {
-        let inner_start = if s.starts_with("*const ") { 7 } else { 5 };
-        return ResolvedType::Ref {
-            inner: Box::new(parse_type_string(&s[inner_start..], registry)),
-        };
-    }
-
-    // Primitives
-    match s {
-        "i32" => return ResolvedType::I32,
-        "i64" => return ResolvedType::I64,
-        "f64" => return ResolvedType::F64,
-        "bool" => return ResolvedType::Bool,
-        "usize" => return ResolvedType::Usize,
-        "()" => return ResolvedType::Void,
-        _ => {}
-    }
-
-    // Generic types: "Vec<i32>", "Pair<i32, i64>"
-    if let Some(open) = s.find('<') {
-        if s.ends_with('>') {
-            let base = &s[..open];
-            let args_str = &s[open + 1..s.len() - 1];
-            let args = split_type_args(args_str);
-
-            if base == "Vec" {
-                let resolved_args: Vec<ResolvedType> = args.iter()
-                    .map(|a| parse_type_string(a, registry))
-                    .collect();
-                return ResolvedType::RustType { name: "Vec".to_string(), type_args: resolved_args };
-            }
-
-            // Generic struct: look up in registry and substitute type params
-            if let Some(toy_struct) = registry.structs.get(base) {
-                let resolved_args: Vec<ResolvedType> = args.iter()
-                    .map(|a| parse_type_string(a, registry))
-                    .collect();
-                let subst: HashMap<&str, &ResolvedType> = toy_struct.type_params.iter()
-                    .zip(resolved_args.iter())
-                    .map(|(param, resolved)| (param.as_str(), resolved))
-                    .collect();
-                let field_types: Vec<ResolvedType> = toy_struct.fields.iter()
-                    .map(|f| resolve_field_type(&f.rust_type, &subst, registry))
-                    .collect();
-                return ResolvedType::Struct {
-                    name: base.to_string(),
-                    type_args: resolved_args,
-                    field_types,
-                };
+/// Convert a `StructRef` → `Struct` by looking up fields in the registry.
+/// Recursively resolves nested struct references.
+pub fn resolve_struct_fields(ty: &ResolvedType, registry: &ToylangRegistry) -> ResolvedType {
+    match ty {
+        ResolvedType::StructRef { name, type_args } => {
+            let Some(toy_struct) = registry.structs.get(name.as_str()) else {
+                panic!("StructRef '{}' not found in registry", name);
+            };
+            // Build substitution map from type_args
+            let subst: HashMap<String, ResolvedType> = toy_struct.type_params.iter()
+                .zip(type_args.iter())
+                .map(|(param, arg)| (param.clone(), arg.clone()))
+                .collect();
+            let resolved_fields: Vec<ResolvedType> = toy_struct.fields.iter()
+                .map(|f| {
+                    let substituted = substitute_type_params(&f.rust_type, &subst);
+                    resolve_struct_fields(&substituted, registry)
+                })
+                .collect();
+            ResolvedType::Struct {
+                name: name.clone(),
+                type_args: type_args.clone(),
+                field_types: resolved_fields,
             }
         }
-    }
-
-    // Non-generic struct
-    if let Some(toy_struct) = registry.structs.get(s) {
-        let field_types: Vec<ResolvedType> = toy_struct.fields.iter()
-            .map(|f| resolve_field_type(&f.rust_type, &HashMap::new(), registry))
-            .collect();
-        return ResolvedType::Struct {
-            name: s.to_string(),
-            type_args: vec![],
-            field_types,
-        };
-    }
-
-    // Unknown non-generic name — treat as an opaque Rust type (e.g. "Global")
-    ResolvedType::RustType { name: s.to_string(), type_args: vec![] }
-}
-
-/// Split "i32, i64" into ["i32", "i64"], handling nested generics.
-fn split_type_args(s: &str) -> Vec<&str> {
-    let mut args = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth -= 1,
-            ',' if depth == 0 => {
-                args.push(s[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
+        ResolvedType::Ref { inner } => {
+            ResolvedType::Ref { inner: Box::new(resolve_struct_fields(inner, registry)) }
         }
+        other => other.clone(),
     }
-    let last = s[start..].trim();
-    if !last.is_empty() {
-        args.push(last);
-    }
-    args
 }
 
-/// Resolve a ToyFieldType to a ResolvedType, substituting type params.
-fn resolve_field_type(
-    ft: &ToyFieldType,
-    subst: &HashMap<&str, &ResolvedType>,
-    registry: &ToylangRegistry,
+/// Substitute TypeParam variants in a ResolvedType with concrete types from the map.
+pub fn substitute_type_params(
+    ty: &ResolvedType,
+    subst: &HashMap<String, ResolvedType>,
 ) -> ResolvedType {
-    match ft {
-        ToyFieldType::I32 => ResolvedType::I32,
-        ToyFieldType::I64 => ResolvedType::I64,
-        ToyFieldType::F64 => ResolvedType::F64,
-        ToyFieldType::Bool => ResolvedType::Bool,
-        ToyFieldType::TypeParam(name) => {
-            (*subst.get(name.as_str())
-                .unwrap_or_else(|| panic!("unresolved type param '{}'", name)))
+    match ty {
+        ResolvedType::TypeParam(name) => {
+            subst.get(name)
+                .unwrap_or_else(|| panic!("unresolved type param '{}'", name))
                 .clone()
         }
-        ToyFieldType::ToyStruct(name) => {
-            parse_type_string(name, registry)
+        ResolvedType::StructRef { name, type_args } => {
+            ResolvedType::StructRef {
+                name: name.clone(),
+                type_args: type_args.iter().map(|a| substitute_type_params(a, subst)).collect(),
+            }
         }
-        ToyFieldType::RustGeneric(name, args) => {
-            let resolved_args: Vec<ResolvedType> = args.iter()
-                .map(|a| resolve_field_type(a, subst, registry))
-                .collect();
-            ResolvedType::RustType { name: name.clone(), type_args: resolved_args }
+        ResolvedType::Struct { name, type_args, field_types } => {
+            ResolvedType::Struct {
+                name: name.clone(),
+                type_args: type_args.iter().map(|a| substitute_type_params(a, subst)).collect(),
+                field_types: field_types.iter().map(|f| substitute_type_params(f, subst)).collect(),
+            }
         }
+        ResolvedType::RustType { name, type_args } => {
+            ResolvedType::RustType {
+                name: name.clone(),
+                type_args: type_args.iter().map(|a| substitute_type_params(a, subst)).collect(),
+            }
+        }
+        ResolvedType::Ref { inner } => {
+            ResolvedType::Ref { inner: Box::new(substitute_type_params(inner, subst)) }
+        }
+        // Primitives pass through unchanged
+        other => other.clone(),
     }
 }
 
@@ -249,9 +182,12 @@ fn resolve_expr(
             // Look up the struct and resolve field types
             let resolved_ty = if expected_ty != &ResolvedType::Void {
                 // Use expected type (already resolved with type params)
-                expected_ty.clone()
+                resolve_struct_fields(expected_ty, registry)
             } else {
-                parse_type_string(name, registry)
+                resolve_struct_fields(
+                    &ResolvedType::StructRef { name: name.clone(), type_args: vec![] },
+                    registry,
+                )
             };
 
             let field_types = match &resolved_ty {
@@ -279,20 +215,6 @@ fn resolve_expr(
             }
         }
 
-        Expr::FnCall { name, type_args: _, args } if name == "println" => {
-            let typed_args: Vec<TypedExpr> = args.iter()
-                .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry, rust_method_ret))
-                .collect();
-            TypedExpr {
-                kind: TypedExprKind::FnCall {
-                    name: "println".into(),
-                    type_args: vec![],
-                    args: typed_args,
-                },
-                ty: ResolvedType::Void,
-            }
-        }
-
         Expr::FnCall { name, type_args, args } => {
             let func = registry.functions.get(name.as_str())
                 .unwrap_or_else(|| panic!("function '{}' not found in registry", name));
@@ -303,16 +225,16 @@ fn resolve_expr(
                     "function '{}' requires {} type args, got {}",
                     name, func.type_params.len(), type_args.len());
 
-                // Build substitution map directly from explicit type args
-                let type_arg_subst: HashMap<String, String> = func.type_params.iter()
+                // Build substitution map: TypeParam name → concrete ResolvedType
+                let type_arg_subst: HashMap<String, ResolvedType> = func.type_params.iter()
                     .zip(type_args.iter())
                     .map(|(param, arg)| (param.clone(), arg.clone()))
                     .collect();
 
                 // Compute return type from substitution
-                let ret_ty = if let Some(ret_str) = &func.return_ty {
-                    let resolved_ret_str = substitute_type_params(ret_str, &type_arg_subst);
-                    parse_type_string(&resolved_ret_str, registry)
+                let ret_ty = if let Some(ret) = &func.return_ty {
+                    let substituted = substitute_type_params(ret, &type_arg_subst);
+                    resolve_struct_fields(&substituted, registry)
                 } else {
                     ResolvedType::Void
                 };
@@ -320,9 +242,8 @@ fn resolve_expr(
                 let typed_args: Vec<TypedExpr> = args.iter()
                     .enumerate()
                     .map(|(i, a)| {
-                        let param_ty_str = &func.params[i].ty;
-                        let resolved_param_str = substitute_type_params(param_ty_str, &type_arg_subst);
-                        let expected = parse_type_string(&resolved_param_str, registry);
+                        let substituted = substitute_type_params(&func.params[i].ty, &type_arg_subst);
+                        let expected = resolve_struct_fields(&substituted, registry);
                         resolve_expr(a, &expected, scope, registry, rust_method_ret)
                     })
                     .collect();
@@ -337,14 +258,14 @@ fn resolve_expr(
                 }
             } else {
                 // Concrete function call
-                let ret_ty = func.return_ty.as_deref()
-                    .map(|s| parse_type_string(s, registry))
+                let ret_ty = func.return_ty.as_ref()
+                    .map(|rt| resolve_struct_fields(rt, registry))
                     .unwrap_or(ResolvedType::Void);
                 let typed_args: Vec<TypedExpr> = args.iter()
                     .enumerate()
                     .map(|(i, a)| {
                         let expected = if i < func.params.len() {
-                            parse_type_string(&func.params[i].ty, registry)
+                            resolve_struct_fields(&func.params[i].ty, registry)
                         } else {
                             ResolvedType::Void
                         };
@@ -384,9 +305,7 @@ fn resolve_expr(
                     // Vec element type must be provided explicitly: Vec::new<Point>()
                     assert!(!type_args.is_empty(),
                         "Vec::new requires explicit element type: Vec::new<Point>()");
-                    let resolved_type_args: Vec<ResolvedType> = type_args.iter()
-                        .map(|a| parse_type_string(a, registry))
-                        .collect();
+                    let resolved_type_args = type_args.clone();
                     let vec_ty = ResolvedType::RustType { name: "Vec".to_string(), type_args: resolved_type_args.clone() };
                     TypedExpr {
                         kind: TypedExprKind::StaticCall {
@@ -479,24 +398,6 @@ fn resolve_stmt(
     }
 }
 
-fn substitute_type_params(ty_str: &str, subst: &HashMap<String, String>) -> String {
-    if let Some(replacement) = subst.get(ty_str) {
-        return replacement.clone();
-    }
-    if let Some(open) = ty_str.find('<') {
-        if ty_str.ends_with('>') {
-            let base = &ty_str[..open];
-            let args_str = &ty_str[open + 1..ty_str.len() - 1];
-            let args: Vec<&str> = split_type_args(args_str);
-            let resolved: Vec<String> = args.iter()
-                .map(|a| substitute_type_params(a, subst))
-                .collect();
-            return format!("{}<{}>", base, resolved.join(", "));
-        }
-    }
-    ty_str.to_string()
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -524,66 +425,66 @@ mod tests {
         structs.insert("Counter".to_string(), ToyStruct {
             name: "Counter".to_string(),
             type_params: vec![],
-            fields: vec![ToyField { name: "value".to_string(), rust_type: ToyFieldType::I32 }],
+            fields: vec![ToyField { name: "value".to_string(), rust_type: ResolvedType::I32 }],
         });
         structs.insert("Point".to_string(), ToyStruct {
             name: "Point".to_string(),
             type_params: vec![],
             fields: vec![
-                ToyField { name: "x".to_string(), rust_type: ToyFieldType::I32 },
-                ToyField { name: "y".to_string(), rust_type: ToyFieldType::I32 },
+                ToyField { name: "x".to_string(), rust_type: ResolvedType::I32 },
+                ToyField { name: "y".to_string(), rust_type: ResolvedType::I32 },
             ],
         });
         structs.insert("Pair".to_string(), ToyStruct {
             name: "Pair".to_string(),
             type_params: vec!["A".to_string(), "B".to_string()],
             fields: vec![
-                ToyField { name: "first".to_string(), rust_type: ToyFieldType::TypeParam("A".to_string()) },
-                ToyField { name: "second".to_string(), rust_type: ToyFieldType::TypeParam("B".to_string()) },
+                ToyField { name: "first".to_string(), rust_type: ResolvedType::TypeParam("A".to_string()) },
+                ToyField { name: "second".to_string(), rust_type: ResolvedType::TypeParam("B".to_string()) },
             ],
         });
         structs.insert("ToyInner".to_string(), ToyStruct {
             name: "ToyInner".to_string(),
             type_params: vec![],
-            fields: vec![ToyField { name: "x".to_string(), rust_type: ToyFieldType::I32 }],
+            fields: vec![ToyField { name: "x".to_string(), rust_type: ResolvedType::I32 }],
         });
         structs.insert("ToyOuter".to_string(), ToyStruct {
             name: "ToyOuter".to_string(),
             type_params: vec![],
-            fields: vec![ToyField { name: "inner".to_string(), rust_type: ToyFieldType::ToyStruct("ToyInner".to_string()) }],
+            fields: vec![ToyField { name: "inner".to_string(), rust_type: ResolvedType::StructRef { name: "ToyInner".to_string(), type_args: vec![] } }],
         });
         structs.insert("ToyShip".to_string(), ToyStruct {
             name: "ToyShip".to_string(),
             type_params: vec![],
             fields: vec![ToyField {
                 name: "wings".to_string(),
-                rust_type: ToyFieldType::RustGeneric("Vec".to_string(), vec![ToyFieldType::I32]),
+                rust_type: ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32] },
             }],
         });
         ToylangRegistry { structs, functions: std::collections::HashMap::new(), imports: vec![] }
     }
 
     #[test]
-    fn test_parse_primitive() {
+    fn test_resolve_struct_fields_simple() {
         let reg = make_registry();
-        assert_eq!(parse_type_string("i32", &reg), ResolvedType::I32);
-        assert_eq!(parse_type_string("i64", &reg), ResolvedType::I64);
-        assert_eq!(parse_type_string("bool", &reg), ResolvedType::Bool);
-        assert_eq!(parse_type_string("usize", &reg), ResolvedType::Usize);
-    }
-
-    #[test]
-    fn test_parse_struct() {
-        let reg = make_registry();
-        let ty = parse_type_string("Counter", &reg);
+        let ty = resolve_struct_fields(
+            &ResolvedType::StructRef { name: "Counter".to_string(), type_args: vec![] },
+            &reg,
+        );
         assert!(matches!(ty, ResolvedType::Struct { ref name, ref field_types, .. }
             if name == "Counter" && field_types == &[ResolvedType::I32]));
     }
 
     #[test]
-    fn test_parse_generic_struct() {
+    fn test_resolve_struct_fields_generic() {
         let reg = make_registry();
-        let ty = parse_type_string("Pair<i32, i64>", &reg);
+        let ty = resolve_struct_fields(
+            &ResolvedType::StructRef {
+                name: "Pair".to_string(),
+                type_args: vec![ResolvedType::I32, ResolvedType::I64],
+            },
+            &reg,
+        );
         match ty {
             ResolvedType::Struct { name, field_types, .. } => {
                 assert_eq!(name, "Pair");
@@ -594,28 +495,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_vec() {
+    fn test_resolve_struct_fields_ref() {
         let reg = make_registry();
-        let ty = parse_type_string("Vec<i32>", &reg);
-        assert!(matches!(ty, ResolvedType::RustType { ref name, ref type_args }
-            if name == "Vec" && type_args == &[ResolvedType::I32]));
+        // resolve_struct_fields on a Ref containing a StructRef
+        let ty = resolve_struct_fields(
+            &ResolvedType::Ref {
+                inner: Box::new(ResolvedType::StructRef { name: "Point".to_string(), type_args: vec![] }),
+            },
+            &reg,
+        );
+        match ty {
+            ResolvedType::Ref { inner } => {
+                assert!(matches!(*inner, ResolvedType::Struct { ref name, .. } if name == "Point"));
+            }
+            _ => panic!("expected Ref, got {:?}", ty),
+        }
     }
 
     #[test]
-    fn test_parse_ref() {
+    fn test_substitute_type_params() {
+        let mut subst = HashMap::new();
+        subst.insert("T".to_string(), ResolvedType::I32);
+        let result = substitute_type_params(&ResolvedType::TypeParam("T".to_string()), &subst);
+        assert_eq!(result, ResolvedType::I32);
+    }
+
+    #[test]
+    fn test_primitives_pass_through() {
+        // Primitives are already resolved, no struct fields to fill in
         let reg = make_registry();
-        let ty = parse_type_string("&Vec<Point>", &reg);
-        match ty {
-            ResolvedType::Ref { inner } => {
-                match *inner {
-                    ResolvedType::RustType { ref name, ref type_args } if name == "Vec" => {
-                        assert!(matches!(&type_args[0], ResolvedType::Struct { ref name, .. } if name == "Point"));
-                    }
-                    _ => panic!("expected RustType Vec"),
-                }
-            }
-            _ => panic!("expected Ref"),
-        }
+        assert_eq!(resolve_struct_fields(&ResolvedType::I32, &reg), ResolvedType::I32);
+        assert_eq!(resolve_struct_fields(&ResolvedType::Bool, &reg), ResolvedType::Bool);
     }
 
     #[test]
@@ -625,7 +535,7 @@ mod tests {
             name: "f".to_string(),
             type_params: vec![],
             params: vec![],
-            return_ty: Some("i32".to_string()),
+            return_ty: Some(ResolvedType::I32),
             body: Some(FnBody { stmts: vec![], ret: Some(Expr::IntLit(42)) }),
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret);
@@ -641,7 +551,7 @@ mod tests {
             name: "f".to_string(),
             type_params: vec![],
             params: vec![],
-            return_ty: Some("Pair<i32, i64>".to_string()),
+            return_ty: Some(ResolvedType::StructRef { name: "Pair".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::I64] }),
             body: Some(FnBody {
                 stmts: vec![],
                 ret: Some(Expr::StructLit {
@@ -678,8 +588,8 @@ mod tests {
         let func = ToyFunction {
             name: "f".to_string(),
             type_params: vec![],
-            params: vec![ToyParam { name: "x".to_string(), ty: "i32".to_string() }],
-            return_ty: Some("Counter".to_string()),
+            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
+            return_ty: Some(ResolvedType::StructRef { name: "Counter".to_string(), type_args: vec![] }),
             body: Some(FnBody {
                 stmts: vec![],
                 ret: Some(Expr::StructLit {
@@ -702,7 +612,7 @@ mod tests {
             name: "f".to_string(),
             type_params: vec![],
             params: vec![],
-            return_ty: Some("ToyOuter".to_string()),
+            return_ty: Some(ResolvedType::StructRef { name: "ToyOuter".to_string(), type_args: vec![] }),
             body: Some(FnBody {
                 stmts: vec![],
                 ret: Some(Expr::StructLit {
@@ -734,12 +644,12 @@ mod tests {
             name: "f".to_string(),
             type_params: vec![],
             params: vec![],
-            return_ty: Some("ToyShip".to_string()),
+            return_ty: Some(ResolvedType::StructRef { name: "ToyShip".to_string(), type_args: vec![] }),
             body: Some(FnBody {
                 stmts: vec![
                     Stmt::Let {
                         name: "v".to_string(),
-                        expr: Expr::StaticCall { ty: "Vec".to_string(), method: "new".to_string(), type_args: vec!["i32".to_string()], args: vec![] },
+                        expr: Expr::StaticCall { ty: "Vec".to_string(), method: "new".to_string(), type_args: vec![ResolvedType::I32], args: vec![] },
                     },
                     Stmt::ExprStmt(Expr::MethodCall {
                         receiver: Box::new(Expr::Var("v".to_string())),

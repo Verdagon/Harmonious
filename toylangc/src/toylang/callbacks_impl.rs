@@ -10,12 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::ty::{self, GenericArg, Ty, TyCtxt, TyKind};
-use rustc_span::sym;
+use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 
 use rustc_lang_facade::{LangCallbacks, MonomorphizeTypeResult, MonomorphizeFnResult};
 use crate::toylang::ast::FnBody;
-use crate::toylang::registry::{ToylangRegistry, ToyFieldType};
+use crate::toylang::registry::ToylangRegistry;
 
 pub struct ToylangCallbacks {
     pub registry: Arc<ToylangRegistry>,
@@ -29,10 +28,14 @@ impl LangCallbacks for ToylangCallbacks {
     }
 
     fn fn_names(&self) -> std::collections::HashSet<String> {
-        let mut names: std::collections::HashSet<String> = self.registry.functions.keys().cloned().collect();
-        // The "main" wrapper is renamed to "__toylang_main" to avoid conflict with Rust's main
+        // Only include toylang-defined functions (with bodies).
+        // Extern functions (body-less) are real Rust functions and must not be intercepted.
+        let mut names: std::collections::HashSet<String> = self.registry.functions.iter()
+            .filter(|(_, f)| f.body.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
         if names.contains("main") {
-            names.insert("__toylang_main".to_string());
+            names.insert(crate::oracle::TOYLANG_MAIN.to_string());
         }
         names
     }
@@ -54,8 +57,8 @@ impl LangCallbacks for ToylangCallbacks {
         let toy_struct = self.registry.structs.get(name)
             .unwrap_or_else(|| panic!("[toylang] monomorphize_type: struct '{}' not in registry", name));
 
-        // Build type-param substitution from the ADT's generic args.
-        let subst: HashMap<&str, Ty<'tcx>> = if !toy_struct.type_params.is_empty() {
+        // Build type-param substitution at the rustc Ty level (no round-trip through ResolvedType).
+        let ty_subst: HashMap<&str, Ty<'tcx>> = if !toy_struct.type_params.is_empty() {
             if let TyKind::Adt(_, args) = ty.kind() {
                 toy_struct.type_params.iter()
                     .enumerate()
@@ -68,24 +71,9 @@ impl LangCallbacks for ToylangCallbacks {
             HashMap::new()
         };
 
-        // Map each field to a rustc Ty.
+        // Convert each field's ResolvedType to rustc Ty, substituting TypeParams directly.
         let field_types: Vec<Ty<'tcx>> = toy_struct.fields.iter().map(|field| {
-            match &field.rust_type {
-                ToyFieldType::I32 => tcx.types.i32,
-                ToyFieldType::I64 => tcx.types.i64,
-                ToyFieldType::F64 => tcx.types.f64,
-                ToyFieldType::Bool => tcx.types.bool,
-                ToyFieldType::TypeParam(name) => {
-                    *subst.get(name.as_str()).expect("type param not in subst")
-                }
-                ToyFieldType::ToyStruct(struct_name) => {
-                    crate::oracle::find_local_struct_ty(tcx, struct_name)
-                        .unwrap_or_else(|| panic!("[toylang] monomorphize_type: struct '{}' not found", struct_name))
-                }
-                ToyFieldType::RustGeneric(type_name, type_args) => {
-                    resolve_rust_generic_ty(tcx, type_name, type_args, &subst)
-                }
-            }
+            resolved_to_rustc_ty_with_subst(tcx, &field.rust_type, &ty_subst)
         }).collect();
 
         MonomorphizeTypeResult {
@@ -112,8 +100,7 @@ impl LangCallbacks for ToylangCallbacks {
             };
         }
 
-        // __toylang_main wrapper maps back to "main" in the registry
-        let registry_name = if name == "__toylang_main" { "main" } else { name };
+        let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main" } else { name };
         let toy_fn = self.registry.functions.get(registry_name)
             .unwrap_or_else(|| panic!("[toylang] monomorphize_fn: function '{}' not in registry", registry_name));
 
@@ -154,59 +141,41 @@ impl LangCallbacks for ToylangCallbacks {
 // Toylang-specific helpers (moved from queries/mir_build.rs)
 // ============================================================================
 
-/// Resolve a ToyFieldType to a rustc Ty, handling all variants.
-fn resolve_field_ty<'tcx>(
+/// Convert a ResolvedType to a rustc Ty, with direct TypeParam → Ty substitution.
+/// Avoids round-tripping through ResolvedType for type args from rustc.
+fn resolved_to_rustc_ty_with_subst<'tcx>(
     tcx: TyCtxt<'tcx>,
-    ft: &ToyFieldType,
+    ty: &crate::toylang::typed_ast::ResolvedType,
     subst: &HashMap<&str, Ty<'tcx>>,
 ) -> Ty<'tcx> {
-    match ft {
-        ToyFieldType::I32 => tcx.types.i32,
-        ToyFieldType::I64 => tcx.types.i64,
-        ToyFieldType::F64 => tcx.types.f64,
-        ToyFieldType::Bool => tcx.types.bool,
-        ToyFieldType::TypeParam(name) => {
-            *subst.get(name.as_str()).expect("type param not in subst")
+    use crate::toylang::typed_ast::ResolvedType;
+    match ty {
+        ResolvedType::TypeParam(name) => {
+            *subst.get(name.as_str())
+                .unwrap_or_else(|| panic!("type param '{}' not in subst", name))
         }
-        ToyFieldType::ToyStruct(struct_name) => {
-            crate::oracle::find_local_struct_ty(tcx, struct_name)
-                .unwrap_or_else(|| panic!("[toylang] resolve_field_ty: struct '{}' not found", struct_name))
+        ResolvedType::StructRef { name, type_args }
+        | ResolvedType::Struct { name, type_args, .. } => {
+            let def_id = crate::oracle::find_local_struct_def_id(tcx, name)
+                .unwrap_or_else(|| panic!("struct '{}' not found", name));
+            let adt_def = tcx.adt_def(def_id);
+            let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty_with_subst(tcx, ta, subst)))
+                .collect();
+            Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
         }
-        ToyFieldType::RustGeneric(type_name, type_args) => {
-            resolve_rust_generic_ty(tcx, type_name, type_args, subst)
+        ResolvedType::RustType { name, type_args } => {
+            let def_id = crate::oracle::find_rust_type_def_id(tcx, name)
+                .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
+            let adt_def = tcx.adt_def(def_id);
+            let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty_with_subst(tcx, ta, subst)))
+                .collect();
+            Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
         }
+        // Non-parameterized types delegate to the standard conversion
+        other => crate::oracle::resolved_to_rustc_ty(tcx, other),
     }
-}
-
-/// Construct a rustc Ty for a Rust generic type like Vec<i32> or HashMap<K, V>.
-fn resolve_rust_generic_ty<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    type_name: &str,
-    type_args: &[ToyFieldType],
-    subst: &HashMap<&str, Ty<'tcx>>,
-) -> Ty<'tcx> {
-    // Find the DefId for the type name
-    let def_id = match type_name {
-        "Vec" => tcx.get_diagnostic_item(sym::Vec)
-            .expect("[toylang] Vec not found via diagnostic item"),
-        other => {
-            // Fallback: search local definitions
-            crate::oracle::find_local_struct_ty(tcx, other)
-                .map(|ty| {
-                    if let TyKind::Adt(adt_def, _) = ty.kind() {
-                        adt_def.did()
-                    } else {
-                        panic!("[toylang] resolve_rust_generic_ty: '{}' is not an ADT", other)
-                    }
-                })
-                .unwrap_or_else(|| panic!("[toylang] resolve_rust_generic_ty: type '{}' not found", other))
-        }
-    };
-    let adt_def = tcx.adt_def(def_id);
-    let args: Vec<GenericArg<'tcx>> = type_args.iter()
-        .map(|arg| GenericArg::from(resolve_field_ty(tcx, arg, subst)))
-        .collect();
-    Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
 }
 
 /// Scan a function body for calls to other toylang functions and return their
@@ -227,7 +196,7 @@ fn collect_toylang_fn_deps<'tcx>(
         for (i, param_name) in caller_fn.type_params.iter().enumerate() {
             if let Some(arg) = instance.args.get(i) {
                 if let ty::GenericArgKind::Type(ty) = arg.unpack() {
-                    subst.insert(param_name.clone(), rustc_ty_to_type_string(tcx, ty));
+                    subst.insert(param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(tcx, ty));
                 }
             }
         }
@@ -236,30 +205,19 @@ fn collect_toylang_fn_deps<'tcx>(
             type_params: vec![],
             params: caller_fn.params.iter().map(|p| crate::toylang::registry::ToyParam {
                 name: p.name.clone(),
-                ty: crate::llvm_gen::substitute_type_params_str_pub(&p.ty, &subst),
+                ty: crate::toylang::type_resolve::substitute_type_params(&p.ty, &subst),
             }).collect(),
-            return_ty: caller_fn.return_ty.as_deref()
-                .map(|s| crate::llvm_gen::substitute_type_params_str_pub(s, &subst)),
+            return_ty: caller_fn.return_ty.as_ref()
+                .map(|rt| crate::toylang::type_resolve::substitute_type_params(rt, &subst)),
             body: caller_fn.body.clone(),
         }
     } else {
         caller_fn.clone()
     };
 
-    // Run type resolver to get typed body with FnCall type_args filled in
-    // Production callback: hardcoded for now (will query tcx.fn_sig in a later step)
-    let rust_method_ret = |_type_name: &str, method: &str, _type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
-        match method {
-            "new" => {
-                crate::toylang::typed_ast::ResolvedType::RustType {
-                    name: _type_name.to_string(),
-                    type_args: _type_args.to_vec(),
-                }
-            }
-            "push" => crate::toylang::typed_ast::ResolvedType::Void,
-            "len" => crate::toylang::typed_ast::ResolvedType::Usize,
-            _ => panic!("unknown Rust method '{}'", method),
-        }
+    // Query rustc for Rust method return types
+    let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
+        crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
     };
     let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, &resolved_caller, &rust_method_ret);
 
@@ -269,20 +227,28 @@ fn collect_toylang_fn_deps<'tcx>(
     let mut rust_method_deps = Vec::new();
     walk_typed_body_for_deps(&typed_body, &mut fn_calls, &mut rust_method_deps);
 
-    // Resolve toylang function deps
+    // Resolve function call deps (both toylang and extern)
     for (callee_name, type_args) in &fn_calls {
-        let Some(callee_def_id) = find_stub_fn_def_id(tcx, callee_name) else { continue };
-        if !registry.functions.contains_key(callee_name.as_str()) { continue; }
+        let Some(callee_fn) = registry.functions.get(callee_name.as_str()) else { continue };
 
-        if type_args.is_empty() {
-            let args = tcx.mk_args(&[]);
-            deps.push((callee_def_id, args));
+        if callee_fn.body.is_some() {
+            // Toylang function — find its stub wrapper
+            let Some(callee_def_id) = find_stub_fn_def_id(tcx, callee_name) else { continue };
+            if type_args.is_empty() {
+                let args = tcx.mk_args(&[]);
+                deps.push((callee_def_id, args));
+            } else {
+                let ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                    .map(|rt| ty::GenericArg::from(resolved_to_rustc_ty(tcx, rt)))
+                    .collect();
+                let args = tcx.mk_args(&ty_args);
+                deps.push((callee_def_id, args));
+            }
         } else {
-            let ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-                .map(|s| ty::GenericArg::from(string_to_rustc_ty(tcx, s)))
-                .collect();
-            let args = tcx.mk_args(&ty_args);
-            deps.push((callee_def_id, args));
+            // Extern function — find the real Rust function
+            let Some(def_id) = crate::oracle::find_extern_fn_def_id(tcx, callee_name) else { continue };
+            let args = tcx.mk_args(&[]);
+            deps.push((def_id, args));
         }
     }
 
@@ -315,7 +281,7 @@ struct RustMethodDep {
 /// Walk a TypedFnBody and collect toylang FnCall deps and Rust method deps.
 fn walk_typed_body_for_deps(
     body: &crate::toylang::typed_ast::TypedFnBody,
-    fn_calls: &mut Vec<(String, Vec<String>)>,
+    fn_calls: &mut Vec<(String, Vec<crate::toylang::typed_ast::ResolvedType>)>,
     rust_method_deps: &mut Vec<RustMethodDep>,
 ) {
     use crate::toylang::typed_ast::*;
@@ -332,7 +298,7 @@ fn walk_typed_body_for_deps(
 
 fn walk_typed_expr_for_deps(
     expr: &crate::toylang::typed_ast::TypedExpr,
-    fn_calls: &mut Vec<(String, Vec<String>)>,
+    fn_calls: &mut Vec<(String, Vec<crate::toylang::typed_ast::ResolvedType>)>,
     rust_method_deps: &mut Vec<RustMethodDep>,
 ) {
     use crate::toylang::typed_ast::*;
@@ -394,58 +360,10 @@ fn walk_typed_expr_for_deps(
 
 /// Convert a ResolvedType to a rustc Ty.
 fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::typed_ast::ResolvedType) -> Ty<'tcx> {
-    use crate::toylang::typed_ast::ResolvedType;
-    match resolved {
-        ResolvedType::I32 => tcx.types.i32,
-        ResolvedType::I64 => tcx.types.i64,
-        ResolvedType::F64 => tcx.types.f64,
-        ResolvedType::Bool => tcx.types.bool,
-        ResolvedType::Usize => tcx.types.usize,
-        ResolvedType::Void => tcx.types.unit,
-        ResolvedType::Struct { name, type_args, .. } => {
-            let def_id = crate::oracle::find_local_struct_def_id(tcx, name)
-                .unwrap_or_else(|| panic!("struct '{}' not found", name));
-            let adt_def = tcx.adt_def(def_id);
-            let args: Vec<GenericArg<'tcx>> = type_args.iter()
-                .map(|ta| GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
-                .collect();
-            Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
-        }
-        ResolvedType::RustType { name, type_args } => {
-            let def_id = crate::oracle::find_rust_type_def_id(tcx, name)
-                .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
-            let adt_def = tcx.adt_def(def_id);
-            let args: Vec<GenericArg<'tcx>> = type_args.iter()
-                .map(|ta| GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
-                .collect();
-            Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
-        }
-        ResolvedType::Ref { inner } => {
-            let inner_ty = resolved_to_rustc_ty(tcx, inner);
-            Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty)
-        }
-        ResolvedType::Str => panic!("Str type should not need rustc Ty conversion"),
-    }
+    crate::oracle::resolved_to_rustc_ty(tcx, resolved)
 }
 
 /// Convert a type string to a rustc Ty.
-fn string_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, s: &str) -> Ty<'tcx> {
-    match s {
-        "i32" => tcx.types.i32,
-        "i64" => tcx.types.i64,
-        "f64" => tcx.types.f64,
-        "bool" => tcx.types.bool,
-        "usize" => tcx.types.usize,
-        _ => {
-            // Try local struct
-            if let Some(ty) = crate::oracle::find_local_struct_ty(tcx, s) {
-                return ty;
-            }
-            panic!("string_to_rustc_ty: unsupported type '{}'", s)
-        }
-    }
-}
-
 /// Find a function's DefId in __lang_stubs by name.
 fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id::DefId> {
     use rustc_hir::def::DefKind;
@@ -495,31 +413,6 @@ fn mangle_ty_for_symbol<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
                     })
                     .collect();
                 format!("{}_{}", name, arg_strs.join("_"))
-            }
-        }
-        _ => format!("{:?}", ty),
-    }
-}
-
-/// Convert a rustc Ty to a type string usable by the parser/type resolver (e.g. "i32", "Point").
-pub fn rustc_ty_to_type_string<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
-    match ty.kind() {
-        TyKind::Int(int_ty) => int_ty.name_str().to_string(),
-        TyKind::Uint(uint_ty) => uint_ty.name_str().to_string(),
-        TyKind::Float(float_ty) => float_ty.name_str().to_string(),
-        TyKind::Bool => "bool".to_string(),
-        TyKind::Adt(adt_def, args) => {
-            let name = tcx.item_name(adt_def.did()).to_string();
-            if args.is_empty() {
-                name
-            } else {
-                let arg_strs: Vec<String> = args.iter()
-                    .filter_map(|a| match a.unpack() {
-                        ty::GenericArgKind::Type(t) => Some(rustc_ty_to_type_string(tcx, t)),
-                        _ => None,
-                    })
-                    .collect();
-                format!("{}<{}>", name, arg_strs.join(", "))
             }
         }
         _ => format!("{:?}", ty),

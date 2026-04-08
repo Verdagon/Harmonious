@@ -16,7 +16,7 @@ pub enum Expr {
     StringLit(String),
     Var(String),
     /// `Vec::new<Point>()` — IDENT "::" IDENT "<" type_args ">" "(" args ")"
-    StaticCall { ty: String, method: String, type_args: Vec<String>, args: Vec<Expr> },
+    StaticCall { ty: String, method: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, args: Vec<Expr> },
     /// `v.push(x)` — expr "." IDENT "(" args ")"
     MethodCall { receiver: Box<Expr>, method: String, args: Vec<Expr> },
     /// `p.x` — expr "." IDENT
@@ -24,7 +24,7 @@ pub enum Expr {
     /// `Point { x: 1, y: 2 }` — IDENT "{" field_inits "}"
     StructLit { name: String, fields: Vec<(String, Expr)> },
     /// `wrap<i32>(x)` — IDENT "<" type_args ">" "(" args ")"
-    FnCall { name: String, type_args: Vec<String>, args: Vec<Expr> },
+    FnCall { name: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, args: Vec<Expr> },
     /// `a + b`, `x * 2`
     BinaryOp { op: BinOp, left: Box<Expr>, right: Box<Expr> },
 }

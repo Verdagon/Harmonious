@@ -21,7 +21,7 @@ use inkwell::AddressSpace;
 use rustc_middle::ty::{self, GenericArg, TyCtxt};
 
 use crate::toylang::typed_ast::*;
-use crate::toylang::registry::{ToylangRegistry, ToyFieldType, ToyStruct};
+use crate::toylang::registry::{ToylangRegistry, ToyStruct};
 use rustc_lang_facade::LangCallbacks;
 
 /// Convert BasicTypeEnum to AnyTypeEnum (inkwell doesn't impl From directly).
@@ -130,6 +130,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             ResolvedType::Ref { inner: _ } => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
+            ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before codegen", name),
+            ResolvedType::StructRef { name, .. } => panic!("StructRef '{}' should be resolved to Struct before codegen", name),
         }
     }
 
@@ -149,34 +151,12 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
 
     // --- Type resolution ---
 
-    fn resolve_type(&self, ft: &ToyFieldType) -> BasicTypeEnum<'ctx> {
-        match ft {
-            ToyFieldType::I32 => self.context.i32_type().into(),
-            ToyFieldType::I64 => self.context.i64_type().into(),
-            ToyFieldType::F64 => self.context.f64_type().into(),
-            ToyFieldType::Bool => self.context.bool_type().into(),
-            ToyFieldType::TypeParam(_) => panic!("TypeParam should be resolved before codegen"),
-            ToyFieldType::ToyStruct(name) => {
-                let s = self.registry.structs.get(name.as_str())
-                    .unwrap_or_else(|| panic!("struct '{}' not found", name));
-                self.struct_type(s).into()
-            }
-            ToyFieldType::RustGeneric(type_name, _) => {
-                match type_name.as_str() {
-                    "Vec" => {
-                        // All Vec<T> have identical layout, element type irrelevant
-                        let resolved = ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::RustType { name: "Global".to_string(), type_args: vec![] }] };
-                        self.rust_ty_to_llvm_opaque(&resolved).0
-                    }
-                    other => panic!("unsupported Rust generic type '{}'", other),
-                }
-            }
-        }
-    }
-
     fn struct_type(&self, s: &ToyStruct) -> StructType<'ctx> {
         let fields: Vec<BasicTypeEnum<'ctx>> = s.fields.iter()
-            .map(|f| self.resolve_type(&f.rust_type))
+            .map(|f| {
+                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&f.rust_type, self.registry);
+                self.resolved_to_inkwell(&resolved)
+            })
             .collect();
         self.context.struct_type(&fields, false)
     }
@@ -205,83 +185,28 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             return self.struct_type(toy_struct);
         };
 
-        // Build type param → concrete type string map
-        let mut subst: HashMap<&str, &str> = HashMap::new();
-        let type_arg_strings: Vec<String> = toy_struct.type_params.iter()
+        // Build type param → concrete ResolvedType map
+        let subst: HashMap<String, ResolvedType> = toy_struct.type_params.iter()
             .enumerate()
-            .map(|(i, _)| {
+            .map(|(i, param_name)| {
                 let concrete_ty = args[i].expect_ty();
-                crate::toylang::callbacks_impl::rustc_ty_to_type_string(self.tcx, concrete_ty)
+                (param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(self.tcx, concrete_ty))
             })
             .collect();
-        for (i, param_name) in toy_struct.type_params.iter().enumerate() {
-            subst.insert(param_name.as_str(), type_arg_strings[i].as_str());
-        }
 
         // Resolve each field type with substitution
         let fields: Vec<BasicTypeEnum<'ctx>> = toy_struct.fields.iter()
-            .map(|f| self.resolve_field_type_with_subst(&f.rust_type, &subst))
+            .map(|f| {
+                let resolved = crate::toylang::type_resolve::substitute_type_params(&f.rust_type, &subst);
+                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&resolved, self.registry);
+                self.resolved_to_inkwell(&resolved)
+            })
             .collect();
         self.context.struct_type(&fields, false)
     }
 
-    /// Resolve a ToyFieldType with type param substitution, returning an inkwell type.
-    fn resolve_field_type_with_subst(
-        &self,
-        ft: &ToyFieldType,
-        subst: &HashMap<&str, &str>,
-    ) -> BasicTypeEnum<'ctx> {
-        match ft {
-            ToyFieldType::TypeParam(name) => {
-                let concrete = subst.get(name.as_str())
-                    .unwrap_or_else(|| panic!("TypeParam '{}' not in subst", name));
-                self.type_from_string(concrete)
-            }
-            _ => self.resolve_type(ft),
-        }
-    }
-
-    /// Convert a ResolvedType to a rustc Ty<'tcx>.
-    /// Convert a ResolvedType to a rustc Ty. Used for layout_of queries.
     fn resolved_type_to_rustc_ty(&self, resolved: &ResolvedType) -> ty::Ty<'tcx> {
-        match resolved {
-            ResolvedType::I32 => self.tcx.types.i32,
-            ResolvedType::I64 => self.tcx.types.i64,
-            ResolvedType::F64 => self.tcx.types.f64,
-            ResolvedType::Bool => self.tcx.types.bool,
-            ResolvedType::Usize => self.tcx.types.usize,
-            ResolvedType::Void => self.tcx.types.unit,
-            ResolvedType::Struct { name, type_args, .. } => {
-                if type_args.is_empty() {
-                    // Non-generic struct — bare ADT with no args
-                    crate::oracle::find_local_struct_ty(self.tcx, name)
-                        .unwrap_or_else(|| panic!("struct '{}' not found in rustc", name))
-                } else {
-                    // Generic struct — construct ADT with concrete type args
-                    let adt_def_id = crate::oracle::find_local_struct_def_id(self.tcx, name)
-                        .unwrap_or_else(|| panic!("struct '{}' not found in rustc", name));
-                    let adt_def = self.tcx.adt_def(adt_def_id);
-                    let args: Vec<GenericArg<'tcx>> = type_args.iter()
-                        .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
-                        .collect();
-                    ty::Ty::new_adt(self.tcx, adt_def, self.tcx.mk_args(&args))
-                }
-            }
-            ResolvedType::RustType { name, type_args } => {
-                let def_id = crate::oracle::find_rust_type_def_id(self.tcx, name)
-                    .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
-                let adt_def = self.tcx.adt_def(def_id);
-                let args: Vec<GenericArg<'tcx>> = type_args.iter()
-                    .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
-                    .collect();
-                ty::Ty::new_adt(self.tcx, adt_def, self.tcx.mk_args(&args))
-            }
-            ResolvedType::Ref { inner } => {
-                let inner_ty = self.resolved_type_to_rustc_ty(inner);
-                ty::Ty::new_imm_ref(self.tcx, self.tcx.lifetimes.re_erased, inner_ty)
-            }
-            ResolvedType::Str => panic!("Str type should not need rustc Ty conversion"),
-        }
+        crate::oracle::resolved_to_rustc_ty(self.tcx, resolved)
     }
 
     /// Query rustc's layout_of for a Rust type, returning an opaque [N x i8] LLVM type
@@ -307,70 +232,6 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         alloca.as_instruction_value().unwrap()
             .set_alignment(align as u32).unwrap();
         alloca
-    }
-
-    fn struct_type_for_ret(&self, ret_ty_name: &str) -> Option<StructType<'ctx>> {
-        if let Some(s) = self.registry.structs.get(ret_ty_name) {
-            return Some(self.struct_type(s));
-        }
-        if let Some((base, type_args)) = parse_generic_type(ret_ty_name) {
-            if let Some(s) = self.registry.structs.get(base) {
-                let fields: Vec<BasicTypeEnum<'ctx>> = s.fields.iter()
-                    .map(|f| self.resolve_field_with_args(f, &s.type_params, &type_args))
-                    .collect();
-                return Some(self.context.struct_type(&fields, false));
-            }
-        }
-        None
-    }
-
-    fn resolve_field_with_args(
-        &self,
-        field: &crate::toylang::registry::ToyField,
-        type_params: &[String],
-        type_args: &[&str],
-    ) -> BasicTypeEnum<'ctx> {
-        match &field.rust_type {
-            ToyFieldType::TypeParam(name) => {
-                let idx = type_params.iter().position(|p| p == name)
-                    .unwrap_or_else(|| panic!("type param '{}' not found", name));
-                self.type_from_string(type_args[idx])
-            }
-            other => self.resolve_type(other),
-        }
-    }
-
-    /// Resolve a type string (from generic type args) to an inkwell type.
-    /// Handles primitives, struct names, and generic types like Vec<i32>.
-    fn type_from_string(&self, name: &str) -> BasicTypeEnum<'ctx> {
-        match name {
-            "i32" => self.context.i32_type().into(),
-            "i64" => self.context.i64_type().into(),
-            "f64" => self.context.f64_type().into(),
-            "bool" => self.context.bool_type().into(),
-            "usize" => self.usize_type().into(),
-            _ => {
-                // Check for generic types: Vec<i32>, Pair<i32, i64>
-                if let Some((base, type_args)) = parse_generic_type(name) {
-                    if base == "Vec" {
-                        // All Vec<T> have identical layout, element type irrelevant
-                        let resolved = ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::RustType { name: "Global".to_string(), type_args: vec![] }] };
-                        return self.rust_ty_to_llvm_opaque(&resolved).0;
-                    }
-                    if let Some(s) = self.registry.structs.get(base) {
-                        let fields: Vec<BasicTypeEnum<'ctx>> = s.fields.iter()
-                            .map(|f| self.resolve_field_with_args(f, &s.type_params, &type_args))
-                            .collect();
-                        return self.context.struct_type(&fields, false).into();
-                    }
-                }
-                // Check for non-generic struct
-                if let Some(s) = self.registry.structs.get(name) {
-                    return self.struct_type(s).into();
-                }
-                panic!("unsupported type string '{}'", name)
-            }
-        }
     }
 
     // --- External function declaration ---
@@ -439,7 +300,15 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         let expected_count = self.tcx.generics_of(method_def_id).count();
         let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
 
-        let symbol = resolve_rust_symbol(self.tcx, method_def_id, args);
+        // Build Instance for ABI query
+        let instance = ty::Instance::expect_resolve(
+            self.tcx,
+            ty::TypingEnv::fully_monomorphized(),
+            method_def_id,
+            args,
+            rustc_span::DUMMY_SP,
+        );
+        let symbol = self.tcx.symbol_name(instance).name.to_string();
 
         // Check cache
         if self.rust_method_info.contains_key(&symbol) {
@@ -448,39 +317,49 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
 
         self.rust_symbols.push(symbol.clone());
 
-        // Determine if this method uses sret by checking its return type
-        // For now, use a simple heuristic: if the return type is a RustType (opaque),
-        // it's sret. If it's Void or a primitive, it's direct.
-        // (This matches current behavior: Vec::new → sret, push → void, len → usize)
+        // Query rustc ABI to determine calling convention
+        let coerced_ret = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(self.tcx, instance);
+        let coerced_params = rustc_lang_facade::abi_helpers::coerced_param_types_for_instance(self.tcx, instance);
+
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
 
-        // Determine function signature from method name pattern
-        // TODO: Replace with fn_abi_of_instance query in step 7
-        let (param_types, ret_type, sret_info, is_sret) = match method_name {
-            "new" => {
-                // Constructor: sret pattern (ptr param for return value, void return)
-                let result_ty = ResolvedType::RustType {
-                    name: type_name.to_string(),
-                    type_args: type_args.to_vec(),
-                };
-                let (opaque_ty, align) = self.rust_ty_to_llvm_opaque(&result_ty);
-                (
-                    vec![ptr_ty.into()],
-                    None,
-                    Some((opaque_ty, align)),
-                    true,
-                )
+        // Build param types from ABI
+        let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+        let is_sret = matches!(coerced_ret, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
+        if is_sret {
+            param_types.push(ptr_ty.into()); // sret pointer
+        }
+        for cp in &coerced_params {
+            match cp {
+                rustc_lang_facade::abi_helpers::CoercedParam::Ignore => {}
+                rustc_lang_facade::abi_helpers::CoercedParam::Direct(ty_str) => {
+                    param_types.push(parse_coerced_type(self, ty_str).into());
+                }
+                rustc_lang_facade::abi_helpers::CoercedParam::Indirect => {
+                    param_types.push(ptr_ty.into());
+                }
             }
-            "push" => {
-                // Mutating method: receiver ptr + arg ptr, void return
-                (vec![ptr_ty.into(), ptr_ty.into()], None, None, false)
+        }
+
+        // Build return type from ABI
+        let ret_type: Option<BasicTypeEnum<'ctx>> = match &coerced_ret {
+            rustc_lang_facade::abi_helpers::CoercedReturn::Direct(s) => {
+                Some(parse_coerced_type(self, s))
             }
-            "len" => {
-                // Query method: receiver ptr, returns usize
-                let usize_ty = self.usize_type();
-                (vec![ptr_ty.into()], Some(usize_ty.into()), None, false)
-            }
-            _ => panic!("unsupported Rust method '{}' on '{}'", method_name, type_name),
+            rustc_lang_facade::abi_helpers::CoercedReturn::Indirect | rustc_lang_facade::abi_helpers::CoercedReturn::Void => None,
+        };
+
+        // For sret, get the opaque type + alignment for the sret attribute
+        let sret_info = if is_sret {
+            // Get return type from fn_sig to determine opaque layout
+            let sig = self.tcx.fn_sig(method_def_id).instantiate(self.tcx, args);
+            let sig = self.tcx.normalize_erasing_late_bound_regions(
+                ty::TypingEnv::fully_monomorphized(), sig,
+            );
+            let ret_resolved = crate::oracle::rustc_ty_to_resolved_type(self.tcx, sig.output());
+            Some(self.rust_ty_to_llvm_opaque(&ret_resolved))
+        } else {
+            None
         };
 
         let func = self.declare_external_fn(
@@ -618,20 +497,9 @@ fn codegen_internal_function<'ctx, 'tcx>(
     func: &crate::toylang::registry::ToyFunction,
     internal_symbol: &str,
 ) {
-    // Run type resolution pass to get typed AST
-    // Production callback: hardcoded for now (will query tcx.fn_sig in a later step)
-    let rust_method_ret = |_type_name: &str, method: &str, _type_args: &[ResolvedType]| -> ResolvedType {
-        match method {
-            "new" => {
-                ResolvedType::RustType {
-                    name: _type_name.to_string(),
-                    type_args: _type_args.to_vec(),
-                }
-            }
-            "push" => ResolvedType::Void,
-            "len" => ResolvedType::Usize,
-            _ => panic!("unknown Rust method '{}'", method),
-        }
+    // Query rustc for Rust method return types
+    let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> ResolvedType {
+        crate::oracle::rust_method_return_type(ctx.tcx, type_name, method, type_args)
     };
     let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret);
 
@@ -653,7 +521,7 @@ fn codegen_internal_function<'ctx, 'tcx>(
 
     // Build function signature
     let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
-    let usize_ty = ctx.usize_type();
+    let _usize_ty = ctx.usize_type();
 
     let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
     let mut param_names: Vec<String> = Vec::new();
@@ -666,20 +534,8 @@ fn codegen_internal_function<'ctx, 'tcx>(
 
     // Real parameters
     for p in &func.params {
-        let ty = match p.ty.as_str() {
-            "i32" => ctx.context.i32_type().into(),
-            "i64" => ctx.context.i64_type().into(),
-            "f64" => ctx.context.f64_type().into(),
-            "bool" => ctx.context.bool_type().into(),
-            "usize" => usize_ty.into(),
-            other if other.starts_with("&Vec<") => BasicMetadataTypeEnum::from(ptr_ty),
-            other if other.starts_with("&") => BasicMetadataTypeEnum::from(ptr_ty),
-            other if ctx.registry.structs.contains_key(other) => {
-                let s = &ctx.registry.structs[other];
-                ctx.struct_type(s).into()
-            }
-            other => panic!("unsupported param type '{}'", other),
-        };
+        let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry);
+        let ty: BasicMetadataTypeEnum<'ctx> = ctx.resolved_to_inkwell(&resolved).into();
         param_types.push(ty);
         param_names.push(p.name.clone());
     }
@@ -762,25 +618,19 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     extern_symbol: &str,
     internal_symbol: &str,
 ) {
-    let ret_ty_name_owned;
-    let ret_ty_name: &str = match func.return_ty.as_deref() {
-        Some(s) => { ret_ty_name_owned = s.to_string(); &ret_ty_name_owned }
-        None => "void",
-    };
-
     // Resolve the return type for internal ABI decisions
     let ret_resolved = crate::toylang::type_resolve::resolve_return_type(ctx.registry, func);
+    let ret_resolved = crate::toylang::type_resolve::resolve_struct_fields(&ret_resolved, ctx.registry);
     let internal_sret = is_internal_sret(&ret_resolved);
 
     // Query Rust ABI for the extern wrapper's return convention
     let coerced = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(ctx.tcx, instance);
 
     // Determine LLVM return type for complex types (structs and opaque Rust types)
-    let ret_complex_ty: Option<BasicTypeEnum<'ctx>> = if ret_ty_name.starts_with("Vec<") {
-        let vec_resolved = ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::RustType { name: "Global".to_string(), type_args: vec![] }] };
-        Some(ctx.rust_ty_to_llvm_opaque(&vec_resolved).0)
-    } else {
-        ctx.struct_type_for_ret(ret_ty_name).map(|t| t.into())
+    let ret_complex_ty: Option<BasicTypeEnum<'ctx>> = match &ret_resolved {
+        ResolvedType::Struct { .. } => Some(ctx.resolved_to_inkwell(&ret_resolved)),
+        ResolvedType::RustType { .. } => Some(ctx.rust_ty_to_llvm_opaque(&ret_resolved).0),
+        _ => None,
     };
 
     let rust_sret = matches!(coerced, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
@@ -793,14 +643,14 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     // Resolve internal types for each param (what the internal function expects)
     let internal_param_types: Vec<BasicTypeEnum<'ctx>> = func.params.iter()
         .map(|p| {
-            let resolved = crate::toylang::type_resolve::parse_type_string(&p.ty, ctx.registry);
+            let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry);
             ctx.resolved_to_inkwell(&resolved)
         })
         .collect();
 
     // Build extern wrapper signature (matching Rust ABI)
     let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
-    let usize_ty = ctx.usize_type();
+    let _usize_ty = ctx.usize_type();
 
     let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
     if rust_sret {
@@ -821,26 +671,23 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     // Determine Rust ABI LLVM return type
     let rust_ret_type: Option<BasicTypeEnum<'ctx>> = if rust_sret {
         None
-    } else if ret_ty_name == "void" {
-        None
-    } else if ret_ty_name == "usize" || ret_ty_name == "i32" || ret_ty_name == "i64"
-           || ret_ty_name == "f64" || ret_ty_name == "bool" {
-        Some(match ret_ty_name {
-            "usize" => usize_ty.into(),
-            "i32" => ctx.context.i32_type().into(),
-            "i64" => ctx.context.i64_type().into(),
-            "f64" => ctx.context.f64_type().into(),
-            "bool" => ctx.context.bool_type().into(),
-            _ => unreachable!(),
-        })
-    } else if ret_ty_name.starts_with("Vec<") {
-        None
     } else {
-        match &coerced {
-            rustc_lang_facade::abi_helpers::CoercedReturn::Direct(coerced_str) => {
-                Some(parse_coerced_type(ctx, coerced_str))
+        match &ret_resolved {
+            ResolvedType::Void => None,
+            ResolvedType::I32 | ResolvedType::I64 | ResolvedType::F64
+            | ResolvedType::Bool | ResolvedType::Usize => {
+                Some(ctx.resolved_to_inkwell(&ret_resolved))
             }
-            _ => ret_complex_ty.map(|t| t.into()),
+            ResolvedType::RustType { .. } => None, // opaque types use sret or indirect
+            ResolvedType::Struct { .. } => {
+                match &coerced {
+                    rustc_lang_facade::abi_helpers::CoercedReturn::Direct(coerced_str) => {
+                        Some(parse_coerced_type(ctx, coerced_str))
+                    }
+                    _ => ret_complex_ty.map(|t| t.into()),
+                }
+            }
+            _ => None,
         }
     };
 
@@ -1046,71 +893,45 @@ fn lower_typed_expr<'ctx>(
             ExprResult::Ptr(alloca, struct_ty.into())
         }
 
-        TypedExprKind::FnCall { name, args, .. } if name == "println" => {
-            // Build printf format string from the first arg (must be StringLit)
-            let TypedExprKind::StringLit(fmt) = &args[0].kind else {
-                panic!("println first arg must be string literal");
-            };
-
-            // Replace {} with type-appropriate printf specifiers
-            let mut printf_fmt = String::new();
-            let mut arg_idx = 1usize;
-            let mut chars = fmt.chars().peekable();
-            while let Some(c) = chars.next() {
-                if c == '{' && chars.peek() == Some(&'}') {
-                    chars.next(); // consume '}'
-                    let spec = match &args[arg_idx].ty {
-                        ResolvedType::I32 | ResolvedType::Bool => "%d",
-                        ResolvedType::I64 => "%ld",
-                        ResolvedType::Usize => "%zu",
-                        ResolvedType::F64 => "%f",
-                        other => panic!("println: unsupported type {:?} for format arg", other),
-                    };
-                    printf_fmt.push_str(spec);
-                    arg_idx += 1;
-                } else {
-                    printf_fmt.push(c);
-                }
-            }
-            printf_fmt.push('\n');
-
-            // Create global string constant for format
-            let fmt_ptr = ctx.builder.build_global_string_ptr(&printf_fmt, "println_fmt")
-                .unwrap()
-                .as_pointer_value();
-
-            // Declare printf (variadic, C linkage)
-            let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
-            let printf_ty = ctx.context.i32_type().fn_type(&[ptr_ty.into()], true);
-            let printf_fn = ctx.module.get_function("printf").unwrap_or_else(|| {
-                ctx.module.add_function("printf", printf_ty, Some(inkwell::module::Linkage::External))
-            });
-
-            // Build call args: format string + each value arg
-            let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = vec![fmt_ptr.into()];
-            for arg_expr in &args[1..] {
-                let val = lower_typed_expr(ctx, arg_expr).into_value(&ctx.builder);
-                // Coerce bool (i1) to i32 for printf
-                let coerced = if arg_expr.ty == ResolvedType::Bool {
-                    ctx.builder.build_int_z_extend(
-                        val.into_int_value(),
-                        ctx.context.i32_type(), "bool_to_i32").unwrap().into()
-                } else {
-                    val
-                };
-                call_args.push(coerced.into());
-            }
-
-            ctx.builder.build_call(printf_fn, &call_args, "printf_ret").unwrap();
-            ExprResult::Value(ctx.context.i32_type().const_zero().into())
-        }
-
         TypedExprKind::FnCall { name, type_args, args } => {
+            // Check if this is an extern function (body-less declaration)
+            let is_extern = ctx.registry.functions.get(name.as_str())
+                .map_or(false, |f| f.body.is_none());
+
+            if is_extern {
+                // Extern Rust function — resolve its real mangled symbol and call directly
+                let def_id = crate::oracle::find_extern_fn_def_id(ctx.tcx, name)
+                    .unwrap_or_else(|| panic!("extern fn '{}' not found in Rust source", name));
+                let args_ref = ctx.tcx.mk_args(&[]);
+                let symbol = resolve_rust_symbol(ctx.tcx, def_id, args_ref);
+
+                let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = args.iter()
+                    .map(|a| ctx.resolved_to_inkwell(&a.ty).into())
+                    .collect();
+                let ret_type = if expr.ty == ResolvedType::Void {
+                    None
+                } else {
+                    Some(ctx.resolved_to_inkwell(&expr.ty))
+                };
+
+                let callee = ctx.declare_external_fn(&symbol, &param_types, ret_type, None);
+                ctx.rust_symbols.push(symbol);
+
+                let call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = args.iter()
+                    .map(|a| lower_typed_expr(ctx, a).into_value(&ctx.builder).into())
+                    .collect();
+                let result = ctx.builder.build_call(callee, &call_args, "extern_call").unwrap();
+                match result.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
+                    _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                }
+            } else {
+
             // Call a toylang function via its internal symbol (simple, predictable ABI).
             let internal_sym = {
                 let mut sym = format!("__toylang_internal_{}", name);
                 for arg in type_args {
-                    sym.push_str(&format!("__{}", arg));
+                    sym.push_str(&format!("__{}", resolved_type_to_mangled_name(arg)));
                 }
                 sym
             };
@@ -1165,6 +986,8 @@ fn lower_typed_expr<'ctx>(
                     _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
                 }
             }
+
+            } // close else (toylang fn path)
         }
 
         TypedExprKind::StaticCall { ty, method, type_args, args: _ } => {
@@ -1386,6 +1209,31 @@ fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> Struc
 // Helpers (kept from old llvm_gen.rs)
 // ============================================================================
 
+/// Convert a ResolvedType to a string suitable for symbol mangling.
+fn resolved_type_to_mangled_name(ty: &ResolvedType) -> String {
+    match ty {
+        ResolvedType::I32 => "i32".to_string(),
+        ResolvedType::I64 => "i64".to_string(),
+        ResolvedType::F64 => "f64".to_string(),
+        ResolvedType::Bool => "bool".to_string(),
+        ResolvedType::Usize => "usize".to_string(),
+        ResolvedType::Void => "void".to_string(),
+        ResolvedType::StructRef { name, type_args }
+        | ResolvedType::Struct { name, type_args, .. }
+        | ResolvedType::RustType { name, type_args } => {
+            if type_args.is_empty() {
+                name.clone()
+            } else {
+                let args: Vec<String> = type_args.iter().map(resolved_type_to_mangled_name).collect();
+                format!("{}_{}", name, args.join("_"))
+            }
+        }
+        ResolvedType::Ref { inner } => format!("ref_{}", resolved_type_to_mangled_name(inner)),
+        ResolvedType::TypeParam(name) => name.clone(),
+        ResolvedType::Str => "str".to_string(),
+    }
+}
+
 fn resolve_rust_symbol<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: rustc_span::def_id::DefId,
@@ -1401,36 +1249,11 @@ fn resolve_rust_symbol<'tcx>(
     tcx.symbol_name(instance).name.to_string()
 }
 
-/// Parse a generic type string like "Pair<i32, i64>" into ("Pair", ["i32", "i64"]).
-/// Handles nested generics: "ToyWrapper<Vec<i32, Global>>" → ("ToyWrapper", ["Vec<i32, Global>"]).
-fn parse_generic_type(ty: &str) -> Option<(&str, Vec<&str>)> {
-    let open = ty.find('<')?;
-    if !ty.ends_with('>') { return None; }
-    let base = &ty[..open];
-    let args_str = &ty[open+1..ty.len()-1];
-    // Split on commas, respecting nested angle brackets
-    let mut args = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-    for (i, c) in args_str.char_indices() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth -= 1,
-            ',' if depth == 0 => {
-                args.push(args_str[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    let last = args_str[start..].trim();
-    if !last.is_empty() {
-        args.push(last);
-    }
-    Some((base, args))
-}
 
 fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTypeEnum<'ctx> {
+    if s == "ptr" {
+        return ctx.context.ptr_type(AddressSpace::default()).into();
+    }
     if s.starts_with("i") {
         let bits: u32 = s[1..].parse().unwrap_or_else(|_| panic!("bad coerced type: {}", s));
         ctx.int_type(bits).into()
@@ -1509,8 +1332,7 @@ pub fn generate_with_tcx<'tcx>(
 
             // Check if it's a consumer function
             let name = tcx.item_name(def_id).to_string();
-            // __toylang_main wrapper maps back to "main" in the registry
-            let registry_name = if name == "__toylang_main" { "main".to_string() } else { name.clone() };
+            let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main".to_string() } else { name.clone() };
             let Some(toy_fn) = registry.functions.get(&registry_name) else { continue };
             let result = callbacks.monomorphize_fn(&name, tcx, local_def_id, instance);
             if !seen_symbols.insert(result.extern_symbol.clone()) {
@@ -1574,14 +1396,14 @@ fn resolve_function_for_instance<'tcx>(
         return toy_fn.clone();
     }
 
-    // Generic function — substitute type params
+    // Generic function — substitute type params with concrete types from instance
     let mut type_arg_subst = std::collections::HashMap::new();
     for (i, param_name) in toy_fn.type_params.iter().enumerate() {
         if let Some(arg) = instance.args.get(i) {
             if let ty::GenericArgKind::Type(ty) = arg.unpack() {
                 type_arg_subst.insert(
                     param_name.clone(),
-                    crate::toylang::callbacks_impl::rustc_ty_to_type_string(tcx, ty),
+                    crate::oracle::rustc_ty_to_resolved_type(tcx, ty),
                 );
             }
         }
@@ -1593,36 +1415,13 @@ fn resolve_function_for_instance<'tcx>(
         params: toy_fn.params.iter().map(|p| {
             crate::toylang::registry::ToyParam {
                 name: p.name.clone(),
-                ty: substitute_type_params_str(&p.ty, &type_arg_subst),
+                ty: crate::toylang::type_resolve::substitute_type_params(&p.ty, &type_arg_subst),
             }
         }).collect(),
-        return_ty: toy_fn.return_ty.as_deref().map(|s| substitute_type_params_str(s, &type_arg_subst)),
+        return_ty: toy_fn.return_ty.as_ref().map(|rt| {
+            crate::toylang::type_resolve::substitute_type_params(rt, &type_arg_subst)
+        }),
         body: toy_fn.body.clone(),
     }
-}
-
-/// Simple string substitution for type param resolution.
-pub fn substitute_type_params_str_pub(s: &str, subst: &std::collections::HashMap<String, String>) -> String {
-    substitute_type_params_str(s, subst)
-}
-
-fn substitute_type_params_str(s: &str, subst: &std::collections::HashMap<String, String>) -> String {
-    // Direct match
-    if let Some(replacement) = subst.get(s) {
-        return replacement.clone();
-    }
-    // Generic: "Wrapper<T>" → "Wrapper<i32>"
-    if let Some(open) = s.find('<') {
-        if s.ends_with('>') {
-            let base = &s[..open];
-            let args_str = &s[open + 1..s.len() - 1];
-            let args: Vec<&str> = split_respecting_braces(args_str);
-            let resolved: Vec<String> = args.iter()
-                .map(|a| substitute_type_params_str(a.trim(), subst))
-                .collect();
-            return format!("{}<{}>", base, resolved.join(", "));
-        }
-    }
-    s.to_string()
 }
 
