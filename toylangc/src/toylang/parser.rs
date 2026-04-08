@@ -180,9 +180,19 @@ impl Parser {
         let mut structs: HashMap<String, ToyStruct> = HashMap::new();
         let mut struct_names: Vec<String> = Vec::new();
         let mut functions: HashMap<String, ToyFunction> = HashMap::new();
+        let mut imports: Vec<String> = Vec::new();
 
         loop {
             match self.peek() {
+                Token::Ident(s) if s == "use" => {
+                    self.consume(); // eat "use"
+                    let mut path_segments = vec![self.expect_ident()?];
+                    while self.peek() == &Token::DoubleColon {
+                        self.consume(); // eat "::"
+                        path_segments.push(self.expect_ident()?);
+                    }
+                    imports.push(path_segments.join("::"));
+                }
                 Token::Ident(s) if s == "struct" => {
                     let (name, s) = self.parse_struct(&struct_names)?;
                     struct_names.push(name.clone());
@@ -197,7 +207,7 @@ impl Parser {
             }
         }
 
-        Ok(ToylangRegistry { structs, functions })
+        Ok(ToylangRegistry { structs, functions, imports })
     }
 
     fn parse_struct(&mut self, struct_names: &[String]) -> Result<(String, ToyStruct), String> {
@@ -267,10 +277,8 @@ impl Parser {
                 if struct_names.contains(&other.to_string()) {
                     return Ok(ToyFieldType::ToyStruct(other.to_string()));
                 }
-                Err(format!(
-                    "unsupported field type '{}'; expected primitive, type param, struct name, or generic type",
-                    other
-                ))
+                // Unknown name — treat as an opaque Rust type (e.g. Global)
+                Ok(ToyFieldType::RustGeneric(other.to_string(), vec![]))
             }
         }
     }

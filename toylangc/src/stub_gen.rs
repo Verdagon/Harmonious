@@ -33,6 +33,13 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     let mut wrapper_fns: Vec<syn::Item> = Vec::new();
     let mut impl_blocks: Vec<syn::Item> = Vec::new();
 
+    // Emit pub use for each toylang import
+    for import_path in &registry.imports {
+        let path: syn::Path = syn::parse_str(import_path)
+            .unwrap_or_else(|e| panic!("invalid import path '{}': {}", import_path, e));
+        items.push(parse_quote! { pub use #path; });
+    }
+
     // Generate opaque struct definitions + accessor methods
     for (name, toy_struct) in &registry.structs {
         let ident = format_ident!("{}", name);

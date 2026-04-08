@@ -33,6 +33,8 @@ pub struct ToyStruct {
 pub struct ToylangRegistry {
     pub structs: HashMap<String, ToyStruct>,
     pub functions: HashMap<String, ToyFunction>,
+    /// Rust `use` imports (e.g. "std::alloc::Global"). Emitted as `pub use` in stubs.
+    pub imports: Vec<String>,
 }
 
 

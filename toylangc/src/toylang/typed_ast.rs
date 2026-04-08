@@ -19,8 +19,9 @@ pub enum ResolvedType {
         /// Resolved field types (TypeParams substituted with concrete types).
         field_types: Vec<ResolvedType>,
     },
-    Vec {
-        elem: Box<ResolvedType>,
+    RustType {
+        name: String,
+        type_args: Vec<ResolvedType>,
     },
     Ref {
         inner: Box<ResolvedType>,
@@ -57,6 +58,7 @@ pub enum TypedExprKind {
     StaticCall {
         ty: String,
         method: String,
+        type_args: Vec<ResolvedType>,
         #[allow(dead_code)]
         args: Vec<TypedExpr>,
     },

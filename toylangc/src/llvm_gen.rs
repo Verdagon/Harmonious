@@ -20,7 +20,6 @@ use inkwell::AddressSpace;
 
 use rustc_middle::ty::{self, GenericArg, TyCtxt};
 
-use crate::toylang::ast::{Expr, FnBody, Stmt};
 use crate::toylang::typed_ast::*;
 use crate::toylang::registry::{ToylangRegistry, ToyFieldType, ToyStruct};
 use rustc_lang_facade::LangCallbacks;
@@ -56,8 +55,15 @@ struct CodegenCtx<'ctx, 'tcx, 'reg> {
     rust_symbols: Vec<String>,
     /// Declared external functions (cached by symbol name)
     declared_fns: HashMap<String, FunctionValue<'ctx>>,
-    /// Vec method functions keyed by method name ("new", "push", "len")
-    vec_fns: HashMap<String, FunctionValue<'ctx>>,
+    /// Rust method functions keyed by mangled symbol name.
+    /// Lazily populated via get_or_resolve_rust_method.
+    rust_method_info: HashMap<String, RustMethodInfo<'ctx>>,
+}
+
+/// Info about a resolved Rust method (Vec::push, Vec::new, etc.)
+struct RustMethodInfo<'ctx> {
+    func: FunctionValue<'ctx>,
+    is_sret: bool,
 }
 
 impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
@@ -90,7 +96,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             vars: HashMap::new(),
             rust_symbols: Vec::new(),
             declared_fns: HashMap::new(),
-            vec_fns: HashMap::new(),
+            rust_method_info: HashMap::new(),
         }
     }
 
@@ -119,7 +125,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                     .collect();
                 self.context.struct_type(&fields, false).into()
             }
-            ResolvedType::Vec { .. } => self.rust_ty_to_llvm_opaque(ty).0,
+            ResolvedType::RustType { .. } => self.rust_ty_to_llvm_opaque(ty).0,
             ResolvedType::Str => self.context.ptr_type(AddressSpace::default()).into(),
             ResolvedType::Ref { inner: _ } => {
                 self.context.ptr_type(AddressSpace::default()).into()
@@ -136,7 +142,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                     .collect();
                 self.context.struct_type(&fields, false)
             }
-            ResolvedType::Vec { .. } => panic!("Vec is opaque — use rust_ty_to_llvm_opaque, not struct GEP"),
+            ResolvedType::RustType { .. } => panic!("Vec is opaque — use rust_ty_to_llvm_opaque, not struct GEP"),
             _ => panic!("expected struct type, got {:?}", ty),
         }
     }
@@ -159,7 +165,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 match type_name.as_str() {
                     "Vec" => {
                         // All Vec<T> have identical layout, element type irrelevant
-                        let resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+                        let resolved = ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::RustType { name: "Global".to_string(), type_args: vec![] }] };
                         self.rust_ty_to_llvm_opaque(&resolved).0
                     }
                     other => panic!("unsupported Rust generic type '{}'", other),
@@ -236,7 +242,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
     }
 
     /// Convert a ResolvedType to a rustc Ty<'tcx>.
-    /// Generalizes resolve_rust_ty_from_string to work on the typed AST directly.
+    /// Convert a ResolvedType to a rustc Ty. Used for layout_of queries.
     fn resolved_type_to_rustc_ty(&self, resolved: &ResolvedType) -> ty::Ty<'tcx> {
         match resolved {
             ResolvedType::I32 => self.tcx.types.i32,
@@ -261,14 +267,14 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                     ty::Ty::new_adt(self.tcx, adt_def, self.tcx.mk_args(&args))
                 }
             }
-            ResolvedType::Vec { elem } => {
-                let elem_ty = self.resolved_type_to_rustc_ty(elem);
-                let vec_did = self.tcx.get_diagnostic_item(rustc_span::sym::Vec).unwrap();
-                let new_def_id = crate::oracle::find_vec_method(self.tcx, "new").unwrap();
-                let global_ty = crate::oracle::extract_global_ty(self.tcx, elem_ty, new_def_id).unwrap();
-                let adt_def = self.tcx.adt_def(vec_did);
-                ty::Ty::new_adt(self.tcx, adt_def,
-                    self.tcx.mk_args(&[GenericArg::from(elem_ty), GenericArg::from(global_ty)]))
+            ResolvedType::RustType { name, type_args } => {
+                let def_id = crate::oracle::find_rust_type_def_id(self.tcx, name)
+                    .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
+                let adt_def = self.tcx.adt_def(def_id);
+                let args: Vec<GenericArg<'tcx>> = type_args.iter()
+                    .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
+                    .collect();
+                ty::Ty::new_adt(self.tcx, adt_def, self.tcx.mk_args(&args))
             }
             ResolvedType::Ref { inner } => {
                 let inner_ty = self.resolved_type_to_rustc_ty(inner);
@@ -348,7 +354,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 if let Some((base, type_args)) = parse_generic_type(name) {
                     if base == "Vec" {
                         // All Vec<T> have identical layout, element type irrelevant
-                        let resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+                        let resolved = ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::RustType { name: "Global".to_string(), type_args: vec![] }] };
                         return self.rust_ty_to_llvm_opaque(&resolved).0;
                     }
                     if let Some(s) = self.registry.structs.get(base) {
@@ -363,36 +369,6 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                     return self.struct_type(s).into();
                 }
                 panic!("unsupported type string '{}'", name)
-            }
-        }
-    }
-
-    /// Resolve a type name string to a rustc Ty. Handles primitives, structs, and generics.
-    fn resolve_rust_ty_from_string(&self, name: &str) -> ty::Ty<'tcx> {
-        match name {
-            "i32" => self.tcx.types.i32,
-            "i64" => self.tcx.types.i64,
-            "f64" => self.tcx.types.f64,
-            "bool" => self.tcx.types.bool,
-            _ => {
-                // Try local struct
-                if let Some(ty) = crate::oracle::find_local_struct_ty(self.tcx, name) {
-                    return ty;
-                }
-                // Try generic: "Vec<ToyPoint>"
-                if let Some((base, args)) = parse_generic_type(name) {
-                    if base == "Vec" {
-                        let inner_ty = self.resolve_rust_ty_from_string(args[0]);
-                        let vec_did = self.tcx.get_diagnostic_item(rustc_span::sym::Vec)
-                            .expect("Vec not found");
-                        let new_def_id = crate::oracle::find_vec_method(self.tcx, "new").unwrap();
-                        let global_ty = crate::oracle::extract_global_ty(self.tcx, inner_ty, new_def_id).unwrap();
-                        let adt_def = self.tcx.adt_def(vec_did);
-                        return ty::Ty::new_adt(self.tcx, adt_def,
-                            self.tcx.mk_args(&[GenericArg::from(inner_ty), GenericArg::from(global_ty)]));
-                    }
-                }
-                panic!("resolve_rust_ty_from_string: unsupported type '{}'", name)
             }
         }
     }
@@ -441,59 +417,81 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         func
     }
 
-    // --- Vec operation helpers ---
+    // --- Rust method resolution ---
 
-    fn resolve_vec_symbols(&mut self, elem_ty_name: &str) {
-        let elem_ty = self.resolve_rust_ty_from_string(elem_ty_name);
+    /// Lazily resolve and cache a Rust method. Returns the mangled symbol name
+    /// (which is the key into rust_method_info).
+    fn get_or_resolve_rust_method(
+        &mut self,
+        type_name: &str,
+        method_name: &str,
+        type_args: &[ResolvedType],
+    ) -> String {
+        let type_def_id = crate::oracle::find_rust_type_def_id(self.tcx, type_name)
+            .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
+        let method_def_id = crate::oracle::find_inherent_method(self.tcx, type_def_id, method_name)
+            .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
 
+        // Build generic args from type_args (all type args must be explicit)
+        let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
+            .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
+            .collect();
+        let expected_count = self.tcx.generics_of(method_def_id).count();
+        let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
 
-        let new_def_id = crate::oracle::find_vec_method(self.tcx, "new").unwrap();
-        let push_def_id = crate::oracle::find_vec_method(self.tcx, "push").unwrap();
-        let len_def_id = crate::oracle::find_vec_method(self.tcx, "len").unwrap();
-        let global_ty = crate::oracle::extract_global_ty(self.tcx, elem_ty, new_def_id).unwrap();
+        let symbol = resolve_rust_symbol(self.tcx, method_def_id, args);
 
-        let new_args = self.tcx.mk_args(&[GenericArg::from(elem_ty)]);
-        let push_args = self.tcx.mk_args(&[GenericArg::from(elem_ty), GenericArg::from(global_ty)]);
-        let len_args = self.tcx.mk_args(&[GenericArg::from(elem_ty), GenericArg::from(global_ty)]);
+        // Check cache
+        if self.rust_method_info.contains_key(&symbol) {
+            return symbol;
+        }
 
-        let new_sym = resolve_rust_symbol(self.tcx, new_def_id, new_args);
-        let push_sym = resolve_rust_symbol(self.tcx, push_def_id, push_args);
-        let len_sym = resolve_rust_symbol(self.tcx, len_def_id, len_args);
+        self.rust_symbols.push(symbol.clone());
 
-        self.rust_symbols.extend([new_sym.clone(), push_sym.clone(), len_sym.clone()]);
-
-        // All Vec<T> have identical layout
-        let vec_resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
-        let (vec_opaque_ty, vec_align) = self.rust_ty_to_llvm_opaque(&vec_resolved);
+        // Determine if this method uses sret by checking its return type
+        // For now, use a simple heuristic: if the return type is a RustType (opaque),
+        // it's sret. If it's Void or a primitive, it's direct.
+        // (This matches current behavior: Vec::new → sret, push → void, len → usize)
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let usize_ty = self.usize_type();
 
-        // Declare Vec::new (sret)
-        let new_fn = self.declare_external_fn(
-            &new_sym,
-            &[ptr_ty.into()],
-            None,
-            Some((vec_opaque_ty, vec_align)),
-        );
-        self.vec_fns.insert("new".to_string(), new_fn);
+        // Determine function signature from method name pattern
+        // TODO: Replace with fn_abi_of_instance query in step 7
+        let (param_types, ret_type, sret_info, is_sret) = match method_name {
+            "new" => {
+                // Constructor: sret pattern (ptr param for return value, void return)
+                let result_ty = ResolvedType::RustType {
+                    name: type_name.to_string(),
+                    type_args: type_args.to_vec(),
+                };
+                let (opaque_ty, align) = self.rust_ty_to_llvm_opaque(&result_ty);
+                (
+                    vec![ptr_ty.into()],
+                    None,
+                    Some((opaque_ty, align)),
+                    true,
+                )
+            }
+            "push" => {
+                // Mutating method: receiver ptr + arg ptr, void return
+                (vec![ptr_ty.into(), ptr_ty.into()], None, None, false)
+            }
+            "len" => {
+                // Query method: receiver ptr, returns usize
+                let usize_ty = self.usize_type();
+                (vec![ptr_ty.into()], Some(usize_ty.into()), None, false)
+            }
+            _ => panic!("unsupported Rust method '{}' on '{}'", method_name, type_name),
+        };
 
-        // Declare Vec::push
-        let push_fn = self.declare_external_fn(
-            &push_sym,
-            &[ptr_ty.into(), ptr_ty.into()],
-            None,
-            None,
+        let func = self.declare_external_fn(
+            &symbol,
+            &param_types,
+            ret_type,
+            sret_info,
         );
-        self.vec_fns.insert("push".to_string(), push_fn);
 
-        // Declare Vec::len
-        let len_fn = self.declare_external_fn(
-            &len_sym,
-            &[ptr_ty.into()],
-            Some(usize_ty.into()),
-            None,
-        );
-        self.vec_fns.insert("len".to_string(), len_fn);
+        self.rust_method_info.insert(symbol.clone(), RustMethodInfo { func, is_sret });
+        symbol
     }
 }
 
@@ -557,8 +555,59 @@ fn coerce_int_to_type<'ctx>(
 // ============================================================================
 
 /// Whether a ResolvedType uses sret under the internal ABI.
+/// Walk a typed body and resolve any Rust method symbols (StaticCall/MethodCall on RustType).
+fn resolve_rust_methods_from_typed_body(ctx: &mut CodegenCtx, body: &TypedFnBody) {
+    fn walk_expr(ctx: &mut CodegenCtx, expr: &TypedExpr) {
+        match &expr.kind {
+            TypedExprKind::StaticCall { ty, method, type_args, .. } => {
+                ctx.get_or_resolve_rust_method(ty, method, type_args);
+            }
+            TypedExprKind::MethodCall { receiver, method, args } => {
+                // Extract RustType from receiver (direct or via &ref)
+                let rust_info = match &receiver.ty {
+                    ResolvedType::RustType { name, type_args } => Some((name.as_str(), type_args.as_slice())),
+                    ResolvedType::Ref { inner } => match inner.as_ref() {
+                        ResolvedType::RustType { name, type_args } => Some((name.as_str(), type_args.as_slice())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((type_name, type_args)) = rust_info {
+                    ctx.get_or_resolve_rust_method(type_name, method, type_args);
+                }
+                walk_expr(ctx, receiver);
+                for arg in args { walk_expr(ctx, arg); }
+                return; // already walked children
+            }
+            TypedExprKind::FnCall { args, .. } => {
+                for arg in args { walk_expr(ctx, arg); }
+            }
+            TypedExprKind::StructLit { fields, .. } => {
+                for (_, e) in fields { walk_expr(ctx, e); }
+            }
+            TypedExprKind::BinaryOp { left, right, .. } => {
+                walk_expr(ctx, left);
+                walk_expr(ctx, right);
+            }
+            TypedExprKind::FieldAccess { receiver, .. } => {
+                walk_expr(ctx, receiver);
+            }
+            _ => {} // IntLit, BoolLit, Var, StringLit
+        }
+    }
+    for stmt in &body.stmts {
+        match stmt {
+            TypedStmt::Let { expr, .. } => walk_expr(ctx, expr),
+            TypedStmt::ExprStmt(expr) => walk_expr(ctx, expr),
+        }
+    }
+    if let Some(ref ret) = body.ret {
+        walk_expr(ctx, ret);
+    }
+}
+
 fn is_internal_sret(ty: &ResolvedType) -> bool {
-    matches!(ty, ResolvedType::Struct { .. } | ResolvedType::Vec { .. })
+    matches!(ty, ResolvedType::Struct { .. } | ResolvedType::RustType { .. })
 }
 
 /// Codegen a toylang function body with the simple internal ABI.
@@ -569,29 +618,25 @@ fn codegen_internal_function<'ctx, 'tcx>(
     func: &crate::toylang::registry::ToyFunction,
     internal_symbol: &str,
 ) {
-    let ret_ty_name_owned;
-    let ret_ty_name: &str = match func.return_ty.as_deref() {
-        Some(s) => { ret_ty_name_owned = s.to_string(); &ret_ty_name_owned }
-        None => "void",
-    };
-
     // Run type resolution pass to get typed AST
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func);
-    let body = func.body.as_ref().unwrap();
-
-    // Resolve Vec symbols if needed
-    let uses_vec = body_uses_vec(body);
-    if uses_vec {
-        // Get Vec element type from explicit type args (Vec::new<Point>()),
-        // function return type, or params
-        let elem_name = find_vec_elem_from_explicit_ast(body)
-            .or_else(|| find_vec_elem_name(ret_ty_name, ctx.registry))
-            .or_else(|| find_vec_elem_from_params(func));
-        match elem_name {
-            Some(elem) => ctx.resolve_vec_symbols(&elem),
-            None => panic!("function uses Vec but could not determine element type"),
+    // Production callback: hardcoded for now (will query tcx.fn_sig in a later step)
+    let rust_method_ret = |_type_name: &str, method: &str, _type_args: &[ResolvedType]| -> ResolvedType {
+        match method {
+            "new" => {
+                ResolvedType::RustType {
+                    name: _type_name.to_string(),
+                    type_args: _type_args.to_vec(),
+                }
+            }
+            "push" => ResolvedType::Void,
+            "len" => ResolvedType::Usize,
+            _ => panic!("unknown Rust method '{}'", method),
         }
-    }
+    };
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret);
+
+    // Resolve any Rust method symbols used in this function by walking the typed body
+    resolve_rust_methods_from_typed_body(ctx, &typed_body);
 
     // Determine internal return type from the typed AST
     let ret_resolved = typed_body.ret.as_ref()
@@ -732,7 +777,7 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
 
     // Determine LLVM return type for complex types (structs and opaque Rust types)
     let ret_complex_ty: Option<BasicTypeEnum<'ctx>> = if ret_ty_name.starts_with("Vec<") {
-        let vec_resolved = ResolvedType::Vec { elem: Box::new(ResolvedType::I32) };
+        let vec_resolved = ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::RustType { name: "Global".to_string(), type_args: vec![] }] };
         Some(ctx.rust_ty_to_llvm_opaque(&vec_resolved).0)
     } else {
         ctx.struct_type_for_ret(ret_ty_name).map(|t| t.into())
@@ -986,7 +1031,7 @@ fn lower_typed_expr<'ctx>(
 
                 // For complex types (structs, Vecs), copy memory. For primitives, store directly.
                 match &field_expr.ty {
-                    ResolvedType::Struct { .. } | ResolvedType::Vec { .. } => {
+                    ResolvedType::Struct { .. } | ResolvedType::RustType { .. } => {
                         let src_ptr = val.into_ptr(&ctx.builder, field_inkwell_ty, "src");
                         let size_val = field_inkwell_ty.size_of().unwrap();
                         ctx.builder.build_memcpy(gep, 8, src_ptr, 8, size_val).unwrap();
@@ -1122,19 +1167,23 @@ fn lower_typed_expr<'ctx>(
             }
         }
 
-        TypedExprKind::StaticCall { ty, method, args: _ } => {
-            match (ty.as_str(), method.as_str()) {
-                ("Vec", "new") => {
-                    let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "vec_new");
-                    let vec_llvm_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
+        TypedExprKind::StaticCall { ty, method, type_args, args: _ } => {
+            let sym = ctx.get_or_resolve_rust_method(ty, method, type_args);
+            let info = ctx.rust_method_info.get(&sym).unwrap();
+            let func = info.func;
+            let is_sret = info.is_sret;
 
-                    let new_fn = *ctx.vec_fns.get("new")
-                        .expect("Vec::new not declared");
-
-                    ctx.builder.build_call(new_fn, &[alloca.into()], "").unwrap();
-                    ExprResult::Ptr(alloca, vec_llvm_ty)
+            if is_sret {
+                let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, &format!("{}_new", ty));
+                let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
+                ctx.builder.build_call(func, &[alloca.into()], "").unwrap();
+                ExprResult::Ptr(alloca, opaque_ty)
+            } else {
+                let result = ctx.builder.build_call(func, &[], "static_call").unwrap();
+                match result.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
+                    _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
                 }
-                _ => panic!("unsupported static call: {}::{}", ty, method),
             }
         }
 
@@ -1159,7 +1208,7 @@ fn lower_typed_expr<'ctx>(
                 struct_ty.as_basic_type_enum(), "fa_recv");
             let gep = ctx.builder.build_struct_gep(struct_ty, struct_ptr, field_idx, field).unwrap();
             match &expr.ty {
-                ResolvedType::Struct { .. } | ResolvedType::Vec { .. } => {
+                ResolvedType::Struct { .. } | ResolvedType::RustType { .. } => {
                     // Complex types — return pointer to the field
                     ExprResult::Ptr(gep, ctx.resolved_to_inkwell(&expr.ty))
                 }
@@ -1198,33 +1247,48 @@ fn lower_typed_expr<'ctx>(
                 }
             };
 
-            match method.as_str() {
-                "push" => {
+            // Extract Rust type info from receiver (direct or via &ref)
+            let (type_name, type_args) = match &receiver.ty {
+                ResolvedType::RustType { name, type_args } => (name.as_str(), type_args.as_slice()),
+                ResolvedType::Ref { inner } => match inner.as_ref() {
+                    ResolvedType::RustType { name, type_args } => (name.as_str(), type_args.as_slice()),
+                    _ => panic!("method call on unsupported type: {:?}", receiver.ty),
+                },
+                _ => panic!("method call on unsupported type: {:?}", receiver.ty),
+            };
 
-                    let arg = lower_typed_expr(ctx, &args[0]);
-                    let arg_ty = ctx.resolved_to_inkwell(&args[0].ty);
-                    let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "push_arg");
+            let sym = ctx.get_or_resolve_rust_method(type_name, method, type_args);
+            let info = ctx.rust_method_info.get(&sym).unwrap();
+            let func = info.func;
+            let is_sret = info.is_sret;
 
-                    let push_fn = *ctx.vec_fns.get("push")
-                        .expect("Vec::push not declared");
-
-                    ctx.builder.build_call(push_fn, &[recv_ptr.into(), arg_ptr.into()], "").unwrap();
-                    ExprResult::Value(ctx.context.i32_type().const_zero().into())
+            if is_sret {
+                // sret method call (constructor-like returning opaque type)
+                let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "method_sret");
+                let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![alloca.into(), recv_ptr.into()];
+                for a in args {
+                    let arg = lower_typed_expr(ctx, a);
+                    let arg_ty = ctx.resolved_to_inkwell(&a.ty);
+                    let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
+                    call_args.push(arg_ptr.into());
                 }
-
-                "len" => {
-                    let len_fn = *ctx.vec_fns.get("len")
-                        .expect("Vec::len not declared");
-
-                    let call_site = ctx.builder.build_call(len_fn, &[recv_ptr.into()], "len").unwrap();
-                    let result = match call_site.try_as_basic_value() {
-                        inkwell::values::ValueKind::Basic(val) => val,
-                        _ => panic!("len should return a basic value"),
-                    };
-                    ExprResult::Value(result)
+                ctx.builder.build_call(func, &call_args, "").unwrap();
+                ExprResult::Ptr(alloca, opaque_ty)
+            } else {
+                // Non-sret method call
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![recv_ptr.into()];
+                for a in args {
+                    let arg = lower_typed_expr(ctx, a);
+                    let arg_ty = ctx.resolved_to_inkwell(&a.ty);
+                    let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
+                    call_args.push(arg_ptr.into());
                 }
-
-                _ => panic!("unsupported method: .{}", method),
+                let result = ctx.builder.build_call(func, &call_args, "method_call").unwrap();
+                match result.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
+                    _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                }
             }
         }
     }
@@ -1337,156 +1401,33 @@ fn resolve_rust_symbol<'tcx>(
     tcx.symbol_name(instance).name.to_string()
 }
 
-fn body_uses_vec(body: &FnBody) -> bool {
-    body.stmts.iter().any(stmt_uses_vec)
-        || body.ret.as_ref().map_or(false, expr_uses_vec)
-}
-
-fn stmt_uses_vec(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Let { expr, .. } => expr_uses_vec(expr),
-        Stmt::ExprStmt(expr) => expr_uses_vec(expr),
-    }
-}
-
-fn expr_uses_vec(expr: &Expr) -> bool {
-    match expr {
-        Expr::StaticCall { ty, .. } if ty == "Vec" => true,
-        Expr::MethodCall { method, .. } if method == "push" || method == "len" => true,
-        Expr::MethodCall { receiver, .. } => expr_uses_vec(receiver),
-        _ => false,
-    }
-}
-
-/// Find the Vec element type from explicit type args on Vec::new<ElemType>() in the body.
-fn find_vec_elem_from_explicit_ast(body: &FnBody) -> Option<String> {
-    fn scan_expr(expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::StaticCall { ty, method, type_args, .. }
-                if ty == "Vec" && method == "new" && !type_args.is_empty() =>
-            {
-                Some(type_args[0].clone())
-            }
-            Expr::MethodCall { receiver, .. } => scan_expr(receiver),
-            Expr::FnCall { args, .. } => {
-                for a in args { if let Some(n) = scan_expr(a) { return Some(n); } }
-                None
-            }
-            _ => None,
-        }
-    }
-    for stmt in &body.stmts {
-        let expr = match stmt {
-            Stmt::Let { expr, .. } => expr,
-            Stmt::ExprStmt(expr) => expr,
-        };
-        if let Some(name) = scan_expr(expr) { return Some(name); }
-    }
-    if let Some(ref ret) = body.ret {
-        if let Some(name) = scan_expr(ret) { return Some(name); }
-    }
-    None
-}
-
+/// Parse a generic type string like "Pair<i32, i64>" into ("Pair", ["i32", "i64"]).
+/// Handles nested generics: "ToyWrapper<Vec<i32, Global>>" → ("ToyWrapper", ["Vec<i32, Global>"]).
 fn parse_generic_type(ty: &str) -> Option<(&str, Vec<&str>)> {
     let open = ty.find('<')?;
     if !ty.ends_with('>') { return None; }
     let base = &ty[..open];
     let args_str = &ty[open+1..ty.len()-1];
-    let args: Vec<&str> = args_str.split(',').map(|s| s.trim()).collect();
-    Some((base, args))
-}
-
-/// Find the Vec element type name from context. Searches recursively into nested structs,
-/// resolving generic type params from the return type string.
-fn find_vec_elem_name(ret_ty_name: &str, registry: &ToylangRegistry) -> Option<String> {
-    // Direct Vec return: "Vec<Point>" → "Point"
-    if ret_ty_name.starts_with("Vec<") && ret_ty_name.ends_with('>') {
-        return Some(ret_ty_name[4..ret_ty_name.len()-1].to_string());
-    }
-    // Non-generic struct
-    if let Some(s) = registry.structs.get(ret_ty_name) {
-        return find_vec_in_struct_fields(s, registry, &HashMap::new());
-    }
-    // Generic struct: "ToyWrapper<Vec<i32>>" → parse type args and build subst
-    if let Some((base, type_args)) = parse_generic_type(ret_ty_name) {
-        if let Some(s) = registry.structs.get(base) {
-            let subst: HashMap<&str, &str> = s.type_params.iter()
-                .zip(type_args.iter())
-                .map(|(param, arg)| (param.as_str(), *arg))
-                .collect();
-            return find_vec_in_struct_fields(s, registry, &subst);
-        }
-    }
-    None
-}
-
-/// Recursively search struct fields for a Vec type, returning its element type name.
-/// `subst` maps type param names to their concrete string representations.
-fn find_vec_in_struct_fields(
-    s: &ToyStruct,
-    registry: &ToylangRegistry,
-    subst: &HashMap<&str, &str>,
-) -> Option<String> {
-    for field in &s.fields {
-        match &field.rust_type {
-            ToyFieldType::RustGeneric(name, args) if name == "Vec" && !args.is_empty() => {
-                // Resolve the element type, substituting type params
-                let elem_str = resolve_field_type_name(&args[0], subst);
-                return Some(elem_str);
-            }
-            ToyFieldType::TypeParam(param_name) => {
-                // Resolve via subst — the concrete type might be a Vec
-                if let Some(&concrete) = subst.get(param_name.as_str()) {
-                    if concrete.starts_with("Vec<") && concrete.ends_with('>') {
-                        return Some(concrete[4..concrete.len()-1].to_string());
-                    }
-                }
-            }
-            ToyFieldType::ToyStruct(struct_name) => {
-                if let Some(inner) = registry.structs.get(struct_name.as_str()) {
-                    if let Some(elem) = find_vec_in_struct_fields(inner, registry, subst) {
-                        return Some(elem);
-                    }
-                }
+    // Split on commas, respecting nested angle brackets
+    let mut args = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in args_str.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(args_str[start..i].trim());
+                start = i + 1;
             }
             _ => {}
         }
     }
-    None
-}
-
-/// Resolve a ToyFieldType to a type name string, substituting type params.
-fn resolve_field_type_name(ft: &ToyFieldType, subst: &HashMap<&str, &str>) -> String {
-    match ft {
-        ToyFieldType::I32 => "i32".to_string(),
-        ToyFieldType::I64 => "i64".to_string(),
-        ToyFieldType::F64 => "f64".to_string(),
-        ToyFieldType::Bool => "bool".to_string(),
-        ToyFieldType::TypeParam(name) => {
-            subst.get(name.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| name.clone())
-        }
-        ToyFieldType::ToyStruct(name) => name.clone(),
-        ToyFieldType::RustGeneric(name, args) => {
-            let arg_strs: Vec<String> = args.iter()
-                .map(|a| resolve_field_type_name(a, subst))
-                .collect();
-            format!("{}<{}>", name, arg_strs.join(", "))
-        }
+    let last = args_str[start..].trim();
+    if !last.is_empty() {
+        args.push(last);
     }
-}
-
-/// Search function parameters for Vec<T> and return the element type name.
-fn find_vec_elem_from_params(func: &crate::toylang::registry::ToyFunction) -> Option<String> {
-    for p in &func.params {
-        let ty = p.ty.trim_start_matches('&');
-        if ty.starts_with("Vec<") && ty.ends_with('>') {
-            return Some(ty[4..ty.len() - 1].to_string());
-        }
-    }
-    None
+    Some((base, args))
 }
 
 fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTypeEnum<'ctx> {

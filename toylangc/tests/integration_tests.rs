@@ -191,23 +191,26 @@ fn main() {
 fn test_vec_point() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct Point {
     x: i32,
     y: i32,
 }
 
-fn make_vec() -> Vec<Point> {
-    let v = Vec::new<Point>();
+fn make_vec() -> Vec<Point, Global> {
+    let v = Vec::new<Point, Global>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     v
 }
 
-fn vec_len(v: &Vec<Point>) -> usize {
+fn vec_len(v: &Vec<Point, Global>) -> usize {
     v.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -347,18 +350,21 @@ fn main() {
 fn test_t_of_r_vec_field() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyShip {
-    wings: Vec<i32>,
+    wings: Vec<i32, Global>,
 }
 
 fn make_ship() -> ToyShip {
-    let v = Vec::new<i32>();
+    let v = Vec::new<i32, Global>();
     v.push(1);
     v.push(2);
     ToyShip { wings: v }
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -376,11 +382,14 @@ fn main() {
 fn test_t_of_r_layout() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyShip {
-    wings: Vec<i32>,
+    wings: Vec<i32, Global>,
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -460,23 +469,26 @@ fn main() {
 fn test_r_t_r_vec_of_ship() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyShip {
-    wings: Vec<i32>,
+    wings: Vec<i32, Global>,
 }
 
-fn make_fleet() -> Vec<ToyShip> {
-    let fleet = Vec::new<ToyShip>();
-    let v = Vec::new<i32>();
+fn make_fleet() -> Vec<ToyShip, Global> {
+    let fleet = Vec::new<ToyShip, Global>();
+    let v = Vec::new<i32, Global>();
     v.push(10);
     fleet.push(ToyShip { wings: v });
     fleet
 }
 
-fn fleet_len(f: &Vec<ToyShip>) -> usize {
+fn fleet_len(f: &Vec<ToyShip, Global>) -> usize {
     f.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -497,23 +509,26 @@ fn main() {
 fn test_t_r_t_construct() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyPoint {
     x: i32,
     y: i32,
 }
 
 struct ToyFleet {
-    ships: Vec<ToyPoint>,
+    ships: Vec<ToyPoint, Global>,
 }
 
 fn make_fleet() -> ToyFleet {
-    let v = Vec::new<ToyPoint>();
+    let v = Vec::new<ToyPoint, Global>();
     v.push(ToyPoint { x: 1, y: 2 });
     v.push(ToyPoint { x: 3, y: 4 });
     ToyFleet { ships: v }
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -533,8 +548,10 @@ fn main() {
 fn test_t_t_r_construct() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyEngine {
-    parts: Vec<i32>,
+    parts: Vec<i32, Global>,
 }
 
 struct ToyShip {
@@ -542,12 +559,13 @@ struct ToyShip {
 }
 
 fn make_ship() -> ToyShip {
-    let v = Vec::new<i32>();
+    let v = Vec::new<i32, Global>();
     v.push(100);
     ToyShip { engine: ToyEngine { parts: v } }
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -567,24 +585,27 @@ fn main() {
 fn test_r_r_t_vec_of_vec() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyPoint {
     x: i32,
     y: i32,
 }
 
-fn make_nested() -> Vec<Vec<ToyPoint>> {
-    let inner = Vec::new<ToyPoint>();
+fn make_nested() -> Vec<Vec<ToyPoint, Global>, Global> {
+    let inner = Vec::new<ToyPoint, Global>();
     inner.push(ToyPoint { x: 1, y: 2 });
-    let outer = Vec::new<Vec<ToyPoint>>();
+    let outer = Vec::new<Vec<ToyPoint, Global>, Global>();
     outer.push(inner);
     outer
 }
 
-fn outer_len(v: &Vec<Vec<ToyPoint>>) -> usize {
+fn outer_len(v: &Vec<Vec<ToyPoint, Global>, Global>) -> usize {
     v.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -605,17 +626,20 @@ fn main() {
 fn test_tg_of_vec() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyWrapper<T> {
     inner: T,
 }
 
-fn wrap_vec() -> ToyWrapper<Vec<i32>> {
-    let v = Vec::new<i32>();
+fn wrap_vec() -> ToyWrapper<Vec<i32, Global>> {
+    let v = Vec::new<i32, Global>();
     v.push(42);
     ToyWrapper { inner: v }
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -718,29 +742,32 @@ fn main() {
 fn test_deep_t_r_t_r() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyLeaf {
     value: i32,
 }
 
 struct ToyBranch {
-    leaves: Vec<ToyLeaf>,
+    leaves: Vec<ToyLeaf, Global>,
 }
 
-fn make_tree() -> Vec<ToyBranch> {
-    let leaves = Vec::new<ToyLeaf>();
+fn make_tree() -> Vec<ToyBranch, Global> {
+    let leaves = Vec::new<ToyLeaf, Global>();
     leaves.push(ToyLeaf { value: 1 });
     leaves.push(ToyLeaf { value: 2 });
     let branch = ToyBranch { leaves: leaves };
-    let tree = Vec::new<ToyBranch>();
+    let tree = Vec::new<ToyBranch, Global>();
     tree.push(branch);
     tree
 }
 
-fn tree_len(t: &Vec<ToyBranch>) -> usize {
+fn tree_len(t: &Vec<ToyBranch, Global>) -> usize {
     t.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -761,6 +788,8 @@ fn main() {
 fn test_mixed_fields() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyPoint {
     x: i32,
     y: i32,
@@ -768,17 +797,18 @@ struct ToyPoint {
 
 struct ToyMixed {
     a: i32,
-    b: Vec<i32>,
+    b: Vec<i32, Global>,
     c: ToyPoint,
 }
 
 fn make_mixed() -> ToyMixed {
-    let v = Vec::new<i32>();
+    let v = Vec::new<i32, Global>();
     v.push(10);
     ToyMixed { a: 1, b: v, c: ToyPoint { x: 2, y: 3 } }
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -799,20 +829,23 @@ fn main() {
 fn test_mixed_generic() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct ToyGenMixed<T> {
     a: T,
-    b: Vec<T>,
+    b: Vec<T, Global>,
     c: i32,
 }
 
 fn make_mixed() -> ToyGenMixed<i32> {
-    let v = Vec::new<i32>();
+    let v = Vec::new<i32, Global>();
     v.push(10);
     v.push(20);
     ToyGenMixed { a: 42, b: v, c: 99 }
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -1198,19 +1231,22 @@ fn main() {
 fn test_vec_i32() {
     let output = run_toylang_test(
         r#"
-fn make_vec() -> Vec<i32> {
-    let v = Vec::new<i32>();
+use std::alloc::Global
+
+fn make_vec() -> Vec<i32, Global> {
+    let v = Vec::new<i32, Global>();
     v.push(10);
     v.push(20);
     v.push(30);
     v
 }
 
-fn vec_len(v: &Vec<i32>) -> usize {
+fn vec_len(v: &Vec<i32, Global>) -> usize {
     v.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -1255,19 +1291,22 @@ fn main() {
 fn test_struct_with_vec_and_primitive() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct Data {
     count: i32,
-    items: Vec<i32>,
+    items: Vec<i32, Global>,
 }
 
 fn make_data() -> Data {
-    let v = Vec::new<i32>();
+    let v = Vec::new<i32, Global>();
     v.push(10);
     v.push(20);
     Data { count: 2, items: v }
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -1286,24 +1325,27 @@ fn main() {
 fn test_vec_of_structs_len() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct Point {
     x: i32,
     y: i32,
 }
 
-fn make_points() -> Vec<Point> {
-    let v = Vec::new<Point>();
+fn make_points() -> Vec<Point, Global> {
+    let v = Vec::new<Point, Global>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     v.push(Point { x: 5, y: 6 });
     v
 }
 
-fn count_points(v: &Vec<Point>) -> usize {
+fn count_points(v: &Vec<Point, Global>) -> usize {
     v.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -1525,23 +1567,26 @@ fn main() {
 fn test_toylang_main_with_vec_v2() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct Point {
     x: i32,
     y: i32,
 }
 
-fn make_vec() -> Vec<Point> {
-    let v = Vec::new<Point>();
+fn make_vec() -> Vec<Point, Global> {
+    let v = Vec::new<Point, Global>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     v
 }
 
-fn vec_len(v: &Vec<Point>) -> usize {
+fn vec_len(v: &Vec<Point, Global>) -> usize {
     v.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -1560,19 +1605,22 @@ fn main() {
 fn test_toylang_main_with_vec() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct Point {
     x: i32,
     y: i32,
 }
 
 fn main() {
-    let v = Vec::new<Point>();
+    let v = Vec::new<Point, Global>();
     v.push(Point { x: 1, y: 2 });
     v.push(Point { x: 3, y: 4 });
     println("Vec length: {}", v.len());
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -1656,6 +1704,8 @@ fn test_vec_method_lookup_is_exact() {
     // HashMap ordering is nondeterministic, so this may pass intermittently.
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct Point {
     x: i32,
     y: i32,
@@ -1669,20 +1719,21 @@ fn new_point() -> Point {
     Point { x: 1, y: 2 }
 }
 
-fn make_vec() -> Vec<Point> {
+fn make_vec() -> Vec<Point, Global> {
     let fresh = renew();
     let also_new = new_point();
-    let v = Vec::new<Point>();
+    let v = Vec::new<Point, Global>();
     v.push(fresh);
     v.push(also_new);
     v
 }
 
-fn vec_len(v: &Vec<Point>) -> usize {
+fn vec_len(v: &Vec<Point, Global>) -> usize {
     v.len()
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 
@@ -1701,6 +1752,8 @@ fn main() {
 fn test_vec_push_fn_call_result() {
     let output = run_toylang_test(
         r#"
+use std::alloc::Global
+
 struct Point {
     x: i32,
     y: i32,
@@ -1711,12 +1764,13 @@ fn make_point() -> Point {
 }
 
 fn main() {
-    let v = Vec::new<Point>();
+    let v = Vec::new<Point, Global>();
     v.push(make_point());
     println("len: {}", v.len());
 }
         "#,
         r#"
+#![feature(allocator_api)]
 mod __lang_stubs;
 use __lang_stubs::*;
 

@@ -6,6 +6,8 @@
 > inter-toylang calls, arithmetic, direct field access, `println` built-in,
 > toylang-owned main, internal/extern ABI split with full param+return coercion.
 > 4 query providers. Zero compiler warnings. No type inference machinery.
+> Generalized Rust type support (no Vec-specific code in the main pipeline).
+> `use` imports for Rust types. Explicit type args everywhere including allocators.
 
 ## Overview
 
@@ -202,30 +204,37 @@ values are available for ABI queries in the extern wrapper pass.
 - **IntLit:** Correct width from context (i32 default, overridden by field types,
   return types, and param types)
 - **Generic type params:** Substituted with concrete types from Instance args
-- **Vec element types:** Read from explicit type args on `Vec::new<Point>()`
+- **Rust type args:** Read from explicit type args on `Vec::new<Point, Global>()`
 - **FnCall type args:** Read from explicit type args on `wrap<i32>(42)` — no inference
 - **BinaryOp:** Both operands share the expected type
+- **Rust method return types:** Via callback (`rust_method_ret`). Production
+  closures are hardcoded for now; unit tests supply their own closures.
 
-**No inference machinery.** All generic type args must be provided explicitly at
-call sites. Vec element types must be specified on `Vec::new<T>()`. Integer
+**No inference machinery.** All type args must be provided explicitly at call
+sites, including allocator types (`Vec::new<Point, Global>()`). Integer
 literals default to i32 unless the immediate context provides an expected type
 (return position, struct field, function parameter).
+
+**`ResolvedType::RustType`** represents any Rust type (Vec, Global, HashMap,
+etc.) with explicit type args. Replaces the old `ResolvedType::Vec { elem }`
+variant. Unknown type names (not primitives, not in registry) are treated as
+opaque Rust types.
 
 ### 4.3 Dependency discovery via type resolver
 
 `collect_toylang_fn_deps` runs `type_resolve::resolve_fn_body` on the caller's
-body to produce a TypedFnBody, then walks it for FnCall nodes with explicit
-type args. This unified approach handles all cases:
-- Concrete-to-concrete calls (empty type args)
-- Concrete-to-generic calls (type args provided explicitly at call site)
-- Generic-to-generic calls (caller's type params substituted first via Instance args)
+body to produce a TypedFnBody, then walks it for both toylang FnCall deps and
+Rust method deps in a single pass (`walk_typed_body_for_deps`).
 
-The explicit FnCall type args are converted to rustc `Ty<'tcx>` values and
-used to construct concrete `GenericArgsRef` for the callee Instance.
+**Toylang function deps:** FnCall nodes with explicit type args → concrete
+`GenericArgsRef` for the callee Instance.
 
-Vec element types for `collect_rust_deps` are discovered by scanning the AST
-for `Vec::new<ElemType>()` calls — the explicit type arg provides the element
-type directly with no inference needed.
+**Rust method deps:** StaticCall and MethodCall nodes on `RustType` receivers →
+`find_inherent_method` for method DefId + `generics_of` to determine correct
+generic arg count → concrete `(DefId, GenericArgsRef)` deps.
+
+This unified approach replaced the old `collect_rust_deps` function which
+scanned the untyped AST for Vec-specific patterns (~150 lines deleted).
 
 Note: the type resolver runs twice per function — once during dep discovery
 (in `monomorphize_fn`) and once during LLVM codegen (in `generate_with_tcx`).
@@ -245,8 +254,13 @@ for compatibility with rustc 1.86). Expression lowering handles:
 - `BinaryOp` → build_int_add/sub/mul/div or float equivalents
 - `FnCall` → call via `__toylang_internal_` symbol (internal ABI)
 - `FnCall` (println) → format string → `printf` call with type-appropriate specifiers
-- `StaticCall` (Vec::new) → sret call to Rust mangled symbol
-- `MethodCall` (push/len) → call to Rust mangled symbol
+- `StaticCall` (Rust type::method) → looked up in `rust_method_info`, sret or direct
+- `MethodCall` (Rust type methods) → looked up in `rust_method_info`, receiver + args
+
+**Rust method resolution:** `rust_method_info: HashMap<String, RustMethodInfo>`
+keyed by mangled symbol name. Lazily populated via `get_or_resolve_rust_method`
+which finds method DefIds via `find_inherent_method`, resolves mangled symbols,
+and declares LLVM external functions. Cached across function bodies.
 
 Rust types (Vec, etc.) use opaque `[N x i8]` byte arrays — size and alignment
 queried from `tcx.layout_of`. Toylang structs use real LLVM struct types with
@@ -368,7 +382,8 @@ i1 to i32 for printf compatibility.
 - Direct field access (`p.x`)
 - `println` built-in (compiles to C printf)
 - Toylang-owned main (`fn main()` in toylang, called via `__toylang_main`)
-- Explicit Vec element types (`Vec::new<Point>()`)
+- Explicit type args everywhere (`Vec::new<Point, Global>()`)
+- `use` imports (`use std::alloc::Global`)
 
 ### ABI
 - Internal/extern ABI split (internal: predictable, extern: matches Rust)
@@ -377,11 +392,14 @@ i1 to i32 for printf compatibility.
 - Bool i1↔i8 coercion handled by `coerce_int_to_type`
 - Struct ABI coercion (e.g. `{ i32, i32 }` → `i64` on aarch64, both params and returns)
 
-### Vec operations
-- Vec<primitive> and Vec<struct>
-- Vec::new, push, len
-- Vec as struct field
-- Nested Vec (Vec<Vec<T>>)
+### Rust type operations (generalized, not Vec-specific)
+- Vec<primitive> and Vec<struct> (with explicit allocator: `Vec<i32, Global>`)
+- Inherent methods: new, push, len (via `find_inherent_method`)
+- Rust types as struct fields
+- Nested Vec (Vec<Vec<T, Global>, Global>)
+
+### Imports
+- `use std::alloc::Global` (emitted as `pub use` in stubs, resolved via module_children_local)
 
 ### Infrastructure
 - Drop glue for consumer types
@@ -414,9 +432,9 @@ i1 to i32 for printf compatibility.
 
 | File | Purpose |
 |------|---------|
-| `llvm_gen.rs` | Inkwell LLVM backend: MonoItems walk, internal/extern codegen, accessor GEPs |
-| `stub_gen.rs` | Generates `__lang_stubs.rs` (opaque structs, wrappers, externs) |
-| `oracle.rs` | TyCtxt query helpers (find_local_struct_ty, find_vec_method, etc.) |
+| `llvm_gen.rs` | Inkwell LLVM backend: MonoItems walk, internal/extern codegen, accessor GEPs, Rust method resolution |
+| `stub_gen.rs` | Generates `__lang_stubs.rs` (opaque structs, wrappers, externs, `pub use` re-exports) |
+| `oracle.rs` | TyCtxt query helpers (find_inherent_method, find_rust_type_def_id, find_reexported_type) |
 | `main.rs` | CLI entry point, registry setup, rustc invocation |
 | `toylang/ast.rs` | Untyped AST (Expr incl. FieldAccess/StringLit, Stmt, FnBody, BinOp) |
 | `toylang/typed_ast.rs` | Typed AST (TypedExpr with ResolvedType incl. Str) |
@@ -616,6 +634,18 @@ Started with 5 tests passing (string-based LLVM backend, no fork, manual
 17. Bug fixes — exact Vec method lookup, lexer rejects unknown chars, panic on
     missing --toylang-input
 
+**Session 4: Generalized Rust type support (53 tests, refactored):**
+18. `ResolvedType::Vec` → `ResolvedType::RustType` (general for any Rust type)
+19. `rust_method_ret` callback on type resolver (no hardcoded method return types)
+20. Unified dep discovery — one typed AST walk for both toylang and Rust deps
+    (deleted `collect_rust_deps` + ~150 lines of Vec helpers)
+21. Generalized codegen — `rust_method_info` keyed by mangled symbol, lazy cached
+    (deleted `vec_fns` + `resolve_vec_symbols` + ~200 lines of Vec helpers)
+22. `use` imports — `use std::alloc::Global` in toylang → `pub use` in stubs →
+    resolved via `module_children_local`
+23. Explicit type args everywhere — `Vec::new<Point, Global>()`, no default filling
+24. Deleted `extract_global_ty`, `find_vec_method`, and all Vec-specific scanning
+
 **Query surface reduced from 6 providers to 4:**
 - Removed: `mir_built`, `mir_borrowck`
 - Kept: `layout_of`, `mir_shims`, `per_instance_mir`, `symbol_name`
@@ -635,17 +665,32 @@ All 53 tests pass. No known blockers.
 3. **Trait implementations** — `impl Trait for ConsumerType` in stubs. The
    `per_instance_mir` foundation supports it. Biggest remaining architectural feature.
 
-4. **Eliminate Vec-specific logic** — see Part 10.4 roadmap.
+4. **Replace method signature heuristics with `fn_abi_of_instance`** — The
+   `get_or_resolve_rust_method` function currently uses method-name matching
+   ("new" → sret, "push" → ptr+ptr+void, "len" → ptr+usize) to determine LLVM
+   signatures. Replace with `fn_abi_of_instance` queries for full generality.
+
+5. **Replace `rust_method_ret` hardcoded closures with `tcx.fn_sig()`** —
+   Production closures currently hardcode push→Void, len→Usize. Query the
+   actual method signature from rustc for full generality.
 
 ### Known technical debt
 
-- **String-based type resolution** duplicated in 6+ places (type_from_string,
-  resolve_rust_ty_from_string, parse_coerced_type, etc.) — each slightly different
+- **String-based type resolution** duplicated in several places (type_from_string,
+  parse_coerced_type, etc.) — each slightly different. `resolve_rust_ty_from_string`
+  was deleted in the generalization refactor.
 - **println hardcoding** — special-cased by name in type resolver and codegen
 - **Ref param redundant conversion** in extern wrapper — `fn_abi` reports `i64` for
   pointers, internal expects `ptr`, bitcast-via-memory fires unnecessarily (LLVM
   optimizes it away)
-- **Vec-specific code** (~200 lines) — hardcoded push/len/new handling throughout
+- **Rust method signature heuristics** — `get_or_resolve_rust_method` uses method
+  name to determine LLVM signature (new→sret, push→void, len→usize). Should use
+  `fn_abi_of_instance`. This is the main remaining non-general code.
+- **Hardcoded `rust_method_ret` closures** — production closures match method names
+  to return types. Should query `tcx.fn_sig()`.
+- **`#![feature(allocator_api)]` required** — Rust crate roots must enable this
+  unstable feature to use `std::alloc::Global`. Unavoidable until Rust stabilizes
+  the allocator API.
 
 ### Building the forked toolchain
 
@@ -711,34 +756,36 @@ are already generated.
 
 ### 10.3 Rust method resolution: inherent + explicit trait qualification
 
-- **Inherent methods** (push, len, new, get, insert, etc.): resolved by iterating
-  `tcx.inherent_impls(adt_def_id)` and finding the method by name. This is a
-  direct generalization of `find_vec_method` in `oracle.rs`.
+- **Inherent methods** (push, len, new, get, insert, etc.): resolved by
+  `find_inherent_method(tcx, type_def_id, method_name)` in `oracle.rs`.
+  Already implemented and general — works for any Rust type, not just Vec.
 - **Trait methods** (clone, to_string, etc.): toylang uses UFCS syntax —
   `Clone::clone(my_vec)` — so the user explicitly names the trait. The compiler
   looks up the trait's impl for the concrete type via `tcx.trait_impls_of`.
   No implicit trait resolution or method probing needed.
 - This means toylang never needs autoderef or method resolution probing.
 
-### 10.4 Roadmap to eliminate Vec-specific logic
+### 10.4 Vec-specific logic elimination (DONE)
 
-Vec is currently the only Rust type toylang uses directly. ~200 lines of
-Vec-specific code are spread across `llvm_gen.rs`, `callbacks_impl.rs`, and
-`oracle.rs`. The elimination roadmap has 4 moves:
+The original roadmap had 4 moves. All are now complete:
 
-1. **Move 1 (done):** Opaque Rust types via `layout_of`. Foundation:
-   `resolved_type_to_rustc_ty` + `rust_ty_to_llvm_opaque`. Replaced `vec_type()`
-   hardcoded `{usize, usize, usize}` with `[N x i8]` from `layout_of`.
+1. **Move 1 (done, session 3):** Opaque Rust types via `layout_of`.
+2. **Move 2 (done, session 4):** General inherent method resolution via
+   `find_inherent_method`. `resolve_vec_symbols` and `find_vec_method` deleted.
+3. **Move 3 (done, session 4):** Merged dep discovery into single typed AST
+   walk (`walk_typed_body_for_deps`). `collect_rust_deps` and all Vec scanning
+   helpers deleted (~150 lines).
+4. **Move 4 (done, session 4):** General Rust method codegen via
+   `rust_method_info` + `get_or_resolve_rust_method`. Hardcoded push/len/new
+   match arms replaced with general lookup. ~200 lines of Vec helpers deleted.
 
-2. **Move 2:** General inherent method resolution. Replace `find_vec_method` +
-   `resolve_vec_symbols` with `find_inherent_method(tcx, adt_def_id, method_name)`.
-   Use `fn_abi_of_instance` for calling conventions (both params and return).
-   On-demand resolution at call sites, no upfront symbol scanning.
+**Additional (session 4):**
+5. `use` imports added to toylang (`use std::alloc::Global`).
+6. All type args explicit (`Vec<Point, Global>`) — no default filling.
+7. `ResolvedType::Vec` replaced with general `ResolvedType::RustType`.
 
-3. **Move 3:** Merge `collect_rust_deps` (untyped AST scan for Vec ops) into
-   `collect_toylang_fn_deps` (typed AST walk). One walk, all deps. Eliminates
-   `scan_body_vec_ops`, `find_vec_elem_ty`, `find_vec_in_fields_recursive`,
-   `body_uses_vec`, `find_vec_elem_name`, `find_vec_elem_from_params`.
-
-4. **Move 4:** Replace hardcoded `push`/`len`/`new` codegen match arms with
-   general "call Rust method" path using ABI info from `fn_abi_of_instance`.
+**Remaining non-general code (small, isolated):**
+- Method signature heuristic in `get_or_resolve_rust_method` (method name →
+  LLVM signature). Replace with `fn_abi_of_instance` for full generality.
+- Hardcoded `rust_method_ret` closures. Replace with `tcx.fn_sig()` queries.
+- Three dummy `Vec<I32, Global>` constructions for layout queries.
