@@ -10,7 +10,6 @@ extern crate rustc_span;
 use rustc_hir::def::DefKind;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::DefId;
-use rustc_span::sym;
 
 /// Walk local HIR definitions to find a struct named `name`.
 /// Also resolves `pub use` re-exports to the original struct DefId.
@@ -137,14 +136,40 @@ pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> c
                     _ => None,
                 })
                 .collect();
-            // Check if this is a toylang struct
-            if find_local_struct_def_id(tcx, &name).map_or(false, |id| id == adt_def.did()) {
+            // Check if this is a toylang struct (defined in __lang_stubs)
+            if rustc_lang_facade::is_from_lang_stubs(tcx, adt_def.did()) {
                 ResolvedType::StructRef { name, type_args }
             } else {
                 ResolvedType::RustType { name, type_args }
             }
         }
         _ => panic!("rustc_ty_to_resolved_type: unsupported type {:?}", ty),
+    }
+}
+
+/// Convert a ResolvedType to a string suitable for symbol mangling.
+pub fn resolved_type_to_mangled_name(ty: &crate::toylang::typed_ast::ResolvedType) -> String {
+    use crate::toylang::typed_ast::ResolvedType;
+    match ty {
+        ResolvedType::I32 => "i32".to_string(),
+        ResolvedType::I64 => "i64".to_string(),
+        ResolvedType::F64 => "f64".to_string(),
+        ResolvedType::Bool => "bool".to_string(),
+        ResolvedType::Usize => "usize".to_string(),
+        ResolvedType::Void => "void".to_string(),
+        ResolvedType::StructRef { name, type_args }
+        | ResolvedType::Struct { name, type_args, .. }
+        | ResolvedType::RustType { name, type_args } => {
+            if type_args.is_empty() {
+                name.clone()
+            } else {
+                let args: Vec<String> = type_args.iter().map(resolved_type_to_mangled_name).collect();
+                format!("{}_{}", name, args.join("_"))
+            }
+        }
+        ResolvedType::Ref { inner } => format!("ref_{}", resolved_type_to_mangled_name(inner)),
+        ResolvedType::TypeParam(name) => name.clone(),
+        ResolvedType::Str => "str".to_string(),
     }
 }
 
@@ -190,13 +215,8 @@ pub fn find_extern_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
 }
 
 pub fn find_rust_type_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
-    // Well-known types via diagnostic items
-    let diag = match name {
-        "Vec" => tcx.get_diagnostic_item(sym::Vec),
-        _ => None,
-    };
-    if diag.is_some() { return diag; }
-
-    // Fall back to local definitions and pub use re-exports
+    // All Rust types must be imported via `use` in toylang source.
+    // The stub generator emits `pub use` re-exports, and
+    // find_local_struct_def_id finds them via module_children_local.
     find_local_struct_def_id(tcx, name)
 }

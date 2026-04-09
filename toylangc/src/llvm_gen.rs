@@ -473,18 +473,42 @@ fn resolve_rust_methods_from_typed_body(ctx: &mut CodegenCtx, body: &TypedFnBody
             TypedExprKind::FieldAccess { receiver, .. } => {
                 walk_expr(ctx, receiver);
             }
+            TypedExprKind::If { cond, then_stmts, then_expr, else_stmts, else_expr } => {
+                walk_expr(ctx, cond);
+                for stmt in then_stmts {
+                    match stmt {
+                        TypedStmt::Let { expr, .. } | TypedStmt::ExprStmt(expr) => walk_expr(ctx, expr),
+                        TypedStmt::While { cond, body } => { walk_expr(ctx, cond); walk_body(ctx, body); }
+                    }
+                }
+                if let Some(e) = then_expr { walk_expr(ctx, e); }
+                for stmt in else_stmts {
+                    match stmt {
+                        TypedStmt::Let { expr, .. } | TypedStmt::ExprStmt(expr) => walk_expr(ctx, expr),
+                        TypedStmt::While { cond, body } => { walk_expr(ctx, cond); walk_body(ctx, body); }
+                    }
+                }
+                if let Some(e) = else_expr { walk_expr(ctx, e); }
+            }
             _ => {} // IntLit, BoolLit, Var, StringLit
         }
     }
-    for stmt in &body.stmts {
-        match stmt {
-            TypedStmt::Let { expr, .. } => walk_expr(ctx, expr),
-            TypedStmt::ExprStmt(expr) => walk_expr(ctx, expr),
+    fn walk_body(ctx: &mut CodegenCtx, body: &crate::toylang::typed_ast::TypedFnBody) {
+        for stmt in &body.stmts {
+            match stmt {
+                TypedStmt::Let { expr, .. } => walk_expr(ctx, expr),
+                TypedStmt::ExprStmt(expr) => walk_expr(ctx, expr),
+                TypedStmt::While { cond, body } => {
+                    walk_expr(ctx, cond);
+                    walk_body(ctx, body);
+                }
+            }
+        }
+        if let Some(ref ret) = body.ret {
+            walk_expr(ctx, ret);
         }
     }
-    if let Some(ref ret) = body.ret {
-        walk_expr(ctx, ret);
-    }
+    walk_body(ctx, body);
 }
 
 fn is_internal_sret(ty: &ResolvedType) -> bool {
@@ -839,6 +863,7 @@ fn lower_typed_expr<'ctx>(
 
         TypedExprKind::BinaryOp { op, left, right } => {
             use crate::toylang::ast::BinOp;
+            use inkwell::IntPredicate;
             let lhs = lower_typed_expr(ctx, left).into_value(&ctx.builder);
             let rhs = lower_typed_expr(ctx, right).into_value(&ctx.builder);
             let result = match (lhs, rhs) {
@@ -848,6 +873,12 @@ fn lower_typed_expr<'ctx>(
                         BinOp::Sub => ctx.builder.build_int_sub(l, r, "sub").unwrap(),
                         BinOp::Mul => ctx.builder.build_int_mul(l, r, "mul").unwrap(),
                         BinOp::Div => ctx.builder.build_int_signed_div(l, r, "div").unwrap(),
+                        BinOp::Eq => ctx.builder.build_int_compare(IntPredicate::EQ, l, r, "eq").unwrap(),
+                        BinOp::Ne => ctx.builder.build_int_compare(IntPredicate::NE, l, r, "ne").unwrap(),
+                        BinOp::Lt => ctx.builder.build_int_compare(IntPredicate::SLT, l, r, "lt").unwrap(),
+                        BinOp::Le => ctx.builder.build_int_compare(IntPredicate::SLE, l, r, "le").unwrap(),
+                        BinOp::Gt => ctx.builder.build_int_compare(IntPredicate::SGT, l, r, "gt").unwrap(),
+                        BinOp::Ge => ctx.builder.build_int_compare(IntPredicate::SGE, l, r, "ge").unwrap(),
                     };
                     BasicValueEnum::IntValue(val)
                 }
@@ -857,6 +888,7 @@ fn lower_typed_expr<'ctx>(
                         BinOp::Sub => ctx.builder.build_float_sub(l, r, "fsub").unwrap(),
                         BinOp::Mul => ctx.builder.build_float_mul(l, r, "fmul").unwrap(),
                         BinOp::Div => ctx.builder.build_float_div(l, r, "fdiv").unwrap(),
+                        _ => panic!("BinaryOp: float comparisons not yet supported"),
                     };
                     BasicValueEnum::FloatValue(val)
                 }
@@ -938,7 +970,7 @@ fn lower_typed_expr<'ctx>(
             let internal_sym = {
                 let mut sym = format!("__toylang_internal_{}", name);
                 for arg in type_args {
-                    sym.push_str(&format!("__{}", resolved_type_to_mangled_name(arg)));
+                    sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(arg)));
                 }
                 sym
             };
@@ -1121,6 +1153,45 @@ fn lower_typed_expr<'ctx>(
                 }
             }
         }
+
+        TypedExprKind::If { cond, then_stmts, then_expr, else_stmts, else_expr } => {
+            let cond_val = lower_typed_expr(ctx, cond).into_value(&ctx.builder).into_int_value();
+            let function = ctx.builder.get_insert_block().unwrap().get_parent().unwrap();
+
+            let then_bb = ctx.context.append_basic_block(function, "then");
+            let else_bb = ctx.context.append_basic_block(function, "else");
+            let merge_bb = ctx.context.append_basic_block(function, "merge");
+
+            ctx.builder.build_conditional_branch(cond_val, then_bb, if else_stmts.is_empty() && else_expr.is_none() { merge_bb } else { else_bb }).unwrap();
+
+            // Then branch
+            ctx.builder.position_at_end(then_bb);
+            let saved_vars = ctx.vars.clone();
+            for stmt in then_stmts { lower_typed_stmt(ctx, stmt); }
+            let then_val = then_expr.as_ref().map(|e| lower_typed_expr(ctx, e).into_value(&ctx.builder));
+            let then_end_bb = ctx.builder.get_insert_block().unwrap();
+            ctx.builder.build_unconditional_branch(merge_bb).unwrap();
+            ctx.vars = saved_vars.clone();
+
+            // Else branch
+            ctx.builder.position_at_end(else_bb);
+            for stmt in else_stmts { lower_typed_stmt(ctx, stmt); }
+            let else_val = else_expr.as_ref().map(|e| lower_typed_expr(ctx, e).into_value(&ctx.builder));
+            let else_end_bb = ctx.builder.get_insert_block().unwrap();
+            ctx.builder.build_unconditional_branch(merge_bb).unwrap();
+            ctx.vars = saved_vars;
+
+            // Merge block
+            ctx.builder.position_at_end(merge_bb);
+
+            if let (Some(tv), Some(ev)) = (then_val, else_val) {
+                let phi = ctx.builder.build_phi(tv.get_type(), "if_val").unwrap();
+                phi.add_incoming(&[(&tv, then_end_bb), (&ev, else_end_bb)]);
+                ExprResult::Value(phi.as_basic_value())
+            } else {
+                ExprResult::Value(ctx.context.i32_type().const_zero().into())
+            }
+        }
     }
 }
 
@@ -1142,6 +1213,49 @@ fn lower_typed_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>, stmt: &TypedStmt) 
         }
         TypedStmt::ExprStmt(expr) => {
             let _ = lower_typed_expr(ctx, expr);
+        }
+        TypedStmt::While { cond, body } => {
+            let function = ctx.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let header_bb = ctx.context.append_basic_block(function, "while_header");
+            let body_bb = ctx.context.append_basic_block(function, "while_body");
+            let exit_bb = ctx.context.append_basic_block(function, "while_exit");
+
+            // Snapshot vars before loop (the "original" allocas)
+            let pre_loop_vars = ctx.vars.clone();
+
+            // Jump to header
+            ctx.builder.build_unconditional_branch(header_bb).unwrap();
+
+            // Header: evaluate condition (uses current ctx.vars — original allocas on first pass)
+            ctx.builder.position_at_end(header_bb);
+            let cond_val = lower_typed_expr(ctx, cond).into_value(&ctx.builder).into_int_value();
+            ctx.builder.build_conditional_branch(cond_val, body_bb, exit_bb).unwrap();
+
+            // Body: lower stmts
+            ctx.builder.position_at_end(body_bb);
+            for stmt in &body.stmts { lower_typed_stmt(ctx, stmt); }
+            if let Some(ref ret) = body.ret {
+                let _ = lower_typed_expr(ctx, ret);
+            }
+
+            // Store rebound values back into original allocas so the header sees them
+            for (name, (orig_ptr, orig_ty)) in &pre_loop_vars {
+                if let Some((new_ptr, _)) = ctx.vars.get(name) {
+                    if *new_ptr != *orig_ptr {
+                        // Variable was rebound — load from new alloca, store into original
+                        let val = ctx.builder.build_load(*orig_ty, *new_ptr, "loop_update").unwrap();
+                        ctx.builder.build_store(*orig_ptr, val).unwrap();
+                    }
+                }
+            }
+
+            ctx.builder.build_unconditional_branch(header_bb).unwrap();
+
+            // Restore vars to original allocas (header reads from these)
+            ctx.vars = pre_loop_vars;
+
+            // Continue after loop
+            ctx.builder.position_at_end(exit_bb);
         }
     }
 }
@@ -1186,31 +1300,6 @@ fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> Struc
 // ============================================================================
 // Helpers (kept from old llvm_gen.rs)
 // ============================================================================
-
-/// Convert a ResolvedType to a string suitable for symbol mangling.
-fn resolved_type_to_mangled_name(ty: &ResolvedType) -> String {
-    match ty {
-        ResolvedType::I32 => "i32".to_string(),
-        ResolvedType::I64 => "i64".to_string(),
-        ResolvedType::F64 => "f64".to_string(),
-        ResolvedType::Bool => "bool".to_string(),
-        ResolvedType::Usize => "usize".to_string(),
-        ResolvedType::Void => "void".to_string(),
-        ResolvedType::StructRef { name, type_args }
-        | ResolvedType::Struct { name, type_args, .. }
-        | ResolvedType::RustType { name, type_args } => {
-            if type_args.is_empty() {
-                name.clone()
-            } else {
-                let args: Vec<String> = type_args.iter().map(resolved_type_to_mangled_name).collect();
-                format!("{}_{}", name, args.join("_"))
-            }
-        }
-        ResolvedType::Ref { inner } => format!("ref_{}", resolved_type_to_mangled_name(inner)),
-        ResolvedType::TypeParam(name) => name.clone(),
-        ResolvedType::Str => "str".to_string(),
-    }
-}
 
 fn resolve_rust_symbol<'tcx>(
     tcx: TyCtxt<'tcx>,

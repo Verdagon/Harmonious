@@ -279,7 +279,7 @@ fn collect_toylang_fn_deps<'tcx>(
         crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
     };
     let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, &resolved_caller, &rust_method_ret)
-        .expect("type resolution should succeed (already validated)");
+        .unwrap_or_else(|e| panic!("[toylang] type error in '{}': {:?}", resolved_caller.name, e));
 
     // Walk typed body for both toylang FnCall deps and Rust method deps
     let mut deps = Vec::new();
@@ -349,6 +349,10 @@ fn walk_typed_body_for_deps(
         match stmt {
             TypedStmt::Let { expr, .. } => walk_typed_expr_for_deps(expr, fn_calls, rust_method_deps),
             TypedStmt::ExprStmt(expr) => walk_typed_expr_for_deps(expr, fn_calls, rust_method_deps),
+            TypedStmt::While { cond, body } => {
+                walk_typed_expr_for_deps(cond, fn_calls, rust_method_deps);
+                walk_typed_body_for_deps(body, fn_calls, rust_method_deps);
+            }
         }
     }
     if let Some(ref ret) = body.ret {
@@ -414,6 +418,31 @@ fn walk_typed_expr_for_deps(
                 walk_typed_expr_for_deps(arg, fn_calls, rust_method_deps);
             }
         }
+        TypedExprKind::If { cond, then_stmts, then_expr, else_stmts, else_expr } => {
+            walk_typed_expr_for_deps(cond, fn_calls, rust_method_deps);
+            for stmt in then_stmts {
+                match stmt {
+                    TypedStmt::Let { expr, .. } => walk_typed_expr_for_deps(expr, fn_calls, rust_method_deps),
+                    TypedStmt::ExprStmt(expr) => walk_typed_expr_for_deps(expr, fn_calls, rust_method_deps),
+                    TypedStmt::While { cond, body } => {
+                        walk_typed_expr_for_deps(cond, fn_calls, rust_method_deps);
+                        walk_typed_body_for_deps(body, fn_calls, rust_method_deps);
+                    }
+                }
+            }
+            if let Some(e) = then_expr { walk_typed_expr_for_deps(e, fn_calls, rust_method_deps); }
+            for stmt in else_stmts {
+                match stmt {
+                    TypedStmt::Let { expr, .. } => walk_typed_expr_for_deps(expr, fn_calls, rust_method_deps),
+                    TypedStmt::ExprStmt(expr) => walk_typed_expr_for_deps(expr, fn_calls, rust_method_deps),
+                    TypedStmt::While { cond, body } => {
+                        walk_typed_expr_for_deps(cond, fn_calls, rust_method_deps);
+                        walk_typed_body_for_deps(body, fn_calls, rust_method_deps);
+                    }
+                }
+            }
+            if let Some(e) = else_expr { walk_typed_expr_for_deps(e, fn_calls, rust_method_deps); }
+        }
         _ => {} // IntLit, BoolLit, Var, StringLit — no children
     }
 }
@@ -462,42 +491,11 @@ fn compute_fn_symbol<'tcx>(name: &str, tcx: TyCtxt<'tcx>, instance: ty::Instance
     let mut sym = format!("__toylang_impl_{}", name);
     for arg in instance.args.iter() {
         if let ty::GenericArgKind::Type(ty) = arg.unpack() {
-            sym.push_str(&format!("__{}", mangle_ty_for_symbol(tcx, ty)));
+            let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
+            sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
         }
     }
     sym
-}
-
-fn mangle_ty_for_symbol<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
-    match ty.kind() {
-        TyKind::Int(int_ty) => int_ty.name_str().to_string(),
-        TyKind::Uint(uint_ty) => uint_ty.name_str().to_string(),
-        TyKind::Float(float_ty) => float_ty.name_str().to_string(),
-        TyKind::Bool => "bool".to_string(),
-        TyKind::Adt(adt_def, args) => {
-            let name = tcx.item_name(adt_def.did()).to_string();
-            if args.is_empty() {
-                name
-            } else {
-                let arg_strs: Vec<String> = args.iter()
-                    .filter_map(|a| match a.unpack() {
-                        ty::GenericArgKind::Type(t) => Some(mangle_ty_for_symbol(tcx, t)),
-                        _ => None,
-                    })
-                    .collect();
-                format!("{}_{}", name, arg_strs.join("_"))
-            }
-        }
-        TyKind::Str => "str".to_string(),
-        TyKind::Ref(_, inner_ty, _) => format!("ref_{}", mangle_ty_for_symbol(tcx, *inner_ty)),
-        TyKind::RawPtr(inner_ty, _) => format!("ptr_{}", mangle_ty_for_symbol(tcx, *inner_ty)),
-        TyKind::Slice(elem_ty) => format!("slice_{}", mangle_ty_for_symbol(tcx, *elem_ty)),
-        TyKind::Tuple(tys) => {
-            let parts: Vec<String> = tys.iter().map(|t| mangle_ty_for_symbol(tcx, t)).collect();
-            format!("tuple_{}", parts.join("_"))
-        }
-        _ => panic!("mangle_ty_for_symbol: unsupported type {:?}", ty),
-    }
 }
 
 

@@ -86,12 +86,20 @@ pub enum TypedExprKind {
         field: String,
     },
     StringLit(String),
+    If {
+        cond: Box<TypedExpr>,
+        then_stmts: Vec<TypedStmt>,
+        then_expr: Option<Box<TypedExpr>>,
+        else_stmts: Vec<TypedStmt>,
+        else_expr: Option<Box<TypedExpr>>,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum TypedStmt {
     Let { name: String, expr: TypedExpr },
     ExprStmt(TypedExpr),
+    While { cond: TypedExpr, body: TypedFnBody },
 }
 
 #[derive(Clone, Debug)]

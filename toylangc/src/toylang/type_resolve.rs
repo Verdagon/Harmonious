@@ -25,6 +25,9 @@ pub enum TypeResolveError {
     MethodCallOnUnsupportedType { ty: ResolvedType, method: String },
     WrongTypeArgCount { func_name: String, expected: usize, got: usize },
     NonStructLitType { ty: ResolvedType },
+    IfConditionNotBool { ty: ResolvedType },
+    WhileConditionNotBool { ty: ResolvedType },
+    IfElseTypeMismatch { then_ty: ResolvedType, else_ty: ResolvedType },
 }
 
 // ============================================================================
@@ -192,18 +195,30 @@ pub fn substitute_type_params_in_body(
                 left: Box::new(subst_expr(left, subst)),
                 right: Box::new(subst_expr(right, subst)),
             },
+            Expr::If { cond, then_body, else_body } => Expr::If {
+                cond: Box::new(subst_expr(cond, subst)),
+                then_body: Box::new(subst_fn_body(then_body, subst)),
+                else_body: else_body.as_ref().map(|b| Box::new(subst_fn_body(b, subst))),
+            },
         }
     }
     fn subst_stmt(stmt: &Stmt, subst: &HashMap<String, ResolvedType>) -> Stmt {
         match stmt {
             Stmt::Let { name, expr } => Stmt::Let { name: name.clone(), expr: subst_expr(expr, subst) },
             Stmt::ExprStmt(expr) => Stmt::ExprStmt(subst_expr(expr, subst)),
+            Stmt::While { cond, body } => Stmt::While {
+                cond: subst_expr(cond, subst),
+                body: Box::new(subst_fn_body(body, subst)),
+            },
         }
     }
-    super::ast::FnBody {
-        stmts: body.stmts.iter().map(|s| subst_stmt(s, subst)).collect(),
-        ret: body.ret.as_ref().map(|e| subst_expr(e, subst)),
+    fn subst_fn_body(body: &super::ast::FnBody, subst: &HashMap<String, ResolvedType>) -> super::ast::FnBody {
+        super::ast::FnBody {
+            stmts: body.stmts.iter().map(|s| subst_stmt(s, subst)).collect(),
+            ret: body.ret.as_ref().map(|e| subst_expr(e, subst)),
+        }
     }
+    subst_fn_body(body, subst)
 }
 
 fn find_field_index(toy_struct: &super::registry::ToyStruct, field_name: &str) -> Result<usize, TypeResolveError> {
@@ -221,7 +236,7 @@ fn find_field_index(toy_struct: &super::registry::ToyStruct, field_name: &str) -
 
 fn resolve_expr(
     expr: &Expr,
-    expected_ty: &ResolvedType,
+    _expected_ty: &ResolvedType,
     scope: &HashMap<String, ResolvedType>,
     registry: &ToylangRegistry,
     rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> ResolvedType,
@@ -342,20 +357,19 @@ fn resolve_expr(
         }
 
         Expr::BinaryOp { op, left, right } => {
-            let operand_ty = if expected_ty != &ResolvedType::Void {
-                expected_ty.clone()
-            } else {
-                ResolvedType::I32
-            };
-            let typed_left = resolve_expr(left, &operand_ty, scope, registry, rust_method_ret)?;
+            use crate::toylang::ast::BinOp;
+            let is_comparison = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+            let typed_left = resolve_expr(left, &ResolvedType::Void, scope, registry, rust_method_ret)?;
+            let operand_ty = typed_left.ty.clone();
             let typed_right = resolve_expr(right, &operand_ty, scope, registry, rust_method_ret)?;
+            let result_ty = if is_comparison { ResolvedType::Bool } else { operand_ty };
             Ok(TypedExpr {
                 kind: TypedExprKind::BinaryOp {
                     op: *op,
                     left: Box::new(typed_left),
                     right: Box::new(typed_right),
                 },
-                ty: operand_ty,
+                ty: result_ty,
             })
         }
 
@@ -425,6 +439,61 @@ fn resolve_expr(
                 ty: ret_ty,
             })
         }
+
+        Expr::If { cond, then_body, else_body } => {
+            let typed_cond = resolve_expr(cond, &ResolvedType::Void, scope, registry, rust_method_ret)?;
+            if typed_cond.ty != ResolvedType::Bool {
+                return Err(TypeResolveError::IfConditionNotBool { ty: typed_cond.ty.clone() });
+            }
+
+            // Resolve then branch in cloned scope (branch-scoped)
+            let mut then_scope = scope.clone();
+            let then_stmts: Vec<TypedStmt> = then_body.stmts.iter()
+                .map(|s| resolve_stmt(s, &mut then_scope, &ResolvedType::Void, registry, rust_method_ret))
+                .collect::<Result<Vec<_>, _>>()?;
+            let then_expr = then_body.ret.as_ref()
+                .map(|e| resolve_expr(e, &ResolvedType::Void, &then_scope, registry, rust_method_ret))
+                .transpose()?;
+
+            // Resolve else branch in cloned scope (branch-scoped)
+            let (else_stmts, else_expr) = if let Some(else_body) = else_body {
+                let mut else_scope = scope.clone();
+                let stmts: Vec<TypedStmt> = else_body.stmts.iter()
+                    .map(|s| resolve_stmt(s, &mut else_scope, &ResolvedType::Void, registry, rust_method_ret))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let expr = else_body.ret.as_ref()
+                    .map(|e| resolve_expr(e, &ResolvedType::Void, &else_scope, registry, rust_method_ret))
+                    .transpose()?;
+                (stmts, expr)
+            } else {
+                (vec![], None)
+            };
+
+            // Determine result type
+            let result_ty = match (&then_expr, &else_expr) {
+                (Some(te), Some(ee)) => {
+                    if te.ty != ee.ty {
+                        return Err(TypeResolveError::IfElseTypeMismatch {
+                            then_ty: te.ty.clone(),
+                            else_ty: ee.ty.clone(),
+                        });
+                    }
+                    te.ty.clone()
+                }
+                _ => ResolvedType::Void,
+            };
+
+            Ok(TypedExpr {
+                kind: TypedExprKind::If {
+                    cond: Box::new(typed_cond),
+                    then_stmts,
+                    then_expr: then_expr.map(Box::new),
+                    else_stmts,
+                    else_expr: else_expr.map(Box::new),
+                },
+                ty: result_ty,
+            })
+        }
     }
 }
 
@@ -444,6 +513,23 @@ fn resolve_stmt(
         Stmt::ExprStmt(expr) => {
             let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry, rust_method_ret)?;
             Ok(TypedStmt::ExprStmt(typed_expr))
+        }
+        Stmt::While { cond, body } => {
+            let typed_cond = resolve_expr(cond, &ResolvedType::Void, scope, registry, rust_method_ret)?;
+            if typed_cond.ty != ResolvedType::Bool {
+                return Err(TypeResolveError::WhileConditionNotBool { ty: typed_cond.ty.clone() });
+            }
+            // Resolve body in current scope (NOT cloned — let rebindings persist across iterations)
+            let body_stmts: Vec<TypedStmt> = body.stmts.iter()
+                .map(|s| resolve_stmt(s, scope, &ResolvedType::Void, registry, rust_method_ret))
+                .collect::<Result<Vec<_>, _>>()?;
+            let body_ret = body.ret.as_ref()
+                .map(|e| resolve_expr(e, &ResolvedType::Void, scope, registry, rust_method_ret))
+                .transpose()?;
+            Ok(TypedStmt::While {
+                cond: typed_cond,
+                body: TypedFnBody { stmts: body_stmts, ret: body_ret },
+            })
         }
     }
 }
@@ -977,5 +1063,71 @@ mod tests {
         assert_eq!(func_name, "wrap");
         assert_eq!(expected, 1);
         assert_eq!(got, 0);
+    }
+
+    #[test]
+    fn test_if_condition_not_bool_error() {
+        let reg = make_registry();
+        let func = ToyFunction {
+            name: "f".to_string(),
+            type_params: vec![],
+            params: vec![],
+            return_ty: Some(ResolvedType::I32),
+            body: Some(FnBody {
+                stmts: vec![],
+                ret: Some(Expr::If {
+                    cond: Box::new(Expr::IntLit(42, ResolvedType::I32)),
+                    then_body: Box::new(FnBody { stmts: vec![], ret: Some(Expr::IntLit(1, ResolvedType::I32)) }),
+                    else_body: Some(Box::new(FnBody { stmts: vec![], ret: Some(Expr::IntLit(0, ResolvedType::I32)) })),
+                }),
+            }),
+        };
+        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret);
+        let Err(TypeResolveError::IfConditionNotBool { ty }) = result else { panic!("expected IfConditionNotBool error") };
+        assert_eq!(ty, ResolvedType::I32);
+    }
+
+    #[test]
+    fn test_while_condition_not_bool_error() {
+        let reg = make_registry();
+        let func = ToyFunction {
+            name: "f".to_string(),
+            type_params: vec![],
+            params: vec![],
+            return_ty: Some(ResolvedType::I32),
+            body: Some(FnBody {
+                stmts: vec![Stmt::While {
+                    cond: Expr::IntLit(42, ResolvedType::I32),
+                    body: Box::new(FnBody { stmts: vec![], ret: None }),
+                }],
+                ret: Some(Expr::IntLit(0, ResolvedType::I32)),
+            }),
+        };
+        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret);
+        let Err(TypeResolveError::WhileConditionNotBool { ty }) = result else { panic!("expected WhileConditionNotBool error") };
+        assert_eq!(ty, ResolvedType::I32);
+    }
+
+    #[test]
+    fn test_if_else_type_mismatch_error() {
+        let reg = make_registry();
+        let func = ToyFunction {
+            name: "f".to_string(),
+            type_params: vec![],
+            params: vec![],
+            return_ty: Some(ResolvedType::I32),
+            body: Some(FnBody {
+                stmts: vec![],
+                ret: Some(Expr::If {
+                    cond: Box::new(Expr::BoolLit(true)),
+                    then_body: Box::new(FnBody { stmts: vec![], ret: Some(Expr::IntLit(1, ResolvedType::I32)) }),
+                    else_body: Some(Box::new(FnBody { stmts: vec![], ret: Some(Expr::BoolLit(true)) })),
+                }),
+            }),
+        };
+        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret);
+        let Err(TypeResolveError::IfElseTypeMismatch { then_ty, else_ty }) = result else { panic!("expected IfElseTypeMismatch error") };
+        assert_eq!(then_ty, ResolvedType::I32);
+        assert_eq!(else_ty, ResolvedType::Bool);
     }
 }

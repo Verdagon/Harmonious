@@ -1,15 +1,17 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 55 integration tests passing, 0 ignored. Minimal rustc fork
-> with `per_instance_mir` query. Inkwell LLVM backend with type annotation pass.
-> Unified MonoItems discovery. Generic functions with explicit type args,
-> inter-toylang calls, arithmetic, direct field access, extern function calls,
-> toylang-owned main, internal/extern ABI split with full param+return coercion.
-> 4 query providers. Zero compiler warnings. No type inference machinery.
-> Generalized Rust type support — method signatures and return types queried
-> from rustc via `fn_abi_of_instance` and `fn_sig`. Unified type representation
-> (`ResolvedType` everywhere — no string-based type resolution, no `ToyFieldType`).
-> `use` imports for Rust types. Explicit type args everywhere including allocators.
+> **Current status:** 55 integration tests + 28 unit tests passing, 0 ignored.
+> All tech debt resolved. Minimal rustc fork with `per_instance_mir` query.
+> Inkwell LLVM backend with type annotation pass. Unified MonoItems discovery.
+> Generic functions with explicit type args, inter-toylang calls, arithmetic,
+> direct field access, extern function calls, toylang-owned main,
+> internal/extern ABI split with full param+return coercion. 4 query providers.
+> Zero compiler warnings. No type inference machinery. Generalized Rust type
+> support — method signatures and return types queried from rustc via
+> `fn_abi_of_instance` and `fn_sig`. Unified type representation (`ResolvedType`
+> everywhere). Explicit typed literals (integer suffixes, generic struct literal
+> type args). Typed error enums (`TypeResolveError`, `ParseError`). Full ABI
+> coverage including ScalarPair and byval params.
 
 ## Overview
 
@@ -203,19 +205,27 @@ values are available for ABI queries in the extern wrapper pass.
 `type_resolve.rs` produces a `TypedFnBody` where every expression carries a
 `ResolvedType`. This runs before LLVM codegen and handles:
 
-- **IntLit:** Correct width from context (i32 default, overridden by field types,
-  return types, and param types)
+- **IntLit:** Type carried on the AST node from lexer (suffixes: `42i32`, `42i64`,
+  `42usize`; default i32, auto-promote to i64 if value overflows i32)
+- **Generic struct literals:** Type args carried on AST node (`Pair<i32, i64> { ... }`)
 - **Generic type params:** Substituted with concrete types from Instance args
+  (including in body expressions via `substitute_type_params_in_body`)
 - **Rust type args:** Read from explicit type args on `Vec::new<Point, Global>()`
 - **FnCall type args:** Read from explicit type args on `wrap<i32>(42)` — no inference
-- **BinaryOp:** Both operands share the expected type
-- **Rust method return types:** Via callback (`rust_method_ret`). Production
-  closures are hardcoded for now; unit tests supply their own closures.
+- **Static calls:** Generalized — `rust_method_ret` callback for any Rust type
+  (not just Vec::new)
+- **BinaryOp:** Left operand's type propagates to right
+- **Rust method return types:** Via callback (`rust_method_ret`) which delegates
+  to `oracle::rust_method_return_type` (queries `tcx.fn_sig`)
 
 **No inference machinery.** All type args must be provided explicitly at call
 sites, including allocator types (`Vec::new<Point, Global>()`). Integer
-literals default to i32 unless the immediate context provides an expected type
-(return position, struct field, function parameter).
+literals carry their own type from the parser (no expected-type propagation).
+
+**Error handling:** Returns `Result<T, TypeResolveError>` with 8 typed error
+variants. Callers in codegen use `.expect(...)` (runs post-validation).
+`after_rust_analysis` validates non-generic function bodies and reports all
+errors before aborting.
 
 **`ResolvedType::RustType`** represents any Rust type (Vec, Global, HashMap,
 etc.) with explicit type args. Replaces the old `ResolvedType::Vec { elem }`
@@ -418,6 +428,8 @@ exists as `DoubleColon`.
 - Struct param coercion (extern per `coerced_param_types_for_instance`)
 - Bool i1↔i8 coercion handled by `coerce_int_to_type`
 - Struct ABI coercion (e.g. `{ i32, i32 }` → `i64` on aarch64, both params and returns)
+- ScalarPair returns/params emit `{ scalar1, scalar2 }` LLVM struct types
+- `PassMode::Indirect { on_stack: true }` (byval, 32-bit x86) handled as Indirect
 
 ### Rust type operations (generalized, not Vec-specific)
 - Vec<primitive> and Vec<struct> (with explicit allocator: `Vec<i32, Global>`)
@@ -466,8 +478,8 @@ exists as `DoubleColon`.
 | `main.rs` | CLI entry point, registry setup, rustc invocation |
 | `toylang/ast.rs` | Untyped AST (Expr incl. FieldAccess/StringLit, Stmt, FnBody, BinOp) |
 | `toylang/typed_ast.rs` | `ResolvedType` enum (unified type representation: TypeParam, StructRef, Struct, RustType, primitives, Ref, Str) |
-| `toylang/type_resolve.rs` | Type annotation pass, `resolve_struct_fields`, `substitute_type_params` (10 unit tests) |
-| `toylang/parser.rs` | Toylang parser — produces `ResolvedType` directly (no string types) |
+| `toylang/type_resolve.rs` | Type annotation pass, `resolve_struct_fields`, `substitute_type_params`, `TypeResolveError` enum (21 unit tests) |
+| `toylang/parser.rs` | Toylang parser — produces `ResolvedType` directly, integer suffixes, generic struct literals, `ParseError` enum (7 unit tests) |
 | `toylang/registry.rs` | Data structures (ToyStruct, ToyFunction, ToyParam — all use ResolvedType) |
 | `toylang/callbacks_impl.rs` | `LangCallbacks` impl, dep discovery, MonoItems helpers |
 
@@ -566,15 +578,24 @@ check (in `after_rust_analysis` where TyCtxt is available).
 
 ### Phase 2: Type checking (during analysis)
 
-**`after_rust_analysis(tcx)`** → currently a no-op.
+**`after_rust_analysis(tcx)`** → 5 validation checks:
+1. Every toylang struct is visible to rustc (`find_local_struct_def_id`)
+2. Every toylang function with a body has a stub (`find_stub_fn_def_id`)
+3. Rust types referenced in struct fields exist (`find_rust_type_def_id`)
+4. Extern (body-less) functions exist in Rust (`find_extern_fn_def_id`)
+5. Non-generic function bodies type-resolve successfully (`resolve_fn_body`)
 
-This is where toylang's type checker should eventually run — verifying toylang
-code against Rust's type system (types exist, method signatures match, trait
-bounds satisfied). Full TyCtxt is available.
+Errors collected into `Vec<String>`, all reported before aborting. Generic
+function bodies are skipped — they need concrete type args to resolve.
+Currently validated at monomorphization time instead (errors surface as
+typed `TypeResolveError` panics with clear messages).
 
-Currently, toylang generics are like C++ templates: unchecked until instantiated.
-A generic function with errors is only caught at monomorphization/codegen time
-via panics, not at type-check time with error messages.
+**Long-term plan:** Add trait bounds to toylang generics
+(`fn wrap<T: Clone>(x: T)`). With bounds, `after_rust_analysis` can validate
+generic function bodies at definition time against the bound's interface —
+no concrete instantiation needed. This would move generic validation from
+monomorphization time (C++ template style) to definition time (Rust style).
+Until then, monomorphization-time checking is the correct approach.
 
 ### Phase 3: Monomorphization (fixpoint loop inside codegen_crate)
 
@@ -680,7 +701,7 @@ Started with 5 tests passing (string-based LLVM backend, no fork, manual
 
 ### What remains (0 ignored tests)
 
-All 53 tests pass. No known blockers.
+All 55 integration tests + 28 unit tests pass. No known blockers.
 
 ### Recommended next steps
 
@@ -690,35 +711,26 @@ All 53 tests pass. No known blockers.
 2. **Loops** (`while`) — back-edge branches in inkwell. With arithmetic + comparisons
    + loops, toylang is Turing-complete.
 
-3. **Trait implementations** — `impl Trait for ConsumerType` in stubs. The
+3. **Trait bounds on generics** — `fn wrap<T: Clone>(x: T)`. Enables
+   `after_rust_analysis` to validate generic function bodies at definition time
+   (currently validated at monomorphization time). Also enables trait method calls
+   on generic type params.
+
+4. **Trait implementations** — `impl Trait for ConsumerType` in stubs. The
    `per_instance_mir` foundation supports it. Biggest remaining architectural feature.
-
-4. **Replace method signature heuristics with `fn_abi_of_instance`** — The
-   `get_or_resolve_rust_method` function currently uses method-name matching
-   ("new" → sret, "push" → ptr+ptr+void, "len" → ptr+usize) to determine LLVM
-   signatures. Replace with `fn_abi_of_instance` queries for full generality.
-
-5. **Replace `rust_method_ret` hardcoded closures with `tcx.fn_sig()`** —
-   Production closures currently hardcode push→Void, len→Usize. Query the
-   actual method signature from rustc for full generality.
 
 ### Known technical debt
 
-- **String-based type resolution** duplicated in several places (type_from_string,
-  parse_coerced_type, etc.) — each slightly different. `resolve_rust_ty_from_string`
-  was deleted in the generalization refactor.
-- **println hardcoding** — special-cased by name in type resolver and codegen
-- **Ref param redundant conversion** in extern wrapper — `fn_abi` reports `i64` for
-  pointers, internal expects `ptr`, bitcast-via-memory fires unnecessarily (LLVM
-  optimizes it away)
-- **Rust method signature heuristics** — `get_or_resolve_rust_method` uses method
-  name to determine LLVM signature (new→sret, push→void, len→usize). Should use
-  `fn_abi_of_instance`. This is the main remaining non-general code.
-- **Hardcoded `rust_method_ret` closures** — production closures match method names
-  to return types. Should query `tcx.fn_sig()`.
+See `docs/known-tech-debt.md` for full details. Summary:
+- **String-based struct/type lookups** — name-based HashMap lookups (~15 sites).
+  Could resolve to DefIds or indices early.
+- **Redundant `monomorphize_fn` calls** — 3x per instance, could cache.
+- **Generic function body validation** — blocked on trait bounds (above).
 - **`#![feature(allocator_api)]` required** — Rust crate roots must enable this
   unstable feature to use `std::alloc::Global`. Unavoidable until Rust stabilizes
   the allocator API.
+- **Redundant `monomorphize_fn` calls** — called 3 times per function instance
+  (per_instance_mir, symbol_name, generate_and_compile). Could be cached.
 
 ### Building the forked toolchain
 
@@ -743,14 +755,14 @@ cargo +rustc-fork test -p toylangc --test integration_tests
 ### Running tests
 
 ```bash
-# All tests (should be 53 passed, 0 failed, 0 ignored):
+# Integration tests (55 passed, 0 failed, 0 ignored):
 cargo +rustc-fork test -p toylangc --test integration_tests
 
-# Including ignored (shows what still needs work):
-cargo +rustc-fork test -p toylangc --test integration_tests -- --include-ignored
-
-# Type resolver unit tests:
+# Type resolver unit tests (21 passed):
 cargo +rustc-fork test -p toylangc --bin toylangc -- type_resolve
+
+# Parser unit tests (7 passed):
+cargo +rustc-fork test -p toylangc --bin toylangc -- parser::tests
 ```
 
 ---

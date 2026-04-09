@@ -1,325 +1,24 @@
 # Known Technical Debt
 
-> Last updated: session 6 (55 tests passing, 0 ignored)
->
-> Items 1–9 from the original list are resolved. Item 10 (panics) expanded
-> into a broader set of issues discovered during a fresh codebase scan.
-> Items 15–18 added from a second scan focusing on string-based lookups.
+> Last updated: session 7 (74 integration tests + 31 unit tests passing, 0 ignored)
 
 ---
 
-## 1. Hardcoded `Vec::new` in Type Resolver
+## 1. String-Based Struct/Type Lookups
 
 ### Problem
 
-Only `("Vec", "new")` is handled for static calls in `type_resolve.rs:302-320`.
-Any other static method panics with "unsupported static call". This prevents
-`HashMap::new`, `Option::Some`, user-defined constructors, etc.
-
-### Fix Options
-
-**Option A: Query `tcx.fn_sig()` for static calls** (same as method calls).
-The infrastructure exists — `rust_method_return_type` in oracle.rs already
-queries fn_sig for inherent methods. Extend to handle static calls the same
-way: find the method DefId, query its signature, determine return type.
-
-**Option B: General static call resolution in type_resolve.** Instead of
-matching `("Vec", "new")`, look up the type name in the registry or as a
-RustType, find the method, and query its return type via the `rust_method_ret`
-callback (which already delegates to `oracle::rust_method_return_type`).
-
----
-
-## 2. Method Call Arg Type Inference Uses Only `type_args[0]`
-
-### Problem
-
-In `type_resolve.rs:357-368`, method call arguments all get `type_args[0]` as
-their expected type. Works for `Vec<T>::push(T)` but breaks for multi-parameter
-methods like `HashMap<K, V>::insert(k, v)` where k and v have different types.
-
-### Fix Options
-
-**Option A: Query method signature for param types.** Use `tcx.fn_sig()` on
-the method DefId (via the `rust_method_ret` callback or a new
-`rust_method_param_types` callback) to get the actual parameter types. Map
-each arg to its corresponding param type.
-
-**Option B: Extend `rust_method_ret` to return full signature.** Change the
-callback to return param types too (or add a parallel callback). The type
-resolver uses the full signature for arg type inference.
-
----
-
-## 3. `mangle_ty_for_symbol` Fallback to Debug Format
-
-### Problem
-
-In `callbacks_impl.rs:418`, unknown types get `format!("{:?}", ty)` as their
-symbol mangling. This produces nondeterministic, non-demanglable symbols and
-could cause collisions.
-
-### Fix Options
-
-**Option A: Extend the match to cover all TyKind variants** that can appear
-in generic args (slices, references, raw pointers, tuples). Panic on truly
-unexpected types.
-
-**Option B: Use rustc's own symbol mangling.** Call `tcx.symbol_name()` on a
-dummy Instance to get the correctly mangled form, or delegate to
-`resolved_type_to_mangled_name` (which already handles ResolvedType).
-
----
-
-## 4. `PassMode::Indirect { on_stack: true }` Unimplemented
-
-### Problem
-
-In `abi_helpers.rs:127-132`, byval parameters (used on 32-bit x86) hit an
-assert and panic. The code only handles `on_stack: false` (pointer indirect).
-
-### Fix Options
-
-**Option A: Emit byval attribute.** When `on_stack: true`, emit
-`CoercedParam::Indirect` but with a note to add the LLVM `byval` attribute.
-The extern wrapper passes the value on the stack instead of by pointer.
-
-**Option B: Emit as Direct with the full type size.** Treat byval as a large
-Direct parameter. LLVM handles the stack copy.
-
----
-
-## 5. `PassMode::Pair` Treated as Single Scalar
-
-### Problem
-
-In `abi_helpers.rs:66-84`, ScalarPair returns are treated as a single integer
-of the total size. The comment says "rare for extern functions" but this isn't
-validated. Could silently produce wrong register assignments.
-
-### Fix Options
-
-**Option A: Emit as LLVM struct return `{ scalar1, scalar2 }`.** Parse the
-two scalars from the Pair and emit a two-field struct type string. The caller
-unpacks the two values.
-
-**Option B: Validate that Pair doesn't occur for extern functions.** Add a
-diagnostic check: if Pair appears for a consumer function's extern wrapper,
-emit an error explaining the limitation.
-
----
-
-## 6. Panics Instead of User-Facing Errors (~30 sites)
-
-### Problem
-
-User code errors cause compiler panics instead of proper error messages.
-Scattered across type_resolve.rs (~12 sites), llvm_gen.rs (~15 sites),
-callbacks_impl.rs (~5 sites), oracle.rs (~3 sites).
-
-### Fix Options
-
-**Option A: Thread `Result` through the type resolver first.** The type
-resolver is the first place user errors surface (unknown types, wrong arg
-counts, etc.). Convert `resolve_fn_body` and `resolve_expr` to return
-`Result<T, Vec<Diagnostic>>`. Codegen panics are compiler bugs (acceptable).
-
-**Option B: Incremental — add `Result` at the outermost boundary.** Wrap
-`resolve_fn_body` in a `catch_unwind`, collect the panic message, and report
-it as a user error. Hacky but fast to implement.
-
----
-
-## 7. No Parser Tests
-
-### Problem
-
-Zero tests for the parser. Type resolution has 10 unit tests, but parser
-syntax handling (struct parsing, function signatures, expressions, type
-parsing, error recovery) is completely untested.
-
-### Fix Options
-
-**Option A: Unit tests for `parse_type`.** Test each ResolvedType variant:
-primitives, refs, generics, nested generics, TypeParam, StructRef, RustType.
-
-**Option B: Round-trip tests.** Parse toylang source → check registry contents
-(struct names, field types, function signatures).
-
----
-
-## 8. No Error Case Integration Tests
-
-### Problem
-
-All 55 integration tests are positive cases. No tests verify that the compiler
-reports errors (instead of panicking) for: wrong types, missing structs, wrong
-arg counts, undefined methods, etc.
-
-### Fix Options
-
-Depends on #6 (error handling). Once errors are `Result`-based, add tests that
-assert compilation fails with a specific error message instead of a panic.
-
----
-
-## 9. `after_rust_analysis` Is a TODO Stub
-
-### Problem
-
-`callbacks_impl.rs:43-44`: `fn after_rust_analysis` does nothing. Toylang
-types are never validated against Rust types. A toylang function claiming to
-return `Point` but actually returning `Counter` won't be caught.
-
-### Fix Options
-
-**Option A: Type-check toylang function bodies against Rust signatures.** In
-`after_rust_analysis`, run the type resolver and compare resolved types against
-what rustc expects (from the stub signatures).
-
-**Option B: Defer to codegen.** Mismatches will surface as LLVM type errors
-or ABI mismatches at codegen time. Less user-friendly but catches the same
-bugs.
-
----
-
-## 10. No Tests for Rust Types Other Than Vec
-
-### Problem
-
-The mechanism is general (fn_abi, fn_sig queries), but only Vec is exercised
-in tests. HashMap, String, Option, etc. are untested. Subtle differences in
-their ABI or method signatures could break silently.
-
-### Fix Options
-
-Add integration tests for at least one more Rust type (e.g., `String` with
-`push_str`/`len`, or a simple wrapper type) to validate the general mechanism.
-
----
-
-## 11. `parse_coerced_type` / `parse_struct_type_str` Duplication
-
-### Problem
-
-Two LLVM type string parsers in `llvm_gen.rs` with overlapping primitive
-handling (`"i32"`, `"i64"`, `"double"`, etc.). Both parse strings from
-`rustc_lang_facade` ABI helpers.
-
-### Fix Options
-
-**Option A: Unify into one parser.** `parse_coerced_type` already delegates
-to `parse_struct_type_str` for struct types. Merge the remaining primitives.
-
-**Option B: Change ABI helpers to return structured types** instead of strings.
-`CoercedReturn::Direct` and `CoercedParam::Direct` would carry an enum
-(like `AbiType::Int(bits)`, `AbiType::Float`, `AbiType::Ptr`, etc.) instead
-of a string. Eliminates string parsing entirely.
-
----
-
-## 12. Duplicate Field Lookup Pattern
-
-### Problem
-
-`type_resolve.rs` has `fields.iter().position(|f| f.name == ...)` repeated
-2+ times with near-identical panic messages.
-
-### Fix Options
-
-Extract `fn find_field_index(struct: &ToyStruct, name: &str) -> Result<usize>`.
-
----
-
-## 13. `resolved_to_rustc_ty` Forwarding Wrapper
-
-### Problem
-
-`callbacks_impl.rs:362-364` is a trivial one-line wrapper around
-`oracle::resolved_to_rustc_ty`. Used 3 times in the same file.
-
-### Fix Options
-
-Delete the wrapper. Call `crate::oracle::resolved_to_rustc_ty` directly at
-each call site.
-
----
-
-## 14. `struct_names.clone()` in Parser (4 clones)
-
-### Problem
-
-`parser.rs` clones `self.struct_names` 4 times during parsing to work around
-borrow checker constraints. O(n²) copies for n structs.
-
-### Fix — acceptable for POC
-
-The clone count is bounded by the number of top-level definitions, which is
-small. Could refactor with indices or split borrows if performance matters.
-
----
-
-## 15. String-Based StaticCall and MethodCall Names
-
-### Problem
-
-`StaticCall { ty: String, method: String }` and `MethodCall { method: String }`
-keep the type and method names as plain strings in both the untyped and typed AST.
-The type name (e.g. `"Vec"`) is never resolved to a `ResolvedType` or `DefId` at
-the AST level — it stays a string that gets looked up by name later in codegen
-via `find_rust_type_def_id`. Similarly the method name is a string matched by
-`find_inherent_method`.
-
-### Fix Options
-
-**Option A: Resolve to DefId during type resolution.** The type resolver already
-has access to `rust_method_ret` (which calls into oracle). Add a callback to
-resolve type+method to a `DefId` pair during type resolution, and store that in
-the typed AST instead of strings.
-
-**Option B: Keep strings but validate early.** During type resolution, validate
-that the type and method exist (via the existing callbacks) and panic/error if
-not. Strings stay in the AST but are guaranteed valid. Lower risk than Option A.
-
----
-
-## 16. Hand-Rolled Symbol Mangling
-
-### Problem
-
-`compute_fn_symbol` in `callbacks_impl.rs` and `resolved_type_to_mangled_name`
-in `llvm_gen.rs` build mangled symbols by hand with string formatting (e.g.
-`__toylang_impl_wrap__i32`). This works for toylang-defined functions but is
-fragile — it doesn't use rustc's `tcx.symbol_name()` and could produce
-collisions or non-demanglable names for complex types.
-
-### Fix Options
-
-**Option A: Use `tcx.symbol_name()` for toylang functions.** Build a proper
-`Instance` for each toylang function and use rustc's mangling. Requires toylang
-functions to have valid `DefId`s (they already do via stubs).
-
-**Option B: Keep hand-rolled but harden.** Cover all `ResolvedType` variants
-exhaustively (already done for `mangle_ty_for_symbol` after tech debt #3 fix).
-Accept that the scheme diverges from rustc's mangling. Acceptable for a POC.
-
----
-
-## 17. Struct/Type Lookups by Name String
-
-### Problem
-
-Throughout the codebase, structs and types are looked up via
-`registry.structs.get(name)` and `find_rust_type_def_id(tcx, name)` using string
-names. A production compiler would resolve names to `DefId`s or indices early
-(during parsing or type resolution) and carry those forward, avoiding repeated
-string lookups and potential name collisions.
+Structs and types are looked up by string name throughout the codebase:
+`registry.structs.get(name)` (~8 sites across type_resolve.rs, callbacks_impl.rs,
+llvm_gen.rs) and `find_rust_type_def_id(tcx, name)` (~7 sites). All live in a
+flat namespace with no module qualification. Risk of name collisions if a struct
+and function share the same name, or if types from different modules clash.
 
 ### Fix Options
 
 **Option A: Resolve to indices during parsing.** Parser assigns each struct a
-numeric ID. All references use the ID instead of the name string. Registry
-becomes index-based.
+numeric ID. Registry becomes `Vec<ToyStruct>` indexed by ID. All references
+carry the ID instead of the name string.
 
 **Option B: Resolve to DefId during type resolution.** After stub generation,
 each toylang struct has a `DefId`. The type resolver stores `DefId`s alongside
@@ -328,38 +27,142 @@ uses the `DefId` directly.
 
 ---
 
-## 18. `find_rust_type_def_id` Hardcoded Diagnostic Items
+## 2. Hand-Rolled Symbol Mangling
 
 ### Problem
 
-In `oracle.rs:192-201`, only `"Vec"` is mapped to a rustc diagnostic item. All
-other Rust type names fall through to `find_local_struct_def_id`, which does a
-linear scan of local definitions by name string. This is fragile: it won't find
-types from external crates (unless re-exported locally), can't handle module
-paths, and could match the wrong type on name collisions.
+Two independent mangling functions build symbols by hand:
+
+- `compute_fn_symbol` + `mangle_ty_for_symbol` in `callbacks_impl.rs:461-501`
+  (39 lines) — builds `__toylang_impl_wrap__i32` from rustc `Ty<'tcx>` types
+- `resolved_type_to_mangled_name` in `llvm_gen.rs:1191-1213` (22 lines) —
+  builds mangled names from `ResolvedType` for internal symbols
+
+No unified mangling scheme. Doesn't use `tcx.symbol_name()`. Could produce
+collisions or non-demanglable names for complex types (nested generics, tuples).
+
+### Fix Options
+
+**Option A: Use `tcx.symbol_name()` for toylang functions.** Build a proper
+`Instance` for each toylang function and use rustc's mangling. Requires toylang
+functions to have valid `DefId`s (they already do via stubs).
+
+**Option B: Keep hand-rolled but unify.** Merge the two mangling functions into
+one that operates on `ResolvedType` (already covers all variants exhaustively).
+Accept that the scheme diverges from rustc's mangling.
+
+---
+
+## 3. `find_rust_type_def_id` Hardcoded Diagnostic Items
+
+### Problem
+
+In `oracle.rs:192-202`, only `"Vec"` is mapped to a rustc diagnostic item via
+`sym::Vec`. All other Rust type names fall through to `find_local_struct_def_id`,
+which scans local definitions by name string. This won't find std library types
+like `HashMap`, `String`, `Box` unless they're re-exported via `pub use` in
+`__lang_stubs.rs`.
 
 ### Fix Options
 
 **Option A: Expand the diagnostic item map.** Add entries for commonly used Rust
-types (`String`, `HashMap`, `Option`, `Box`, etc.). Each maps to its well-known
-`rustc_diagnostic_item` symbol.
+types: `String` → `sym::String`, `HashMap` → `sym::HashMap`,
+`Box` → `sym::Box`, `Option` → `sym::Option`, etc.
 
-**Option B: Use `tcx.resolve_path()` or equivalent.** Instead of matching names,
-resolve the full path (e.g. `std::collections::HashMap`) through rustc's name
-resolution. Requires toylang to specify full paths for Rust types.
+**Option B: Require `use` imports for all Rust types.** The `use` import
+mechanism already works (`use std::alloc::Global`). Require all Rust types
+to be imported, then look them up via `find_local_struct_def_id` which finds
+re-exported types through `module_children_local`. No hardcoded diagnostic items
+needed.
 
 ---
 
-## Resolved Items (sessions 1–5)
+## 4. Redundant `monomorphize_fn` Calls
 
-| # | Item | Session |
-|---|------|---------|
-| — | String-based type resolution | 5 |
-| — | Vec-specific code | 4 |
-| — | println hardcoding | 5 |
-| — | Ref param redundant conversion | 5 |
-| — | `__toylang_main` duplication | 5 |
-| — | Method signature heuristic | 5 |
-| — | `rust_method_ret` closures | 5 |
-| — | Duplicated `resolved_type_to_rustc_ty` | 5 |
-| — | Dummy Vec constructions | 5 |
+### Problem
+
+`monomorphize_fn` is called 3 times per consumer function instance:
+1. From `per_instance_mir` (facade, dep discovery + symbol)
+2. From `symbol_name` (facade, symbol only)
+3. From `generate_with_tcx` (llvm_gen.rs, symbol + type resolver for codegen)
+
+Each call recomputes the extern symbol. Calls 1 and 3 also run the full type
+resolver on the body. Correct but wasteful.
+
+### Fix Options
+
+**Option A: Cache in `ToylangCallbacks`.** Use
+`Mutex<HashMap<String, CachedMonoResult>>` keyed by extern symbol (which is
+lifetime-free and unique per Instance). `per_instance_mir` populates on first
+call. `symbol_name` reads cached symbol. `generate_and_compile` reads cached
+TypedFnBody. Can't key by `Instance<'tcx>` directly (has lifetime).
+
+**Option B: Accept the redundancy.** `resolve_fn_body` is cheap (no LLVM, just
+scope tracking). The redundancy is ~3x a fast operation. Only optimize if
+profiling shows it matters.
+
+---
+
+## 5. Generic Function Body Validation
+
+### Problem
+
+`after_rust_analysis` skips generic functions during validation because
+`resolve_fn_body` can't resolve unsubstituted `TypeParam` variants. Generic
+functions are validated at monomorphization time instead — `collect_toylang_fn_deps`
+substitutes concrete type args and runs `resolve_fn_body`, panicking with a
+typed `TypeResolveError` if it fails. This gives decent error messages but means
+a generic function with a bug that's never called won't be caught.
+
+### Fix — blocked on trait bounds
+
+The real long-term fix is trait bounds (`fn wrap<T: Clone>(x: T)`) which allow
+validating generic bodies at definition time against the bound's interface.
+Until then, monomorphization-time validation is the correct approach (same as
+C++ templates).
+
+---
+
+## 6. `FnBody` Misnamed
+
+### Problem
+
+`ast::FnBody` (`{ stmts: Vec<Stmt>, ret: Option<Expr> }`) is used for function
+bodies, if/else branches, and while loop bodies. The name `FnBody` is misleading
+since it's really a general "block" construct. Same for `typed_ast::TypedFnBody`.
+
+### Fix
+
+Rename to `Block` / `TypedBlock` (or `CodeBlock`). Mechanical rename — ~20
+references across ast.rs, typed_ast.rs, parser.rs, type_resolve.rs, llvm_gen.rs,
+callbacks_impl.rs.
+
+---
+
+## Resolved Items (sessions 1–7)
+
+| # | Item | Session | Resolution |
+|---|------|---------|------------|
+| 1 | Hardcoded `Vec::new` in type resolver | 6 | Replaced with `rust_method_ret` callback |
+| 2 | Method arg inference uses `type_args[0]` | 6 | Explicit typed literals; `expected_ty` eliminated for literals |
+| 3 | `mangle_ty_for_symbol` Debug fallback | 6 | Extended match for Str, Ref, RawPtr, Slice, Tuple |
+| 4 | `PassMode::Indirect { on_stack: true }` | 6 | Removed assert; both on_stack variants emit Indirect |
+| 5 | `PassMode::Pair` as single scalar | 6 | Proper ScalarPair → `{ scalar1, scalar2 }` LLVM struct |
+| 6 | Panics instead of user-facing errors | 6 | `TypeResolveError` (8 variants) + `ParseError` (7 variants) |
+| 7 | No parser tests | 6 | 7 parser unit tests (all error cases) |
+| 8 | No error case integration tests | 6 | 18 error-case unit tests across parser + type resolver |
+| 9 | `after_rust_analysis` stub | 6 | 5 validation checks (structs, stubs, Rust types, externs, bodies) |
+| 10 | No tests for Rust types other than Vec | — | Accepted: mechanism is general, Vec exercises it |
+| 11 | `parse_coerced_type` / `parse_struct_type_str` duplication | 6 | Unified; struct parser delegates to coerced parser |
+| 12 | Duplicate field lookup pattern | 6 | Extracted `find_field_index` helper |
+| 13 | `resolved_to_rustc_ty` forwarding wrapper | 6 | Deleted; direct `oracle::` calls |
+| 14 | `struct_names.clone()` in parser | 6 | Removed from Parser struct; threaded as `&[String]` param |
+| — | String-based type resolution | 5 | Unified onto `ResolvedType` |
+| — | Vec-specific code | 4 | Generalized to any Rust type |
+| — | println hardcoding | 5 | Replaced with extern fn mechanism |
+| — | Ref param redundant conversion | 5 | `Scalar(Pointer)` detection emits `"ptr"` |
+| — | `__toylang_main` duplication | 5 | `TOYLANG_MAIN` constant |
+| — | Method signature heuristic | 5 | `fn_abi_of_instance` queries |
+| — | `rust_method_ret` closures | 5 | `tcx.fn_sig()` via oracle |
+| — | Duplicated `resolved_type_to_rustc_ty` | 5 | Deleted duplicate |
+| — | Dummy Vec constructions | 5 | Deleted |

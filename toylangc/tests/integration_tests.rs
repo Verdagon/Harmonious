@@ -192,6 +192,7 @@ fn test_vec_point() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct Point {
     x: i32,
@@ -351,6 +352,7 @@ fn test_t_of_r_vec_field() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyShip {
     wings: Vec<i32, Global>,
@@ -383,6 +385,7 @@ fn test_t_of_r_layout() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyShip {
     wings: Vec<i32, Global>,
@@ -470,6 +473,7 @@ fn test_r_t_r_vec_of_ship() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyShip {
     wings: Vec<i32, Global>,
@@ -510,6 +514,7 @@ fn test_t_r_t_construct() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyPoint {
     x: i32,
@@ -549,6 +554,7 @@ fn test_t_t_r_construct() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyEngine {
     parts: Vec<i32, Global>,
@@ -586,6 +592,7 @@ fn test_r_r_t_vec_of_vec() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyPoint {
     x: i32,
@@ -627,6 +634,7 @@ fn test_tg_of_vec() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyWrapper<T> {
     inner: T,
@@ -743,6 +751,7 @@ fn test_deep_t_r_t_r() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyLeaf {
     value: i32,
@@ -789,6 +798,7 @@ fn test_mixed_fields() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyPoint {
     x: i32,
@@ -830,6 +840,7 @@ fn test_mixed_generic() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct ToyGenMixed<T> {
     a: T,
@@ -1232,6 +1243,7 @@ fn test_vec_i32() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 fn make_vec() -> Vec<i32, Global> {
     let v = Vec::new<i32, Global>();
@@ -1292,6 +1304,7 @@ fn test_struct_with_vec_and_primitive() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct Data {
     count: i32,
@@ -1326,6 +1339,7 @@ fn test_vec_of_structs_len() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct Point {
     x: i32,
@@ -1585,6 +1599,7 @@ fn test_toylang_main_with_vec_v2() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct Point {
     x: i32,
@@ -1623,6 +1638,7 @@ fn test_toylang_main_with_vec() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 fn println_usize(x: usize)
 
@@ -1730,6 +1746,7 @@ fn test_vec_method_lookup_is_exact() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 struct Point {
     x: i32,
@@ -1778,6 +1795,7 @@ fn test_vec_push_fn_call_result() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 fn println_usize(x: usize)
 
@@ -1904,6 +1922,7 @@ fn test_vec_capacity() {
     let output = run_toylang_test(
         r#"
 use std::alloc::Global
+use std::vec::Vec
 
 fn println_usize(x: usize)
 
@@ -1930,4 +1949,304 @@ fn main() {
     // Vec capacity after 3 pushes is implementation-defined but >= 3
     let cap: usize = output.trim().parse().expect("output should be a number");
     assert!(cap >= 3, "capacity should be >= 3, got {}", cap);
+}
+
+// ============================================================================
+// Group: Comparison operators
+// ============================================================================
+
+#[test]
+fn test_eq_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 5 == 5 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_eq_false() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 5 == 3 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), false); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_ne_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 5 != 3 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_lt_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 3 < 5 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_lt_false() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 5 < 3 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), false); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_le_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 5 <= 5 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_gt_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 5 > 3 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_ge_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 5 >= 5 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_comparison_with_arithmetic() {
+    let output = run_toylang_test(
+        "fn check() -> bool { 2 + 3 == 5 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_comparison_with_variables() {
+    let output = run_toylang_test(
+        r#"
+fn cmp(a: i32, b: i32) -> bool {
+    a == b
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(cmp(3, 3), true);
+    assert_eq!(cmp(3, 5), false);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+// ============================================================================
+// Group: if/else
+// ============================================================================
+
+#[test]
+fn test_if_else_basic() {
+    let output = run_toylang_test(
+        r#"
+fn pick(x: i32) -> i32 {
+    if x > 0 { 1 } else { 0 }
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(pick(5), 1);
+    assert_eq!(pick(-1), 0);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_if_with_bool_var() {
+    let output = run_toylang_test(
+        r#"
+fn check(flag: bool) -> i32 {
+    if flag { 42 } else { 0 }
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(check(true), 42);
+    assert_eq!(check(false), 0);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_if_else_expr_in_let() {
+    let output = run_toylang_test(
+        r#"
+fn max(a: i32, b: i32) -> i32 {
+    let result = if a > b { a } else { b };
+    result
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(max(3, 5), 5);
+    assert_eq!(max(7, 2), 7);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_if_else_expr_in_return() {
+    let output = run_toylang_test(
+        r#"
+fn abs(x: i32) -> i32 {
+    if x > 0 { x } else { 0 - x }
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(abs(5), 5);
+    assert_eq!(abs(-3), 3);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_if_else_nested() {
+    let output = run_toylang_test(
+        r#"
+fn classify(x: i32) -> i32 {
+    if x > 0 { 1 } else { if x < 0 { 2 } else { 0 } }
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(classify(5), 1);
+    assert_eq!(classify(-3), 2);
+    assert_eq!(classify(0), 0);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+// ============================================================================
+// Group: while loops
+// ============================================================================
+
+#[test]
+fn test_while_basic() {
+    let output = run_toylang_test(
+        r#"
+fn count_to(n: i32) -> i32 {
+    let i = 0;
+    while i < n {
+        let i = i + 1;
+    }
+    i
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(count_to(10), 10);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_while_sum() {
+    let output = run_toylang_test(
+        r#"
+fn sum_to(n: i32) -> i32 {
+    let i = 0;
+    let sum = 0;
+    while i < n {
+        let i = i + 1;
+        let sum = sum + i;
+    }
+    sum
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(sum_to(10), 55);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_while_zero_iterations() {
+    let output = run_toylang_test(
+        r#"
+fn noop() -> i32 {
+    let i = 10;
+    while i < 5 {
+        let i = i + 1;
+    }
+    i
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(noop(), 10);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_while_with_if() {
+    let output = run_toylang_test(
+        r#"
+fn count_big(n: i32) -> i32 {
+    let i = 0;
+    let count = 0;
+    while i < n {
+        let count = count + if i > 2 { 1 } else { 0 };
+        let i = i + 1;
+    }
+    count
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(count_big(5), 2);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
 }

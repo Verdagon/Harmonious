@@ -33,6 +33,12 @@ enum Token {
     RParen,
     LAngle,
     RAngle,
+    Lt,        // < with spaces (comparison)
+    Gt,        // > with spaces (comparison)
+    LAngleEq,  // <=
+    RAngleEq,  // >=
+    EqEq,      // ==
+    BangEq,    // !=
     Colon,
     DoubleColon, // ::
     Comma,
@@ -89,6 +95,47 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
             continue;
         }
 
+        // == and !=
+        if chars[i] == '=' && i + 1 < chars.len() && chars[i + 1] == '=' {
+            tokens.push(Token::EqEq);
+            i += 2;
+            continue;
+        }
+        if chars[i] == '!' && i + 1 < chars.len() && chars[i + 1] == '=' {
+            tokens.push(Token::BangEq);
+            i += 2;
+            continue;
+        }
+
+        // <= and >= (always comparison — no template meaning)
+        if chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] == '=' {
+            tokens.push(Token::LAngleEq);
+            i += 2;
+            continue;
+        }
+        if chars[i] == '>' && i + 1 < chars.len() && chars[i + 1] == '=' {
+            tokens.push(Token::RAngleEq);
+            i += 2;
+            continue;
+        }
+
+        // < and > — disambiguate comparison vs template syntax by whitespace
+        // `a < b` (spaces) → Lt (comparison), `Vec<i32>` (no space) → LAngle (template)
+        if chars[i] == '<' {
+            let space_before = i > 0 && chars[i - 1].is_whitespace();
+            let space_after = i + 1 < chars.len() && chars[i + 1].is_whitespace();
+            tokens.push(if space_before && space_after { Token::Lt } else { Token::LAngle });
+            i += 1;
+            continue;
+        }
+        if chars[i] == '>' {
+            let space_before = i > 0 && chars[i - 1].is_whitespace();
+            let space_after = i + 1 >= chars.len() || chars[i + 1].is_whitespace();
+            tokens.push(if space_before && space_after { Token::Gt } else { Token::RAngle });
+            i += 1;
+            continue;
+        }
+
         // String literals
         if chars[i] == '"' {
             i += 1; // skip opening quote
@@ -142,8 +189,6 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
             '}' => { tokens.push(Token::RBrace); i += 1; }
             '(' => { tokens.push(Token::LParen); i += 1; }
             ')' => { tokens.push(Token::RParen); i += 1; }
-            '<' => { tokens.push(Token::LAngle); i += 1; }
-            '>' => { tokens.push(Token::RAngle); i += 1; }
             ':' => { tokens.push(Token::Colon); i += 1; }
             ',' => { tokens.push(Token::Comma); i += 1; }
             '&' => { tokens.push(Token::Ampersand); i += 1; }
@@ -348,12 +393,25 @@ impl Parser {
                     stmts.push(Stmt::Let { name: var_name, expr });
                     continue;
                 }
+                if s == "while" {
+                    self.consume();
+                    let cond = self.parse_expr(type_params, struct_names)?;
+                    self.expect(Token::LBrace)?;
+                    let body = self.parse_fn_body(type_params, struct_names)?;
+                    stmts.push(Stmt::While { cond, body: Box::new(body) });
+                    continue;
+                }
             }
 
             // Expression — either trailing return or stmt followed by ';'
             let expr = self.parse_expr(type_params, struct_names)?;
+            // if/else expressions don't need ';' when used as statements
+            let is_block_expr = matches!(expr, Expr::If { .. });
             if self.peek() == &Token::Semicolon {
                 self.consume(); // consume ';'
+                stmts.push(Stmt::ExprStmt(expr));
+            } else if is_block_expr && self.peek() != &Token::RBrace {
+                // Block expression followed by more code — treat as statement (no ';' needed)
                 stmts.push(Stmt::ExprStmt(expr));
             } else {
                 // trailing expression — return value
@@ -364,7 +422,27 @@ impl Parser {
     }
 
     fn parse_expr(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
-        self.parse_additive(type_params, struct_names)
+        self.parse_comparison(type_params, struct_names)
+    }
+
+    // Precedence: comparison (==, !=, <, <=, >, >=) < additive (+, -) < multiplicative (*, /)
+    fn parse_comparison(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
+        let mut left = self.parse_additive(type_params, struct_names)?;
+        loop {
+            let op = match self.peek() {
+                Token::EqEq     => BinOp::Eq,
+                Token::BangEq   => BinOp::Ne,
+                Token::Lt       => BinOp::Lt,
+                Token::LAngleEq => BinOp::Le,
+                Token::Gt       => BinOp::Gt,
+                Token::RAngleEq => BinOp::Ge,
+                _ => break,
+            };
+            self.consume();
+            let right = self.parse_additive(type_params, struct_names)?;
+            left = Expr::BinaryOp { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
     }
 
     // Precedence: additive (+, -) < multiplicative (*, /)
@@ -449,6 +527,20 @@ impl Parser {
                 self.consume();
                 Ok(Expr::BoolLit(val))
             }
+            Token::Ident(ref name) if name == "if" => {
+                self.consume();
+                let cond = self.parse_expr(type_params, struct_names)?;
+                self.expect(Token::LBrace)?;
+                let then_body = self.parse_fn_body(type_params, struct_names)?;
+                let else_body = if let Token::Ident(s) = self.peek() {
+                    if s == "else" {
+                        self.consume();
+                        self.expect(Token::LBrace)?;
+                        Some(self.parse_fn_body(type_params, struct_names)?)
+                    } else { None }
+                } else { None };
+                Ok(Expr::If { cond: Box::new(cond), then_body: Box::new(then_body), else_body: else_body.map(Box::new) })
+            }
             Token::Ident(name) => {
                 // peek ahead to distinguish:
                 //   IDENT "::" IDENT "(" -> StaticCall
@@ -470,8 +562,8 @@ impl Parser {
                     let args = self.parse_args(type_params, struct_names)?;
                     self.expect(Token::RParen)?;
                     Ok(Expr::StaticCall { ty: name, method, type_args, args })
-                } else if self.peek() == &Token::LBrace {
-                    // StructLit: Name { field: expr, ... }
+                } else if self.peek() == &Token::LBrace && struct_names.contains(&name) {
+                    // StructLit: Name { field: expr, ... } — only if name is a known struct
                     let fields = self.parse_struct_lit_fields(type_params, struct_names)?;
                     Ok(Expr::StructLit { name, type_args: vec![], fields })
                 } else if self.peek() == &Token::LAngle {

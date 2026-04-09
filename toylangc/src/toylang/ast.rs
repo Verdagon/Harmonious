@@ -5,6 +5,12 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// A Toylang expression.
@@ -27,6 +33,8 @@ pub enum Expr {
     FnCall { name: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, args: Vec<Expr> },
     /// `a + b`, `x * 2`
     BinaryOp { op: BinOp, left: Box<Expr>, right: Box<Expr> },
+    /// `if cond { ... } else { ... }` — expression (like Rust)
+    If { cond: Box<Expr>, then_body: Box<FnBody>, else_body: Option<Box<FnBody>> },
 }
 
 /// A Toylang statement.
@@ -34,6 +42,7 @@ pub enum Expr {
 pub enum Stmt {
     Let { name: String, expr: Expr },
     ExprStmt(Expr),
+    While { cond: Expr, body: Box<FnBody> },
 }
 
 /// A parsed Toylang function body.
