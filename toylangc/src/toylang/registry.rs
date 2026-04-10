@@ -11,8 +11,6 @@ pub struct ToyField {
 /// A Toylang struct definition.
 #[derive(Clone, Debug)]
 pub struct ToyStruct {
-    #[allow(dead_code)]
-    pub name: String,
     pub type_params: Vec<String>,   // e.g. ["A", "B"]; empty for non-generic
     pub fields: Vec<ToyField>,
 }
@@ -34,10 +32,8 @@ pub struct ToyParam {
 
 #[derive(Clone, Debug)]
 pub struct ToyFunction {
-    #[allow(dead_code)]
-    pub name: String,
     pub type_params: Vec<String>,   // e.g. ["T"]; empty for non-generic functions
     pub params: Vec<ToyParam>,
     pub return_ty: Option<ResolvedType>,
-    pub body: Option<crate::toylang::ast::FnBody>,
+    pub body: Option<crate::toylang::ast::Block>,
 }

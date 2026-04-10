@@ -22,15 +22,7 @@
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::Body;
 use rustc_middle::ty::{self, TyCtxt};
-use std::sync::OnceLock;
-
-type MirShimsFn = for<'tcx> fn(TyCtxt<'tcx>, ty::InstanceKind<'tcx>) -> Body<'tcx>;
-
-static DEFAULT_MIR_SHIMS: OnceLock<MirShimsFn> = OnceLock::new();
-
-pub fn save_default(f: MirShimsFn) {
-    let _ = DEFAULT_MIR_SHIMS.set(f);
-}
+pub type MirShimsFn = for<'tcx> fn(TyCtxt<'tcx>, ty::InstanceKind<'tcx>) -> Body<'tcx>;
 
 /// Generate drop glue for consumer-defined types. Falls through to rustc's
 /// default for Rust types.
@@ -47,7 +39,7 @@ pub fn toy_mir_shims<'tcx>(
             return crate::mir_helpers::build_drop_call_body(tcx, def_id, ty, &struct_name);
         }
     }
-    let default = DEFAULT_MIR_SHIMS.get().expect("default mir_shims not saved");
+    let default = crate::default_mir_shims();
     default(tcx, instance)
 }
 

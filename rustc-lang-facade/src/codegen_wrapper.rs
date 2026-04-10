@@ -29,22 +29,13 @@ use rustc_session::config::OutputFilenames;
 use rustc_session::Session;
 use std::any::Any;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-
-/// Path to the consumer's compiled .o file. Set during `codegen_crate`
-/// (after monomorphization), read during `join_codegen`. Uses OnceLock
-/// because the CodegenBackend methods can't capture state (they're trait
-/// methods on a struct created before codegen runs).
-static LANG_OBJ_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Store the path to the consumer's compiled .o file for later injection.
 /// Called from `LangCodegenBackend::codegen_crate` after the consumer's
 /// `generate_and_compile` callback returns.
 pub fn set_lang_compiled_object(obj_path: PathBuf, _rust_symbols: Vec<String>) {
-    let _ = LANG_OBJ_PATH.set(obj_path);
-    // rust_symbols was originally intended for globalizing Rust symbols in .o files,
-    // but `-C codegen-units=16` made this unnecessary by forcing external linkage
-    // for cross-CGU references. The parameter is kept for API compatibility but ignored.
+    let mut g = crate::GLOBALS.get().expect("globals not installed").lock().unwrap();
+    g.lang_obj_path = Some(obj_path);
 }
 
 /// Thin wrapper around `LlvmCodegenBackend` that injects the consumer's .o file
@@ -115,7 +106,9 @@ impl CodegenBackend for LangCodegenBackend {
         // Inject Toylang's compiled object as an additional module.
         // Fat LTO will merge this with the Rust modules.
         // Add Toylang's compiled object as an additional module.
-        if let Some(obj_path) = LANG_OBJ_PATH.get() {
+        let obj_path = crate::GLOBALS.get()
+            .and_then(|g| g.lock().unwrap().lang_obj_path.clone());
+        if let Some(ref obj_path) = obj_path {
             eprintln!("[toylang] injecting module: {}", obj_path.display());
             results.modules.push(CompiledModule {
                 name: "toylang_external".to_string(),

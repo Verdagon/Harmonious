@@ -19,9 +19,11 @@ pub fn lang_override_queries(
     _session: &rustc_session::Session,
     providers: &mut rustc_middle::util::Providers,
 ) {
-    layout::save_default(providers.layout_of);
-    drop_glue::save_default(providers.mir_shims);
-    symbol_name::save_default(providers.symbol_name);
+    crate::install_query_defaults(
+        providers.layout_of,
+        providers.mir_shims,
+        providers.symbol_name,
+    );
 
     providers.layout_of        = layout::toy_layout_of;
     providers.mir_shims        = drop_glue::toy_mir_shims;

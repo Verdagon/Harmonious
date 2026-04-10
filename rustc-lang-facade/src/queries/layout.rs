@@ -28,24 +28,13 @@ use rustc_abi::{
 };
 use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
 use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv, TyKind, TypeVisitableExt};
-use std::sync::OnceLock;
-
 // The provider function type. This must match rustc's Providers::layout_of signature
 // exactly — it changes between nightlies. On nightly-2025-01-15 it uses
 // PseudoCanonicalInput. On other nightlies it may use ParamEnvAnd.
-type LayoutOfFn = for<'tcx> fn(
+pub type LayoutOfFn = for<'tcx> fn(
     TyCtxt<'tcx>,
     PseudoCanonicalInput<'tcx, Ty<'tcx>>,
 ) -> Result<TyAndLayout<'tcx>, &'tcx LayoutError<'tcx>>;
-
-/// Saved default provider. Used to fall through for non-consumer types.
-/// Stored in OnceLock because query providers are function pointers — they
-/// can't capture the original provider as a closure variable.
-static DEFAULT_LAYOUT_OF: OnceLock<LayoutOfFn> = OnceLock::new();
-
-pub fn save_default(f: LayoutOfFn) {
-    let _ = DEFAULT_LAYOUT_OF.set(f);
-}
 
 /// The layout_of override. Intercepts consumer-defined types, falls through
 /// to rustc's default for everything else.
@@ -75,7 +64,7 @@ pub fn toy_layout_of<'tcx>(
     }
 
     // Fall through to rustc's default provider.
-    let default = DEFAULT_LAYOUT_OF.get().expect("default layout_of not saved");
+    let default = crate::default_layout_of();
     default(tcx, query)
 }
 

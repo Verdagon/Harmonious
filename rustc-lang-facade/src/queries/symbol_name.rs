@@ -7,15 +7,8 @@
 //! the consumer's .o provides.
 
 use rustc_middle::ty::{self, Instance, TyCtxt};
-use std::sync::OnceLock;
 
-type SymbolNameFn = for<'tcx> fn(TyCtxt<'tcx>, Instance<'tcx>) -> ty::SymbolName<'tcx>;
-
-static DEFAULT_SYMBOL_NAME: OnceLock<SymbolNameFn> = OnceLock::new();
-
-pub fn save_default(f: SymbolNameFn) {
-    let _ = DEFAULT_SYMBOL_NAME.set(f);
-}
+pub type SymbolNameFn = for<'tcx> fn(TyCtxt<'tcx>, Instance<'tcx>) -> ty::SymbolName<'tcx>;
 
 pub fn lang_symbol_name<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -64,6 +57,6 @@ pub fn lang_symbol_name<'tcx>(
         }
     }
 
-    let default = DEFAULT_SYMBOL_NAME.get().expect("default symbol_name not saved");
+    let default = crate::default_symbol_name();
     default(tcx, instance)
 }

@@ -42,9 +42,7 @@ pub fn run_compiler<C: LangCallbacks + 'static>(
     rustc_args: &[String],
 ) {
     let stubs = callbacks.generate_stubs();
-    let type_names = callbacks.type_names();
-    let fn_names = callbacks.fn_names();
-    crate::install_callbacks(callbacks, type_names, fn_names);
+    crate::install_callbacks(callbacks);
     // Always install the codegen backend wrapper. If generate_and_compile
     // returns None at runtime, no .o gets injected — no harm done.
     let mut driver = LangDriver::new(stubs);

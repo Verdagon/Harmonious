@@ -22,7 +22,7 @@ use rustc_middle::ty::{self, GenericArg, TyCtxt};
 
 use crate::toylang::typed_ast::*;
 use crate::toylang::registry::{ToylangRegistry, ToyStruct};
-use rustc_lang_facade::LangCallbacks;
+
 
 /// Convert BasicTypeEnum to AnyTypeEnum (inkwell doesn't impl From directly).
 fn basic_type_to_any<'ctx>(ty: BasicTypeEnum<'ctx>) -> inkwell::types::AnyTypeEnum<'ctx> {
@@ -64,6 +64,9 @@ struct CodegenCtx<'ctx, 'tcx, 'reg> {
 struct RustMethodInfo<'ctx> {
     func: FunctionValue<'ctx>,
     is_sret: bool,
+    /// Per @TCHAPZ, #[track_caller] functions have a hidden &Location parameter
+    /// that we must pass as null at every call site.
+    has_track_caller: bool,
 }
 
 impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
@@ -289,18 +292,52 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         type_name: &str,
         method_name: &str,
         type_args: &[ResolvedType],
+        receiver_ty: Option<&ResolvedType>,
     ) -> String {
-        let type_def_id = crate::oracle::find_rust_type_def_id(self.tcx, type_name)
-            .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
-        let method_def_id = crate::oracle::find_inherent_method(self.tcx, type_def_id, method_name)
-            .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
-
-        // Build generic args from type_args (all type args must be explicit)
-        let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
-            .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
-            .collect();
-        let expected_count = self.tcx.generics_of(method_def_id).count();
-        let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+        let (method_def_id, args) = if let Some(recv_ty) = receiver_ty {
+            // Trait static call: look up trait, find impl for receiver
+            if let Some(trait_def_id) = crate::oracle::find_use_imported_trait_def_id(self.tcx, type_name) {
+                let self_resolved = crate::oracle::strip_ref(recv_ty);
+                let self_ty = self.resolved_type_to_rustc_ty(self_resolved);
+                // Per @TVIMDGAZ, use trait definition method DefId with [Self, ...] args
+                let trait_method_def_id = self.tcx.associated_item_def_ids(trait_def_id)
+                    .iter()
+                    .find(|&&id| self.tcx.item_name(id).as_str() == method_name)
+                    .copied()
+                    .unwrap_or_else(|| panic!("method '{}' not defined on trait '{}'", method_name, type_name));
+                let mut all_ty_args: Vec<GenericArg<'tcx>> = vec![GenericArg::from(self_ty)];
+                for ta in type_args {
+                    all_ty_args.push(GenericArg::from(self.resolved_type_to_rustc_ty(ta)));
+                }
+                let expected_count = self.tcx.generics_of(trait_method_def_id).count();
+                let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+                (trait_method_def_id, args)
+            } else {
+                // Fall through to inherent lookup
+                let type_def_id = crate::oracle::find_rust_type_def_id(self.tcx, type_name)
+                    .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
+                let method_def_id = crate::oracle::find_inherent_method(self.tcx, type_def_id, method_name)
+                    .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
+                let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
+                    .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
+                    .collect();
+                let expected_count = self.tcx.generics_of(method_def_id).count();
+                let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+                (method_def_id, args)
+            }
+        } else {
+            // Inherent method call
+            let type_def_id = crate::oracle::find_rust_type_def_id(self.tcx, type_name)
+                .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
+            let method_def_id = crate::oracle::find_inherent_method(self.tcx, type_def_id, method_name)
+                .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
+            let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
+                .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
+                .collect();
+            let expected_count = self.tcx.generics_of(method_def_id).count();
+            let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+            (method_def_id, args)
+        };
 
         // Build Instance for ABI query
         let instance = ty::Instance::expect_resolve(
@@ -310,6 +347,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             args,
             rustc_span::DUMMY_SP,
         );
+        // Detect hidden #[track_caller] parameter (see @TCHAPZ)
+        let has_track_caller = instance.def.requires_caller_location(self.tcx);
         let symbol = self.tcx.symbol_name(instance).name.to_string();
 
         // Check cache
@@ -371,7 +410,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             sret_info,
         );
 
-        self.rust_method_info.insert(symbol.clone(), RustMethodInfo { func, is_sret });
+        self.rust_method_info.insert(symbol.clone(), RustMethodInfo { func, is_sret, has_track_caller });
         symbol
     }
 }
@@ -437,11 +476,14 @@ fn coerce_int_to_type<'ctx>(
 
 /// Whether a ResolvedType uses sret under the internal ABI.
 /// Walk a typed body and resolve any Rust method symbols (StaticCall/MethodCall on RustType).
-fn resolve_rust_methods_from_typed_body(ctx: &mut CodegenCtx, body: &TypedFnBody) {
+fn resolve_rust_methods_from_typed_body(ctx: &mut CodegenCtx, body: &TypedBlock) {
     fn walk_expr(ctx: &mut CodegenCtx, expr: &TypedExpr) {
         match &expr.kind {
-            TypedExprKind::StaticCall { ty, method, type_args, .. } => {
-                ctx.get_or_resolve_rust_method(ty, method, type_args);
+            TypedExprKind::StaticCall { ty, method, type_args, args } => {
+                let receiver_ty = args.first().map(|a| &a.ty);
+                ctx.get_or_resolve_rust_method(ty, method, type_args, receiver_ty);
+                for arg in args { walk_expr(ctx, arg); }
+                return; // already walked children
             }
             TypedExprKind::MethodCall { receiver, method, args } => {
                 // Extract RustType from receiver (direct or via &ref)
@@ -454,7 +496,7 @@ fn resolve_rust_methods_from_typed_body(ctx: &mut CodegenCtx, body: &TypedFnBody
                     _ => None,
                 };
                 if let Some((type_name, type_args)) = rust_info {
-                    ctx.get_or_resolve_rust_method(type_name, method, type_args);
+                    ctx.get_or_resolve_rust_method(type_name, method, type_args, None);
                 }
                 walk_expr(ctx, receiver);
                 for arg in args { walk_expr(ctx, arg); }
@@ -477,23 +519,26 @@ fn resolve_rust_methods_from_typed_body(ctx: &mut CodegenCtx, body: &TypedFnBody
                 walk_expr(ctx, cond);
                 for stmt in then_stmts {
                     match stmt {
-                        TypedStmt::Let { expr, .. } | TypedStmt::ExprStmt(expr) => walk_expr(ctx, expr),
+                        TypedStmt::Let { expr, .. } | TypedStmt::ExprStmt(expr) | TypedStmt::Assign { expr, .. } => walk_expr(ctx, expr),
                         TypedStmt::While { cond, body } => { walk_expr(ctx, cond); walk_body(ctx, body); }
                     }
                 }
                 if let Some(e) = then_expr { walk_expr(ctx, e); }
                 for stmt in else_stmts {
                     match stmt {
-                        TypedStmt::Let { expr, .. } | TypedStmt::ExprStmt(expr) => walk_expr(ctx, expr),
+                        TypedStmt::Let { expr, .. } | TypedStmt::ExprStmt(expr) | TypedStmt::Assign { expr, .. } => walk_expr(ctx, expr),
                         TypedStmt::While { cond, body } => { walk_expr(ctx, cond); walk_body(ctx, body); }
                     }
                 }
                 if let Some(e) = else_expr { walk_expr(ctx, e); }
             }
+            TypedExprKind::Ref(inner) => {
+                walk_expr(ctx, inner);
+            }
             _ => {} // IntLit, BoolLit, Var, StringLit
         }
     }
-    fn walk_body(ctx: &mut CodegenCtx, body: &crate::toylang::typed_ast::TypedFnBody) {
+    fn walk_body(ctx: &mut CodegenCtx, body: &crate::toylang::typed_ast::TypedBlock) {
         for stmt in &body.stmts {
             match stmt {
                 TypedStmt::Let { expr, .. } => walk_expr(ctx, expr),
@@ -502,6 +547,7 @@ fn resolve_rust_methods_from_typed_body(ctx: &mut CodegenCtx, body: &TypedFnBody
                     walk_expr(ctx, cond);
                     walk_body(ctx, body);
                 }
+                TypedStmt::Assign { expr, .. } => walk_expr(ctx, expr),
             }
         }
         if let Some(ref ret) = body.ret {
@@ -525,7 +571,13 @@ fn codegen_internal_function<'ctx, 'tcx>(
 ) {
     // Query rustc for Rust method return types
     let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> ResolvedType {
-        crate::oracle::rust_method_return_type(ctx.tcx, type_name, method, type_args)
+        if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+            let receiver_ty = &type_args[0];
+            let explicit_args = &type_args[1..];
+            crate::oracle::rust_trait_method_return_type(ctx.tcx, trait_name, method, receiver_ty, explicit_args)
+        } else {
+            crate::oracle::rust_method_return_type(ctx.tcx, type_name, method, type_args)
+        }
     };
     let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret)
         .expect("type resolution should succeed (already validated)");
@@ -665,7 +717,9 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
 
     let rust_sret = matches!(coerced, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
 
-    // Query Rust ABI for parameter types
+    // Query Rust ABI for parameter types.
+    // Per @TCHAPZ, coerced_params may include a hidden #[track_caller] param,
+    // but toylang-defined functions never have it, so the assert holds.
     let coerced_params = rustc_lang_facade::abi_helpers::coerced_param_types_for_instance(ctx.tcx, instance);
     assert_eq!(coerced_params.len(), func.params.len(),
         "fn_abi.args length mismatch for {}", extern_symbol);
@@ -879,6 +933,8 @@ fn lower_typed_expr<'ctx>(
                         BinOp::Le => ctx.builder.build_int_compare(IntPredicate::SLE, l, r, "le").unwrap(),
                         BinOp::Gt => ctx.builder.build_int_compare(IntPredicate::SGT, l, r, "gt").unwrap(),
                         BinOp::Ge => ctx.builder.build_int_compare(IntPredicate::SGE, l, r, "ge").unwrap(),
+                        BinOp::And => ctx.builder.build_and(l, r, "and").unwrap(),
+                        BinOp::Or  => ctx.builder.build_or(l, r, "or").unwrap(),
                     };
                     BasicValueEnum::IntValue(val)
                 }
@@ -1029,22 +1085,88 @@ fn lower_typed_expr<'ctx>(
             } // close else (toylang fn path)
         }
 
-        TypedExprKind::StaticCall { ty, method, type_args, args: _ } => {
-            let sym = ctx.get_or_resolve_rust_method(ty, method, type_args);
+        TypedExprKind::StaticCall { ty, method, type_args, args } => {
+            let receiver_ty = args.first().map(|a| &a.ty);
+            let sym = ctx.get_or_resolve_rust_method(ty, method, type_args, receiver_ty);
             let info = ctx.rust_method_info.get(&sym).unwrap();
             let func = info.func;
             let is_sret = info.is_sret;
+            let has_track_caller = info.has_track_caller;
 
-            if is_sret {
-                let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, &format!("{}_new", ty));
-                let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
-                ctx.builder.build_call(func, &[alloca.into()], "").unwrap();
-                ExprResult::Ptr(alloca, opaque_ty)
+            let is_trait_call = args.first().is_some()
+                && crate::oracle::find_use_imported_trait_def_id(ctx.tcx, ty).is_some();
+            if is_trait_call {
+                // Trait static call: first arg is receiver, rest are regular args.
+                // Handle receiver like MethodCall: for Ref types, load the pointer.
+                let recv_expr = &args[0];
+                let recv = lower_typed_expr(ctx, recv_expr);
+                let recv_ptr = match &recv_expr.ty {
+                    ResolvedType::Ref { .. } => {
+                        match recv {
+                            ExprResult::Ptr(alloca, ty) => {
+                                ctx.builder.build_load(ty, alloca, "recv_load")
+                                    .unwrap()
+                                    .into_pointer_value()
+                            }
+                            ExprResult::Value(v) => v.into_pointer_value(),
+                        }
+                    }
+                    _ => {
+                        match recv {
+                            ExprResult::Ptr(ptr, _) => ptr,
+                            _ => panic!("trait call receiver must be a pointer"),
+                        }
+                    }
+                };
+
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
+
+                if is_sret {
+                    let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, &format!("{}_trait", ty));
+                    call_args.push(alloca.into());
+                    call_args.push(recv_ptr.into());
+                    for arg_expr in &args[1..] {
+                        let arg = lower_typed_expr(ctx, arg_expr);
+                        let arg_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
+                        let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "trait_arg");
+                        call_args.push(arg_ptr.into());
+                    }
+                    if has_track_caller {
+                        call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
+                    }
+                    ctx.builder.build_call(func, &call_args, "").unwrap();
+                    let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
+                    ExprResult::Ptr(alloca, opaque_ty)
+                } else {
+                    call_args.push(recv_ptr.into());
+                    for arg_expr in &args[1..] {
+                        let arg = lower_typed_expr(ctx, arg_expr);
+                        let arg_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
+                        let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "trait_arg");
+                        call_args.push(arg_ptr.into());
+                    }
+                    if has_track_caller {
+                        call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
+                    }
+                    let result = ctx.builder.build_call(func, &call_args, "trait_call").unwrap();
+                    match result.try_as_basic_value() {
+                        inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
+                        _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                    }
+                }
             } else {
-                let result = ctx.builder.build_call(func, &[], "static_call").unwrap();
-                match result.try_as_basic_value() {
-                    inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
-                    _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                // Inherent static call (e.g., Vec::new) — no args
+                if is_sret {
+                    let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, &format!("{}_new", ty));
+                    let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
+                    ctx.builder.build_call(func, &[alloca.into()], "").unwrap();
+                    ExprResult::Ptr(alloca, opaque_ty)
+                } else {
+                    let result = ctx.builder.build_call(func, &[], "static_call").unwrap();
+                    match result.try_as_basic_value() {
+                        inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
+                        _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                    }
                 }
             }
         }
@@ -1119,11 +1241,11 @@ fn lower_typed_expr<'ctx>(
                 _ => panic!("method call on unsupported type: {:?}", receiver.ty),
             };
 
-            let sym = ctx.get_or_resolve_rust_method(type_name, method, type_args);
+            let sym = ctx.get_or_resolve_rust_method(type_name, method, type_args, None);
             let info = ctx.rust_method_info.get(&sym).unwrap();
             let func = info.func;
             let is_sret = info.is_sret;
-
+            let has_track_caller = info.has_track_caller;
             if is_sret {
                 // sret method call (constructor-like returning opaque type)
                 let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "method_sret");
@@ -1135,6 +1257,9 @@ fn lower_typed_expr<'ctx>(
                     let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
                     call_args.push(arg_ptr.into());
                 }
+                if has_track_caller { // @TCHAPZ: pass null for hidden Location param
+                    call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
+                }
                 ctx.builder.build_call(func, &call_args, "").unwrap();
                 ExprResult::Ptr(alloca, opaque_ty)
             } else {
@@ -1145,6 +1270,9 @@ fn lower_typed_expr<'ctx>(
                     let arg_ty = ctx.resolved_to_inkwell(&a.ty);
                     let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
                     call_args.push(arg_ptr.into());
+                }
+                if has_track_caller { // @TCHAPZ: pass null for hidden Location param
+                    call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
                 }
                 let result = ctx.builder.build_call(func, &call_args, "method_call").unwrap();
                 match result.try_as_basic_value() {
@@ -1191,6 +1319,14 @@ fn lower_typed_expr<'ctx>(
             } else {
                 ExprResult::Value(ctx.context.i32_type().const_zero().into())
             }
+        }
+
+        TypedExprKind::Ref(inner) => {
+            // &expr — take a pointer to the inner expression
+            let inner_result = lower_typed_expr(ctx, inner);
+            let inner_ty = ctx.resolved_to_inkwell(&inner.ty);
+            let ptr = inner_result.into_ptr(&ctx.builder, inner_ty, "ref_val");
+            ExprResult::Value(ptr.into())
         }
     }
 }
@@ -1256,6 +1392,13 @@ fn lower_typed_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>, stmt: &TypedStmt) 
 
             // Continue after loop
             ctx.builder.position_at_end(exit_bb);
+        }
+        TypedStmt::Assign { name, expr } => {
+            let (ptr, _ty) = ctx.vars.get(name.as_str())
+                .expect("assign to undefined var (should be caught by type resolver)")
+                .clone();
+            let val = lower_typed_expr(ctx, expr).into_value(&ctx.builder);
+            ctx.builder.build_store(ptr, val).unwrap();
         }
     }
 }
@@ -1356,6 +1499,7 @@ pub fn generate_with_tcx<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
     callbacks: &crate::toylang::callbacks_impl::ToylangCallbacks,
+    state: &mut crate::toylang::callbacks_impl::ToylangState,
 ) -> (String, Vec<String>) {
     let context = Context::create();
     let mut ctx = CodegenCtx::new(&context, tcx, registry);
@@ -1364,11 +1508,15 @@ pub fn generate_with_tcx<'tcx>(
     // Collect all toylang mono items (accessors and functions) first, then codegen.
     struct FnItem<'tcx> {
         resolved_func: crate::toylang::registry::ToyFunction,
-        instance: ty::Instance<'tcx>,
+        /// Some for entry-point functions (Rust calls them), None for internal-only.
+        /// Used to generate extern ABI wrappers.
+        instance: Option<ty::Instance<'tcx>>,
         extern_symbol: String,
     }
     let mut fn_items: Vec<FnItem<'tcx>> = Vec::new();
 
+    // Walk MonoItems for accessor methods (still discovered via rustc).
+    // Regular toylang functions come from state.toylang_instances instead.
     let (_, cgus) = tcx.collect_and_partition_mono_items(());
     for cgu in cgus.iter() {
         for (&mono_item, _) in cgu.items() {
@@ -1389,7 +1537,7 @@ pub fn generate_with_tcx<'tcx>(
                         let field_name = tcx.item_name(def_id).to_string();
                         if let Some(field_index) = toy_struct.fields.iter().position(|f| f.name == field_name) {
                             let callback_name = format!("{}.{}", struct_name, field_name);
-                            let result = callbacks.monomorphize_fn(&callback_name, tcx, local_def_id, instance);
+                            let result = callbacks.monomorphize_fn_inner(state, &callback_name, tcx, local_def_id, instance);
                             if seen_symbols.insert(result.extern_symbol.clone()) {
                                 let struct_ty = ctx.struct_type_for_instance(toy_struct, instance);
                                 codegen_accessor_inline(&mut ctx, &result.extern_symbol, struct_ty, field_index);
@@ -1400,21 +1548,35 @@ pub fn generate_with_tcx<'tcx>(
                 continue;
             }
 
-            // Check if it's a consumer function
+            // For regular consumer functions from MonoItems: record the Instance
+            // so we can generate an extern wrapper. The resolved_func comes from
+            // toylang_instances (populated during the deep walk in monomorphize_fn).
             let name = tcx.item_name(def_id).to_string();
             let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main".to_string() } else { name.clone() };
-            let Some(toy_fn) = registry.functions.get(&registry_name) else { continue };
-            let result = callbacks.monomorphize_fn(&name, tcx, local_def_id, instance);
-            if !seen_symbols.insert(result.extern_symbol.clone()) {
-                continue;
+            if registry.functions.get(&registry_name).is_none() { continue; }
+            let extern_symbol = crate::toylang::callbacks_impl::compute_fn_symbol(
+                &registry_name, tcx, instance,
+            );
+            // Find the matching toylang_instance and promote it to have an Instance
+            if let Some(inst) = state.toylang_instances.iter().find(|i| i.extern_symbol == extern_symbol) {
+                if seen_symbols.insert(extern_symbol.clone()) {
+                    fn_items.push(FnItem {
+                        resolved_func: inst.resolved_func.clone(),
+                        instance: Some(instance),
+                        extern_symbol,
+                    });
+                }
             }
+        }
+    }
 
-            // Build resolved function with concrete type args substituted
-            let resolved_func = resolve_function_for_instance(toy_fn, &registry_name, instance, tcx);
+    // Add internal-only toylang instances (discovered during deep walk, not in MonoItems)
+    for inst in &state.toylang_instances {
+        if seen_symbols.insert(inst.extern_symbol.clone()) {
             fn_items.push(FnItem {
-                resolved_func,
-                instance,
-                extern_symbol: result.extern_symbol,
+                resolved_func: inst.resolved_func.clone(),
+                instance: None,
+                extern_symbol: inst.extern_symbol.clone(),
             });
         }
     }
@@ -1422,15 +1584,16 @@ pub fn generate_with_tcx<'tcx>(
     // Two-pass codegen: internal functions first, then extern wrappers.
     // Internal functions use a simple ABI (structs always sret, primitives direct).
     // Extern wrappers adapt to Rust ABI and delegate to the internal function.
-    // No ordering dependency between internal functions since the internal ABI
-    // is predictable from ResolvedType alone.
+    // Only entry-point functions (with Instance) get extern wrappers.
     for item in &fn_items {
         let internal_symbol = item.extern_symbol.replace("__toylang_impl_", "__toylang_internal_");
         codegen_internal_function(&mut ctx, &item.resolved_func, &internal_symbol);
     }
     for item in &fn_items {
-        let internal_symbol = item.extern_symbol.replace("__toylang_impl_", "__toylang_internal_");
-        codegen_extern_wrapper(&mut ctx, &item.resolved_func, item.instance, &item.extern_symbol, &internal_symbol);
+        if let Some(instance) = item.instance {
+            let internal_symbol = item.extern_symbol.replace("__toylang_impl_", "__toylang_internal_");
+            codegen_extern_wrapper(&mut ctx, &item.resolved_func, instance, &item.extern_symbol, &internal_symbol);
+        }
     }
 
     let rust_symbols = ctx.rust_symbols.clone();
@@ -1455,45 +1618,4 @@ fn codegen_accessor_inline<'ctx>(
     ctx.builder.build_return(Some(&gep)).unwrap();
 }
 
-/// Build a resolved ToyFunction with type params substituted for a concrete instance.
-fn resolve_function_for_instance<'tcx>(
-    toy_fn: &crate::toylang::registry::ToyFunction,
-    name: &str,
-    instance: ty::Instance<'tcx>,
-    tcx: TyCtxt<'tcx>,
-) -> crate::toylang::registry::ToyFunction {
-    if toy_fn.type_params.is_empty() {
-        return toy_fn.clone();
-    }
-
-    // Generic function — substitute type params with concrete types from instance
-    let mut type_arg_subst = std::collections::HashMap::new();
-    for (i, param_name) in toy_fn.type_params.iter().enumerate() {
-        if let Some(arg) = instance.args.get(i) {
-            if let ty::GenericArgKind::Type(ty) = arg.unpack() {
-                type_arg_subst.insert(
-                    param_name.clone(),
-                    crate::oracle::rustc_ty_to_resolved_type(tcx, ty),
-                );
-            }
-        }
-    }
-
-    crate::toylang::registry::ToyFunction {
-        name: name.to_string(),
-        type_params: vec![],
-        params: toy_fn.params.iter().map(|p| {
-            crate::toylang::registry::ToyParam {
-                name: p.name.clone(),
-                ty: crate::toylang::type_resolve::substitute_type_params(&p.ty, &type_arg_subst),
-            }
-        }).collect(),
-        return_ty: toy_fn.return_ty.as_ref().map(|rt| {
-            crate::toylang::type_resolve::substitute_type_params(rt, &type_arg_subst)
-        }),
-        body: toy_fn.body.as_ref().map(|b| {
-            crate::toylang::type_resolve::substitute_type_params_in_body(b, &type_arg_subst)
-        }),
-    }
-}
 

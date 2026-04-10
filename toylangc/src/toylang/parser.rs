@@ -1,4 +1,4 @@
-use super::ast::{BinOp, Expr, FnBody, Stmt};
+use super::ast::{BinOp, Expr, Block, Stmt};
 use super::registry::{
     ToyField, ToyFunction, ToyParam, ToyStruct, ToylangRegistry,
 };
@@ -18,6 +18,9 @@ pub enum ParseError {
     ExpectedExpression { got: String },
     ExpectedType { got: String },
     ExpectedPointerQualifier { got: String },
+    DuplicateStruct { name: String },
+    DuplicateFunction { name: String },
+    ReservedName { name: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +54,8 @@ enum Token {
     Dot,       // .
     Semicolon, // ;
     Equals,    // =
+    AmpAmp,    // &&
+    PipePipe,  // ||
     IntLit(i64, ResolvedType),
     StringLit(String),
     Eof,
@@ -183,6 +188,19 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
             continue;
         }
 
+        // && (logical AND)
+        if chars[i] == '&' && i + 1 < chars.len() && chars[i + 1] == '&' {
+            tokens.push(Token::AmpAmp);
+            i += 2;
+            continue;
+        }
+        // || (logical OR)
+        if chars[i] == '|' && i + 1 < chars.len() && chars[i + 1] == '|' {
+            tokens.push(Token::PipePipe);
+            i += 2;
+            continue;
+        }
+
         // Single-char tokens
         match chars[i] {
             '{' => { tokens.push(Token::LBrace); i += 1; }
@@ -279,11 +297,23 @@ impl Parser {
                 }
                 Token::Ident(s) if s == "struct" => {
                     let (name, s) = self.parse_struct(&struct_names)?;
+                    if name.starts_with("__toylang_") {
+                        return Err(ParseError::ReservedName { name });
+                    }
+                    if structs.contains_key(&name) {
+                        return Err(ParseError::DuplicateStruct { name });
+                    }
                     struct_names.push(name.clone());
                     structs.insert(name, s);
                 }
                 Token::Ident(s) if s == "fn" => {
                     let (name, f) = self.parse_fn(&struct_names)?;
+                    if name.starts_with("__toylang_") {
+                        return Err(ParseError::ReservedName { name });
+                    }
+                    if functions.contains_key(&name) {
+                        return Err(ParseError::DuplicateFunction { name });
+                    }
                     functions.insert(name, f);
                 }
                 Token::Eof => break,
@@ -325,7 +355,7 @@ impl Parser {
         }
         self.expect(Token::RBrace)?;
 
-        Ok((name.clone(), ToyStruct { name, type_params, fields }))
+        Ok((name, ToyStruct { type_params, fields }))
     }
 
     fn parse_field(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ToyField, ParseError> {
@@ -366,20 +396,20 @@ impl Parser {
         if self.peek() == &Token::LBrace {
             self.expect(Token::LBrace)?;
             let body = self.parse_fn_body(&type_params, struct_names)?;
-            Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: Some(body) }))
+            Ok((name, ToyFunction { type_params, params, return_ty, body: Some(body) }))
         } else {
-            Ok((name.clone(), ToyFunction { name, type_params, params, return_ty, body: None }))
+            Ok((name, ToyFunction { type_params, params, return_ty, body: None }))
         }
     }
 
-    fn parse_fn_body(&mut self, type_params: &[String], struct_names: &[String]) -> Result<FnBody, ParseError> {
+    fn parse_fn_body(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Block, ParseError> {
         let mut stmts = Vec::new();
 
         loop {
             // End of body
             if self.peek() == &Token::RBrace || self.peek() == &Token::Eof {
                 self.consume(); // consume '}'
-                return Ok(FnBody { stmts, ret: None });
+                return Ok(Block { stmts, ret: None });
             }
 
             // "let" statement
@@ -403,6 +433,21 @@ impl Parser {
                 }
             }
 
+            // Assignment: IDENT = expr ;
+            // Must check peek2 to distinguish from expressions starting with an ident
+            if let Token::Ident(s) = self.peek() {
+                if s != "if" && s != "true" && s != "false" && s != "else" {
+                    if self.peek2() == Some(&Token::Equals) {
+                        let name = self.expect_ident()?;
+                        self.expect(Token::Equals)?;
+                        let expr = self.parse_expr(type_params, struct_names)?;
+                        self.expect(Token::Semicolon)?;
+                        stmts.push(Stmt::Assign { name, expr });
+                        continue;
+                    }
+                }
+            }
+
             // Expression — either trailing return or stmt followed by ';'
             let expr = self.parse_expr(type_params, struct_names)?;
             // if/else expressions don't need ';' when used as statements
@@ -416,16 +461,38 @@ impl Parser {
             } else {
                 // trailing expression — return value
                 self.expect(Token::RBrace)?;
-                return Ok(FnBody { stmts, ret: Some(expr) });
+                return Ok(Block { stmts, ret: Some(expr) });
             }
         }
     }
 
     fn parse_expr(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
-        self.parse_comparison(type_params, struct_names)
+        self.parse_logical_or(type_params, struct_names)
     }
 
-    // Precedence: comparison (==, !=, <, <=, >, >=) < additive (+, -) < multiplicative (*, /)
+    // Precedence: || < && < comparison (==, !=, <, <=, >, >=) < additive (+, -) < multiplicative (*, /)
+    fn parse_logical_or(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
+        let mut left = self.parse_logical_and(type_params, struct_names)?;
+        loop {
+            if self.peek() != &Token::PipePipe { break; }
+            self.consume();
+            let right = self.parse_logical_and(type_params, struct_names)?;
+            left = Expr::BinaryOp { op: BinOp::Or, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    fn parse_logical_and(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
+        let mut left = self.parse_comparison(type_params, struct_names)?;
+        loop {
+            if self.peek() != &Token::AmpAmp { break; }
+            self.consume();
+            let right = self.parse_comparison(type_params, struct_names)?;
+            left = Expr::BinaryOp { op: BinOp::And, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
     fn parse_comparison(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
         let mut left = self.parse_additive(type_params, struct_names)?;
         loop {
@@ -511,6 +578,16 @@ impl Parser {
 
     fn parse_primary(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Expr, ParseError> {
         match self.peek().clone() {
+            Token::Minus => {
+                self.consume();
+                let operand = self.parse_primary(type_params, struct_names)?;
+                Ok(Expr::UnaryNeg(Box::new(operand)))
+            }
+            Token::Ampersand => {
+                self.consume();
+                let operand = self.parse_primary(type_params, struct_names)?;
+                Ok(Expr::Ref(Box::new(operand)))
+            }
             Token::StringLit(s) => {
                 let s = s.clone();
                 self.consume();
@@ -535,8 +612,20 @@ impl Parser {
                 let else_body = if let Token::Ident(s) = self.peek() {
                     if s == "else" {
                         self.consume();
-                        self.expect(Token::LBrace)?;
-                        Some(self.parse_fn_body(type_params, struct_names)?)
+                        // Check for "else if" sugar
+                        if let Token::Ident(s2) = self.peek() {
+                            if s2 == "if" {
+                                // Desugar: else if → else { if ... }
+                                let inner_if = self.parse_expr(type_params, struct_names)?;
+                                Some(Block { stmts: vec![], ret: Some(inner_if) })
+                            } else {
+                                self.expect(Token::LBrace)?;
+                                Some(self.parse_fn_body(type_params, struct_names)?)
+                            }
+                        } else {
+                            self.expect(Token::LBrace)?;
+                            Some(self.parse_fn_body(type_params, struct_names)?)
+                        }
                     } else { None }
                 } else { None };
                 Ok(Expr::If { cond: Box::new(cond), then_body: Box::new(then_body), else_body: else_body.map(Box::new) })
@@ -772,5 +861,33 @@ mod tests {
         let result = parse("fn f(x: *wrong i32) { }");
         let Err(ParseError::ExpectedPointerQualifier { got }) = result else { panic!("expected ExpectedPointerQualifier") };
         assert_eq!(got, "wrong");
+    }
+
+    #[test]
+    fn test_parse_duplicate_struct() {
+        let result = parse("struct Foo { x: i32 } struct Foo { y: i32 }");
+        let Err(ParseError::DuplicateStruct { name }) = result else { panic!("expected DuplicateStruct") };
+        assert_eq!(name, "Foo");
+    }
+
+    #[test]
+    fn test_parse_duplicate_function() {
+        let result = parse("fn f() -> i32 { 1 } fn f() -> i32 { 2 }");
+        let Err(ParseError::DuplicateFunction { name }) = result else { panic!("expected DuplicateFunction") };
+        assert_eq!(name, "f");
+    }
+
+    #[test]
+    fn test_parse_reserved_struct_name() {
+        let result = parse("struct __toylang_foo { x: i32 }");
+        let Err(ParseError::ReservedName { name }) = result else { panic!("expected ReservedName") };
+        assert_eq!(name, "__toylang_foo");
+    }
+
+    #[test]
+    fn test_parse_reserved_function_name() {
+        let result = parse("fn __toylang_main() -> i32 { 0 }");
+        let Err(ParseError::ReservedName { name }) = result else { panic!("expected ReservedName") };
+        assert_eq!(name, "__toylang_main");
     }
 }

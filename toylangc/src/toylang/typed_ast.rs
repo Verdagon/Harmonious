@@ -93,17 +93,20 @@ pub enum TypedExprKind {
         else_stmts: Vec<TypedStmt>,
         else_expr: Option<Box<TypedExpr>>,
     },
+    /// `&expr` — reference expression
+    Ref(Box<TypedExpr>),
 }
 
 #[derive(Clone, Debug)]
 pub enum TypedStmt {
     Let { name: String, expr: TypedExpr },
     ExprStmt(TypedExpr),
-    While { cond: TypedExpr, body: TypedFnBody },
+    While { cond: TypedExpr, body: TypedBlock },
+    Assign { name: String, expr: TypedExpr },
 }
 
 #[derive(Clone, Debug)]
-pub struct TypedFnBody {
+pub struct TypedBlock {
     pub stmts: Vec<TypedStmt>,
     pub ret: Option<TypedExpr>,
 }

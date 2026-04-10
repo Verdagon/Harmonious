@@ -27,7 +27,6 @@ pub mod file_loader;
 pub mod mir_helpers;
 pub mod queries;
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use rustc_hir::def_id::LocalDefId;
@@ -63,72 +62,51 @@ pub struct MonomorphizeFnResult<'tcx> {
 /// need to provide is_lang_type / is_lang_fn methods.
 ///
 /// Must be Send + Sync because rustc query providers run on Rayon worker threads.
-pub trait LangCallbacks: Send + Sync {
-    /// Return the names of all consumer-defined types.
-    /// Used by the library to detect consumer items in query overrides.
-    ///
-    /// Future: if generate_stubs returned structured data (e.g. a list of
-    /// TypeStub/FnStub with names + source), the library could extract names
-    /// from there and this method wouldn't be needed.
-    fn type_names(&self) -> HashSet<String>;
+use std::any::Any;
 
-    /// Return the names of all consumer-defined functions.
-    /// Used by the library to detect consumer items in query overrides.
-    /// See type_names() for future simplification note.
-    fn fn_names(&self) -> HashSet<String>;
+pub trait LangCallbacks: Send + Sync {
+    /// Create the consumer's mutable state. Called once at startup.
+    /// The facade stores this in its global and passes `&mut dyn Any` to every
+    /// callback. The consumer downcasts to its concrete state type.
+    fn create_state(&self) -> Box<dyn Any + Send + Sync>;
+
+    /// Check if a type name belongs to the consumer's language.
+    fn is_consumer_type(&self, name: &str) -> bool;
+
+    /// Check if a function name belongs to the consumer's language.
+    fn is_consumer_fn(&self, name: &str) -> bool;
 
     /// Generate the Rust source code to inject via FileLoader.
-    /// Must contain struct definitions and extern "C" declarations that
-    /// make the consumer's types visible to rustc's type checker.
-    /// Called once before rustc parsing begins.
     fn generate_stubs(&self) -> String;
 
     /// Monomorphize a consumer type for concrete type args.
-    /// Called from the layout_of override when rustc needs the layout of a
-    /// consumer type (possibly a generic instantiation like MyStruct<i32>).
-    ///
-    /// `ty` is the concrete type (e.g. `Pair<i32, i32>`), with generic args
-    /// already substituted. The consumer can extract type args from it via
-    /// `if let TyKind::Adt(_, args) = ty.kind() { args[0].expect_ty() }`.
-    ///
-    /// Returns the concrete field types for this instantiation. The library
-    /// calls tcx.layout_of() on each field type to compute the struct layout.
+    /// `state` is the consumer's mutable state (downcast to your concrete type).
     fn monomorphize_type<'tcx>(
         &self,
+        state: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         ty: Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx>;
 
     /// Monomorphize a consumer function for a concrete instantiation.
-    /// Called from per_instance_mir when rustc's monomorphizer encounters
-    /// a consumer function instance.
-    ///
-    /// `instance` contains the concrete generic args (e.g., `wrap::<i32>`).
-    /// The consumer uses it to:
-    /// - Compute the extern symbol name (including mangled type args)
-    /// - Query `fn_abi_of_instance` for the correct return ABI
-    /// - Discover Rust-side dependencies
+    /// `state` is the consumer's mutable state (downcast to your concrete type).
     fn monomorphize_fn<'tcx>(
         &self,
+        state: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
         instance: ty::Instance<'tcx>,
     ) -> MonomorphizeFnResult<'tcx>;
 
-    /// Called after rustc's analysis phase completes (after type checking,
-    /// before monomorphization). Full tcx available.
-    ///
-    /// Use this to type-check your language against Rust types — e.g. resolve
-    /// what methods Vec has, verify that trait bounds are satisfied, etc.
-    /// Results should be stashed for later use by monomorphize_fn/generate_and_compile.
-    fn after_rust_analysis<'tcx>(&self, tcx: TyCtxt<'tcx>);
+    /// Called after rustc's analysis phase completes.
+    /// `state` is the consumer's mutable state (downcast to your concrete type).
+    fn after_rust_analysis<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>);
 
     /// Compile the consumer's function bodies and return the path to the .o file.
-    /// Called during after_analysis when the full TyCtxt is available for
-    /// symbol name resolution, ABI queries, etc. Return None if no codegen needed.
-    fn generate_and_compile<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)>;
+    /// `state` is the consumer's mutable state (downcast to your concrete type).
+    fn generate_and_compile<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)>;
 }
 
 // ============================================================================
@@ -143,53 +121,70 @@ pub trait LangCallbacks: Send + Sync {
 // 4. Query overrides call through the vtable, which downcasts and dispatches
 // ============================================================================
 
-use std::any::Any;
 use std::sync::OnceLock;
 
 /// Manual vtable for LangCallbacks, using higher-ranked function pointers
 /// to handle the `'tcx` lifetime without requiring object safety.
-pub(crate) struct CallbackVtable {
-    pub monomorphize_type: for<'tcx> fn(
+struct CallbackVtable {
+    is_consumer_type: fn(&(dyn Any + Send + Sync), &str) -> bool,
+    is_consumer_fn: fn(&(dyn Any + Send + Sync), &str) -> bool,
+
+    monomorphize_type: for<'tcx> fn(
         &(dyn Any + Send + Sync),
+        &mut (dyn Any + Send + Sync),
         &str,
         TyCtxt<'tcx>,
         Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx>,
 
-    pub monomorphize_fn: for<'tcx> fn(
+    monomorphize_fn: for<'tcx> fn(
         &(dyn Any + Send + Sync),
+        &mut (dyn Any + Send + Sync),
         &str,
         TyCtxt<'tcx>,
         LocalDefId,
         ty::Instance<'tcx>,
     ) -> MonomorphizeFnResult<'tcx>,
 
-    pub after_rust_analysis: for<'tcx> fn(
+    after_rust_analysis: for<'tcx> fn(
         &(dyn Any + Send + Sync),
+        &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
     ),
 
-    pub generate_and_compile: for<'tcx> fn(
+    generate_and_compile: for<'tcx> fn(
         &(dyn Any + Send + Sync),
+        &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
     ) -> Option<(PathBuf, Vec<String>)>,
 }
 
-pub(crate) static CALLBACKS: OnceLock<Box<dyn Any + Send + Sync>> = OnceLock::new();
-pub(crate) static VTABLE: OnceLock<CallbackVtable> = OnceLock::new();
+/// All facade globals in one place. Initialized in two phases:
+/// 1. `install_callbacks` sets callbacks, vtable, type_names, fn_names, consumer_state
+/// 2. `install_query_defaults` sets the saved original query providers
+pub(crate) struct FacadeGlobals {
+    callbacks: Box<dyn Any + Send + Sync>,
+    consumer_state: Box<dyn Any + Send + Sync>,
+    vtable: CallbackVtable,
+    default_layout_of: Option<queries::layout::LayoutOfFn>,
+    default_mir_shims: Option<queries::drop_glue::MirShimsFn>,
+    default_symbol_name: Option<queries::symbol_name::SymbolNameFn>,
+    pub lang_obj_path: Option<PathBuf>,
+}
 
-/// Names of consumer-defined types and functions, for query override detection.
-pub(crate) static CONSUMER_TYPE_NAMES: OnceLock<HashSet<String>> = OnceLock::new();
-pub(crate) static CONSUMER_FN_NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+// Safety: the function pointer types within are Send+Sync (plain fn pointers).
+unsafe impl Send for FacadeGlobals {}
+unsafe impl Sync for FacadeGlobals {}
+
+static GLOBALS: OnceLock<std::sync::Mutex<FacadeGlobals>> = OnceLock::new();
 
 /// Check if a type name belongs to the consumer's language.
 pub(crate) fn is_consumer_type(name: &str) -> bool {
-    CONSUMER_TYPE_NAMES.get().map_or(false, |s| s.contains(name))
+    let g = GLOBALS.get().expect("globals not installed").lock().unwrap();
+    (g.vtable.is_consumer_type)(&*g.callbacks, name)
 }
 
 /// Check if a DefId is from the __lang_stubs module (the consumer's injected stubs).
-/// This prevents name collisions with user-defined types that happen to share a name.
-/// Uses the def_path to check if any ancestor is the __lang_stubs module.
 pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     let path = tcx.def_path_str(def_id);
     path.starts_with("__lang_stubs::")
@@ -197,97 +192,159 @@ pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 
 /// Check if a function name belongs to the consumer's language.
 pub(crate) fn is_consumer_fn(name: &str) -> bool {
-    CONSUMER_FN_NAMES.get().map_or(false, |s| s.contains(name))
+    let g = GLOBALS.get().expect("globals not installed").lock().unwrap();
+    (g.vtable.is_consumer_fn)(&*g.callbacks, name)
 }
 
-/// Call the consumer's monomorphize_type through the vtable.
+/// Call the consumer's monomorphize_type. Holds the global mutex for the entire call.
 pub(crate) fn call_monomorphize_type<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> MonomorphizeTypeResult<'tcx> {
-    let vtable = VTABLE.get().expect("vtable not installed");
-    let data = CALLBACKS.get().expect("callbacks not installed");
-    (vtable.monomorphize_type)(data.as_ref(), name, tcx, ty)
+    let mut g = GLOBALS.get().expect("globals not installed").lock().unwrap();
+    let func = g.vtable.monomorphize_type;
+    // Safety: we split the borrow — callbacks is immutable, consumer_state is mutable.
+    // Both live inside the MutexGuard which we hold for the entire call.
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*g.callbacks;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, ty)
 }
 
-/// Call the consumer's monomorphize_fn through the vtable.
+/// Call the consumer's monomorphize_fn. Holds the global mutex for the entire call.
 pub(crate) fn call_monomorphize_fn<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     instance: ty::Instance<'tcx>,
 ) -> MonomorphizeFnResult<'tcx> {
-    let vtable = VTABLE.get().expect("vtable not installed");
-    let data = CALLBACKS.get().expect("callbacks not installed");
-    (vtable.monomorphize_fn)(data.as_ref(), name, tcx, def_id, instance)
+    let mut g = GLOBALS.get().expect("globals not installed").lock().unwrap();
+    let func = g.vtable.monomorphize_fn;
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*g.callbacks;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, def_id, instance)
 }
 
-/// Call the consumer's after_rust_analysis through the vtable.
+/// Call the consumer's after_rust_analysis. Holds the global mutex for the entire call.
 pub(crate) fn call_after_rust_analysis<'tcx>(tcx: TyCtxt<'tcx>) {
-    let vtable = VTABLE.get().expect("vtable not installed");
-    let data = CALLBACKS.get().expect("callbacks not installed");
-    (vtable.after_rust_analysis)(data.as_ref(), tcx)
+    let mut g = GLOBALS.get().expect("globals not installed").lock().unwrap();
+    let func = g.vtable.after_rust_analysis;
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*g.callbacks;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
-/// Call the consumer's generate_and_compile through the vtable.
+/// Call the consumer's generate_and_compile. Holds the global mutex for the entire call.
 pub(crate) fn call_generate_and_compile<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Option<(PathBuf, Vec<String>)> {
-    let vtable = VTABLE.get().expect("vtable not installed");
-    let data = CALLBACKS.get().expect("callbacks not installed");
-    (vtable.generate_and_compile)(data.as_ref(), tcx)
+    let mut g = GLOBALS.get().expect("globals not installed").lock().unwrap();
+    let func = g.vtable.generate_and_compile;
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*g.callbacks;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
+}
+
+/// Read a saved default query provider.
+pub(crate) fn default_layout_of() -> queries::layout::LayoutOfFn {
+    GLOBALS.get().expect("globals not installed").lock().unwrap()
+        .default_layout_of.expect("default layout_of not saved")
+}
+
+pub(crate) fn default_mir_shims() -> queries::drop_glue::MirShimsFn {
+    GLOBALS.get().expect("globals not installed").lock().unwrap()
+        .default_mir_shims.expect("default mir_shims not saved")
+}
+
+pub(crate) fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
+    GLOBALS.get().expect("globals not installed").lock().unwrap()
+        .default_symbol_name.expect("default symbol_name not saved")
 }
 
 // Trampoline functions — monomorphized for a specific C, then stored as fn pointers.
 
+fn trampoline_is_consumer_type<C: LangCallbacks + 'static>(
+    data: &(dyn Any + Send + Sync),
+    name: &str,
+) -> bool {
+    data.downcast_ref::<C>().unwrap().is_consumer_type(name)
+}
+
+fn trampoline_is_consumer_fn<C: LangCallbacks + 'static>(
+    data: &(dyn Any + Send + Sync),
+    name: &str,
+) -> bool {
+    data.downcast_ref::<C>().unwrap().is_consumer_fn(name)
+}
+
 fn trampoline_monomorphize_type<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
+    state: &mut (dyn Any + Send + Sync),
     name: &str,
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> MonomorphizeTypeResult<'tcx> {
-    data.downcast_ref::<C>().unwrap().monomorphize_type(name, tcx, ty)
+    data.downcast_ref::<C>().unwrap().monomorphize_type(state, name, tcx, ty)
 }
 
 fn trampoline_monomorphize_fn<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
+    state: &mut (dyn Any + Send + Sync),
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     instance: ty::Instance<'tcx>,
 ) -> MonomorphizeFnResult<'tcx> {
-    data.downcast_ref::<C>().unwrap().monomorphize_fn(name, tcx, def_id, instance)
+    data.downcast_ref::<C>().unwrap().monomorphize_fn(state, name, tcx, def_id, instance)
 }
 
 fn trampoline_after_rust_analysis<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
+    state: &mut (dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
 ) {
-    data.downcast_ref::<C>().unwrap().after_rust_analysis(tcx)
+    data.downcast_ref::<C>().unwrap().after_rust_analysis(state, tcx)
 }
 
 fn trampoline_generate_and_compile<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
+    state: &mut (dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
 ) -> Option<(PathBuf, Vec<String>)> {
-    data.downcast_ref::<C>().unwrap().generate_and_compile(tcx)
+    data.downcast_ref::<C>().unwrap().generate_and_compile(state, tcx)
 }
 
-/// Install callbacks for use by query overrides.
-/// Called from run_compiler<C>() with the concrete consumer type.
+/// Install callbacks for use by query overrides. Phase 1 of globals init.
 pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     callbacks: C,
-    type_names: HashSet<String>,
-    fn_names: HashSet<String>,
 ) {
-    let _ = CALLBACKS.set(Box::new(callbacks));
-    let _ = VTABLE.set(CallbackVtable {
-        monomorphize_type: trampoline_monomorphize_type::<C>,
-        monomorphize_fn: trampoline_monomorphize_fn::<C>,
-        after_rust_analysis: trampoline_after_rust_analysis::<C>,
-        generate_and_compile: trampoline_generate_and_compile::<C>,
-    });
-    let _ = CONSUMER_TYPE_NAMES.set(type_names);
-    let _ = CONSUMER_FN_NAMES.set(fn_names);
+    let consumer_state = callbacks.create_state();
+    let _ = GLOBALS.set(std::sync::Mutex::new(FacadeGlobals {
+        callbacks: Box::new(callbacks),
+        consumer_state,
+        vtable: CallbackVtable {
+            is_consumer_type: trampoline_is_consumer_type::<C>,
+            is_consumer_fn: trampoline_is_consumer_fn::<C>,
+            monomorphize_type: trampoline_monomorphize_type::<C>,
+            monomorphize_fn: trampoline_monomorphize_fn::<C>,
+            after_rust_analysis: trampoline_after_rust_analysis::<C>,
+            generate_and_compile: trampoline_generate_and_compile::<C>,
+        },
+        default_layout_of: None,
+        default_mir_shims: None,
+        default_symbol_name: None,
+        lang_obj_path: None,
+    }));
+}
+
+/// Save the original query providers. Phase 2 of globals init.
+pub(crate) fn install_query_defaults(
+    layout_of: queries::layout::LayoutOfFn,
+    mir_shims: queries::drop_glue::MirShimsFn,
+    symbol_name: queries::symbol_name::SymbolNameFn,
+) {
+    let mut g = GLOBALS.get().expect("globals not installed").lock().unwrap();
+    g.default_layout_of = Some(layout_of);
+    g.default_mir_shims = Some(mir_shims);
+    g.default_symbol_name = Some(symbol_name);
 }

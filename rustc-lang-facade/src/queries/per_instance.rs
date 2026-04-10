@@ -95,49 +95,6 @@ fn is_consumer_accessor(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> b
     false
 }
 
-/// Compute the consumer symbol name for an accessor instance, including type args.
-/// E.g., "Pair.first" with args [i32, i64] → "__toylang_accessor_Pair_first__i32__i64"
-pub fn accessor_symbol_for_instance<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: Instance<'tcx>,
-    struct_name: &str,
-    field_name: &str,
-) -> String {
-    let mut sym = format!("__toylang_accessor_{}_{}", struct_name, field_name);
-    if !instance.args.is_empty() {
-        for arg in instance.args.iter() {
-            if let ty::GenericArgKind::Type(ty) = arg.unpack() {
-                sym.push_str(&format!("__{}", mangle_ty(tcx, ty)));
-            }
-        }
-    }
-    sym
-}
-
-fn mangle_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
-    match ty.kind() {
-        ty::TyKind::Int(int_ty) => format!("{}", int_ty.name_str()),
-        ty::TyKind::Uint(uint_ty) => format!("{}", uint_ty.name_str()),
-        ty::TyKind::Float(float_ty) => format!("{}", float_ty.name_str()),
-        ty::TyKind::Bool => "bool".to_string(),
-        ty::TyKind::Adt(adt_def, args) => {
-            let name = tcx.item_name(adt_def.did()).to_string();
-            if args.is_empty() {
-                name
-            } else {
-                let arg_strs: Vec<String> = args.iter()
-                    .filter_map(|a| match a.unpack() {
-                        ty::GenericArgKind::Type(t) => Some(mangle_ty(tcx, t)),
-                        _ => None,
-                    })
-                    .collect();
-                format!("{}_{}", name, arg_strs.join("_"))
-            }
-        }
-        _ => format!("{:?}", ty),
-    }
-}
-
 /// Build a MIR body that references Rust dependencies (so the monomorphization
 /// collector discovers them) and terminates with Abort (never executed).
 fn build_dependency_body<'tcx>(

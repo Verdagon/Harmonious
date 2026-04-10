@@ -11,6 +11,8 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    And,
+    Or,
 }
 
 /// A Toylang expression.
@@ -34,7 +36,11 @@ pub enum Expr {
     /// `a + b`, `x * 2`
     BinaryOp { op: BinOp, left: Box<Expr>, right: Box<Expr> },
     /// `if cond { ... } else { ... }` — expression (like Rust)
-    If { cond: Box<Expr>, then_body: Box<FnBody>, else_body: Option<Box<FnBody>> },
+    If { cond: Box<Expr>, then_body: Box<Block>, else_body: Option<Box<Block>> },
+    /// `-expr` — unary negation
+    UnaryNeg(Box<Expr>),
+    /// `&expr` — reference
+    Ref(Box<Expr>),
 }
 
 /// A Toylang statement.
@@ -42,12 +48,13 @@ pub enum Expr {
 pub enum Stmt {
     Let { name: String, expr: Expr },
     ExprStmt(Expr),
-    While { cond: Expr, body: Box<FnBody> },
+    While { cond: Expr, body: Box<Block> },
+    Assign { name: String, expr: Expr },
 }
 
 /// A parsed Toylang function body.
 #[derive(Clone, Debug)]
-pub struct FnBody {
+pub struct Block {
     pub stmts: Vec<Stmt>,
     pub ret: Option<Expr>, // trailing expression — becomes return value
 }

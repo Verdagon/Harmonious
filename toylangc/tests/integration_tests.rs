@@ -114,6 +114,54 @@ fn compile_and_run(
     String::from_utf8(run.stdout).unwrap()
 }
 
+/// Compile and run, returning (stdout, compiler_stderr).
+fn compile_and_run_with_env(
+    toylang_path: &Path,
+    rust_path: &Path,
+    bin_path: &Path,
+    env: &[(&str, &str)],
+) -> (String, String) {
+    let args = vec![
+        "--edition".to_string(), "2021".to_string(),
+        "--toylang-input".to_string(), toylang_path.to_str().unwrap().to_string(),
+        rust_path.to_str().unwrap().to_string(),
+        "-o".to_string(), bin_path.to_str().unwrap().to_string(),
+    ];
+
+    let mut cmd = Command::new(toylangc_bin());
+    cmd.env("DYLD_LIBRARY_PATH", sysroot_lib()).args(&args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let compile = cmd.output().expect("failed to run toylangc");
+
+    let compiler_stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+
+    if !compile.status.success() {
+        panic!(
+            "Compilation failed (exit {}):\nstdout: {}\nstderr: {}",
+            compile.status,
+            String::from_utf8_lossy(&compile.stdout),
+            compiler_stderr,
+        );
+    }
+
+    let run = Command::new(bin_path)
+        .output()
+        .expect("failed to run test binary");
+
+    if !run.status.success() {
+        panic!(
+            "Test binary failed (exit {}):\nstdout: {}\nstderr: {}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+
+    (String::from_utf8(run.stdout).unwrap(), compiler_stderr)
+}
+
 /// Path to the runtime.o for drop tests.
 fn runtime_obj() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -2249,4 +2297,781 @@ fn main() {
 }"#,
     );
     assert!(output.contains("ok"));
+}
+
+// ============================================================================
+// Phase 1: Mutable Assignment
+// ============================================================================
+
+#[test]
+fn test_assign_basic() {
+    let output = run_toylang_test(
+        r#"
+fn compute() -> i32 {
+    let x = 0;
+    x = 5;
+    x
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(compute(), 5); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_assign_in_while() {
+    let output = run_toylang_test(
+        r#"
+fn count_to(n: i32) -> i32 {
+    let i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    i
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(count_to(10), 10); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_assign_in_if() {
+    let output = run_toylang_test(
+        r#"
+fn pick(x: i32) -> i32 {
+    let result = 0;
+    if x > 0 {
+        result = 1;
+    }
+    result
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(pick(5), 1);
+    assert_eq!(pick(-1), 0);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_assign_in_while_with_if() {
+    let output = run_toylang_test(
+        r#"
+fn count_big_assign(n: i32) -> i32 {
+    let i = 0;
+    let count = 0;
+    while i < n {
+        if i > 2 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(count_big_assign(5), 2); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+// ============================================================================
+// Phase 2: else if
+// ============================================================================
+
+#[test]
+fn test_else_if_chain() {
+    let output = run_toylang_test(
+        r#"
+fn classify(x: i32) -> i32 {
+    if x > 0 {
+        1
+    } else if x < 0 {
+        2
+    } else {
+        0
+    }
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(classify(5), 1);
+    assert_eq!(classify(-3), 2);
+    assert_eq!(classify(0), 0);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_else_if_key_dispatch() {
+    let output = run_toylang_test(
+        r#"
+fn handle_key(key: i32) -> i32 {
+    let result = 0;
+    if key == 1 {
+        result = 10;
+    } else if key == 2 {
+        result = 20;
+    } else if key == 3 {
+        result = 30;
+    }
+    result
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(handle_key(1), 10);
+    assert_eq!(handle_key(2), 20);
+    assert_eq!(handle_key(3), 30);
+    assert_eq!(handle_key(99), 0);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+// ============================================================================
+// Phase 3: Boolean Operators (&&, ||)
+// ============================================================================
+
+#[test]
+fn test_and_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { true && true }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_and_false() {
+    let output = run_toylang_test(
+        "fn check() -> bool { true && false }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), false); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_or_true() {
+    let output = run_toylang_test(
+        "fn check() -> bool { false || true }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), true); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_or_false() {
+    let output = run_toylang_test(
+        "fn check() -> bool { false || false }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(check(), false); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_and_with_comparisons() {
+    let output = run_toylang_test(
+        r#"
+fn in_range(x: i32) -> bool {
+    x > 0 && x < 10
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(in_range(5), true);
+    assert_eq!(in_range(-1), false);
+    assert_eq!(in_range(15), false);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_or_with_comparisons() {
+    let output = run_toylang_test(
+        r#"
+fn out_of_range(x: i32) -> bool {
+    x < 0 || x > 10
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    assert_eq!(out_of_range(-5), true);
+    assert_eq!(out_of_range(15), true);
+    assert_eq!(out_of_range(5), false);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_compound_while_condition() {
+    let output = run_toylang_test(
+        r#"
+fn search(n: i32) -> i32 {
+    let i = 0;
+    let found = false;
+    while i < n && found == false {
+        if i == 5 {
+            found = true;
+        }
+        i = i + 1;
+    }
+    i
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(search(10), 6); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+// ============================================================================
+// Phase 4: Roguelike Integration Test
+// ============================================================================
+
+#[test]
+fn test_roguelike() {
+    let output = run_toylang_test(
+        r#"
+fn board_is_wall(row: i32, col: i32) -> bool
+fn get_move(i: i32) -> i32
+fn num_moves() -> i32
+fn print_int(x: i32)
+
+fn game() -> i32 {
+    let pr = 4;
+    let pc = 3;
+    let g1r = 1;
+    let g1c = 7;
+    let g2r = 3;
+    let g2c = 3;
+    let g3r = 6;
+    let g3c = 5;
+    let alive = 3;
+    let i = 0;
+    let nm = num_moves();
+    while i < nm {
+        let key = get_move(i);
+        let nr = pr;
+        let nc = pc;
+        if key == 0 {
+            nr = nr - 1;
+        } else if key == 1 {
+            nr = nr + 1;
+        } else if key == 2 {
+            nc = nc - 1;
+        } else if key == 3 {
+            nc = nc + 1;
+        }
+        if board_is_wall(nr, nc) == false {
+            pr = nr;
+            pc = nc;
+        }
+        if pr == g1r && pc == g1c {
+            g1r = -1;
+            g1c = -1;
+            alive = alive - 1;
+        }
+        if pr == g2r && pc == g2c {
+            g2r = -1;
+            g2c = -1;
+            alive = alive - 1;
+        }
+        if pr == g3r && pc == g3c {
+            g3r = -1;
+            g3c = -1;
+            alive = alive - 1;
+        }
+        i = i + 1;
+    }
+    print_int(pr);
+    print_int(pc);
+    print_int(alive);
+    alive
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+
+pub fn board_is_wall(row: i32, col: i32) -> bool {
+    row <= 0 || row >= 9 || col <= 0 || col >= 9
+}
+
+static MOVES: &[i32] = &[
+    0, 0, 0,
+    3, 3, 3, 3,
+    1, 1,
+];
+
+pub fn get_move(i: i32) -> i32 { MOVES[i as usize] }
+pub fn num_moves() -> i32 { MOVES.len() as i32 }
+pub fn print_int(x: i32) { println!("{}", x); }
+
+fn main() {
+    let alive = game();
+    assert_eq!(alive, 1);
+    println!("roguelike ok");
+}"#,
+    );
+    assert!(output.contains("roguelike ok"));
+}
+
+// ============================================================================
+// Tech debt fixes: precedence, assign type check, unary neg
+// ============================================================================
+
+#[test]
+fn test_and_higher_precedence_than_or() {
+    let output = run_toylang_test(
+        r#"
+fn check(a: bool, b: bool, c: bool) -> bool {
+    a || b && c
+}
+        "#,
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() {
+    // a || (b && c): true || (false && false) == true
+    assert_eq!(check(true, false, false), true);
+    // a || (b && c): false || (true && true) == true
+    assert_eq!(check(false, true, true), true);
+    // a || (b && c): false || (true && false) == false
+    assert_eq!(check(false, true, false), false);
+    println!("ok");
+}"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+#[test]
+fn test_negate_i64() {
+    let output = run_toylang_test(
+        "fn neg() -> i64 { -1i64 }",
+        r#"mod __lang_stubs; use __lang_stubs::*;
+fn main() { assert_eq!(neg(), -1i64); println!("ok"); }"#,
+    );
+    assert!(output.contains("ok"));
+}
+
+// ============================================================================
+// Deep monomorphization: internal toylang fns should not be exposed to rustc
+// ============================================================================
+
+/// Rust calls spork() which calls bork() (toylang-internal) which calls a Rust
+/// extern fn. Rustc should never see bork — the deep walk in per_instance_mir
+/// should discover the transitive Rust dep directly.
+///
+/// Currently FAILS because collect_toylang_fn_deps reports bork to rustc
+/// instead of recursively walking into it.
+#[test]
+fn test_internal_toylang_fn_not_monomorphized_by_rustc() {
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+    let log_path = dir.path().join("callback.log");
+
+    // bork is an internal toylang fn — only called by spork, never by Rust.
+    // Rustc should never need to monomorphize it.
+    std::fs::write(&toylang_path, r#"
+fn add_ten(x: i32) -> i32
+
+fn bork(x: i32) -> i32 {
+    add_ten(x)
+}
+
+fn spork(x: i32) -> i32 {
+    bork(x)
+}
+    "#).unwrap();
+
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs; use __lang_stubs::*;
+pub fn add_ten(x: i32) -> i32 { x + 10 }
+fn main() {
+    assert_eq!(spork(5), 15);
+    println!("ok");
+}
+    "#).unwrap();
+
+    let (output, _stderr) = compile_and_run_with_env(
+        &toylang_path,
+        &rust_path,
+        &bin_path,
+        &[("TOYLANG_LOG_PATH", log_path.to_str().unwrap())],
+    );
+    assert!(output.contains("ok"));
+
+    // Read the callback log and verify rustc never asked us to monomorphize bork.
+    let log = std::fs::read_to_string(&log_path).expect("callback log not written");
+    assert!(log.contains("MonomorphizeFn { name: \"spork\" }"),
+        "expected spork to be monomorphized, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"bork\" }"),
+        "bork should NOT be monomorphized by rustc — it's internal to toylang, log:\n{}", log);
+}
+
+/// Three-deep chain: Rust → a → b → c → Rust extern.
+/// Only `a` should be monomorphized by rustc. `b` and `c` are internal.
+#[test]
+fn test_deep_chain_only_entry_point_monomorphized() {
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+    let log_path = dir.path().join("callback.log");
+
+    std::fs::write(&toylang_path, r#"
+fn add_one(x: i32) -> i32
+
+fn c(x: i32) -> i32 {
+    add_one(x)
+}
+
+fn b(x: i32) -> i32 {
+    c(x)
+}
+
+fn a(x: i32) -> i32 {
+    b(x)
+}
+    "#).unwrap();
+
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs; use __lang_stubs::*;
+pub fn add_one(x: i32) -> i32 { x + 1 }
+fn main() {
+    assert_eq!(a(10), 11);
+    println!("ok");
+}
+    "#).unwrap();
+
+    let (output, _stderr) = compile_and_run_with_env(
+        &toylang_path, &rust_path, &bin_path,
+        &[("TOYLANG_LOG_PATH", log_path.to_str().unwrap())],
+    );
+    assert!(output.contains("ok"));
+
+    let log = std::fs::read_to_string(&log_path).expect("callback log not written");
+    assert!(log.contains("MonomorphizeFn { name: \"a\" }"),
+        "expected a to be monomorphized, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"b\" }"),
+        "b should NOT be monomorphized by rustc, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"c\" }"),
+        "c should NOT be monomorphized by rustc, log:\n{}", log);
+}
+
+/// Diamond call pattern: entry → left → bottom, entry → right → bottom.
+/// Only `entry` should be monomorphized by rustc. left, right, bottom are internal.
+#[test]
+fn test_diamond_call_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+    let log_path = dir.path().join("callback.log");
+
+    std::fs::write(&toylang_path, r#"
+fn add(x: i32, y: i32) -> i32
+
+fn bottom(x: i32) -> i32 {
+    add(x, 1)
+}
+
+fn left(x: i32) -> i32 {
+    bottom(x)
+}
+
+fn right(x: i32) -> i32 {
+    bottom(x)
+}
+
+fn entry(x: i32) -> i32 {
+    add(left(x), right(x))
+}
+    "#).unwrap();
+
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs; use __lang_stubs::*;
+pub fn add(x: i32, y: i32) -> i32 { x + y }
+fn main() {
+    assert_eq!(entry(5), 12);
+    println!("ok");
+}
+    "#).unwrap();
+
+    let (output, _stderr) = compile_and_run_with_env(
+        &toylang_path, &rust_path, &bin_path,
+        &[("TOYLANG_LOG_PATH", log_path.to_str().unwrap())],
+    );
+    assert!(output.contains("ok"));
+
+    let log = std::fs::read_to_string(&log_path).expect("callback log not written");
+    assert!(log.contains("MonomorphizeFn { name: \"entry\" }"),
+        "expected entry to be monomorphized, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"left\" }"),
+        "left should NOT be monomorphized by rustc, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"right\" }"),
+        "right should NOT be monomorphized by rustc, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"bottom\" }"),
+        "bottom should NOT be monomorphized by rustc, log:\n{}", log);
+}
+
+/// Generic deep walk: entry<i32> → helper<i32> → Rust extern.
+/// Only entry should be monomorphized by rustc. helper is internal.
+#[test]
+fn test_generic_deep_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+    let log_path = dir.path().join("callback.log");
+
+    std::fs::write(&toylang_path, r#"
+fn identity(x: i32) -> i32
+
+fn helper<T>(x: T) -> T {
+    x
+}
+
+fn entry(x: i32) -> i32 {
+    let y = helper<i32>(x);
+    identity(y)
+}
+    "#).unwrap();
+
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs; use __lang_stubs::*;
+pub fn identity(x: i32) -> i32 { x }
+fn main() {
+    assert_eq!(entry(42), 42);
+    println!("ok");
+}
+    "#).unwrap();
+
+    let (output, _stderr) = compile_and_run_with_env(
+        &toylang_path, &rust_path, &bin_path,
+        &[("TOYLANG_LOG_PATH", log_path.to_str().unwrap())],
+    );
+    assert!(output.contains("ok"));
+
+    let log = std::fs::read_to_string(&log_path).expect("callback log not written");
+    assert!(log.contains("MonomorphizeFn { name: \"entry\" }"),
+        "expected entry to be monomorphized, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"helper\" }"),
+        "helper should NOT be monomorphized by rustc, log:\n{}", log);
+}
+
+/// Two Rust entry points calling the same internal function.
+/// Both entry points should be monomorphized, but the shared internal fn should not.
+#[test]
+fn test_two_entry_points_shared_internal() {
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+    let log_path = dir.path().join("callback.log");
+
+    std::fs::write(&toylang_path, r#"
+fn double(x: i32) -> i32
+
+fn internal_helper(x: i32) -> i32 {
+    double(x)
+}
+
+fn entry_a(x: i32) -> i32 {
+    internal_helper(x)
+}
+
+fn entry_b(x: i32) -> i32 {
+    internal_helper(x)
+}
+    "#).unwrap();
+
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs; use __lang_stubs::*;
+pub fn double(x: i32) -> i32 { x * 2 }
+fn main() {
+    assert_eq!(entry_a(5), 10);
+    assert_eq!(entry_b(7), 14);
+    println!("ok");
+}
+    "#).unwrap();
+
+    let (output, _stderr) = compile_and_run_with_env(
+        &toylang_path, &rust_path, &bin_path,
+        &[("TOYLANG_LOG_PATH", log_path.to_str().unwrap())],
+    );
+    assert!(output.contains("ok"));
+
+    let log = std::fs::read_to_string(&log_path).expect("callback log not written");
+    assert!(log.contains("MonomorphizeFn { name: \"entry_a\" }"),
+        "expected entry_a to be monomorphized, log:\n{}", log);
+    assert!(log.contains("MonomorphizeFn { name: \"entry_b\" }"),
+        "expected entry_b to be monomorphized, log:\n{}", log);
+    assert!(!log.contains("MonomorphizeFn { name: \"internal_helper\" }"),
+        "internal_helper should NOT be monomorphized by rustc, log:\n{}", log);
+}
+
+// ============================================================================
+// Group: Trait static calls (Trait::method(receiver, args))
+// ============================================================================
+
+#[test]
+fn test_trait_static_call_inherent_still_works() {
+    // Verify that inherent StaticCall (Vec::new) still works after trait support was added
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+
+fn get_len() -> usize {
+    let v = Vec::new<i32, Global>();
+    v.push(42);
+    v.len()
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { println!("{}", get_len()); }
+        "#,
+    );
+    assert!(output.contains("1"));
+}
+
+#[test]
+fn test_trait_static_call_clone_vec() {
+    // Call Clone::clone(&v) on a Vec — trait method via explicit qualification.
+    // Tests sret return + @TCHAPZ null pointer fix for #[track_caller].
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+use std::clone::Clone
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(10);
+    v.push(20);
+    Clone::clone(&v);
+    println_usize(v.len())
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+pub fn println_usize(x: usize) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("2"));
+}
+
+#[test]
+fn test_trait_static_call_clone_vec_use_result() {
+    // Clone a Vec and verify the cloned Vec has the correct length
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+use std::clone::Clone
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    let v2 = Clone::clone(&v);
+    println_usize(v2.len())
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+pub fn println_usize(x: usize) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("3"));
+}
+
+#[test]
+fn test_trait_static_call_result_discarded() {
+    // Clone::clone as ExprStmt — result is discarded
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+use std::clone::Clone
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(1);
+    Clone::clone(&v);
+    println_usize(v.len())
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+pub fn println_usize(x: usize) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("1"));
+}
+
+#[test]
+fn test_ref_expr_basic() {
+    // &var produces a reference — used as argument to trait method
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+use std::clone::Clone
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(42);
+    let r = &v;
+    let v2 = Clone::clone(r);
+    println_usize(v2.len())
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+pub fn println_usize(x: usize) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("1"));
 }

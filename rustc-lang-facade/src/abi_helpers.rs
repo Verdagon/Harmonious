@@ -104,6 +104,10 @@ pub enum CoercedParam {
 /// Returns one `CoercedParam` per declared parameter (NOT including sret).
 /// The consumer's extern wrapper uses this to build a signature matching Rust's ABI,
 /// then converts each param to the internal function's expected type.
+///
+/// Per @TCHAPZ, for `#[track_caller]` functions this includes a hidden
+/// `&Location` pointer as the last entry. Callers must detect this via
+/// `instance.def.requires_caller_location(tcx)` and pass null at call sites.
 pub fn coerced_param_types_for_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
