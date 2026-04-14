@@ -3134,3 +3134,230 @@ fn main() { __toylang_main(); }
     assert!(!compile.status.success(),
         "compilation should have failed for undefined function, but succeeded");
 }
+
+#[test]
+fn test_byte_string_let_binding() {
+    // Verify b"hello" compiles and the program runs without crashing.
+    let output = run_toylang_test(
+        r#"
+fn main() -> i32 {
+    let x = b"hello";
+    42i32
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { let code = __toylang_main(); println!("{}", code); }
+        "#,
+    );
+    assert_eq!(output.trim(), "42");
+}
+
+#[test]
+fn test_byte_string_passed_to_rust_fn() {
+    // Critical ScalarPair ABI test: pass b"hello" (a fat pointer { ptr, len })
+    // to a Rust function taking &[u8]. If the ABI is wrong (struct vs two scalars),
+    // this will segfault or return garbage.
+    let output = run_toylang_test(
+        r#"
+fn check_bytes(data: &[u8]) -> i32
+
+fn main() -> i32 {
+    check_bytes(b"hello")
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+#[no_mangle]
+pub fn check_bytes(data: &[u8]) -> i32 {
+    data.len() as i32
+}
+
+fn main() { let code = __toylang_main(); println!("{}", code); }
+        "#,
+    );
+    assert_eq!(output.trim(), "5");
+}
+
+// ── Phase 4: I/O integration ────────────────────────────────────────
+
+#[test]
+fn test_stdout_call() {
+    // Verify stdout() alone compiles — isolates free-function-returning-struct
+    // from trait call machinery.
+    let output = run_toylang_test(
+        r#"
+use std::io::stdout
+use std::io::Stdout
+
+fn println_i32(x: i32)
+
+fn main() {
+    let out = stdout();
+    println_i32(42i32)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_stdout_write_all() {
+    // Full I/O: Write::write_all(&stdout(), b"hello from toylang\n")
+    let output = run_toylang_test(
+        r#"
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn println_i32(x: i32)
+
+fn main() {
+    let out = stdout();
+    Write::write_all(&out, b"hello from toylang\n");
+    println_i32(0i32)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("hello from toylang"));
+}
+
+#[test]
+fn test_stdout_multiple_writes() {
+    // Multiple Write::write_all calls
+    let output = run_toylang_test(
+        r#"
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn println_i32(x: i32)
+
+fn main() {
+    let out = stdout();
+    Write::write_all(&out, b"aaa\n");
+    Write::write_all(&out, b"bbb\n");
+    println_i32(0i32)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("aaa"));
+    assert!(output.contains("bbb"));
+}
+
+#[test]
+fn test_write_all_result_bound() {
+    // Bind write_all's Result<(), Error> return value to a variable.
+    // Exercises rustc_ty_to_resolved_type on Result and its nested types.
+    let output = run_toylang_test(
+        r#"
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+use std::result::Result
+use std::io::Error
+
+fn println_i32(x: i32)
+
+fn main() {
+    let out = stdout();
+    let r = Write::write_all(&out, b"hello\n");
+    println_i32(42i32)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("hello"));
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_vec_pop_returns_option() {
+    // Vec::pop() returns Option<T> — exercises rustc_ty_to_resolved_type on
+    // Option (Adt with type arg). Binding the result exercises the full
+    // type conversion chain including the i32 type arg inside Option.
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+use std::option::Option
+
+fn println_i32(x: i32)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(99);
+    let popped = v.pop();
+    println_i32(42i32)
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_rust_fn_returning_option_u8() {
+    // A Rust function returning Option<u8> exercises rustc_ty_to_resolved_type
+    // on TyKind::Uint(U8) inside the Option's type args.
+    let output = run_toylang_test(
+        r#"
+use std::option::Option
+
+fn get_byte() -> Option<u8>
+fn println_i32(x: i32)
+
+fn main() {
+    let b = get_byte();
+    println_i32(42i32)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn get_byte() -> Option<u8> { Some(7) }
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("42"));
+}

@@ -29,6 +29,8 @@ pub type MirShimsFn = for<'tcx> fn(TyCtxt<'tcx>, ty::InstanceKind<'tcx>) -> Body
 ///
 /// Intercepts `InstanceKind::DropGlue(_, Some(ty))` where `ty` is a consumer
 /// type. Generates a MIR body that calls `__toylang_drop_TypeName(ptr)`.
+///
+/// Per @GCMLZ, only reads CONFIG and DEFAULT_MIR_SHIMS (no mutex lock).
 pub fn toy_mir_shims<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::InstanceKind<'tcx>,
@@ -39,6 +41,7 @@ pub fn toy_mir_shims<'tcx>(
             return crate::mir_helpers::build_drop_call_body(tcx, def_id, ty, &struct_name);
         }
     }
+    // Per @GCMLZ, default_mir_shims() reads from OnceLock (no mutex lock).
     let default = crate::default_mir_shims();
     default(tcx, instance)
 }

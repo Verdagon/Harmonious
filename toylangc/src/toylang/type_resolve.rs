@@ -187,6 +187,7 @@ pub fn substitute_type_params_in_body(
             Expr::IntLit(n, ty) => Expr::IntLit(*n, super::type_resolve::substitute_type_params(ty, subst)),
             Expr::BoolLit(b) => Expr::BoolLit(*b),
             Expr::StringLit(s) => Expr::StringLit(s.clone()),
+            Expr::ByteStringLit(b) => Expr::ByteStringLit(b.clone()),
             Expr::Var(name) => Expr::Var(name.clone()),
             Expr::StructLit { name, type_args, fields } => Expr::StructLit {
                 name: name.clone(),
@@ -283,6 +284,11 @@ fn resolve_expr(
         Expr::StringLit(s) => Ok(TypedExpr {
             kind: TypedExprKind::StringLit(s.clone()),
             ty: ResolvedType::Str,
+        }),
+
+        Expr::ByteStringLit(bytes) => Ok(TypedExpr {
+            kind: TypedExprKind::ByteStringLit(bytes.clone()),
+            ty: ResolvedType::Ref { inner: Box::new(ResolvedType::ByteSlice) },
         }),
 
         Expr::Var(name) => {
@@ -1655,5 +1661,23 @@ mod tests {
         let Err(TypeResolveError::UndefinedVariable { name }) = result
             else { panic!("expected UndefinedVariable error") };
         assert_eq!(name, "x");
+    }
+
+    #[test]
+    fn test_resolve_byte_string_lit() {
+        let reg = make_registry();
+        let func = ToyFunction {
+            type_params: vec![],
+            params: vec![],
+            return_ty: Some(ResolvedType::Ref { inner: Box::new(ResolvedType::ByteSlice) }),
+            body: Some(Block {
+                stmts: vec![],
+                ret: Some(Expr::ByteStringLit(vec![104, 101, 108, 108, 111])),
+            }),
+        };
+        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types).unwrap();
+        let ret = typed.ret.unwrap();
+        assert!(matches!(ret.kind, TypedExprKind::ByteStringLit(ref b) if b == &[104, 101, 108, 108, 111]));
+        assert_eq!(ret.ty, ResolvedType::Ref { inner: Box::new(ResolvedType::ByteSlice) });
     }
 }

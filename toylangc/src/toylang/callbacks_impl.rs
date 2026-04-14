@@ -648,7 +648,7 @@ fn walk_typed_expr_for_deps(
         TypedExprKind::Ref(inner) => {
             walk_typed_expr_for_deps(inner, fn_calls, rust_method_deps);
         }
-        _ => {} // IntLit, BoolLit, Var, StringLit — no children
+        _ => {} // IntLit, BoolLit, Var, StringLit, ByteStringLit — no children
     }
 }
 

@@ -22,6 +22,7 @@ pub enum Expr {
     IntLit(i64, crate::toylang::typed_ast::ResolvedType),
     BoolLit(bool),
     StringLit(String),
+    ByteStringLit(Vec<u8>),
     Var(String),
     /// `Vec::new<Point>()` — IDENT "::" IDENT "<" type_args ">" "(" args ")"
     StaticCall { ty: String, method: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, args: Vec<Expr> },

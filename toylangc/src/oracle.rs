@@ -28,15 +28,22 @@ pub fn find_local_struct_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
 }
 
 /// Search local module children for a `pub use` re-export matching `name`.
+/// Matches Struct and Enum (e.g., Option, Result are enums, not structs).
 fn find_reexported_type(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
     use rustc_hir::def::Res;
+    fn is_type_def<Id>(res: &Res<Id>) -> Option<DefId> {
+        match res {
+            Res::Def(DefKind::Struct, id) | Res::Def(DefKind::Enum, id) => Some(*id),
+            _ => None,
+        }
+    }
     // module_children_local works for local modules
     for local_def_id in tcx.hir_crate_items(()).definitions() {
         if tcx.def_kind(local_def_id.to_def_id()) != DefKind::Mod { continue; }
         for child in tcx.module_children_local(local_def_id) {
             if child.ident.as_str() == name {
-                if let Res::Def(DefKind::Struct, target_def_id) = child.res {
-                    return Some(target_def_id);
+                if let Some(def_id) = is_type_def(&child.res) {
+                    return Some(def_id);
                 }
             }
         }
@@ -44,8 +51,8 @@ fn find_reexported_type(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
     // Also check the crate root
     for child in tcx.module_children_local(rustc_hir::def_id::CRATE_DEF_ID) {
         if child.ident.as_str() == name {
-            if let Res::Def(DefKind::Struct, target_def_id) = child.res {
-                return Some(target_def_id);
+            if let Some(def_id) = is_type_def(&child.res) {
+                return Some(def_id);
             }
         }
     }
@@ -88,6 +95,19 @@ pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::
             ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
         }
         ResolvedType::RustType { name, type_args } => {
+            // Primitive types that appear as type args in Rust generics
+            // (e.g., Option<u8>) are mapped to RustType by rustc_ty_to_resolved_type.
+            // Convert them back to rustc primitives here.
+            match name.as_str() {
+                "u8" => return tcx.types.u8,
+                "u16" => return tcx.types.u16,
+                "u32" => return tcx.types.u32,
+                "u64" => return tcx.types.u64,
+                "i8" => return ty::Ty::new_int(tcx, ty::IntTy::I8),
+                "i16" => return ty::Ty::new_int(tcx, ty::IntTy::I16),
+                "f32" => return ty::Ty::new_float(tcx, ty::FloatTy::F32),
+                _ => {}
+            }
             let def_id = find_rust_type_def_id(tcx, name)
                 .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
             let adt_def = tcx.adt_def(def_id);
@@ -101,6 +121,7 @@ pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::
             ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty)
         }
         ResolvedType::Str => panic!("Str type should not need rustc Ty conversion"),
+        ResolvedType::ByteSlice => ty::Ty::new_slice(tcx, tcx.types.u8),
         ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before rustc Ty conversion", name),
     }
 }
@@ -113,15 +134,17 @@ pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> c
         TyKind::Int(int_ty) => match int_ty {
             ty::IntTy::I32 => ResolvedType::I32,
             ty::IntTy::I64 => ResolvedType::I64,
-            other => panic!("unsupported int type {:?}", other),
+            // Unsupported as toylang primitives but may appear as type args in
+            // Rust generic types (e.g., HashMap<i8, ...>). Map to opaque RustType.
+            other => ResolvedType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
         },
         TyKind::Uint(uint_ty) => match uint_ty {
             ty::UintTy::Usize => ResolvedType::Usize,
-            other => panic!("unsupported uint type {:?}", other),
+            other => ResolvedType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
         },
         TyKind::Float(float_ty) => match float_ty {
             ty::FloatTy::F64 => ResolvedType::F64,
-            other => panic!("unsupported float type {:?}", other),
+            other => ResolvedType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
         },
         TyKind::Bool => ResolvedType::Bool,
         TyKind::Tuple(tys) if tys.is_empty() => ResolvedType::Void,
@@ -143,6 +166,27 @@ pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> c
                 ResolvedType::RustType { name, type_args }
             }
         }
+        TyKind::Slice(elem_ty) => {
+            if matches!(elem_ty.kind(), TyKind::Uint(ty::UintTy::U8)) {
+                ResolvedType::ByteSlice
+            } else {
+                panic!("rustc_ty_to_resolved_type: unsupported slice element type {:?}", elem_ty)
+            }
+        }
+        // Types that may appear as type args in Rust generic types (e.g., inside
+        // Result<(), Error> or HashMap internals). Toylang never inspects these —
+        // they pass through as opaque RustType values.
+        TyKind::Str => ResolvedType::RustType { name: "str".to_string(), type_args: vec![] },
+        TyKind::Never => ResolvedType::RustType { name: "never".to_string(), type_args: vec![] },
+        TyKind::RawPtr(inner, _) => ResolvedType::RustType {
+            name: "raw_ptr".to_string(),
+            type_args: vec![rustc_ty_to_resolved_type(tcx, *inner)],
+        },
+        TyKind::Dynamic(..) => ResolvedType::RustType { name: "dyn_trait".to_string(), type_args: vec![] },
+        TyKind::Tuple(tys) => ResolvedType::RustType {
+            name: "tuple".to_string(),
+            type_args: tys.iter().map(|t| rustc_ty_to_resolved_type(tcx, t)).collect(),
+        },
         _ => panic!("rustc_ty_to_resolved_type: unsupported type {:?}", ty),
     }
 }
@@ -170,6 +214,7 @@ pub fn resolved_type_to_mangled_name(ty: &crate::toylang::typed_ast::ResolvedTyp
         ResolvedType::Ref { inner } => format!("ref_{}", resolved_type_to_mangled_name(inner)),
         ResolvedType::TypeParam(name) => panic!("resolved_type_to_mangled_name: unresolved TypeParam '{}' during mangling", name),
         ResolvedType::Str => "str".to_string(),
+        ResolvedType::ByteSlice => "byte_slice".to_string(),
     }
 }
 

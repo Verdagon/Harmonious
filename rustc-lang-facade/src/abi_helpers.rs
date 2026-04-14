@@ -19,8 +19,9 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_target::callconv::{CastTarget, PassMode};
 
 /// Describes how a function's return value should be represented in LLVM IR.
+/// Per @ACRTFDZ, the consumer must use this coerced type (not its own type
+/// representation) when declaring LLVM functions that call Rust code.
 ///
-/// The consumer's LLVM backend uses this to decide how to emit the `ret` instruction:
 /// - `Direct("i64")` → the struct is returned as a scalar, use alloca+store+load pattern
 /// - `Indirect` → the caller provides an sret pointer, return via pointer write
 /// - `Void` → no return value
@@ -52,6 +53,9 @@ pub fn coerced_return_type<'tcx>(
     coerced_return_type_for_instance(tcx, instance)
 }
 
+/// Query rustc for the ABI-coerced return type of a function instance.
+/// Per @ACRTFDZ, callers must use this result (not the source-level type)
+/// when declaring LLVM functions.
 pub fn coerced_return_type_for_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
@@ -93,6 +97,9 @@ pub enum CoercedParam {
     /// Passed as the given LLVM type string (e.g. "i64" for a coerced struct,
     /// "i32" for a scalar). The consumer must convert to the internal type if different.
     Direct(String),
+    /// ScalarPair — two values passed in separate registers (e.g. ptr + len for &[u8]).
+    /// Rustc emits these as two separate LLVM function parameters, not one struct.
+    Pair(String, String),
     /// Passed by pointer (large structs, or byval on 32-bit x86).
     Indirect,
     /// ZST — not present in the LLVM signature.
@@ -130,11 +137,12 @@ pub fn coerced_param_types_for_instance<'tcx>(
                 CoercedParam::Direct(format!("i{}", arg.layout.size.bits()))
             }
             PassMode::Pair(_, _) => {
-                // ScalarPair — two values passed in registers.
+                // ScalarPair — two values passed in separate registers.
+                // Rustc emits these as two separate LLVM params, not one struct.
                 if let rustc_abi::BackendRepr::ScalarPair(s1, s2) = arg.layout.backend_repr {
                     let a_str = primitive_to_llvm_str(s1.primitive());
                     let b_str = primitive_to_llvm_str(s2.primitive());
-                    CoercedParam::Direct(format!("{{ {}, {} }}", a_str, b_str))
+                    CoercedParam::Pair(a_str, b_str)
                 } else {
                     CoercedParam::Direct(format!("i{}", arg.layout.size.bits()))
                 }

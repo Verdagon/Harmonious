@@ -34,8 +34,7 @@ use std::path::PathBuf;
 /// Called from `LangCodegenBackend::codegen_crate` after the consumer's
 /// `generate_and_compile` callback returns.
 pub fn set_lang_compiled_object(obj_path: PathBuf, _rust_symbols: Vec<String>) {
-    let mut g = crate::GLOBALS.get().expect("globals not installed").lock().unwrap();
-    g.lang_obj_path = Some(obj_path);
+    crate::set_lang_obj_path(obj_path);
 }
 
 /// Thin wrapper around `LlvmCodegenBackend` that injects the consumer's .o file
@@ -76,15 +75,15 @@ impl CodegenBackend for LangCodegenBackend {
         metadata: rustc_metadata::EncodedMetadata,
         need_metadata_module: bool,
     ) -> Box<dyn Any> {
-        // The inner codegen_crate runs monomorphization as its first step
-        // (collect_and_partition_mono_items), then compiles Rust code to LLVM.
-        // Our monomorphize_fn/monomorphize_type callbacks fire during this.
+        // Phase 1: inner.codegen_crate runs monomorphization (collect_and_partition_mono_items)
+        // then compiles Rust code to LLVM. Our monomorphize_fn/monomorphize_type callbacks
+        // fire during this phase. Query providers (symbol_name, layout_of, etc.) also fire
+        // here — their results get cached in rustc's query system.
         let result = self.inner.codegen_crate(tcx, metadata, need_metadata_module);
 
-        // NOW monomorphization is complete. The consumer has stashed all
-        // monomorphized function bodies during monomorphize_fn callbacks.
-        // Call generate_and_compile so the consumer can compile its .o file
-        // with full tcx access (mangled symbol names, ABI queries, etc.).
+        // Phase 2: generate_and_compile. Per @GCMLZ, this locks MUTABLE_STATE for the
+        // entire duration. Query providers triggered during codegen read only from
+        // CONFIG and DEFAULT_* OnceLocks, avoiding deadlock.
         if let Some((obj_path, rust_symbols)) = crate::call_generate_and_compile(tcx) {
             set_lang_compiled_object(obj_path, rust_symbols);
         }
@@ -106,8 +105,7 @@ impl CodegenBackend for LangCodegenBackend {
         // Inject Toylang's compiled object as an additional module.
         // Fat LTO will merge this with the Rust modules.
         // Add Toylang's compiled object as an additional module.
-        let obj_path = crate::GLOBALS.get()
-            .and_then(|g| g.lock().unwrap().lang_obj_path.clone());
+        let obj_path = crate::get_lang_obj_path();
         if let Some(ref obj_path) = obj_path {
             eprintln!("[toylang] injecting module: {}", obj_path.display());
             results.modules.push(CompiledModule {

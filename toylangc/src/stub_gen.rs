@@ -34,6 +34,7 @@ fn resolved_type_to_syn(ty: &ResolvedType) -> syn::Type {
             parse_quote!(&#inner_ty)
         }
         ResolvedType::Str => parse_quote!(&str),
+        ResolvedType::ByteSlice => parse_quote!([u8]),
     }
 }
 

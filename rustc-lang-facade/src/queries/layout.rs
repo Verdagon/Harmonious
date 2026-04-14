@@ -38,6 +38,11 @@ pub type LayoutOfFn = for<'tcx> fn(
 
 /// The layout_of override. Intercepts consumer-defined types, falls through
 /// to rustc's default for everything else.
+///
+/// Per @GCMLZ, may fire during generate_and_compile. For non-consumer types,
+/// only reads CONFIG and DEFAULT_LAYOUT_OF (no lock). For consumer types,
+/// calls call_monomorphize_type (locks MUTABLE_STATE), but those are always
+/// cached from inner.codegen_crate.
 pub fn toy_layout_of<'tcx>(
     tcx: TyCtxt<'tcx>,
     query: PseudoCanonicalInput<'tcx, Ty<'tcx>>,
@@ -63,7 +68,7 @@ pub fn toy_layout_of<'tcx>(
         }
     }
 
-    // Fall through to rustc's default provider.
+    // Per @GCMLZ, default_layout_of() reads from OnceLock (no mutex lock).
     let default = crate::default_layout_of();
     default(tcx, query)
 }

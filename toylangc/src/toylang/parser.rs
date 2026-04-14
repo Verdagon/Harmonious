@@ -21,6 +21,8 @@ pub enum ParseError {
     DuplicateStruct { name: String },
     DuplicateFunction { name: String },
     ReservedName { name: String },
+    UnknownEscape { ch: char },
+    UnterminatedString,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,8 +58,11 @@ enum Token {
     Equals,    // =
     AmpAmp,    // &&
     PipePipe,  // ||
+    LBracket,  // [
+    RBracket,  // ]
     IntLit(i64, ResolvedType),
     StringLit(String),
+    ByteStringLit(Vec<u8>),
     Eof,
 }
 
@@ -141,6 +146,31 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
             continue;
         }
 
+        // Byte string literals: b"hello"
+        if chars[i] == 'b' && i + 1 < chars.len() && chars[i + 1] == '"' {
+            i += 2; // skip b"
+            let mut bytes = Vec::new();
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    match chars[i + 1] {
+                        'n' => { bytes.push(b'\n'); i += 2; }
+                        't' => { bytes.push(b'\t'); i += 2; }
+                        '\\' => { bytes.push(b'\\'); i += 2; }
+                        '0' => { bytes.push(0); i += 2; }
+                        '"' => { bytes.push(b'"'); i += 2; }
+                        ch => return Err(ParseError::UnknownEscape { ch }),
+                    }
+                } else {
+                    bytes.push(chars[i] as u8);
+                    i += 1;
+                }
+            }
+            if i >= chars.len() { return Err(ParseError::UnterminatedString); }
+            i += 1; // skip closing "
+            tokens.push(Token::ByteStringLit(bytes));
+            continue;
+        }
+
         // String literals
         if chars[i] == '"' {
             i += 1; // skip opening quote
@@ -214,6 +244,8 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
             '+' => { tokens.push(Token::Plus); i += 1; }
             '/' => { tokens.push(Token::Slash); i += 1; }
             '.' => { tokens.push(Token::Dot); i += 1; }
+            '[' => { tokens.push(Token::LBracket); i += 1; }
+            ']' => { tokens.push(Token::RBracket); i += 1; }
             ';' => { tokens.push(Token::Semicolon); i += 1; }
             '=' => { tokens.push(Token::Equals); i += 1; }
             c if c.is_alphabetic() || c == '_' => {
@@ -593,6 +625,11 @@ impl Parser {
                 self.consume();
                 Ok(Expr::StringLit(s))
             }
+            Token::ByteStringLit(bytes) => {
+                let bytes = bytes.clone();
+                self.consume();
+                Ok(Expr::ByteStringLit(bytes))
+            }
             Token::IntLit(n, ty) => {
                 let n = n;
                 let ty = ty.clone();
@@ -762,6 +799,16 @@ impl Parser {
                 let inner = self.parse_type(type_params, struct_names)?;
                 Ok(ResolvedType::Ref { inner: Box::new(inner) })
             }
+            Token::LBracket => {
+                // [u8] → ByteSlice
+                self.consume();
+                let elem = self.expect_ident()?;
+                if elem != "u8" {
+                    return Err(ParseError::ExpectedType { got: format!("[{}]", elem) });
+                }
+                self.expect(Token::RBracket)?;
+                Ok(ResolvedType::ByteSlice)
+            }
             Token::Ident(s) => {
                 let s = s.clone();
                 self.consume();
@@ -889,5 +936,42 @@ mod tests {
         let result = parse("fn __toylang_main() -> i32 { 0 }");
         let Err(ParseError::ReservedName { name }) = result else { panic!("expected ReservedName") };
         assert_eq!(name, "__toylang_main");
+    }
+
+    #[test]
+    fn test_lex_byte_string() {
+        let tokens = tokenize(r#"b"hello""#).unwrap();
+        assert_eq!(tokens[0], Token::ByteStringLit(vec![104, 101, 108, 108, 111]));
+    }
+
+    #[test]
+    fn test_lex_byte_string_escapes() {
+        let tokens = tokenize(r#"b"hello\n\t\0""#).unwrap();
+        assert_eq!(tokens[0], Token::ByteStringLit(vec![104, 101, 108, 108, 111, b'\n', b'\t', 0]));
+    }
+
+    #[test]
+    fn test_lex_byte_string_escaped_quote() {
+        let tokens = tokenize(r#"b"say \"hi\"""#).unwrap();
+        assert_eq!(tokens[0], Token::ByteStringLit(vec![115, 97, 121, 32, b'"', 104, 105, b'"']));
+    }
+
+    #[test]
+    fn test_lex_byte_string_empty() {
+        let tokens = tokenize(r#"b"""#).unwrap();
+        assert_eq!(tokens[0], Token::ByteStringLit(vec![]));
+    }
+
+    #[test]
+    fn test_lex_byte_string_unterminated() {
+        let result = tokenize("b\"hello");
+        assert!(matches!(result, Err(ParseError::UnterminatedString)));
+    }
+
+    #[test]
+    fn test_lex_byte_string_unknown_escape() {
+        let result = tokenize(r#"b"\q""#);
+        let Err(ParseError::UnknownEscape { ch }) = result else { panic!("expected UnknownEscape") };
+        assert_eq!(ch, 'q');
     }
 }

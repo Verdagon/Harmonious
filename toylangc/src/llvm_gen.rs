@@ -67,6 +67,8 @@ struct RustMethodInfo<'ctx> {
     /// Per @TCHAPZ, #[track_caller] functions have a hidden &Location parameter
     /// that we must pass as null at every call site.
     has_track_caller: bool,
+    /// ABI-coerced parameter types, used at call sites to detect ScalarPair splitting.
+    coerced_params: Vec<rustc_lang_facade::abi_helpers::CoercedParam>,
 }
 
 impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
@@ -130,6 +132,13 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             }
             ResolvedType::RustType { .. } => self.rust_ty_to_llvm_opaque(ty).0,
             ResolvedType::Str => self.context.ptr_type(AddressSpace::default()).into(),
+            ResolvedType::ByteSlice => panic!("bare ByteSlice should not appear without Ref wrapper"),
+            ResolvedType::Ref { inner } if matches!(inner.as_ref(), ResolvedType::ByteSlice) => {
+                // &[u8] is a fat pointer: { ptr, i64 } (pointer + length)
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let len_ty = self.context.i64_type();
+                self.context.struct_type(&[ptr_ty.into(), len_ty.into()], false).into()
+            }
             ResolvedType::Ref { inner: _ } => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
@@ -362,6 +371,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         let coerced_ret = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(self.tcx, instance);
         let coerced_params = rustc_lang_facade::abi_helpers::coerced_param_types_for_instance(self.tcx, instance);
 
+
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
 
         // Build param types from ABI
@@ -376,13 +386,18 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 rustc_lang_facade::abi_helpers::CoercedParam::Direct(ty_str) => {
                     param_types.push(parse_coerced_type(self, ty_str).into());
                 }
+                rustc_lang_facade::abi_helpers::CoercedParam::Pair(a_str, b_str) => {
+                    param_types.push(parse_coerced_type(self, a_str).into());
+                    param_types.push(parse_coerced_type(self, b_str).into());
+                }
                 rustc_lang_facade::abi_helpers::CoercedParam::Indirect => {
                     param_types.push(ptr_ty.into());
                 }
             }
         }
 
-        // Build return type from ABI
+        // Per @ACRTFDZ, must use parse_coerced_type (the ABI type), not
+        // resolved_to_inkwell (the toylang type).
         let ret_type: Option<BasicTypeEnum<'ctx>> = match &coerced_ret {
             rustc_lang_facade::abi_helpers::CoercedReturn::Direct(s) => {
                 Some(parse_coerced_type(self, s))
@@ -410,7 +425,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             sret_info,
         );
 
-        self.rust_method_info.insert(symbol.clone(), RustMethodInfo { func, is_sret, has_track_caller });
+        self.rust_method_info.insert(symbol.clone(), RustMethodInfo { func, is_sret, has_track_caller, coerced_params });
         symbol
     }
 }
@@ -446,6 +461,41 @@ impl<'ctx> ExprResult<'ctx> {
                 alloca
             }
         }
+    }
+}
+
+/// Returns true if this resolved type is a ScalarPair at the Rust ABI level
+/// (i.e. it should be passed as two separate LLVM params, not one struct).
+///
+/// SYNC: This must stay in sync with `CoercedParam::Pair` in abi_helpers.rs.
+/// If you add a new type that rustc passes as ScalarPair (e.g. `&str`, `&[T]`),
+/// you must add it here too, or the call site will pass one struct arg where
+/// the Rust function expects two scalar args. The FnCall path asserts
+/// `call_args.len() == param_types.len()` to catch this.
+fn is_scalar_pair_type(ty: &ResolvedType) -> bool {
+    matches!(ty, ResolvedType::Ref { inner } if matches!(inner.as_ref(), ResolvedType::ByteSlice))
+}
+
+/// Push an argument to call_args, splitting ScalarPair types (like &[u8]) into
+/// two separate LLVM args (ptr, len) to match the Rust ABI declaration.
+fn push_arg_for_rust_call<'ctx>(
+    ctx: &mut CodegenCtx<'ctx, '_, '_>,
+    arg_expr: &TypedExpr,
+    call_args: &mut Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>,
+) {
+    let arg = lower_typed_expr(ctx, arg_expr);
+    if is_scalar_pair_type(&arg_expr.ty) {
+        // Fat pointer — extract the two components and pass separately.
+        let val = arg.into_value(&ctx.builder);
+        let struct_val = val.into_struct_value();
+        let first = ctx.builder.build_extract_value(struct_val, 0, "pair_first").unwrap();
+        let second = ctx.builder.build_extract_value(struct_val, 1, "pair_second").unwrap();
+        call_args.push(first.into());
+        call_args.push(second.into());
+    } else {
+        let arg_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
+        let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
+        call_args.push(arg_ptr.into());
     }
 }
 
@@ -603,7 +653,10 @@ fn codegen_internal_function<'ctx, 'tcx>(
         .unwrap_or(ResolvedType::Void);
     let internal_sret = is_internal_sret(&ret_resolved);
 
-    // The LLVM type for the sret value (struct or opaque Vec)
+    // The LLVM type for the sret value (struct or opaque Vec).
+    // Uses resolved_to_inkwell (NOT parse_coerced_type) because internal functions
+    // use toylang's own ABI, not Rust's. Per @ACRTFDZ, only Rust-facing declarations
+    // need ABI-coerced types.
     let ret_llvm_ty: Option<BasicTypeEnum<'ctx>> = if internal_sret {
         Some(ctx.resolved_to_inkwell(&ret_resolved))
     } else {
@@ -759,13 +812,19 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
             rustc_lang_facade::abi_helpers::CoercedParam::Direct(ty_str) => {
                 param_types.push(parse_coerced_type(ctx, ty_str).into());
             }
+            rustc_lang_facade::abi_helpers::CoercedParam::Pair(a_str, b_str) => {
+                param_types.push(parse_coerced_type(ctx, a_str).into());
+                param_types.push(parse_coerced_type(ctx, b_str).into());
+            }
             rustc_lang_facade::abi_helpers::CoercedParam::Indirect => {
                 param_types.push(ptr_ty.into());
             }
         }
     }
 
-    // Determine Rust ABI LLVM return type
+    // Per @ACRTFDZ, the extern wrapper's return type must match the Rust ABI.
+    // For structs, use parse_coerced_type; for primitives, resolved_to_inkwell
+    // happens to match (both are scalars). For RustType, always sret.
     let rust_ret_type: Option<BasicTypeEnum<'ctx>> = if rust_sret {
         None
     } else {
@@ -847,13 +906,36 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
                     // Same type (primitives) — pass through
                     call_args.push(param.into());
                 } else {
-                    // Type mismatch (e.g. Rust passes i64 for { i32, i32 }) —
-                    // bitcast via memory: alloca rust type, store, load as internal type
+                    // Per @ACRTFDZ (same pattern for params), type mismatch
+                    // (e.g. Rust passes i64 for { i32, i32 }) — store-through-pointer
+                    // reinterpretation: alloca rust type, store, load as internal type
                     let alloca = ctx.builder.build_alloca(rust_abi_ty, "param_coerce").unwrap();
                     ctx.builder.build_store(alloca, param).unwrap();
                     let converted = ctx.builder.build_load(internal_ty, alloca, "converted").unwrap();
                     call_args.push(converted.into());
                 }
+            }
+            rustc_lang_facade::abi_helpers::CoercedParam::Pair(a_str, b_str) => {
+                // ScalarPair — Rust passes two separate params (e.g. ptr + len for &[u8]).
+                // Reassemble into a struct for the internal function.
+                let param_a = function.get_nth_param(rust_llvm_idx as u32).unwrap();
+                rust_llvm_idx += 1;
+                let param_b = function.get_nth_param(rust_llvm_idx as u32).unwrap();
+                rust_llvm_idx += 1;
+                let a_ty = parse_coerced_type(ctx, a_str);
+                let b_ty = parse_coerced_type(ctx, b_str);
+                let struct_ty = ctx.context.struct_type(&[a_ty, b_ty], false);
+                // The reassembled struct must match what the internal function expects.
+                assert_eq!(BasicTypeEnum::StructType(struct_ty), internal_param_types[i],
+                    "Pair reassembly type mismatch for param {} of '{}': \
+                     rebuilt {{ {}, {} }} but internal expects {:?}",
+                    i, extern_symbol, a_str, b_str, internal_param_types[i]);
+                let mut agg = struct_ty.get_undef();
+                agg = ctx.builder.build_insert_value(agg, param_a, 0, "pair_a")
+                    .unwrap().into_struct_value();
+                agg = ctx.builder.build_insert_value(agg, param_b, 1, "pair_b")
+                    .unwrap().into_struct_value();
+                call_args.push(agg.into());
             }
             rustc_lang_facade::abi_helpers::CoercedParam::Indirect => {
                 // Rust passes by pointer — load value for internal (which takes by value)
@@ -866,6 +948,14 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
         }
     }
 
+    // Verify we consumed exactly the right number of LLVM params.
+    // If this fires, a CoercedParam variant is incrementing rust_llvm_idx wrong.
+    let expected_llvm_params = function.count_params() as usize;
+    assert_eq!(rust_llvm_idx, expected_llvm_params,
+        "extern wrapper '{}': consumed {} LLVM params but function has {}. \
+         Check Pair/Direct/Indirect param index accounting.",
+        extern_symbol, rust_llvm_idx, expected_llvm_params);
+
     let call_site = ctx.builder.build_call(internal_fn, &call_args, "wrapper_call").unwrap();
 
     // Handle return value adaptation
@@ -875,8 +965,9 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
         // Rust uses sret — internal already wrote to the sret pointer
         ctx.builder.build_return(None).unwrap();
     } else if internal_sret {
-        // Internal used sret, but Rust expects a direct return (coerced)
-        // The tmp alloca has the result — load as the Rust-expected type
+        // Per @ACRTFDZ, internal used sret but Rust expects a direct return
+        // (e.g., {i32,i32} coerced to i64). Load from the sret alloca as the
+        // ABI-coerced type so the return matches what the caller expects.
         let tmp = call_args[0].into_pointer_value();
         let coerced_val = ctx.builder.build_load(
             rust_ret_type.unwrap(), tmp, "coerced_ret",
@@ -1001,13 +1092,23 @@ fn lower_typed_expr<'ctx>(
         }
 
         TypedExprKind::FnCall { name, type_args, args } => {
-            // Check if this is an extern function (body-less declaration)
+            // Three kinds of FnCall:
+            // 1. Extern-declared (body-less `fn foo(x: i32)` in toylang) → linked from Rust source
+            // 2. Use-imported (`use std::io::stdout` → `stdout()`) → real Rust function
+            // 3. Toylang function (has body) → internal ABI, handled below
+            //
+            // Cases 1 and 2 need ABI-correct declarations from rustc's coerced_param/return
+            // types. Case 3 uses toylang's simple internal ABI.
             let registry_fn = ctx.registry.functions.get(name.as_str());
             let is_extern_decl = registry_fn.map_or(false, |f| f.body.is_none());
             let is_use_import = registry_fn.is_none();
 
             if is_extern_decl || is_use_import {
-                // Extern or use-imported Rust function — resolve its real mangled symbol and call directly
+                // Extern or use-imported Rust function — must match rustc's ABI exactly.
+                // We query coerced_param_types and coerced_return_type to build the LLVM
+                // function declaration, then pass args as direct values (not pointers).
+                // This differs from MethodCall/StaticCall which use get_or_resolve_rust_method
+                // and pass args as pointers (Indirect convention).
                 let def_id = if is_extern_decl {
                     crate::oracle::find_extern_fn_def_id(ctx.tcx, name)
                         .unwrap_or_else(|| panic!("extern fn '{}' not found in Rust source", name))
@@ -1015,32 +1116,119 @@ fn lower_typed_expr<'ctx>(
                     crate::oracle::find_use_imported_fn_def_id(ctx.tcx, name)
                         .unwrap_or_else(|| panic!("use-imported fn '{}' not found in Rust stubs", name))
                 };
-                // Build generic args from toylang type_args (non-generic = empty slice, same path)
                 let ty_arg_refs: Vec<ty::GenericArg<'_>> = type_args.iter()
                     .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(ctx.tcx, ta)))
                     .collect();
                 let args_ref = ctx.tcx.mk_args(&ty_arg_refs);
+                let instance = ty::Instance::new(def_id, args_ref);
                 let symbol = resolve_rust_symbol(ctx.tcx, def_id, args_ref);
 
-                let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = args.iter()
-                    .map(|a| ctx.resolved_to_inkwell(&a.ty).into())
-                    .collect();
-                let ret_type = if expr.ty == ResolvedType::Void {
-                    None
-                } else {
-                    Some(ctx.resolved_to_inkwell(&expr.ty))
+                // Query Rust ABI for params and return convention
+                let coerced_params = rustc_lang_facade::abi_helpers::coerced_param_types_for_instance(ctx.tcx, instance);
+                let coerced_ret = rustc_lang_facade::abi_helpers::coerced_return_type_for_instance(ctx.tcx, instance);
+                let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
+                let is_sret = matches!(coerced_ret, rustc_lang_facade::abi_helpers::CoercedReturn::Indirect);
+
+                // Build param types from ABI
+                let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+                if is_sret {
+                    param_types.push(ptr_ty.into()); // sret pointer
+                }
+                for cp in &coerced_params {
+                    match cp {
+                        rustc_lang_facade::abi_helpers::CoercedParam::Ignore => {}
+                        rustc_lang_facade::abi_helpers::CoercedParam::Direct(ty_str) => {
+                            param_types.push(parse_coerced_type(ctx, ty_str).into());
+                        }
+                        rustc_lang_facade::abi_helpers::CoercedParam::Pair(a_str, b_str) => {
+                            param_types.push(parse_coerced_type(ctx, a_str).into());
+                            param_types.push(parse_coerced_type(ctx, b_str).into());
+                        }
+                        rustc_lang_facade::abi_helpers::CoercedParam::Indirect => {
+                            param_types.push(ptr_ty.into());
+                        }
+                    }
+                }
+
+                // Per @ACRTFDZ, must use parse_coerced_type (the ABI type), NOT
+                // resolved_to_inkwell (the toylang type). LLVM treats aggregate returns
+                // (e.g., [8 x i8]) differently from scalar returns (e.g., i64) — using
+                // the wrong one causes the return value to be read from the wrong location.
+                let ret_type: Option<BasicTypeEnum<'ctx>> = match &coerced_ret {
+                    rustc_lang_facade::abi_helpers::CoercedReturn::Direct(s) => {
+                        Some(parse_coerced_type(ctx, s))
+                    }
+                    rustc_lang_facade::abi_helpers::CoercedReturn::Indirect
+                    | rustc_lang_facade::abi_helpers::CoercedReturn::Void => None,
                 };
 
-                let callee = ctx.declare_external_fn(&symbol, &param_types, ret_type, None);
+                // For sret, get the opaque type for the sret attribute
+                let sret_info = if is_sret {
+                    let sig = ctx.tcx.fn_sig(def_id).instantiate(ctx.tcx, args_ref);
+                    let sig = ctx.tcx.normalize_erasing_late_bound_regions(
+                        ty::TypingEnv::fully_monomorphized(), sig,
+                    );
+                    let ret_resolved = crate::oracle::rustc_ty_to_resolved_type(ctx.tcx, sig.output());
+                    Some(ctx.rust_ty_to_llvm_opaque(&ret_resolved))
+                } else {
+                    None
+                };
+
+                let callee = ctx.declare_external_fn(&symbol, &param_types, ret_type, sret_info);
                 ctx.rust_symbols.push(symbol);
 
-                let call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = args.iter()
-                    .map(|a| lower_typed_expr(ctx, a).into_value(&ctx.builder).into())
-                    .collect();
-                let result = ctx.builder.build_call(callee, &call_args, "extern_call").unwrap();
-                match result.try_as_basic_value() {
-                    inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
-                    _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                // Build call args: pass values directly (matching coerced_params declaration),
+                // splitting ScalarPair types into two separate args.
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
+
+                if is_sret {
+                    // Allocate space for the sret return and pass pointer as first arg
+                    let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "fncall_sret");
+                    call_args.push(alloca.into());
+                }
+
+                for a in args {
+                    let val = lower_typed_expr(ctx, a).into_value(&ctx.builder);
+                    if is_scalar_pair_type(&a.ty) {
+                        let struct_val = val.into_struct_value();
+                        let first = ctx.builder.build_extract_value(struct_val, 0, "pair_first").unwrap();
+                        let second = ctx.builder.build_extract_value(struct_val, 1, "pair_second").unwrap();
+                        call_args.push(first.into());
+                        call_args.push(second.into());
+                    } else {
+                        call_args.push(val.into());
+                    }
+                }
+                assert_eq!(call_args.len(), param_types.len(),
+                    "FnCall '{}': call_args count ({}) != param_types count ({}). \
+                     If you added a new ScalarPair type, update is_scalar_pair_type().",
+                    name, call_args.len(), param_types.len());
+
+                if is_sret {
+                    // sret: the first call arg is the alloca pointer where the callee
+                    // writes the return value. The LLVM call returns void.
+                    let alloca = call_args[0].into_pointer_value();
+                    let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
+                    ctx.builder.build_call(callee, &call_args, "").unwrap();
+                    ExprResult::Ptr(alloca, opaque_ty)
+                } else {
+                    let result = ctx.builder.build_call(callee, &call_args, "extern_call").unwrap();
+                    match result.try_as_basic_value() {
+                        inkwell::values::ValueKind::Basic(val) => {
+                            // Per @ACRTFDZ, the call returns the ABI-coerced type (e.g., i64
+                            // for Stdout). If this differs from toylang's type (e.g., [8 x i8]),
+                            // store through a pointer to reinterpret the bits.
+                            let toylang_ty = ctx.resolved_to_inkwell(&expr.ty);
+                            if val.get_type() != toylang_ty {
+                                let alloca = ctx.builder.build_alloca(val.get_type(), "abi_ret").unwrap();
+                                ctx.builder.build_store(alloca, val).unwrap();
+                                ExprResult::Ptr(alloca, toylang_ty)
+                            } else {
+                                ExprResult::Value(val)
+                            }
+                        }
+                        _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),
+                    }
                 }
             } else {
 
@@ -1148,10 +1336,7 @@ fn lower_typed_expr<'ctx>(
                     call_args.push(alloca.into());
                     call_args.push(recv_ptr.into());
                     for arg_expr in &args[1..] {
-                        let arg = lower_typed_expr(ctx, arg_expr);
-                        let arg_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
-                        let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "trait_arg");
-                        call_args.push(arg_ptr.into());
+                        push_arg_for_rust_call(ctx, arg_expr, &mut call_args);
                     }
                     if has_track_caller {
                         call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
@@ -1162,10 +1347,7 @@ fn lower_typed_expr<'ctx>(
                 } else {
                     call_args.push(recv_ptr.into());
                     for arg_expr in &args[1..] {
-                        let arg = lower_typed_expr(ctx, arg_expr);
-                        let arg_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
-                        let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "trait_arg");
-                        call_args.push(arg_ptr.into());
+                        push_arg_for_rust_call(ctx, arg_expr, &mut call_args);
                     }
                     if has_track_caller {
                         call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
@@ -1198,6 +1380,43 @@ fn lower_typed_expr<'ctx>(
                 .unwrap()
                 .as_pointer_value();
             ExprResult::Value(ptr.into())
+        }
+
+        TypedExprKind::ByteStringLit(bytes) => {
+            // Create a global constant byte array [N x i8]
+            let array_val = ctx.context.const_string(bytes, false);
+            let array_type = array_val.get_type();
+            let global = ctx.module.add_global(array_type, None, "byte_str_lit");
+            global.set_initializer(&array_val);
+            global.set_constant(true);
+
+            // GEP to get pointer to first element
+            let ptr = unsafe {
+                ctx.builder.build_gep(
+                    array_type,
+                    global.as_pointer_value(),
+                    &[ctx.context.i64_type().const_zero(), ctx.context.i64_type().const_zero()],
+                    "byte_str_ptr",
+                ).unwrap()
+            };
+
+            // Build fat pointer struct { ptr, i64 }.
+            // Must match resolved_to_inkwell(Ref { inner: ByteSlice }).
+            let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
+            let len_ty = ctx.context.i64_type();
+            let struct_ty = ctx.context.struct_type(&[ptr_ty.into(), len_ty.into()], false);
+            debug_assert_eq!(
+                BasicTypeEnum::StructType(struct_ty),
+                ctx.resolved_to_inkwell(&expr.ty),
+                "ByteStringLit struct type doesn't match resolved_to_inkwell for {:?}", expr.ty,
+            );
+            let len_val = ctx.context.i64_type().const_int(bytes.len() as u64, false);
+            let mut fat_ptr = struct_ty.get_undef();
+            fat_ptr = ctx.builder.build_insert_value(fat_ptr, ptr, 0, "fat_ptr_data")
+                .unwrap().into_struct_value();
+            fat_ptr = ctx.builder.build_insert_value(fat_ptr, len_val, 1, "fat_ptr_len")
+                .unwrap().into_struct_value();
+            ExprResult::Value(fat_ptr.into())
         }
 
         TypedExprKind::FieldAccess { receiver, field } => {
@@ -1274,10 +1493,7 @@ fn lower_typed_expr<'ctx>(
                 let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
                 let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![alloca.into(), recv_ptr.into()];
                 for a in args {
-                    let arg = lower_typed_expr(ctx, a);
-                    let arg_ty = ctx.resolved_to_inkwell(&a.ty);
-                    let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
-                    call_args.push(arg_ptr.into());
+                    push_arg_for_rust_call(ctx, a, &mut call_args);
                 }
                 if has_track_caller { // @TCHAPZ: pass null for hidden Location param
                     call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
@@ -1288,10 +1504,7 @@ fn lower_typed_expr<'ctx>(
                 // Non-sret method call
                 let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![recv_ptr.into()];
                 for a in args {
-                    let arg = lower_typed_expr(ctx, a);
-                    let arg_ty = ctx.resolved_to_inkwell(&a.ty);
-                    let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
-                    call_args.push(arg_ptr.into());
+                    push_arg_for_rust_call(ctx, a, &mut call_args);
                 }
                 if has_track_caller { // @TCHAPZ: pass null for hidden Location param
                     call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());

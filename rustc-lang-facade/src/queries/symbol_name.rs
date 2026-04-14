@@ -5,6 +5,11 @@
 //! instead of rustc's default mangled name. This ensures that call sites
 //! in other functions emit calls to the consumer's extern symbol, which
 //! the consumer's .o provides.
+//!
+//! Per @GCMLZ, this provider may fire during generate_and_compile. For
+//! non-consumer items, it only reads CONFIG and DEFAULT_SYMBOL_NAME (no lock).
+//! For consumer items, it calls call_monomorphize_fn (locks MUTABLE_STATE),
+//! but those are always cached from inner.codegen_crate.
 
 use rustc_middle::ty::{self, Instance, TyCtxt};
 
@@ -60,6 +65,7 @@ pub fn lang_symbol_name<'tcx>(
         }
     }
 
+    // Per @GCMLZ, default_symbol_name() reads from OnceLock (no mutex lock).
     let default = crate::default_symbol_name();
     default(tcx, instance)
 }

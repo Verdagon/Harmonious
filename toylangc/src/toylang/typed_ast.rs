@@ -41,6 +41,8 @@ pub enum ResolvedType {
         inner: Box<ResolvedType>,
     },
     Str,
+    /// The unsized byte slice type `[u8]`. Always appears inside `Ref` as `&[u8]`.
+    ByteSlice,
 }
 
 /// A typed expression — every node knows its concrete type.
@@ -86,6 +88,7 @@ pub enum TypedExprKind {
         field: String,
     },
     StringLit(String),
+    ByteStringLit(Vec<u8>),
     If {
         cond: Box<TypedExpr>,
         then_stmts: Vec<TypedStmt>,
