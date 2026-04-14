@@ -33,6 +33,9 @@ pub fn lang_symbol_name<'tcx>(
                 let callback_name = if is_accessor {
                     if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
                         let impl_def_id = assoc_item.container_id(tcx);
+                        // instantiate_identity: structural inspection only — we want the
+                        // impl's self type with its own params as placeholders so we can
+                        // read the ADT name. We are not producing a concrete type here.
                         let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
                         if let ty::TyKind::Adt(adt_def, _) = self_ty.kind() {
                             let struct_name = tcx.item_name(adt_def.did()).to_string();

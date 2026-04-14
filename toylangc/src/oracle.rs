@@ -244,6 +244,113 @@ pub fn find_use_imported_trait_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<Def
     None
 }
 
+/// Find a use-imported free function by name among `pub use` re-exports in __lang_stubs.
+pub fn find_use_imported_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
+    use rustc_hir::def::Res;
+    for local_def_id in tcx.hir_crate_items(()).definitions() {
+        if tcx.def_kind(local_def_id.to_def_id()) != DefKind::Mod { continue; }
+        for child in tcx.module_children_local(local_def_id) {
+            if child.ident.as_str() == name {
+                if let Res::Def(DefKind::Fn, def_id) = child.res {
+                    return Some(def_id);
+                }
+            }
+        }
+    }
+    for child in tcx.module_children_local(rustc_hir::def_id::CRATE_DEF_ID) {
+        if child.ident.as_str() == name {
+            if let Res::Def(DefKind::Fn, def_id) = child.res {
+                return Some(def_id);
+            }
+        }
+    }
+    None
+}
+
+/// Instantiate a free function's fn_sig with given type args.
+/// Non-generic functions pass an empty slice — same code path, no special-casing.
+fn instantiate_free_fn_sig<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> ty::FnSig<'tcx> {
+    let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+        .collect();
+    let expected_count = tcx.generics_of(def_id).count();
+    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    let sig = tcx.fn_sig(def_id).instantiate(tcx, args);
+    tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig)
+}
+
+/// Return type of a use-imported free function. None if not found.
+pub fn rust_free_fn_return_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    name: &str,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> Option<crate::toylang::typed_ast::ResolvedType> {
+    let def_id = find_use_imported_fn_def_id(tcx, name)?;
+    let sig = instantiate_free_fn_sig(tcx, def_id, type_args);
+    Some(rustc_ty_to_resolved_type(tcx, sig.output()))
+}
+
+/// Param types of a use-imported free function. None if not found.
+pub fn rust_free_fn_param_types<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    name: &str,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
+    let def_id = find_use_imported_fn_def_id(tcx, name)?;
+    let sig = instantiate_free_fn_sig(tcx, def_id, type_args);
+    Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect())
+}
+
+/// Param types of a Rust inherent method. None if type or method not found.
+pub fn rust_method_param_types<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    type_name: &str,
+    method_name: &str,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
+    let type_def_id = find_rust_type_def_id(tcx, type_name)?;
+    let method_def_id = find_inherent_method(tcx, type_def_id, method_name)?;
+    let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+        .collect();
+    let expected_count = tcx.generics_of(method_def_id).count();
+    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
+    let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
+    Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect())
+}
+
+/// Param types of a trait method. None if not found.
+pub fn rust_trait_method_param_types<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_name: &str,
+    method_name: &str,
+    receiver_ty: &crate::toylang::typed_ast::ResolvedType,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
+    let trait_def_id = find_use_imported_trait_def_id(tcx, trait_name)?;
+    let self_resolved = strip_ref(receiver_ty);
+    let self_ty = resolved_to_rustc_ty(tcx, self_resolved);
+    let trait_method_def_id = tcx.associated_item_def_ids(trait_def_id)
+        .iter()
+        .find(|&&id| tcx.item_name(id).as_str() == method_name)
+        .copied()?;
+    // Per @TVIMDGAZ, args are [Self, ...explicit] for the trait definition's method DefId
+    let mut all_ty_args: Vec<ty::GenericArg<'tcx>> = vec![ty::GenericArg::from(self_ty)];
+    for ta in type_args {
+        all_ty_args.push(ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)));
+    }
+    let expected_count = tcx.generics_of(trait_method_def_id).count();
+    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    let sig = tcx.fn_sig(trait_method_def_id).instantiate(tcx, args);
+    let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
+    Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect())
+}
+
 /// Find a trait method's DefId given a trait and the receiver's concrete type.
 /// Searches all impls of the trait that match `self_ty`.
 pub fn find_trait_method<'tcx>(

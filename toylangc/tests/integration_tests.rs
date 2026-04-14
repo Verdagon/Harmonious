@@ -3075,3 +3075,62 @@ fn main() { __toylang_main(); }
     );
     assert!(output.contains("1"));
 }
+
+// ==========================================================================
+// Phase 2: Free function calls + arg type checking
+// ==========================================================================
+
+#[test]
+fn test_extern_fn_decl_still_works() {
+    // Regression: body-less extern fn declarations still compile and link
+    let output = run_toylang_test(
+        r#"
+fn print_i32(x: i32)
+
+fn main() {
+    print_i32(42i32)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle] pub extern "C" fn print_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_rust_free_fn_undefined_gives_error() {
+    // Compile-fail: calling a function that doesn't exist anywhere
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+
+    std::fs::write(&toylang_path, r#"
+fn main() {
+    completely_undefined_xyz()
+}
+    "#).unwrap();
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { __toylang_main(); }
+    "#).unwrap();
+
+    let compile = Command::new(toylangc_bin())
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .args(&[
+            "--edition", "2021",
+            "--toylang-input", toylang_path.to_str().unwrap(),
+            rust_path.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run toylangc");
+
+    assert!(!compile.status.success(),
+        "compilation should have failed for undefined function, but succeeded");
+}

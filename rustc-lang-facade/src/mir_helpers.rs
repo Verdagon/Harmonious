@@ -65,6 +65,10 @@ pub fn build_drop_call_body<'tcx>(
 
     // Build the call terminator or fall back to a no-op return
     let (bb0_term, num_blocks) = if let Some(fn_def_id) = drop_fn_def_id {
+        // instantiate_identity: structural inspection only — we need the function's
+        // zero-sized type to build a Const operand for the MIR call terminator.
+        // The drop glue fn is always monomorphic (no type params), so no substitution
+        // is needed; we just want the raw type of the definition.
         let fn_ty = tcx.type_of(fn_def_id).instantiate_identity();
         let func = Operand::Constant(Box::new(ConstOperand {
             span,

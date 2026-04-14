@@ -571,7 +571,10 @@ fn codegen_internal_function<'ctx, 'tcx>(
 ) {
     // Query rustc for Rust method return types
     let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> ResolvedType {
-        if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+        if type_name.is_empty() {
+            crate::oracle::rust_free_fn_return_type(ctx.tcx, method, type_args)
+                .unwrap_or(ResolvedType::Void)
+        } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
             let receiver_ty = &type_args[0];
             let explicit_args = &type_args[1..];
             crate::oracle::rust_trait_method_return_type(ctx.tcx, trait_name, method, receiver_ty, explicit_args)
@@ -579,7 +582,16 @@ fn codegen_internal_function<'ctx, 'tcx>(
             crate::oracle::rust_method_return_type(ctx.tcx, type_name, method, type_args)
         }
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret)
+    let rust_param_types = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Option<Vec<ResolvedType>> {
+        if type_name.is_empty() {
+            crate::oracle::rust_free_fn_param_types(ctx.tcx, method, type_args)
+        } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+            crate::oracle::rust_trait_method_param_types(ctx.tcx, trait_name, method, &type_args[0], &type_args[1..])
+        } else {
+            crate::oracle::rust_method_param_types(ctx.tcx, type_name, method, type_args)
+        }
+    };
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret, &rust_param_types)
         .expect("type resolution should succeed (already validated)");
 
     // Resolve any Rust method symbols used in this function by walking the typed body
@@ -990,14 +1002,24 @@ fn lower_typed_expr<'ctx>(
 
         TypedExprKind::FnCall { name, type_args, args } => {
             // Check if this is an extern function (body-less declaration)
-            let is_extern = ctx.registry.functions.get(name.as_str())
-                .map_or(false, |f| f.body.is_none());
+            let registry_fn = ctx.registry.functions.get(name.as_str());
+            let is_extern_decl = registry_fn.map_or(false, |f| f.body.is_none());
+            let is_use_import = registry_fn.is_none();
 
-            if is_extern {
-                // Extern Rust function — resolve its real mangled symbol and call directly
-                let def_id = crate::oracle::find_extern_fn_def_id(ctx.tcx, name)
-                    .unwrap_or_else(|| panic!("extern fn '{}' not found in Rust source", name));
-                let args_ref = ctx.tcx.mk_args(&[]);
+            if is_extern_decl || is_use_import {
+                // Extern or use-imported Rust function — resolve its real mangled symbol and call directly
+                let def_id = if is_extern_decl {
+                    crate::oracle::find_extern_fn_def_id(ctx.tcx, name)
+                        .unwrap_or_else(|| panic!("extern fn '{}' not found in Rust source", name))
+                } else {
+                    crate::oracle::find_use_imported_fn_def_id(ctx.tcx, name)
+                        .unwrap_or_else(|| panic!("use-imported fn '{}' not found in Rust stubs", name))
+                };
+                // Build generic args from toylang type_args (non-generic = empty slice, same path)
+                let ty_arg_refs: Vec<ty::GenericArg<'_>> = type_args.iter()
+                    .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(ctx.tcx, ta)))
+                    .collect();
+                let args_ref = ctx.tcx.mk_args(&ty_arg_refs);
                 let symbol = resolve_rust_symbol(ctx.tcx, def_id, args_ref);
 
                 let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = args.iter()
@@ -1530,6 +1552,9 @@ pub fn generate_with_tcx<'tcx>(
             // Check if it's an accessor method
             if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
                 let impl_def_id = assoc_item.container_id(tcx);
+                // instantiate_identity: structural inspection only — we want the impl's
+                // self type with its own params as placeholders so we can read the ADT
+                // name and look it up in the registry. Not producing a concrete type.
                 let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
                 if let ty::TyKind::Adt(adt_def, _) = self_ty.kind() {
                     let struct_name = tcx.item_name(adt_def.did()).to_string();

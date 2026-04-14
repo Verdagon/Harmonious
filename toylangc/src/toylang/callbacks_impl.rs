@@ -187,8 +187,10 @@ impl LangCallbacks for ToylangCallbacks {
         for (name, func) in &self.registry.functions {
             if func.body.is_none() || !func.type_params.is_empty() { continue; }
             let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
-                if let Some(trait_name) = type_name.strip_prefix("__trait::") {
-                    // Trait call: type_args[0] is the receiver type, rest are explicit type args
+                if type_name.is_empty() {
+                    crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
+                        .unwrap_or(crate::toylang::typed_ast::ResolvedType::Void)
+                } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
                     let receiver_ty = &type_args[0];
                     let explicit_args = &type_args[1..];
                     crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args)
@@ -196,7 +198,16 @@ impl LangCallbacks for ToylangCallbacks {
                     crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
                 }
             };
-            if let Err(e) = crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret) {
+            let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
+                if type_name.is_empty() {
+                    crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
+                } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+                    crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..])
+                } else {
+                    crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
+                }
+            };
+            if let Err(e) = crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret, &rust_param_types) {
                 errors.push(format!("function '{}': {:?}", name, e));
             }
         }
@@ -393,7 +404,10 @@ fn collect_toylang_fn_deps_inner<'tcx>(
 
     // Type-resolve the already-substituted body
     let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
-        if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+        if type_name.is_empty() {
+            crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
+                .unwrap_or(crate::toylang::typed_ast::ResolvedType::Void)
+        } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
             let receiver_ty = &type_args[0];
             let explicit_args = &type_args[1..];
             crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args)
@@ -401,7 +415,16 @@ fn collect_toylang_fn_deps_inner<'tcx>(
             crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
         }
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, resolved_fn, &rust_method_ret)
+    let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
+        if type_name.is_empty() {
+            crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
+        } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+            crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..])
+        } else {
+            crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
+        }
+    };
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, resolved_fn, &rust_method_ret, &rust_param_types)
         .unwrap_or_else(|e| panic!("[toylang] type error in '{}': {:?}", fn_name, e));
 
     // Walk typed body for fn_calls and rust_method_deps
@@ -412,7 +435,16 @@ fn collect_toylang_fn_deps_inner<'tcx>(
 
     // Process function call deps
     for (callee_name, type_args) in &fn_calls {
-        let Some(callee_fn) = registry.functions.get(callee_name.as_str()) else { continue };
+        let Some(callee_fn) = registry.functions.get(callee_name.as_str()) else {
+            // Not a toylang fn — check if it's a use-imported free function
+            if let Some(def_id) = crate::oracle::find_use_imported_fn_def_id(tcx, callee_name) {
+                let ty_arg_refs: Vec<ty::GenericArg<'_>> = type_args.iter()
+                    .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(tcx, ta)))
+                    .collect();
+                deps.push((def_id, tcx.mk_args(&ty_arg_refs)));
+            }
+            continue;
+        };
 
         if callee_fn.body.is_some() {
             // Toylang callee — recurse instead of reporting to rustc
