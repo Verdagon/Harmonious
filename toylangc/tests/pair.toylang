@@ -1,8 +1,0 @@
-struct Pair<A, B> {
-    first: A,
-    second: B,
-}
-
-fn make_pair() -> Pair<i32, i32> {
-    Pair { first: 10, second: 20 }
-}

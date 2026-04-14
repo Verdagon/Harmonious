@@ -1,0 +1,151 @@
+use std::path::PathBuf;
+use std::process::Command;
+
+fn toylangc_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_toylangc"))
+}
+
+fn sysroot_lib() -> String {
+    let out = Command::new("rustup")
+        .args(["run", "rustc-fork", "rustc", "--print=sysroot"])
+        .output()
+        .expect("failed to run rustup");
+    let sysroot = String::from_utf8(out.stdout).unwrap();
+    format!("{}/lib", sysroot.trim())
+}
+
+fn run_build(project_dir: &std::path::Path) -> std::process::Output {
+    Command::new(toylangc_bin())
+        .current_dir(project_dir)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .args(["build"])
+        .output()
+        .expect("failed to run toylangc build")
+}
+
+#[test]
+fn test_build_minimal_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path();
+
+    std::fs::write(
+        project.join("toylang.toml"),
+        r#"[project]
+name = "minimal_app"
+source = "main.toylang"
+"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("main.toylang"), "fn main() {}\n").unwrap();
+
+    let out = run_build(project);
+    assert!(
+        out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let bin = project
+        .join(".toylang-build")
+        .join("target/debug/minimal_app");
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin).output().expect("failed to run binary");
+    assert!(
+        run.status.success(),
+        "binary exited with error:\nstderr: {}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+}
+
+#[test]
+fn test_build_with_rust_dep() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path();
+
+    // Use `toml` as the dep since it's already a toylangc build dep —
+    // cargo should have it cached so this test doesn't require network.
+    std::fs::write(
+        project.join("toylang.toml"),
+        r#"[project]
+name = "with_dep"
+source = "main.toylang"
+
+[rust-dependencies]
+toml = "0.8"
+"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("main.toylang"), "fn main() {}\n").unwrap();
+
+    let out = run_build(project);
+    assert!(
+        out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let lockfile_path = project.join(".toylang-build/Cargo.lock");
+    let lockfile = std::fs::read_to_string(&lockfile_path)
+        .expect("Cargo.lock should exist after build");
+    assert!(
+        lockfile.contains("name = \"toml\""),
+        "Cargo.lock should list toml as a dep; contents: {}",
+        lockfile
+    );
+}
+
+#[test]
+fn test_build_invalid_manifest_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path();
+
+    // Missing required [project] section.
+    std::fs::write(
+        project.join("toylang.toml"),
+        r#"[rust-dependencies]
+rand = "0.8"
+"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("main.toylang"), "fn main() {}\n").unwrap();
+
+    let out = run_build(project);
+    assert!(
+        !out.status.success(),
+        "toylangc build should fail on manifest missing [project];\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !project.join(".toylang-build").exists(),
+        ".toylang-build should not be created when manifest parsing fails"
+    );
+}
+
+#[test]
+fn test_build_missing_source_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path();
+
+    std::fs::write(
+        project.join("toylang.toml"),
+        r#"[project]
+name = "ghost"
+source = "does_not_exist.toylang"
+"#,
+    )
+    .unwrap();
+    // Intentionally do not create the source file.
+
+    let out = run_build(project);
+    assert!(
+        !out.status.success(),
+        "toylangc build should fail when source file is missing;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

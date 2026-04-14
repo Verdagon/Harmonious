@@ -1,17 +1,33 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 95 integration tests + 37 unit tests passing, 0 ignored.
+> **Current status:** 110 integration tests + 4 standalone tests + 60 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
-> Global mutex serializes all consumer code (single-threaded execution).
-> Unified `ResolvedType` everywhere. Explicit typed literals. Typed error enums.
-> Full ABI coverage. Generic functions with explicit type args. Mutable assignment,
-> else if, boolean operators (&&/||), unary negation. Roguelike integration test.
+> GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
+> (Mutex) to avoid a deadlock where query providers triggered during
+> `generate_and_compile` tried to re-lock the mutex (see @GCMLZ). Unified
+> `ResolvedType` everywhere. Explicit typed literals. Typed error enums.
+> Full ABI coverage including ABI-coerced return types for function declarations
+> (see @ACRTFDZ). Generic functions with explicit type args. Mutable assignment,
+> else if, boolean operators (&&/||), unary negation.
 >
-> **Next milestone:** `toylang.toml` project manifest, trait method resolution,
-> Rust free function calls, byte string literals, and standalone test projects
-> linking against 9 Rust crates (rand, regex, uuid, clap, serde, toml, glob,
-> indexmap, reqwest) — all without glue code or derive macros.
+> **Phases done:**
+> - Phase 1: Explicit trait method calls (`Trait::method(receiver, args)`)
+> - Phase 2: Rust free function calls via `use` imports
+> - Phase 3: Byte string literals (`b"hello\n"`)
+> - Phase 4: I/O integration (`Write::write_all(&stdout(), b"hello\n")`),
+>   GLOBALS deadlock fix, ABI return type coercion, broadened TyKind handling
+>   for `Option`/`Result`, enum support in `find_reexported_type`
+> - Phase 5: `toylang.toml` manifest + `toylangc build` command
+>   orchestrating cargo with `RUSTC_WORKSPACE_WRAPPER`; wrapper mode re-reads
+>   the manifest from `CARGO_MANIFEST_DIR/..` instead of using an env var
+>   side-channel (see @MRRIWMZ)
+>
+> **Next milestone (Phase 6):** `.unwrap()` verification on `Result`/`Option`.
+>
+> **After Phase 6:** 9 standalone test projects linking against rand, regex,
+> uuid, clap, serde, toml, glob, indexmap, reqwest (Phase 7); test harness
+> (Phase 8).
 
 ## Overview
 
@@ -272,13 +288,36 @@ Each entry-point toylang function generates **two** LLVM functions:
    - Primitives (i32, i64, f64, bool, usize): returned directly
    - Void: void return
    - Structs/Vec: always sret (ptr first param, void return)
+   - Uses `resolved_to_inkwell` for types (toylang ABI, not Rust ABI)
 
 2. **Extern wrapper** (`__toylang_impl_{name}`) — thin wrapper matching Rust ABI:
    - Calls the internal function
    - Adapts return/params to match `fn_abi_of_instance`
+   - Uses `parse_coerced_type` from ABI-coerced strings for types (see @ACRTFDZ)
 
 Internal-only toylang functions generate only the internal function (no wrapper).
 Toylang-to-toylang calls use `__toylang_internal_` symbols directly.
+
+### 4.6.1 ABI-coerced return types for Rust function declarations (@ACRTFDZ)
+
+When toylang calls a Rust function (MethodCall, StaticCall, or use-imported
+FnCall), the LLVM function declaration must use rustc's ABI-coerced return type,
+NOT `resolved_to_inkwell` (toylang's type representation). For an 8-byte struct
+like `Stdout`, rustc returns `i64` (Direct scalar) in register `x0` on aarch64,
+but `resolved_to_inkwell` produces `[8 x i8]` (LLVM aggregate). LLVM reads
+aggregates from memory, scalars from registers — the mismatch produces garbage.
+
+Fix: all three Rust call paths use `parse_coerced_type(coerced_ret)` for the
+declaration. When the ABI type differs from toylang's type, the FnCall path
+stores the returned value into an alloca and returns `ExprResult::Ptr` so
+downstream code loads it as the toylang type (a type-punning bitcast via
+memory). The extern wrapper does the same for `internal_sret`-to-Rust-direct
+adaptation, and the param coercion path uses store-through-pointer for
+`Rust i64 → internal { i32, i32 }` reassembly.
+
+This is the reason `stdout()` segfaulted before Phase 4 even after the sret
+fix: the declaration said `[8 x i8]` but the function returned `i64`, so the
+Stdout alloca contained garbage that `Write::write_all` then dereferenced.
 
 ### 4.7 Toylang-owned main
 
@@ -292,48 +331,166 @@ to avoid conflicting with Rust's `main`. The mapping flows through:
 
 Toylang supports `use` statements: `use std::alloc::Global`. The parser stores
 the path in `registry.imports`. The stub generator emits `pub use` in
-`__lang_stubs.rs`. `find_rust_type_def_id` finds re-exported types via
-`module_children_local`.
+`__lang_stubs.rs`. Three oracle functions find re-exports via
+`module_children_local`:
+
+- `find_reexported_type` — matches `DefKind::Struct` and `DefKind::Enum`
+  (the latter added in Phase 4 so `Option` and `Result` work). Called by
+  `find_rust_type_def_id`.
+- `find_use_imported_trait_def_id` — matches `DefKind::Trait`. Used by trait
+  method resolution for `Trait::method(receiver, args)` syntax (Phase 1).
+- `find_use_imported_fn_def_id` — matches `DefKind::Fn`. Used by FnCall
+  use-import path for free function calls like `stdout()` (Phase 2).
+
+### 4.9 Trait method calls (Phase 1)
+
+Toylang calls trait methods via explicit trait qualification using the existing
+`StaticCall` AST node:
+
+```
+use std::io::Write
+fn main() {
+    let out = stdout();
+    Write::write_all(&out, b"hello\n")
+}
+```
+
+The type resolver distinguishes trait calls from inherent calls by checking if
+the name resolves to `find_use_imported_trait_def_id`. For trait calls, it uses
+a `__trait::` prefix convention when calling back into the oracle
+(`rust_method_ret("__trait::Write", "write_all", [&Stdout])`), and the oracle
+returns via `rust_trait_method_return_type`.
+
+For codegen, `get_or_resolve_rust_method` uses the trait definition's method
+`DefId` with `[Self, ...]` args (per @TVIMDGAZ). `Instance::expect_resolve` maps
+from the trait-level DefId to the concrete impl at monomorphization time, so
+default trait methods like `Write::write_all` work automatically.
+
+### 4.10 Rust free function calls (Phase 2)
+
+Use-imported free functions like `stdout()` go through the FnCall use-import
+path. The distinction from regular FnCall: if `registry.functions` has no
+entry, we look up the function via `find_use_imported_fn_def_id` and call the
+real Rust function with rustc's ABI. If the function has no body but IS in the
+registry (extern declaration), same path.
+
+The FnCall path queries `coerced_return_type_for_instance` and
+`coerced_param_types_for_instance` to build the LLVM declaration. It handles
+sret (returns `ExprResult::Ptr` with an alloca), ScalarPair args (splits a fat
+pointer into two args), and ABI return type coercion via store-through-pointer
+reinterpretation (@ACRTFDZ).
+
+### 4.11 Byte string literals (Phase 3)
+
+`b"hello\n"` produces a `&[u8]` (fat pointer: ptr + len). The lexer recognizes
+the `b"` prefix, supports escape sequences (`\n`, `\t`, `\\`, `\0`, `\"`), and
+produces `Token::ByteStringLit(Vec<u8>)`. The type is
+`ResolvedType::Ref { inner: ByteSlice }`.
+
+Codegen emits a global constant byte array and constructs a fat pointer struct
+`{ ptr, i64 }`. When passed to a Rust function that takes `&[u8]`, the
+`CoercedParam::Pair("ptr", "i64")` ABI requires splitting the struct into two
+LLVM args. `push_arg_for_rust_call` handles this for MethodCall/StaticCall;
+the FnCall path inlines the same ScalarPair splitting logic.
+
+The `CoercedParam::Pair` variant was added to `abi_helpers.rs` in Phase 3 —
+previously ScalarPair was incorrectly collapsed into a single
+`Direct("{ ptr, i64 }")` param, producing a latent ABI bug that didn't trigger
+until byte strings existed.
+
+### 4.12 Broadened TyKind handling (Phase 4)
+
+`rustc_ty_to_resolved_type` formerly panicked on anything outside a narrow set
+(i32/i64, usize, f64, bool, unit, Ref, Adt, `[u8]` slice). Phase 4 broadened
+it to handle:
+
+- Unsupported int/uint/float widths (i8, u8, u16, u32, u64, f32, etc.) → opaque
+  `RustType` with the primitive's name
+- `TyKind::Str`, `Never`, `RawPtr`, `Dynamic`, non-empty `Tuple` → opaque
+  `RustType` with a stable name
+
+These types pass through as opaque values — toylang never inspects them. They
+surface as generic type arguments of Rust types (e.g., `Option<u8>`,
+`HashMap<String, i32>` internals).
+
+`resolved_to_rustc_ty` gained a reverse mapping in the `RustType` arm: names
+`u8`/`u16`/`u32`/`u64`/`i8`/`i16`/`f32` map back to `tcx.types.*` for
+round-tripping. Other opaque names still panic if passed here (acceptable —
+these shouldn't reach codegen).
 
 ---
 
 ## Part 5: Global State and Threading
 
-### 5.1 Single global, single mutex
+### 5.1 Split into immutable config and mutable state (@GCMLZ)
 
-All facade and consumer state lives in one global:
+Facade state is split into four statics, each with the minimum synchronization
+necessary:
 
 ```
-GLOBALS: OnceLock<Mutex<FacadeGlobals>>
+CONFIG:              OnceLock<FacadeConfig>                // immutable
+DEFAULT_LAYOUT_OF:   OnceLock<LayoutOfFn>                  // immutable
+DEFAULT_MIR_SHIMS:   OnceLock<MirShimsFn>                  // immutable
+DEFAULT_SYMBOL_NAME: OnceLock<SymbolNameFn>                // immutable
+MUTABLE_STATE:       OnceLock<Mutex<FacadeMutableState>>   // mutable
 ```
 
-`FacadeGlobals` contains:
+`FacadeConfig` (set once during `install_callbacks`, never changes):
 - `callbacks: Box<dyn Any>` — the type-erased `ToylangCallbacks`
-- `consumer_state: Box<dyn Any>` — the type-erased `ToylangState`
 - `vtable: CallbackVtable` — HRTB function pointers for dispatch
-- Saved default query providers (`layout_of`, `mir_shims`, `symbol_name`)
+
+`FacadeMutableState` (locked only by callbacks that need `&mut state`):
+- `consumer_state: Box<dyn Any>` — the type-erased `ToylangState`
 - `lang_obj_path: Option<PathBuf>` — compiled .o path for link injection
 
-### 5.2 Locking protocol
+Default query providers live in their own `OnceLock` statics, read without
+locking during query provider fallthroughs.
 
-Every `call_*` function in the facade locks the global mutex for the entire
-callback invocation. Consumer state is passed as `&mut dyn Any` — the consumer
-downcasts to `&mut ToylangState`.
+### 5.2 Why the split (@GCMLZ)
 
-This ensures all toylang code runs single-threaded, even when rustc's query
-providers fire on Rayon worker threads. No locking needed on the consumer side.
+The previous design had a single `Mutex<FacadeGlobals>` guarding everything.
+`call_generate_and_compile` held that mutex for the entire consumer codegen. During
+codegen, the consumer makes tcx queries like `tcx.symbol_name(stdout)`. These
+trigger our query providers (`lang_symbol_name`), which fell through to
+`default_symbol_name()` — which tried to re-lock the same non-reentrant mutex →
+**deadlock**.
 
-`is_consumer_type` / `is_consumer_fn` also lock briefly (just a vtable call to
-check the registry).
+Existing tests (Vec, Clone, etc.) avoided this by luck: their symbol names were
+cached from `inner.codegen_crate` before `generate_and_compile` began. `stdout`
+was the first uncached case, and it deadlocked silently (0% CPU, hang forever).
 
-### 5.3 Reentrancy avoidance
+The fix: immutable config moves to lock-free `OnceLock` statics. Query providers
+reading config/defaults never touch `MUTABLE_STATE`, so they can freely execute
+during `generate_and_compile`.
+
+Residual risk (documented but not currently hit): if a query provider calls
+`call_monomorphize_fn` for an uncached consumer item during
+`generate_and_compile`, it would try to lock `MUTABLE_STATE` and deadlock.
+This is prevented in practice because all consumer items are cached during
+`inner.codegen_crate`.
+
+### 5.3 Locking protocol
+
+| Function | Reads | Locks |
+|----------|-------|-------|
+| `is_consumer_type` / `is_consumer_fn` | `CONFIG` | none |
+| `default_layout_of` / `default_mir_shims` / `default_symbol_name` | `DEFAULT_*` | none |
+| `call_monomorphize_type` / `call_monomorphize_fn` | `CONFIG` | `MUTABLE_STATE` |
+| `call_after_rust_analysis` / `call_generate_and_compile` | `CONFIG` | `MUTABLE_STATE` |
+| `set_lang_obj_path` / `get_lang_obj_path` | — | `MUTABLE_STATE` (brief) |
+
+This ensures single-threaded toylang code execution even when rustc's query
+providers fire on Rayon worker threads. Query providers reading only config
+are lock-free; only callbacks that need `&mut consumer_state` serialize.
+
+### 5.4 Reentrancy avoidance
 
 `generate_and_compile` calls `generate_with_tcx` which calls
 `callbacks.monomorphize_fn_inner()` — this is NOT the trait method (which would
 re-lock). It's a direct method on `ToylangCallbacks` that takes `&mut ToylangState`
 as a parameter, bypassing the mutex entirely.
 
-### 5.4 Consumer state (`ToylangState`)
+### 5.5 Consumer state (`ToylangState`)
 
 ```rust
 pub struct ToylangState {
@@ -347,7 +504,7 @@ pub struct ToylangState {
 - `toylang_instances` — functions discovered during deep walk (for codegen)
 - `visited_symbols` — deduplication across all `monomorphize_fn` calls
 
-### 5.5 Callback log
+### 5.6 Callback log
 
 `CallbackLog` enum records each rustc→toylang callback:
 ```rust
@@ -364,7 +521,7 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 ---
 
-## Part 6: What Works (95 tests)
+## Part 6: What Works (60 unit + 110 integration + 4 standalone = 174 tests)
 
 ### Struct types
 - Simple, generic, nested, mixed-field, large, single-field structs
@@ -382,17 +539,31 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 - Unary negation (`-expr`)
 - Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`)
 - Arithmetic (`+`, `-`, `*`, `/`)
+- Reference expressions (`&expr`)
 
 ### ABI
 - Internal/extern ABI split
 - Struct sret, param coercion, bool i1↔i8, ScalarPair
 - `PassMode::Indirect` (byval) handled as Indirect
+- ABI-coerced return types for Rust function declarations (@ACRTFDZ)
+- `#[track_caller]` hidden Location parameter appended at all 4 call sites (@TCHAPZ)
+- Trait method resolution via `[Self, ...]` args on trait DefId (@TVIMDGAZ)
 
 ### Rust interop
-- Any Rust type (Vec, etc.) with explicit type args
+- Any Rust type (Vec, Option, Result, etc.) with explicit type args
 - Any inherent method (signatures queried from rustc)
-- `use` imports
+- Trait method calls via `Trait::method(receiver, args)` explicit qualification
+- Rust free function calls via `use` imports (`use std::io::stdout` → `stdout()`)
+- `use` imports for structs, enums, traits, free functions
+- Byte string literals (`b"hello\n"` → `&[u8]`)
+- I/O without glue: `Write::write_all(&stdout(), b"hello\n")`
 - Drop glue
+
+### Type broadening (Phase 4)
+- `Option<T>` and `Result<T, E>` — enum lookup in `find_reexported_type`
+- Primitive types as generic args (u8, u16, u32, u64, i8, i16, f32)
+  pass through as opaque `RustType` values and round-trip back to `tcx.types.*`
+- `Str`, `Never`, `RawPtr`, `Dynamic`, non-empty `Tuple` as opaque passthrough
 
 ### Deep monomorphization
 - Internal toylang functions not exposed to rustc
@@ -403,9 +574,21 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 ### Validation
 - Parser: duplicate names, reserved `__toylang_` prefix, all error variants tested
-- Type resolver: 12 error variants, all tested (assignment type mismatch, undefined
-  variable, wrong type arg count, etc.)
+- Type resolver: 13 error variants (including `ArgTypeMismatch` from Phase 2),
+  all tested
 - `after_rust_analysis`: 5 validation checks
+
+### Build orchestration (Phase 5)
+- `toylangc build` reads `toylang.toml` and produces a working binary with
+  arbitrary crates.io dependencies
+- Three-mode dispatch in `main.rs`: build / wrapper / direct (see §10.5)
+- Wrapper mode re-reads manifest from `CARGO_MANIFEST_DIR/..` instead of
+  using a `TOYLANG_INPUT` env var (see @MRRIWMZ)
+- Dependency crates compile via `rustc_driver::RunCompiler` with
+  `NoopCallbacks`; only the primary crate (`CARGO_PRIMARY_PACKAGE=1`) goes
+  through toylang processing
+- 4 standalone tests: minimal project, project with Rust dep, invalid
+  manifest, missing source
 
 ---
 
@@ -415,13 +598,13 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 | File | Purpose |
 |------|---------|
-| `lib.rs` | `LangCallbacks` trait, `FacadeGlobals`, vtable + trampolines, `is_from_lang_stubs` |
-| `queries/layout.rs` | layout_of override |
+| `lib.rs` | `LangCallbacks` trait, split globals (`CONFIG`, `MUTABLE_STATE`, `DEFAULT_*` — see @GCMLZ), vtable + trampolines, `is_from_lang_stubs` |
+| `queries/layout.rs` | layout_of override (reads CONFIG/DEFAULT_LAYOUT_OF without lock per @GCMLZ) |
 | `queries/per_instance.rs` | per_instance_mir provider |
-| `queries/symbol_name.rs` | symbol_name override |
-| `queries/drop_glue.rs` | Drop glue (mir_shims) override |
+| `queries/symbol_name.rs` | symbol_name override (reads CONFIG/DEFAULT_SYMBOL_NAME without lock per @GCMLZ) |
+| `queries/drop_glue.rs` | Drop glue (mir_shims) override (reads CONFIG/DEFAULT_MIR_SHIMS without lock per @GCMLZ) |
 | `queries/mod.rs` | Query override installation (4 providers) |
-| `abi_helpers.rs` | ABI coercion helpers (includes hidden `#[track_caller]` param, see @TCHAPZ) |
+| `abi_helpers.rs` | ABI coercion helpers: `CoercedReturn`, `CoercedParam` (includes `Pair` variant for ScalarPair, see @ACRTFDZ); hidden `#[track_caller]` param (see @TCHAPZ) |
 | `mir_helpers.rs` | Drop glue MIR builder |
 | `codegen_wrapper.rs` | CodegenBackend wrapper, .o injection |
 | `driver.rs` | `run_compiler` entry point |
@@ -431,16 +614,18 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 | File | Purpose |
 |------|---------|
-| `llvm_gen.rs` | Inkwell LLVM backend: instance discovery, two-pass codegen, Rust method resolution |
+| `llvm_gen.rs` | Inkwell LLVM backend: instance discovery, two-pass codegen, Rust method resolution, FnCall use-import path with ABI return coercion (@ACRTFDZ) |
 | `stub_gen.rs` | Generates `__lang_stubs.rs` |
-| `oracle.rs` | TyCtxt query helpers, type conversion, symbol mangling (`resolved_type_to_mangled_name`) |
-| `main.rs` | CLI entry point |
-| `toylang/ast.rs` | Untyped AST (Expr, Stmt incl. Assign, Block, BinOp incl. And/Or, UnaryNeg) |
-| `toylang/typed_ast.rs` | `ResolvedType` enum, `TypedBlock`, `TypedStmt` incl. Assign |
-| `toylang/type_resolve.rs` | Type annotation pass, `TypeResolveError` (12 variants, 33 unit tests) |
-| `toylang/parser.rs` | Parser — `ParseError` (10 variants, 11 unit tests), precedence: `\|\|` < `&&` < comparison < additive < multiplicative |
-| `toylang/registry.rs` | `ToyStruct`, `ToyFunction` (no redundant `name` field), `ToyParam` |
-| `toylang/callbacks_impl.rs` | `LangCallbacks` impl, `ToylangState`, deep monomorphization walk, `CallbackLog` |
+| `oracle.rs` | TyCtxt query helpers (struct + enum lookup, trait + free function lookup), type conversion with broadened TyKind handling, symbol mangling |
+| `main.rs` | CLI entry point — three-mode dispatch (build / wrapper / direct), `NoopCallbacks` pass-through for dep crates |
+| `build.rs` | `toylangc build` — generates `.toylang-build/` Cargo project, spawns `cargo +rustc-fork build` (Phase 5, read site 1 of @MRRIWMZ) |
+| `manifest.rs` | `toylang.toml` parser — `Manifest`/`Project`/`DepSpec` structs, `parse()` via `toml::from_str` |
+| `toylang/ast.rs` | Untyped AST (Expr, Stmt incl. Assign, Block, BinOp incl. And/Or, UnaryNeg, Ref, ByteStringLit) |
+| `toylang/typed_ast.rs` | `ResolvedType` enum (incl. ByteSlice, Ref), `TypedBlock`, `TypedStmt` incl. Assign |
+| `toylang/type_resolve.rs` | Type annotation pass, `TypeResolveError` (13 variants incl. ArgTypeMismatch) |
+| `toylang/parser.rs` | Parser — `ParseError` variants, byte string lexing, precedence: `\|\|` < `&&` < comparison < additive < multiplicative |
+| `toylang/registry.rs` | `ToyStruct`, `ToyFunction`, `ToyParam` |
+| `toylang/callbacks_impl.rs` | `LangCallbacks` impl, `ToylangState`, deep monomorphization walk, `CallbackLog`, trait + free fn dep collection |
 
 ---
 
@@ -455,13 +640,41 @@ toylang callees, only returning Rust deps. Internal functions are stashed in
 `ToylangState.toylang_instances` for direct codegen. Each function body is walked
 exactly once via `visited_symbols`.
 
-### Why one global mutex
+### Why split globals (immutable OnceLock + mutable Mutex)
 
-Rustc's query providers fire on Rayon worker threads. Rather than making each
-piece of consumer state individually thread-safe, a single `Mutex<FacadeGlobals>`
-serializes all consumer code. The mutex is locked at every rustc→consumer entry
-point. This guarantees single-threaded execution of all toylang code with zero
-concurrency complexity.
+Rustc's query providers fire on Rayon worker threads. The original design used
+a single `Mutex<FacadeGlobals>` to serialize all consumer code. This worked
+until Phase 4's `stdout()` test, which triggered a deadlock:
+`call_generate_and_compile` held the mutex while consumer codegen ran; codegen
+called `tcx.symbol_name(stdout)`; our `lang_symbol_name` provider tried to
+call `default_symbol_name()` which tried to re-lock the same mutex.
+
+The fix splits state by mutability: immutable config (callbacks, vtable,
+default providers) goes in `OnceLock` statics (no locking needed for reads);
+mutable state (consumer_state, lang_obj_path) stays behind a Mutex. Query
+providers reading only config are lock-free, so they can execute during
+`generate_and_compile` without deadlock. See @GCMLZ.
+
+The Mutex on `consumer_state` still serializes all callbacks that need `&mut`
+access, preserving the single-threaded execution guarantee for toylang code.
+
+### Why ABI-coerced return types for Rust function declarations
+
+When declaring an LLVM function that will be called as a Rust function, the
+return type must match rustc's ABI coercion, not toylang's representation.
+For an 8-byte struct like `Stdout`, rustc returns `i64` (Direct scalar in
+register `x0`), but toylang's `resolved_to_inkwell` produces `[8 x i8]` (LLVM
+aggregate in memory). LLVM uses different code paths for the two — declaring
+the wrong one produces garbage return values.
+
+Phase 4 fixed this in all three Rust call paths (MethodCall, StaticCall,
+FnCall use-import) by using `parse_coerced_type(coerced_ret)` for the
+declaration. When the ABI type differs from the toylang type, codegen stores
+the return value through an alloca to reinterpret the bits (type-punning
+bitcast via memory). See @ACRTFDZ.
+
+Internal toylang-to-toylang calls still use `resolved_to_inkwell` because
+their ABI is fully owned by toylang — no rustc coercion applies.
 
 ### Why consumer state is `dyn Any` in the facade
 
@@ -511,35 +724,136 @@ See `known-tech-debt.md` for full details. Open items:
 
 ---
 
-## Part 10: Planned — toylang.toml and Crate Dependencies
+## Part 10: Phases Completed and Planned
 
-### 10.1 Motivation
+### 10.1 Done: Phase 1 — Explicit trait method calls
 
-Toylang currently compiles through rustc but can only use `std` types because
-there's no Cargo integration. The goal is to let toylang use arbitrary Rust
-crates (rand, regex, uuid, clap, serde, etc.) with Cargo as an invisible
-implementation detail. Toylang controls its own build story.
+`Trait::method(receiver, args)` syntax via `StaticCall`. The oracle resolves
+the trait DefId via `find_use_imported_trait_def_id`, finds the method in the
+trait's associated items, and builds args as `[Self, ...]` on the trait
+definition's DefId (@TVIMDGAZ). `Instance::expect_resolve` maps to the
+concrete impl at monomorphization time.
 
-### 10.2 toylang.toml manifest
+Fixed a latent `#[track_caller]` ABI bug along the way (@TCHAPZ): ~43 Vec
+methods have a hidden `&Location` pointer param that must be appended at every
+call site. Previously absent → undefined behavior that happened not to trigger
+in existing tests.
 
-Each toylang project has a `toylang.toml`:
+Tests: `test_trait_static_call_clone_vec`, `test_trait_static_call_result_discarded`,
+`test_ref_expr_basic`, + regression coverage.
 
-```toml
-[project]
-name = "my-app"
-source = "main.toylang"
-edition = "2021"
-features = ["allocator_api"]
+### 10.2 Done: Phase 2 — Rust free function calls
 
-[rust-dependencies]
-rand = "0.8"
-regex = { version = "1.10", features = ["unicode"] }
+Use-imported free functions like `stdout()`. Added `find_use_imported_fn_def_id`
+for `DefKind::Fn` re-exports, `rust_free_fn_return_type` /
+`rust_free_fn_param_types` for the FnCall path, plus `ArgTypeMismatch` error
+variant and `types_match()` for semantic `StructRef` vs `Struct` equivalence.
+
+FnCall dispatch restructured to handle both extern declarations and
+use-imported free functions with real type args. All `instantiate_identity()`
+call sites got comments explaining why structural inspection is safe there.
+
+Tests: 12 new, covering arg type checking, free function resolution, and
+existence sentinel (`Option::None` = "not found", `Some(vec![])` = "found,
+takes no args").
+
+### 10.3 Done: Phase 3 — Byte string literals
+
+`b"hello\n"` → `&[u8]` fat pointer `{ ptr, i64 }`. The lexer recognizes the
+`b"` prefix and handles escape sequences. In LLVM codegen, a global constant
+byte array is allocated and wrapped in a fat pointer struct.
+
+Fixed a latent `ScalarPair` ABI bug: previously ScalarPair was collapsed into
+`Direct("{ ptr, i64 }")` (one LLVM param), but rustc's ABI wants two separate
+params (ptr + i64). Added `CoercedParam::Pair(String, String)` variant. No
+existing code exercised it because no existing code used `&[u8]`.
+
+The FnCall path also gained ABI-correct declarations: previously it built LLVM
+function decls from toylang-internal types, causing silent data corruption for
+extern C functions. Both `FnCall` paths (extern-declared and use-imported) now
+query `coerced_param_types_for_instance`.
+
+Tests: 9 new, covering byte string parsing, type resolution, and ScalarPair ABI.
+
+### 10.4 Done: Phase 4 — I/O integration, GLOBALS split, ABI coercion
+
+`Write::write_all(&stdout(), b"hello\n")` works end-to-end. Implementation
+required four distinct fixes:
+
+1. **GLOBALS deadlock fix (@GCMLZ).** Split the single `Mutex<FacadeGlobals>`
+   into `CONFIG: OnceLock<FacadeConfig>` (immutable), `DEFAULT_*: OnceLock<fn>`
+   (immutable), and `MUTABLE_STATE: OnceLock<Mutex<FacadeMutableState>>`
+   (mutable only). Query providers reading only config are lock-free, so they
+   can execute during `generate_and_compile` without deadlock.
+
+2. **sret handling in FnCall use-import path.** `stdout()` returns `Stdout` —
+   rustc may return it via sret (indirect) depending on size. Added
+   `coerced_return_type_for_instance` query and handling for all three modes
+   (Direct, Indirect, Void), following the pattern from
+   `get_or_resolve_rust_method`.
+
+3. **ABI-coerced return types (@ACRTFDZ).** The FnCall path declared LLVM
+   functions with `resolved_to_inkwell` (toylang's `[8 x i8]` for Stdout), but
+   rustc returns `i64` (Direct scalar). LLVM treats aggregate vs scalar returns
+   differently → garbage return values → segfault when later dereferenced.
+   Fixed by using `parse_coerced_type(coerced_ret)` in the declaration, plus
+   store-through-pointer reinterpretation when ABI type differs from toylang
+   type.
+
+4. **Broadened TyKind handling.** `rustc_ty_to_resolved_type` now handles
+   previously-unsupported types (`u8`/`u16`/etc. as opaque `RustType`, `Str`,
+   `Never`, `RawPtr`, `Dynamic`, non-empty `Tuple`). `find_reexported_type`
+   matches `DefKind::Enum` (fixes `Option`/`Result`). `resolved_to_rustc_ty`
+   maps primitive type names back to `tcx.types.*` for round-tripping.
+
+Tests: 6 new — `test_stdout_call`, `test_stdout_write_all`,
+`test_stdout_multiple_writes`, `test_write_all_result_bound`,
+`test_vec_pop_returns_option`, `test_rust_fn_returning_option_u8`.
+
+### 10.5 Done: Phase 5 — toylang.toml and build orchestration
+
+`toylangc build` reads `toylang.toml` and produces a working binary that can
+depend on arbitrary Rust crates — no hand-written `main.rs`, no linker flags,
+no knowledge of rustc plumbing on the user's side.
+
+```
+toylang.toml + main.toylang
+         ↓
+  toylangc build                         ←  build mode (manifest read #1)
+         ↓
+  generates .toylang-build/
+    ├─ Cargo.toml                        (from [rust-dependencies])
+    ├─ src/main.rs                       (auto-generated shim)
+    └─ rust-toolchain.toml               (pins rustc-fork)
+         ↓
+  cargo +rustc-fork build
+    with RUSTC_WORKSPACE_WRAPPER=<self>
+    and  DYLD_LIBRARY_PATH / LD_LIBRARY_PATH set
+         ↓
+  Dependency crates compile via rustc_driver::RunCompiler
+    with NoopCallbacks (no toylang processing)
+  Primary crate compiles through toylangc wrapper mode
+    gated by CARGO_PRIMARY_PACKAGE=1
+    re-reads ../toylang.toml to locate .toylang source  ← manifest read #2
+         ↓
+  .toylang-build/target/debug/<binary>
 ```
 
-The `[rust-dependencies]` section uses Cargo.toml `[dependencies]` syntax
-verbatim — no translation layer. Users run `toylangc build`, not
-`RUSTC=toylangc cargo build`. No `Cargo.toml`, no `main.rs`, no glue files
-visible to the user.
+`toylangc` operates in three modes:
+1. **Build mode** (`argv[1] == "build"`): parses manifest, generates
+   `.toylang-build/`, spawns cargo.
+2. **Wrapper mode** (`argv[1]` is a path ending in `rustc`): cargo's
+   `RUSTC_WORKSPACE_WRAPPER` protocol. If `CARGO_PRIMARY_PACKAGE` is set,
+   re-reads `toylang.toml` one directory up from `CARGO_MANIFEST_DIR` and
+   compiles through the existing toylang flow; otherwise passes through to
+   plain rustc via `rustc_driver::RunCompiler::new(args, &mut NoopCallbacks)`.
+3. **Direct mode** (`--toylang-input <path>`): existing behavior, unchanged —
+   used by integration tests.
+
+This follows the Clippy/Miri pattern. Dependencies compile with real rustc;
+only the primary crate goes through toylangc. See @MRRIWMZ for why the
+manifest is re-read in wrapper mode instead of carrying the source path via
+a `TOYLANG_INPUT` env var.
 
 **Why `[rust-dependencies]` not `[dependencies]`?** Leaves room for
 `[toylang-dependencies]` when toylang has its own package ecosystem.
@@ -548,183 +862,65 @@ visible to the user.
 Cargo is a tool in toylang's toolbox, not the other way around. If toylang
 moves away from rustc someday, the user-facing contract doesn't change.
 
-### 10.3 Build orchestration
+See `docs/historical/plan-phase5-toylang-toml-build.md` for the full
+implementation history.
 
-`toylangc build` reads `toylang.toml` and orchestrates everything:
-
-```
-toylang.toml + main.toylang
-         ↓
-  toylangc build
-         ↓
-  generates .toylang-build/
-    ├─ Cargo.toml         (from [rust-dependencies])
-    └─ src/main.rs        (auto-generated shim)
-         ↓
-  cargo +rustc-fork build
-    with RUSTC_WORKSPACE_WRAPPER=toylangc
-    and  TOYLANG_INPUT=<path to .toylang source>
-         ↓
-  Dependencies compile with real rustc
-  Workspace crate compiles through toylangc
-         ↓
-  .toylang-build/target/debug/<binary>
-```
-
-`toylangc` operates in three modes:
-1. **Build mode**: `toylangc build` — reads toylang.toml, orchestrates cargo
-2. **Wrapper mode**: invoked as `RUSTC_WORKSPACE_WRAPPER` by cargo. Reads
-   `TOYLANG_INPUT` env var, compiles the workspace crate through the toylang
-   pipeline.
-3. **Direct mode**: `toylangc --toylang-input foo.toylang main.rs -o binary` —
-   the existing compilation flow for integration tests.
-
-This follows the same pattern as Clippy (`cargo-clippy` sets
-`RUSTC_WORKSPACE_WRAPPER=clippy-driver`) and Miri. Dependencies compile with
-real rustc; only the workspace crate goes through toylangc.
-
-### 10.4 Trait method calls (explicit trait qualification)
-
-Toylang calls trait methods using explicit trait qualification via the existing
-`StaticCall` syntax (`Trait::method(receiver, args)`):
-
-```
-use std::io::Write
-use std::io::Stdout
-
-fn main() {
-    let out = stdout()
-    Write::write_all(&out, b"hello\n")
-}
-```
-
-The caller specifies which trait provides the method. The compiler:
-1. Looks up `Write` as a trait by name (via `find_use_imported_trait_def_id`)
-2. Finds `write_all` in the trait's associated items
-3. Resolves the concrete impl for the receiver's type (`Stdout`)
-4. Gets the method's `DefId` from the impl, queries ABI, emits the call
-
-This reuses the existing `StaticCall` AST node. The key change is distinguishing
-"is this name a type or a trait?" in the oracle. For types, we do inherent
-method lookup (existing behavior). For traits, we do trait impl lookup (new).
-
-No trait bounds, no `where` clauses, no `dyn` dispatch. Toylang's generics are
-late-bound (checked at monomorphization time, like C++ templates), so no trait
-system is needed in the language itself.
-
-**Possible future improvement — duck-typed trait method resolution:** Instead of
-requiring explicit trait qualification, the compiler could search all trait impls
-automatically when `receiver.method(args)` doesn't find an inherent method.
-Using `tcx.all_traits()` and `tcx.for_each_relevant_impl()`, it would iterate
-all traits to find one with a matching method that has an impl for the receiver's
-concrete type. This would let users write `out.write_all(bytes)` instead of
-`Write::write_all(&out, bytes)` — cleaner syntax at the cost of searching
-potentially thousands of traits. Deferred because explicit qualification is
-simpler to implement and avoids ambiguity when multiple traits define the same
-method name.
-
-### 10.5 Rust free function calls
-
-Toylang currently supports calling Rust methods on types (`v.push(x)`,
-`Vec::new()`) but not Rust free functions from modules. With `use` imports,
-toylang can call free functions like `std::io::stdout()` or `rand::thread_rng()`:
-
-```
-use std::io::stdout
-
-fn main() {
-    let out = stdout()
-    ...
-}
-```
-
-The stub generator already emits `pub use std::io::stdout;` — the function is
-visible to rustc. A new `find_use_imported_fn_def_id` oracle function searches
-`module_children_local` for `DefKind::Fn` re-exports (parallel to
-`find_reexported_type` for types). The `rust_method_ret` callback uses an
-empty-string convention for the type name to signal a free function lookup.
-
-### 10.6 Byte string literals
-
-`b"hello\n"` syntax produces `&[u8]` values. The lexer recognizes the `b"`
-prefix, supports escape sequences (`\n`, `\t`, `\\`, `\0`, `\"`), and produces
-`Token::ByteStringLit(Vec<u8>)`. The type is `ResolvedType::Ref { inner:
-ByteSlice }`.
-
-In LLVM codegen, a byte string literal becomes a global constant array with a
-fat pointer `{ ptr, usize }`. When passed to Rust functions like `write_all`,
-the `&[u8]` may be a `ScalarPair` in rustc ABI (ptr and len as separate
-arguments rather than a single struct).
-
-### 10.7 I/O without glue
-
-With trait method resolution, free function calls, and byte string literals,
-toylang can do I/O directly:
-
-```
-use std::io::stdout
-use std::io::Stdout
-use std::io::Write
-
-fn main() {
-    let out = stdout()
-    out.write_all(b"hello world\n")
-}
-```
-
-This exercises:
-- Free function call (`stdout()`)
-- Trait method call (`.write_all()` from `Write` trait)
-- Byte string literal (`b"hello world\n"`)
-- Return value discarding (`Result` from `write_all` silently dropped by
-  `ExprStmt` — the codegen does `let _ = lower_typed_expr(...)`)
-
-No `println!()` macro, no glue.rs, no Rust shim. Toylang uses the same
-functions `println!()` uses under the hood.
-
-### 10.8 .unwrap() on Result/Option
+### 10.6 Planned: Phase 6 — .unwrap() on Result/Option
 
 `.unwrap()` is an inherent method on both `Result<T, E>` and `Option<T>` —
-`find_inherent_method` finds it without needing trait resolution. The `E: Debug`
-bound on `Result::unwrap()` isn't checked at method discovery time.
+`find_inherent_method` should find it without needing trait resolution. With
+Phase 4's enum support in `find_reexported_type` and broadened type handling,
+this should work close to out-of-the-box. Phase 6 verifies it end-to-end and
+fixes any surprises.
 
 This unlocks most Rust crate APIs:
 - `Regex::new("pattern").unwrap()` → `Regex`
 - `glob::glob("*.txt").unwrap()` → `Paths`
-- `reqwest::blocking::get(url).unwrap()` → `Response`
 - `toml::from_str::<Value>(text).unwrap()` → `Value`
 
 Full enum support (match expressions, variant construction) is a separate
 future feature. `.unwrap()` is sufficient for the "prove toylang can link
 against arbitrary crates" milestone.
 
-### 10.9 No derive macros needed
+### 10.7 Planned: Phase 7 — Standalone test projects
+
+Standalone test projects under `tests/standalone/`, each with a `toylang.toml`
+and `main.toylang`. No Rust files, no glue. Each project proves toylang can
+link against and call a specific Rust crate.
 
 Every target crate has an imperative API that avoids derive macros:
 
 | Crate | Imperative API | Example |
 |-------|---------------|---------|
-| regex | Method calls | `Regex::new(pat).unwrap().is_match(text)` |
-| clap | Builder pattern | `Command::new("app").arg(Arg::new("input")).get_matches()` |
-| serde_json | `serde_json::Value` | `serde_json::from_str::<Value>(json).unwrap()` |
-| toml | `toml::Value` | `toml::from_str::<Value>(text).unwrap()` |
 | rand | Free fn + trait method | `thread_rng().gen::<i32>()` |
 | uuid | Static method | `Uuid::new_v4()` |
 | indexmap | Constructor + methods | `IndexMap::new()`, `.insert()`, `.len()` |
+| regex | Method calls | `Regex::new(pat).unwrap().is_match(text)` |
+| clap | Builder pattern | `Command::new("app").arg(Arg::new("input"))` |
 | glob | Free function | `glob::glob("*.txt").unwrap()` |
 | reqwest | Free function | `reqwest::blocking::get(url).unwrap()` |
+| toml | `toml::Value` | `toml::from_str::<Value>(text).unwrap()` |
+| serde_json | `serde_json::Value` | `serde_json::from_str::<Value>(json).unwrap()` |
 
 Derive macros are syntactic sugar for trait impls. The underlying APIs are
 always available imperatively.
 
-### 10.10 Test projects
+### 10.8 Planned: Phase 8 — Test harness
 
-Standalone test projects live under `tests/standalone/`, each with a
-`toylang.toml` and `main.toylang`. No Rust files, no glue. Each project proves
-toylang can link against and call a specific Rust crate.
+`toylangc/tests/standalone_tests.rs` builds each standalone project via
+`toylangc build` and asserts expected output. One test function per project.
 
-The test harness (`toylangc/tests/standalone_tests.rs`) builds each project
-via `toylangc build` and asserts expected output.
+### 10.9 Deferred: duck-typed method resolution
+
+Instead of requiring explicit trait qualification `Trait::method(...)`, the
+compiler could search all trait impls automatically when `receiver.method(args)`
+doesn't find an inherent method. Using `tcx.all_traits()` and
+`tcx.for_each_relevant_impl()`, it would iterate all traits to find one with a
+matching method that has an impl for the receiver's concrete type. This would
+let users write `out.write_all(bytes)` instead of `Write::write_all(&out, bytes)` —
+cleaner syntax at the cost of searching potentially thousands of traits.
+Deferred because explicit qualification is simpler and avoids ambiguity when
+multiple traits define the same method name.
 
 ---
 
@@ -747,12 +943,31 @@ rustup toolchain link rustc-fork ~/rust/build/host/stage2
 ### Running tests
 
 ```bash
-# All integration tests (95 passed, 0 ignored):
+# All integration tests (110 passed, 0 ignored):
 cargo +rustc-fork test -p toylangc --test integration_tests
 
-# Unit tests (37 passed):
+# Unit tests (54 passed):
 cargo +rustc-fork test -p toylangc --bin toylangc
+
+# Everything the CI cares about:
+cargo +rustc-fork test -p toylangc --test integration_tests --bin toylangc
 
 # Check for warnings:
 cargo +rustc-fork check -p toylangc
 ```
+
+### Arcana index
+
+Cross-cutting concerns documented as arcana (each has `@ID` comments at
+affected code sites):
+
+- `@TCHAPZ` — Track Caller Hidden ABI Parameter
+  (`docs/arcana/TrackCallerHiddenABIParameter-TCHAPZ.md`)
+- `@TVIMDGAZ` — Trait vs Impl Method DefId Generic Args
+  (`docs/arcana/TraitVsImplMethodDefIdGenericArgs-TVIMDGAZ.md`)
+- `@GCMLZ` — Generate Compile Mutex Lock
+  (`docs/arcana/GenerateCompileMutexLock-GCMLZ.md`)
+- `@ACRTFDZ` — ABI Coerced Return Type In Function Declarations
+  (`docs/arcana/ABICoercedReturnTypeInFunctionDeclarations-ACRTFDZ.md`)
+- `@MRRIWMZ` — Manifest Re-read In Wrapper Mode
+  (`docs/arcana/ManifestReReadInWrapperMode-MRRIWMZ.md`)

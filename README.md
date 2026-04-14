@@ -14,15 +14,66 @@ type system, generics, monomorphization, and standard library.
 ## Quick start
 
 ```bash
-# Build both crates
-cargo build
+# Build the compiler
+cargo +rustc-fork build -p toylangc
 
-# Run the host test (Vec<Point> creation and length check)
-DYLD_LIBRARY_PATH=$(rustup run nightly-2025-01-15 rustc --print=sysroot)/lib \
-  ./target/debug/toylangc --edition 2021 \
-  --toylang-input toylangc/tests/point.toylang \
-  toylangc/tests/host_test.rs -o /tmp/host_test && /tmp/host_test
+# Run the test suite (174 tests: unit + integration + standalone)
+cargo +rustc-fork test -p toylangc
 ```
+
+Then try a minimal toylang project:
+
+```bash
+mkdir -p /tmp/smoke && cd /tmp/smoke
+cat > toylang.toml <<EOF
+[project]
+name = "smoke"
+source = "main.toylang"
+EOF
+echo 'fn main() {}' > main.toylang
+
+DYLD_LIBRARY_PATH=$(rustc +rustc-fork --print sysroot)/lib \
+  /path/to/target/debug/toylangc build
+./.toylang-build/target/debug/smoke; echo "exit: $?"
+```
+
+## Building a project with `toylang.toml`
+
+For real projects (not single-file integration tests), create a `toylang.toml`
+manifest next to your `.toylang` source:
+
+```toml
+[project]
+name = "my_app"
+source = "main.toylang"
+
+[rust-dependencies]
+rand = "0.8"
+regex = { version = "1", features = ["unicode"] }
+```
+
+Then run `toylangc build`. It generates a hidden `.toylang-build/` Cargo
+project, lets cargo resolve the `[rust-dependencies]`, and produces a binary
+at `.toylang-build/target/debug/<name>`.
+
+**How `toylang.toml` is used.** The manifest plays two roles, and both are
+important to understand:
+
+1. **User-facing manifest.** `toylangc build` parses it to generate the
+   internal Cargo project (`Cargo.toml`, `src/main.rs` shim,
+   `rust-toolchain.toml`) and to spawn `cargo +rustc-fork build`.
+2. **Side-channel for wrapper mode.** Cargo then invokes `toylangc` itself as
+   a `RUSTC_WORKSPACE_WRAPPER` for each crate. When it reaches your primary
+   crate, wrapper-mode `toylangc` re-reads the same `toylang.toml` (one
+   directory up from the generated `.toylang-build/`) to locate the
+   `.toylang` source. This keeps the manifest as the single source of truth —
+   no environment variable side-channels, no hidden state.
+
+The trade-off is that the manifest is parsed twice per build (microseconds,
+irrelevant). In exchange, everything the build system needs is visible in one
+user-editable file. See
+[`docs/arcana/ManifestReReadInWrapperMode-MRRIWMZ.md`](docs/arcana/ManifestReReadInWrapperMode-MRRIWMZ.md)
+for the full cross-cutting rationale.
 
 ## How it works
 
