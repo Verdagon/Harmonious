@@ -7,6 +7,10 @@ description: Investigate a bug by building a collapsed call tree with debug prin
 
 Technique for investigating compiler bugs by tracing execution and building a human-readable collapsed call tree.
 
+## CRITICAL RULE: No Logic Changes
+
+**You may ONLY add debug printouts. NO other code changes are allowed.** This prevents speculative fixes from contaminating the diagnostic process. Once root cause is identified, you MUST get explicit user approval before implementing any fix.
+
 ## Process
 
 1. **Add debug printouts** to key functions along the suspected execution path. Print function name, key arguments, and outcomes (success/failure/which branch taken).
@@ -42,9 +46,19 @@ Technique for investigating compiler bugs by tracing execution and building a hu
 
 4. **Iterate**: each round of debug printouts answers questions and raises new ones. Add findings to the markdown file, add more printouts, rerun. Keep going until root cause is clear. **Periodically show the updated investigation doc to the user** so they can follow along and steer.
 
-5. **STOP before implementing any fix.** Show the investigation doc to the user and explicitly ask for approval before writing any fix code. The user always wants to read the findings and understand the root cause before any code changes are made. **Never jump from diagnosis to fix** — not even a "quick" one. Undo any speculative fix attempts if you made them during investigation. The only code changes allowed during investigation are debug printouts.
+5. **STOP and get user approval before implementing any fix.** 
+   - Show the investigation doc to the user and explicitly ask: **"Do you approve these findings?"**
+   - Wait for explicit approval of the root cause analysis
+   - Only after approval, ask: **"Should I proceed with the fix?"**
+   - Wait for explicit approval of the proposed fix before writing any fix code
+   - The user always wants to read findings and understand root cause before any code changes are made
+   - **Never jump from diagnosis to fix** — not even a "quick" one
+   - If you made any speculative fix attempts during investigation, undo them immediately
+   - **The only code changes allowed during investigation are debug printouts**
 
-6. **Clean up** debug printouts when done.
+6. **After user approves the fix, implement it** and then proceed to cleanup.
+
+7. **Clean up** all debug printouts once the fix is verified working.
 
 ## Example
 
