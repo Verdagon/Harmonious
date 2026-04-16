@@ -3136,6 +3136,91 @@ fn main() { __toylang_main(); }
 }
 
 #[test]
+fn test_main_non_void_tail_rejected() {
+    // Per @MBMRVZ, `fn main()` must have a void-typed tail. Non-void
+    // tails used to silently compile and SIGBUS at runtime during
+    // teardown; the type resolver now rejects them with a clean error.
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+
+    // Main's tail is `1i32` — non-void. Should be rejected.
+    std::fs::write(&toylang_path, r#"
+fn main() {
+    1i32
+}
+    "#).unwrap();
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { __toylang_main(); }
+    "#).unwrap();
+
+    let compile = Command::new(toylangc_bin())
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .args(&[
+            "--edition", "2021",
+            "--toylang-input", toylang_path.to_str().unwrap(),
+            rust_path.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run toylangc");
+
+    assert!(!compile.status.success(),
+        "compilation should have failed for non-void main tail, but succeeded");
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(stderr.contains("MainMustReturnVoid"),
+        "stderr should mention MainMustReturnVoid; got: {}", stderr);
+}
+
+#[test]
+fn test_trait_self_not_imported_gives_error() {
+    // Per @RTMEIZ, the Self type of a trait call must be use-imported.
+    // Missing `use std::io::Stdout` → structured error, not a panic/ICE.
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+
+    std::fs::write(&toylang_path, r#"
+use std::io::stdout
+use std::io::Write
+
+fn main() {
+    let out = stdout();
+    Write::write_all(&out, b"hello\n");
+}
+    "#).unwrap();
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { __toylang_main(); }
+    "#).unwrap();
+
+    let compile = Command::new(toylangc_bin())
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .args(&[
+            "--edition", "2021",
+            "--toylang-input", toylang_path.to_str().unwrap(),
+            rust_path.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run toylangc");
+
+    assert!(!compile.status.success(),
+        "compilation should have failed for missing Stdout import, but succeeded");
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(stderr.contains("Stdout"),
+        "stderr should mention 'Stdout'; got: {}", stderr);
+    assert!(stderr.contains("RustTypeNotImported"),
+        "stderr should mention 'RustTypeNotImported'; got: {}", stderr);
+}
+
+
+#[test]
 fn test_byte_string_let_binding() {
     // Verify b"hello" compiles and the program runs without crashing.
     let output = run_toylang_test(

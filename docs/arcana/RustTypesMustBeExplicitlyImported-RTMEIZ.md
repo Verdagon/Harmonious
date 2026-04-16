@@ -3,20 +3,32 @@
 Every Rust type that flows through toylang's type system — even
 transitively, even if the toylang source never names it — must be
 `use`-imported in the toylang source. Otherwise `find_rust_type_def_id`
-returns `None` and `resolved_to_rustc_ty` panics with "Rust type
-'<name>' not found". The surprise is that the set of types a program
+returns `None` and the compiler surfaces either a structured
+`RustTypeNotImported` error (from `after_rust_analysis`, the common
+case) or a codegen-time panic whose message names the missing type
+(rare edge case). The surprise is that the set of types a program
 "uses" per toylang's resolver is wider than the set of types its
 source mentions by name.
 
 ## Where
 
-- `toylangc/src/oracle.rs::resolved_to_rustc_ty` (~line 111-112) —
-  the panic site for the `ResolvedType::RustType` arm.
-- `toylangc/src/oracle.rs::find_rust_type_def_id` (~line 319-324) —
-  the lookup that only searches `pub use` re-exports in `__lang_stubs`.
+- `toylangc/src/oracle.rs::try_resolved_to_rustc_ty` — the conversion
+  that returns `Result<ty::Ty, UnresolvedRustType>` on missing types.
+  Context-aware: reports *why* the type was needed (trait Self, type
+  arg, nested generic, etc.) so the error message is actionable.
+- `toylangc/src/oracle.rs::resolved_to_rustc_ty` — the panicking
+  convenience wrapper for codegen call sites where type resolution
+  already passed; panics with the same actionable message if reached.
+- `toylangc/src/oracle.rs::find_rust_type_def_id` — the lookup that
+  only searches `pub use` re-exports in `__lang_stubs`.
 - `toylangc/src/oracle.rs::rust_trait_method_return_type` — one of
   the callers that traffics in types the user never names (the Self
-  type of a trait method call).
+  type of a trait method call). Propagates the `UnresolvedRustType`
+  error to `after_rust_analysis`.
+- `toylangc/src/toylang/type_resolve.rs::TypeResolveError::RustTypeNotImported`
+  — the structured error variant that `after_rust_analysis` surfaces.
+  Carries `{ name, context }` where context is the human-readable
+  explanation.
 - `toylangc/src/stub_gen.rs` — where `pub use` re-exports are emitted
   into `__lang_stubs.rs` based on the toylang source's `use` imports.
 
@@ -55,13 +67,33 @@ Types a toylang program uses without naming:
    type (not a primitive), it must be imported. For I/O code this
    means `use std::io::Error` alongside `use std::result::Result`.
 
-The failure mode is a runtime panic inside rustc (toylangc running as
-a rustc driver), stack-traced to `oracle.rs:112`, with message
-`Rust type '<name>' not found`. The panic site points at the name
-that wasn't registered; the trace's caller tells you which code path
-wanted it (`rust_trait_method_return_type`, `resolved_to_inkwell`,
-etc.), which tells you whether it was a Self type, a return type, or
-a nested generic arg.
+The common failure mode is a structured compile error batched with
+any other validation errors in `after_rust_analysis`:
+
+```
+[toylang] validation failed with 1 error(s):
+  - function 'main': RustTypeNotImported { name: "Stdout",
+      context: "as Self of trait call `Write::write_all`" }
+[toylang] aborting due to validation errors
+```
+
+The `context` field names the variant of `RustTypeLookupContext` that
+triggered the lookup — `TraitCallSelf`, `TraitMethodTypeArg`,
+`InherentMethodTypeArg`, `FreeFunctionTypeArg`, `NestedGenericArg`,
+`StructField`, or `Codegen`. Each renders via a `Display` impl into a
+human-readable suffix (e.g., `"as Self of trait call \`Write::write_all\`"`).
+
+For codegen-path lookups that slip through validation (rare), the
+panicking wrapper reports the same message via `panic!`:
+
+```
+thread 'rustc' panicked at .../oracle.rs:...
+  Rust type `<name>` is not imported (used during codegen).
+  Add `use <path>::<name>` at the top of your source.
+```
+
+Either way, the message names the type and the context. The fix is
+always in user source: add the missing `use` line.
 
 ## Why it exists
 
@@ -75,17 +107,18 @@ The registry is flat and keyed by type name, not by DefPath. There's
 no path to "find this type by its full module path without an import"
 — toylang only looks at what the user imported.
 
-The long-term fix is auto-registration: when `rustc_ty_to_resolved_type`
-converts a rustc `ty::Ty` into a `ResolvedType::RustType { name, ... }`,
-cache the `DefId` keyed by `name`, and have `find_rust_type_def_id`
-consult that cache before falling back to the `pub use` walk. That
-removes the "did you remember to `use` it?" hazard entirely. Tracked
-in known-tech-debt.
+Auto-registration (caching types encountered during
+`rustc_ty_to_resolved_type`) was considered and explicitly rejected:
+toylang is an explicit language, and silently registering types by
+resolver traversal order would create order-dependent name collisions
+and undermine the import story. The structured error approach is the
+final fix — it keeps the explicit-import contract while making the
+failure mode actionable instead of an ICE.
 
-For now: explicit is correct. When a toylang program uses a Rust crate
-(including `std`), trace every type that flows through a trait call's
-`Self`, any tail expression's return type, any nested generic's args,
-and `use`-import each one at the top of the file. The integration
+When a toylang program uses a Rust crate (including `std`), trace
+every type that flows through a trait call's `Self`, any tail
+expression's return type, any nested generic's args, and
+`use`-import each one at the top of the file. The integration
 tests in `toylangc/tests/integration_tests.rs` (see
 `test_write_all_result_bound`) model the pattern exactly.
 
@@ -96,5 +129,5 @@ tests in `toylangc/tests/integration_tests.rs` (see
 - `docs/arcana/MainBodyMustReturnVoid-MBMRVZ.md` — the related
   `fn main()` requirement. A tail expression's return type is subject
   to this rule even when the tail has `;` (discarded but still typed).
-- `docs/architecture/known-tech-debt.md` — pending auto-registration
-  of types encountered during `rustc_ty_to_resolved_type`.
+- `docs/architecture/known-tech-debt.md` — resolved entry #26 for the
+  structured-error conversion; auto-registration was rejected.

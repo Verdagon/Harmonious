@@ -652,10 +652,10 @@ fn codegen_internal_function<'ctx, 'tcx>(
     // by the Rust shim) will call us with a missing sret buffer and
     // SIGBUS during our final return-value store.
     // Query rustc for Rust method return types
-    let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> ResolvedType {
+    let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
         if type_name.is_empty() {
             crate::oracle::rust_free_fn_return_type(ctx.tcx, method, type_args)
-                .unwrap_or(ResolvedType::Void)
+                .map(|opt| opt.unwrap_or(ResolvedType::Void))
         } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
             let receiver_ty = &type_args[0];
             let explicit_args = &type_args[1..];
@@ -664,7 +664,7 @@ fn codegen_internal_function<'ctx, 'tcx>(
             crate::oracle::rust_method_return_type(ctx.tcx, type_name, method, type_args)
         }
     };
-    let rust_param_types = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Option<Vec<ResolvedType>> {
+    let rust_param_types = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
         if type_name.is_empty() {
             crate::oracle::rust_free_fn_param_types(ctx.tcx, method, type_args)
         } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {

@@ -4,84 +4,6 @@
 
 ---
 
-## 26. Auto-register Rust types encountered during conversion (@RTMEIZ)
-
-### Problem
-
-Every Rust type that flows through toylang's type system must be
-`use`-imported in the toylang source, even types the source never
-names explicitly: the `Self` of a trait-method call, the return type
-of a discarded tail expression, the generic args of a nested type.
-Missing an import surfaces as a runtime panic inside toylangc
-(`Rust type '<name>' not found` at `oracle.rs:112`) instead of a
-clean compile error.
-
-See `docs/arcana/RustTypesMustBeExplicitlyImported-RTMEIZ.md` for the
-full mechanism and `docs/usage/writing-main.md` for the practical
-rule.
-
-### Fix
-
-`rustc_ty_to_resolved_type` at `toylangc/src/oracle.rs` already has
-the `DefId` of every Rust type it encounters at the moment it builds
-a `ResolvedType::RustType { name, ... }`. Cache the `(name, DefId)`
-pair in a `LazyLock<Mutex<HashMap<String, DefId>>>` at that site.
-Update `find_rust_type_def_id` to consult the cache before falling
-back to the `pub use` walk. This removes the "did you remember to
-`use` it?" hazard entirely.
-
-Risks: name collisions between distinct types sharing a base name
-(e.g., `std::io::Error` vs `std::fmt::Error`). Mitigation: store a
-`Vec<DefId>` per name and make the resolver require disambiguation
-when more than one is registered, matching today's `pub use` behavior
-(which already errors on duplicate re-exports).
-
-### Better-UX alternative
-
-Even without auto-registration, reject the panic at type-resolve time
-with a structured error ("Rust type `Stdout` used implicitly as Self
-of `Write::write_all` but not `use`-imported; add `use std::io::Stdout`").
-One-line check in `type_resolve.rs` that wraps the `resolved_to_rustc_ty`
-call in a pre-flight `find_rust_type_def_id` and converts `None` into
-a typed error variant. Cheap, fully compatible with the auto-register
-fix above, and transforms silent SIGBUSes / rustc ICEs into clear
-compile errors.
-
----
-
-## 27. Reject non-void `fn main()` tail expressions (@MBMRVZ)
-
-### Problem
-
-Toylang's `fn main()` body must have a void-typed tail expression. If
-it doesn't, the internal form of main grows an sret return, while the
-extern wrapper `__toylang_impl_main` is fixed at `fn __toylang_main()`
-(void) because the auto-generated Rust shim does
-`fn main() { __toylang_main(); }`. The mismatch produces a SIGBUS
-during the internal body's final store into a dangling sret buffer,
-*after* all side effects complete and output has been printed.
-
-See `docs/arcana/MainBodyMustReturnVoid-MBMRVZ.md` for the full
-cross-cutting explanation and `docs/usage/writing-main.md` for the
-authorial rule.
-
-### Fix
-
-At type-resolve time (`toylangc/src/toylang/type_resolve.rs`), when
-resolving a function named `"main"`, require the block's inferred
-return type to be `ResolvedType::Void`. Emit a new
-`TypeResolveError::MainMustReturnVoid` variant with a message that
-tells the user exactly what to do:
-
-> `fn main()` must return `()`. The last statement's type is
-> `Result<(), Error>` — add `;` to discard it, or end main with a
-> void-typed expression.
-
-Transforms a silent SIGBUS-at-runtime into an actionable compile
-error.
-
----
-
 ## 5. Generic Function Body Validation
 
 ### Problem
@@ -106,6 +28,8 @@ C++ templates).
 
 | # | Item | Session | Resolution |
 |---|------|---------|------------|
+| 27 | Non-void `fn main()` tail SIGBUSes at runtime (@MBMRVZ) | 9 | after_rust_analysis now checks: when `name == "main"` and `return_ty.is_none()`, the body's tail must be void. Emits `TypeResolveError::MainMustReturnVoid`. Test: `test_main_non_void_tail_rejected`. |
+| 26 | Missing-import ICE at `oracle.rs:112` (@RTMEIZ) | 9 | Converted `resolved_to_rustc_ty` panic into structured `TypeResolveError::RustTypeNotImported { name, context }`. Seven `RustTypeLookupContext` variants (TraitCallSelf / TraitMethodTypeArg / InherentMethodTypeArg / FreeFunctionTypeArg / NestedGenericArg / StructField / Codegen) with `Display` impls producing actionable messages. Auto-registration was rejected in favor of explicit imports. Test: `test_trait_self_not_imported_gives_error`. |
 | 15 | Plan's roguelike expected value wrong | 8 | Corrected alive=2 → alive=1 (g2 collision at (3,3) was missed) |
 | 16 | `&&`/`||` equal precedence | 8 | Split `parse_logical` into `parse_logical_or` / `parse_logical_and` |
 | 17 | Assignment doesn't type-check RHS | 8 | Added `AssignTypeMismatch` error variant + explicit check |

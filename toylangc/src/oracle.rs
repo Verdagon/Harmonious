@@ -3,6 +3,55 @@
 /// The stub wrapper name for toylang's `main` function, avoiding conflict with Rust's `main`.
 pub const TOYLANG_MAIN: &str = "__toylang_main";
 
+/// Per @RTMEIZ, returned when `resolved_to_rustc_ty` can't find a Rust
+/// type in the `__lang_stubs` registry. The `context` tells the user
+/// *why* the type was needed (trait-call Self, generic arg, etc.) so the
+/// error message is actionable.
+#[derive(Debug, Clone)]
+pub struct UnresolvedRustType {
+    pub name: String,
+    pub context: RustTypeLookupContext,
+}
+
+#[derive(Debug, Clone)]
+pub enum RustTypeLookupContext {
+    TraitCallSelf { trait_name: String, method: String },
+    TraitMethodTypeArg { trait_name: String, method: String },
+    InherentMethodTypeArg { type_name: String, method: String },
+    FreeFunctionTypeArg { function_name: String },
+    NestedGenericArg { parent_type: String },
+    StructField { struct_name: String },
+    Codegen,
+}
+
+impl std::fmt::Display for RustTypeLookupContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TraitCallSelf { trait_name, method } =>
+                write!(f, "as Self of trait call `{}::{}`", trait_name, method),
+            Self::TraitMethodTypeArg { trait_name, method } =>
+                write!(f, "as type arg of trait call `{}::{}`", trait_name, method),
+            Self::InherentMethodTypeArg { type_name, method } =>
+                write!(f, "as type arg of method `{}::{}`", type_name, method),
+            Self::FreeFunctionTypeArg { function_name } =>
+                write!(f, "as type arg of free function `{}`", function_name),
+            Self::NestedGenericArg { parent_type } =>
+                write!(f, "as generic arg inside `{}`", parent_type),
+            Self::StructField { struct_name } =>
+                write!(f, "as field type in struct `{}`", struct_name),
+            Self::Codegen =>
+                write!(f, "during codegen"),
+        }
+    }
+}
+
+impl std::fmt::Display for UnresolvedRustType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rust type `{}` is not imported (used {}). Add `use <path>::{}` at the top of your source.",
+            self.name, self.context, self.name)
+    }
+}
+
 extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_span;
@@ -71,64 +120,77 @@ pub fn find_inherent_method(tcx: TyCtxt<'_>, type_def_id: DefId, method: &str) -
     None
 }
 
-/// Look up a Rust type's DefId by name.
-/// Checks well-known diagnostic items first, then falls back to local/re-exported items.
 /// Convert a `ResolvedType` to a rustc `Ty<'tcx>`. Used for layout_of queries
-/// and dependency resolution.
-pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::typed_ast::ResolvedType) -> ty::Ty<'tcx> {
+/// and dependency resolution. Returns `Err(UnresolvedRustType)` per @RTMEIZ
+/// when a Rust type isn't `use`-imported in the toylang source.
+pub fn try_resolved_to_rustc_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    resolved: &crate::toylang::typed_ast::ResolvedType,
+    context: &RustTypeLookupContext,
+) -> Result<ty::Ty<'tcx>, UnresolvedRustType> {
     use crate::toylang::typed_ast::ResolvedType;
     match resolved {
-        ResolvedType::I32 => tcx.types.i32,
-        ResolvedType::I64 => tcx.types.i64,
-        ResolvedType::F64 => tcx.types.f64,
-        ResolvedType::Bool => tcx.types.bool,
-        ResolvedType::Usize => tcx.types.usize,
-        ResolvedType::Void => tcx.types.unit,
+        ResolvedType::I32 => Ok(tcx.types.i32),
+        ResolvedType::I64 => Ok(tcx.types.i64),
+        ResolvedType::F64 => Ok(tcx.types.f64),
+        ResolvedType::Bool => Ok(tcx.types.bool),
+        ResolvedType::Usize => Ok(tcx.types.usize),
+        ResolvedType::Void => Ok(tcx.types.unit),
         ResolvedType::StructRef { name, type_args }
         | ResolvedType::Struct { name, type_args, .. } => {
             let def_id = find_local_struct_def_id(tcx, name)
                 .unwrap_or_else(|| panic!("struct '{}' not found", name));
             let adt_def = tcx.adt_def(def_id);
+            let nested = RustTypeLookupContext::NestedGenericArg { parent_type: name.clone() };
             let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-                .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
-                .collect();
-            ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
+                .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &nested)?)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args)))
         }
         ResolvedType::RustType { name, type_args } => {
             // Primitive types that appear as type args in Rust generics
             // (e.g., Option<u8>) are mapped to RustType by rustc_ty_to_resolved_type.
             // Convert them back to rustc primitives here.
             match name.as_str() {
-                "u8" => return tcx.types.u8,
-                "u16" => return tcx.types.u16,
-                "u32" => return tcx.types.u32,
-                "u64" => return tcx.types.u64,
-                "i8" => return ty::Ty::new_int(tcx, ty::IntTy::I8),
-                "i16" => return ty::Ty::new_int(tcx, ty::IntTy::I16),
-                "f32" => return ty::Ty::new_float(tcx, ty::FloatTy::F32),
+                "u8" => return Ok(tcx.types.u8),
+                "u16" => return Ok(tcx.types.u16),
+                "u32" => return Ok(tcx.types.u32),
+                "u64" => return Ok(tcx.types.u64),
+                "i8" => return Ok(ty::Ty::new_int(tcx, ty::IntTy::I8)),
+                "i16" => return Ok(ty::Ty::new_int(tcx, ty::IntTy::I16)),
+                "f32" => return Ok(ty::Ty::new_float(tcx, ty::FloatTy::F32)),
                 _ => {}
             }
-            // Per @RTMEIZ, this panic fires when a Rust type reached
-            // the type system (as a trait-call Self, a tail return
-            // type, or a nested generic arg) without being `use`-imported
-            // in the toylang source. The fix is in user source, not
-            // here — see the arcana for the full resolution pattern.
+            // Per @RTMEIZ, this is the critical site: if the type isn't
+            // `use`-imported, return a structured error instead of panicking.
             let def_id = find_rust_type_def_id(tcx, name)
-                .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
+                .ok_or_else(|| UnresolvedRustType {
+                    name: name.clone(),
+                    context: context.clone(),
+                })?;
             let adt_def = tcx.adt_def(def_id);
+            let nested = RustTypeLookupContext::NestedGenericArg { parent_type: name.clone() };
             let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-                .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
-                .collect();
-            ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args))
+                .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &nested)?)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args)))
         }
         ResolvedType::Ref { inner } => {
-            let inner_ty = resolved_to_rustc_ty(tcx, inner);
-            ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty)
+            let inner_ty = try_resolved_to_rustc_ty(tcx, inner, context)?;
+            Ok(ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty))
         }
         ResolvedType::Str => panic!("Str type should not need rustc Ty conversion"),
-        ResolvedType::ByteSlice => ty::Ty::new_slice(tcx, tcx.types.u8),
+        ResolvedType::ByteSlice => Ok(ty::Ty::new_slice(tcx, tcx.types.u8)),
         ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before rustc Ty conversion", name),
     }
+}
+
+/// Convenience wrapper that panics on error — for call sites where context
+/// is unavailable or errors have already been validated away (e.g., codegen
+/// after `after_rust_analysis` passed).
+pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::typed_ast::ResolvedType) -> ty::Ty<'tcx> {
+    try_resolved_to_rustc_ty(tcx, resolved, &RustTypeLookupContext::Codegen)
+        .unwrap_or_else(|e| panic!("{}", e))
 }
 
 /// Convert a rustc `Ty<'tcx>` to a `ResolvedType`. Inverse of `resolved_to_rustc_ty`.
@@ -286,16 +348,24 @@ pub fn rust_method_return_type<'tcx>(
     type_name: &str,
     method_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> crate::toylang::typed_ast::ResolvedType {
+) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
     let type_def_id = find_rust_type_def_id(tcx, type_name)
-        .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
+        .ok_or_else(|| UnresolvedRustType {
+            name: type_name.to_string(),
+            context: RustTypeLookupContext::InherentMethodTypeArg {
+                type_name: type_name.to_string(), method: method_name.to_string(),
+            },
+        })?;
     let method_def_id = find_inherent_method(tcx, type_def_id, method_name)
         .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
 
     // Build generic args from type_args
+    let arg_ctx = RustTypeLookupContext::InherentMethodTypeArg {
+        type_name: type_name.to_string(), method: method_name.to_string(),
+    };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
-        .collect();
+        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
+        .collect::<Result<Vec<_>, _>>()?;
     let expected_count = tcx.generics_of(method_def_id).count();
     let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
 
@@ -304,7 +374,7 @@ pub fn rust_method_return_type<'tcx>(
     let sig = tcx.normalize_erasing_late_bound_regions(
         ty::TypingEnv::fully_monomorphized(), sig,
     );
-    rustc_ty_to_resolved_type(tcx, sig.output())
+    Ok(rustc_ty_to_resolved_type(tcx, sig.output()))
 }
 
 /// Find an extern (non-toylang) function by name among local definitions.
@@ -380,86 +450,103 @@ pub fn find_use_imported_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId>
 
 /// Instantiate a free function's fn_sig with given type args.
 /// Non-generic functions pass an empty slice — same code path, no special-casing.
-fn instantiate_free_fn_sig<'tcx>(
+fn try_instantiate_free_fn_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
+    fn_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> ty::FnSig<'tcx> {
+) -> Result<ty::FnSig<'tcx>, UnresolvedRustType> {
+    let arg_ctx = RustTypeLookupContext::FreeFunctionTypeArg {
+        function_name: fn_name.to_string(),
+    };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
-        .collect();
+        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
+        .collect::<Result<Vec<_>, _>>()?;
     let expected_count = tcx.generics_of(def_id).count();
     let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
     let sig = tcx.fn_sig(def_id).instantiate(tcx, args);
-    tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig)
+    Ok(tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig))
 }
 
 /// Return type of a use-imported free function. None if not found.
+/// Returns Err if a type arg isn't imported per @RTMEIZ.
 pub fn rust_free_fn_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> Option<crate::toylang::typed_ast::ResolvedType> {
-    let def_id = find_use_imported_fn_def_id(tcx, name)?;
-    let sig = instantiate_free_fn_sig(tcx, def_id, type_args);
-    Some(rustc_ty_to_resolved_type(tcx, sig.output()))
+) -> Result<Option<crate::toylang::typed_ast::ResolvedType>, UnresolvedRustType> {
+    let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
+    let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args)?;
+    Ok(Some(rustc_ty_to_resolved_type(tcx, sig.output())))
 }
 
 /// Param types of a use-imported free function. None if not found.
+/// Returns Err if a type arg isn't imported per @RTMEIZ.
 pub fn rust_free_fn_param_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
-    let def_id = find_use_imported_fn_def_id(tcx, name)?;
-    let sig = instantiate_free_fn_sig(tcx, def_id, type_args);
-    Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect())
+) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+    let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
+    let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args)?;
+    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
 }
 
 /// Param types of a Rust inherent method. None if type or method not found.
+/// Returns Err if a type arg isn't imported per @RTMEIZ.
 pub fn rust_method_param_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     type_name: &str,
     method_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
-    let type_def_id = find_rust_type_def_id(tcx, type_name)?;
-    let method_def_id = find_inherent_method(tcx, type_def_id, method_name)?;
+) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+    let Some(type_def_id) = find_rust_type_def_id(tcx, type_name) else { return Ok(None) };
+    let Some(method_def_id) = find_inherent_method(tcx, type_def_id, method_name) else { return Ok(None) };
+    let arg_ctx = RustTypeLookupContext::InherentMethodTypeArg {
+        type_name: type_name.to_string(), method: method_name.to_string(),
+    };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
-        .collect();
+        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
+        .collect::<Result<Vec<_>, _>>()?;
     let expected_count = tcx.generics_of(method_def_id).count();
     let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
     let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
-    Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect())
+    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
 }
 
-/// Param types of a trait method. None if not found.
+/// Param types of a trait method. None if trait/method not found.
+/// Returns Err if a type arg isn't imported per @RTMEIZ.
 pub fn rust_trait_method_param_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_name: &str,
     method_name: &str,
     receiver_ty: &crate::toylang::typed_ast::ResolvedType,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
-    let trait_def_id = find_use_imported_trait_def_id(tcx, trait_name)?;
+) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+    let Some(trait_def_id) = find_use_imported_trait_def_id(tcx, trait_name) else { return Ok(None) };
     let self_resolved = strip_ref(receiver_ty);
-    let self_ty = resolved_to_rustc_ty(tcx, self_resolved);
-    let trait_method_def_id = tcx.associated_item_def_ids(trait_def_id)
+    let self_ctx = RustTypeLookupContext::TraitCallSelf {
+        trait_name: trait_name.to_string(), method: method_name.to_string(),
+    };
+    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx)?;
+    let Some(trait_method_def_id) = tcx.associated_item_def_ids(trait_def_id)
         .iter()
         .find(|&&id| tcx.item_name(id).as_str() == method_name)
-        .copied()?;
+        .copied() else { return Ok(None) };
     // Per @TVIMDGAZ, args are [Self, ...explicit] for the trait definition's method DefId
+    let arg_ctx = RustTypeLookupContext::TraitMethodTypeArg {
+        trait_name: trait_name.to_string(), method: method_name.to_string(),
+    };
     let mut all_ty_args: Vec<ty::GenericArg<'tcx>> = vec![ty::GenericArg::from(self_ty)];
     for ta in type_args {
-        all_ty_args.push(ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)));
+        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?));
     }
     let expected_count = tcx.generics_of(trait_method_def_id).count();
     let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
     let sig = tcx.fn_sig(trait_method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
-    Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect())
+    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
 }
 
 /// Find a trait method's DefId given a trait and the receiver's concrete type.
@@ -502,15 +589,18 @@ pub fn rust_trait_method_return_type<'tcx>(
     method_name: &str,
     receiver_ty: &crate::toylang::typed_ast::ResolvedType,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> crate::toylang::typed_ast::ResolvedType {
+) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
     let trait_def_id = find_use_imported_trait_def_id(tcx, trait_name)
         .unwrap_or_else(|| panic!("trait '{}' not found", trait_name));
     // Per @TVIMDGAZ, strip &ref to get Self and use the trait definition's method DefId.
     // Per @RTMEIZ, the Self type of a trait call must be `use`-imported in the toylang
-    // source even though the source never names it — resolved_to_rustc_ty needs it
+    // source even though the source never names it — try_resolved_to_rustc_ty needs it
     // findable in the type registry.
     let self_resolved = strip_ref(receiver_ty);
-    let self_ty = resolved_to_rustc_ty(tcx, self_resolved);
+    let self_ctx = RustTypeLookupContext::TraitCallSelf {
+        trait_name: trait_name.to_string(), method: method_name.to_string(),
+    };
+    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx)?;
 
     let trait_method_def_id = {
         let mut found = None;
@@ -524,9 +614,12 @@ pub fn rust_trait_method_return_type<'tcx>(
     };
 
     // Per @TVIMDGAZ, args are [Self, ...explicit] for the trait definition's method DefId
+    let arg_ctx = RustTypeLookupContext::TraitMethodTypeArg {
+        trait_name: trait_name.to_string(), method: method_name.to_string(),
+    };
     let mut all_ty_args: Vec<ty::GenericArg<'tcx>> = vec![ty::GenericArg::from(self_ty)];
     for ta in type_args {
-        all_ty_args.push(ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)));
+        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?));
     }
     let expected_count = tcx.generics_of(trait_method_def_id).count();
     let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
@@ -535,5 +628,5 @@ pub fn rust_trait_method_return_type<'tcx>(
     let sig = tcx.normalize_erasing_late_bound_regions(
         ty::TypingEnv::fully_monomorphized(), sig,
     );
-    rustc_ty_to_resolved_type(tcx, sig.output())
+    Ok(rustc_ty_to_resolved_type(tcx, sig.output()))
 }

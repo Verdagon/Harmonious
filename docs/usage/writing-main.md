@@ -90,12 +90,18 @@ Six imports for a 3-line body. Per-line justification:
 | `std::result::Result` | Implicit: return type of the tail-`;` expression |
 | `std::io::Error` | Implicit: generic arg inside `Result<(), Error>` |
 
-If any of these is missing, toylangc panics during either
-type-resolve (`after_rust_analysis`) or codegen
-(`generate_and_compile`) with `Rust type '<name>' not found` at
-`oracle.rs:112`. The trace tells you which code path wanted the type
-and therefore which kind of usage (Self / return / generic-arg)
-triggered the lookup.
+If any of these is missing, toylangc surfaces a structured error
+naming the type and the context:
+
+```
+[toylang] validation failed with 1 error(s):
+  - function 'main': RustTypeNotImported { name: "Stdout",
+      context: "as Self of trait call `Write::write_all`" }
+```
+
+The `context` field tells you which kind of usage triggered the
+lookup — trait-call Self, trait/method/free-fn type arg, nested
+generic arg, struct field — so you know which `use` to add.
 
 ## Pre-flight checklist for a new toylang program
 
@@ -109,8 +115,8 @@ Before running `toylangc build`, walk the body and answer:
    generic type itself — all `use`-imported?
 
 If the answer to any of (2)-(3) is "I don't know what `typeof(...)` is",
-build-and-fail is faster than staring at the source. The panic tells
-you the name, and you add the import and rerun.
+build-and-fail is faster than staring at the source. The error names
+the type and tells you where it came from — add the import and rerun.
 
 ## See also
 

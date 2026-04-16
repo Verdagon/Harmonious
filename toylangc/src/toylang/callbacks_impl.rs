@@ -219,10 +219,10 @@ impl LangCallbacks for ToylangCallbacks {
         // Check 5: Type-resolve non-generic function bodies
         for (name, func) in &self.registry.functions {
             if func.body.is_none() || !func.type_params.is_empty() { continue; }
-            let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
+            let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
                 if type_name.is_empty() {
                     crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
-                        .unwrap_or(crate::toylang::typed_ast::ResolvedType::Void)
+                        .map(|opt| opt.unwrap_or(crate::toylang::typed_ast::ResolvedType::Void))
                 } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
                     let receiver_ty = &type_args[0];
                     let explicit_args = &type_args[1..];
@@ -231,7 +231,7 @@ impl LangCallbacks for ToylangCallbacks {
                     crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
                 }
             };
-            let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
+            let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
                 if type_name.is_empty() {
                     crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
                 } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
@@ -240,8 +240,27 @@ impl LangCallbacks for ToylangCallbacks {
                     crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
                 }
             };
-            if let Err(e) = crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret, &rust_param_types) {
-                errors.push(format!("function '{}': {:?}", name, e));
+            match crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret, &rust_param_types) {
+                Err(e) => errors.push(format!("function '{}': {:?}", name, e)),
+                Ok(typed) => {
+                    // Per @MBMRVZ, if main has no declared return type (so its
+                    // extern wrapper is pinned to `fn __toylang_main() -> ()`),
+                    // the body's tail must also be void. Declaring `fn main() -> T`
+                    // explicitly is fine — both forms agree on T. The mismatch
+                    // only arises when declared=void but tail=non-void.
+                    if name == "main" && func.return_ty.is_none() {
+                        if let Some(ret_expr) = &typed.ret {
+                            if ret_expr.ty != crate::toylang::typed_ast::ResolvedType::Void {
+                                errors.push(format!(
+                                    "function 'main': {:?}",
+                                    crate::toylang::type_resolve::TypeResolveError::MainMustReturnVoid {
+                                        got: ret_expr.ty.clone(),
+                                    }
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -439,10 +458,10 @@ fn collect_toylang_fn_deps_inner<'tcx>(
     let _body = resolved_fn.body.as_ref().expect("collect_toylang_fn_deps_inner called on extern fn");
 
     // Type-resolve the already-substituted body
-    let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> crate::toylang::typed_ast::ResolvedType {
+    let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
         if type_name.is_empty() {
             crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
-                .unwrap_or(crate::toylang::typed_ast::ResolvedType::Void)
+                .map(|opt| opt.unwrap_or(crate::toylang::typed_ast::ResolvedType::Void))
         } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
             let receiver_ty = &type_args[0];
             let explicit_args = &type_args[1..];
@@ -451,7 +470,7 @@ fn collect_toylang_fn_deps_inner<'tcx>(
             crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
         }
     };
-    let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Option<Vec<crate::toylang::typed_ast::ResolvedType>> {
+    let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
         if type_name.is_empty() {
             crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
         } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {

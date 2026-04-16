@@ -30,6 +30,24 @@ pub enum TypeResolveError {
     IfElseTypeMismatch { then_ty: ResolvedType, else_ty: ResolvedType },
     AssignTypeMismatch { name: String, expected: ResolvedType, got: ResolvedType },
     ArgTypeMismatch { func_name: String, param_index: usize, expected: ResolvedType, got: ResolvedType },
+    // Per @MBMRVZ, toylang `fn main()` must have a void-typed tail. A non-void tail
+    // creates an internal/extern ABI mismatch that SIGBUSes at runtime during the
+    // internal form's sret store. Detected at after_rust_analysis time; actionable
+    // fix in user source (add `;` to the last statement).
+    MainMustReturnVoid { got: ResolvedType },
+    // Per @RTMEIZ, a Rust type that flows through the type system (as
+    // trait-call Self, return type, nested generic arg, etc.) wasn't
+    // `use`-imported. The context tells the user where the type was needed.
+    RustTypeNotImported { name: String, context: String },
+}
+
+impl From<crate::oracle::UnresolvedRustType> for TypeResolveError {
+    fn from(e: crate::oracle::UnresolvedRustType) -> Self {
+        TypeResolveError::RustTypeNotImported {
+            name: e.name,
+            context: e.context.to_string(),
+        }
+    }
 }
 
 // ============================================================================
@@ -51,8 +69,8 @@ pub fn resolve_return_type(
 pub fn resolve_fn_body(
     registry: &ToylangRegistry,
     func: &ToyFunction,
-    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> ResolvedType,
-    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Option<Vec<ResolvedType>>,
+    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType>,
+    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType>,
 ) -> Result<TypedBlock, TypeResolveError> {
     let body = func.body.as_ref().expect("function has no body");
     let ret_ty = match func.return_ty.as_ref() {
@@ -269,8 +287,8 @@ fn resolve_expr(
     _expected_ty: &ResolvedType,
     scope: &HashMap<String, ResolvedType>,
     registry: &ToylangRegistry,
-    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> ResolvedType,
-    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Option<Vec<ResolvedType>>,
+    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType>,
+    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType>,
 ) -> Result<TypedExpr, TypeResolveError> {
     match expr {
         Expr::IntLit(n, ty) => {
@@ -319,7 +337,7 @@ fn resolve_expr(
                     let typed = resolve_expr(field_expr, expected, scope, registry, rust_method_ret, rust_param_types)?;
                     Ok((field_name.clone(), typed))
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, TypeResolveError>>()?;
 
             Ok(TypedExpr {
                 kind: TypedExprKind::StructLit { name: name.clone(), fields: typed_fields },
@@ -404,9 +422,9 @@ fn resolve_expr(
             }
             } else {
                 // Free function: use rust_param_types as existence check (None → not found)
-                let param_types = rust_param_types("", name, type_args)
+                let param_types = rust_param_types("", name, type_args)?
                     .ok_or_else(|| TypeResolveError::UndefinedFunction { name: name.clone() })?;
-                let ret_ty = rust_method_ret("", name, type_args);
+                let ret_ty = rust_method_ret("", name, type_args)?;
                 let typed_args: Vec<TypedExpr> = args.iter()
                     .enumerate()
                     .map(|(i, a)| {
@@ -469,13 +487,13 @@ fn resolve_expr(
                 extended_type_args.extend(type_args.iter().cloned());
                 let trait_key = format!("__trait::{}", ty);
                 (
-                    rust_method_ret(&trait_key, method, &extended_type_args),
-                    rust_param_types(&trait_key, method, &extended_type_args).unwrap_or_default(),
+                    rust_method_ret(&trait_key, method, &extended_type_args)?,
+                    rust_param_types(&trait_key, method, &extended_type_args)?.unwrap_or_default(),
                 )
             } else {
                 (
-                    rust_method_ret(ty, method, type_args),
-                    rust_param_types(ty, method, type_args).unwrap_or_default(),
+                    rust_method_ret(ty, method, type_args)?,
+                    rust_param_types(ty, method, type_args)?.unwrap_or_default(),
                 )
             };
 
@@ -539,8 +557,8 @@ fn resolve_expr(
                 }),
             };
 
-            let ret_ty = rust_method_ret(rust_name, method, rust_type_args);
-            let param_types = rust_param_types(rust_name, method, rust_type_args)
+            let ret_ty = rust_method_ret(rust_name, method, rust_type_args)?;
+            let param_types = rust_param_types(rust_name, method, rust_type_args)?
                 .unwrap_or_default();
             let typed_args: Vec<TypedExpr> = args.iter()
                 .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types))
@@ -660,8 +678,8 @@ fn resolve_stmt(
     scope: &mut HashMap<String, ResolvedType>,
     _ret_ty: &ResolvedType,
     registry: &ToylangRegistry,
-    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> ResolvedType,
-    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Option<Vec<ResolvedType>>,
+    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType>,
+    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType>,
 ) -> Result<TypedStmt, TypeResolveError> {
     match stmt {
         Stmt::Let { name, expr } => {
@@ -717,8 +735,8 @@ mod tests {
     use crate::toylang::registry::*;
 
     /// Test callback for Rust method return types.
-    fn test_rust_method_ret(_type_name: &str, method: &str, _type_args: &[ResolvedType]) -> ResolvedType {
-        match method {
+    fn test_rust_method_ret(_type_name: &str, method: &str, _type_args: &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
+        Ok(match method {
             "new" => ResolvedType::RustType {
                 name: _type_name.to_string(),
                 type_args: _type_args.to_vec(),
@@ -726,24 +744,24 @@ mod tests {
             "push" => ResolvedType::Void,
             "len" => ResolvedType::Usize,
             _ => panic!("unknown Rust method '{}' in test", method),
-        }
+        })
     }
 
-    /// Test callback for Rust param types. Returns None for unknown methods.
+    /// Test callback for Rust param types. Returns Ok(None) for unknown methods.
     /// Returns sig.inputs() including self — self is just another param.
-    fn test_rust_param_types(type_name: &str, method: &str, type_args: &[ResolvedType]) -> Option<Vec<ResolvedType>> {
+    fn test_rust_param_types(type_name: &str, method: &str, type_args: &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
         let self_ref = || ResolvedType::Ref {
             inner: Box::new(ResolvedType::RustType {
                 name: type_name.to_string(),
                 type_args: type_args.to_vec(),
             }),
         };
-        match method {
+        Ok(match method {
             "new" => Some(vec![]),  // associated fn, no self
             "push" => Some(vec![self_ref(), ResolvedType::I32]),
             "len" => Some(vec![self_ref()]),
             _ => None,
-        }
+        })
     }
 
     fn make_registry() -> ToylangRegistry {
@@ -1492,26 +1510,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Mock rust_param_types that knows about a "free_add(i32, i32) -> i32" free fn.
-    fn test_free_fn_param_types(type_name: &str, method: &str, _type_args: &[ResolvedType]) -> Option<Vec<ResolvedType>> {
+    fn test_free_fn_param_types(type_name: &str, method: &str, _type_args: &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
         if !type_name.is_empty() {
             return test_rust_param_types(type_name, method, _type_args);
         }
-        match method {
+        Ok(match method {
             "free_add" => Some(vec![ResolvedType::I32, ResolvedType::I32]),
             "free_unit" => Some(vec![]),  // void-returning, zero params
             _ => None,
-        }
+        })
     }
 
-    fn test_free_fn_method_ret(type_name: &str, method: &str, type_args: &[ResolvedType]) -> ResolvedType {
+    fn test_free_fn_method_ret(type_name: &str, method: &str, type_args: &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
         if !type_name.is_empty() {
             return test_rust_method_ret(type_name, method, type_args);
         }
-        match method {
+        Ok(match method {
             "free_add" => ResolvedType::I32,
             "free_unit" => ResolvedType::Void,
             _ => ResolvedType::Void,
-        }
+        })
     }
 
     #[test]
