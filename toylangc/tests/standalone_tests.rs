@@ -149,3 +149,86 @@ source = "does_not_exist.toylang"
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+#[test]
+fn test_build_inside_another_workspace() {
+    // Regression test: ensure the generated .toylang-build/Cargo.toml
+    // declares itself as its own workspace root, so cargo doesn't walk up
+    // and latch onto a parent [workspace] table. Without the `[workspace]`
+    // line in write_cargo_toml, this test fails with:
+    //   error: current package believes it's in a workspace when it's not
+    // The 4 existing tempdir tests silently pass because a bare tempdir
+    // has no parent workspace; this one synthesizes one on purpose.
+    let outer = tempfile::tempdir().unwrap();
+    let outer_path = outer.path();
+
+    // Parent workspace manifest. Empty members list; we don't want to make
+    // the project dir a member — the whole point is to prove that cargo
+    // would otherwise auto-detect the nested Cargo.toml as belonging here.
+    std::fs::write(
+        outer_path.join("Cargo.toml"),
+        "[workspace]\nmembers = []\n",
+    )
+    .unwrap();
+
+    let project = outer_path.join("inner_project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        project.join("toylang.toml"),
+        r#"[project]
+name = "inner_project"
+source = "main.toylang"
+"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("main.toylang"), "fn main() {}\n").unwrap();
+
+    let out = run_build(&project);
+    assert!(
+        out.status.success(),
+        "toylangc build should succeed when nested under a parent workspace;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn test_standalone_uuid() {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/standalone/uuid_test");
+
+    // Clean any previous build output so the test is hermetic.
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let build_out = run_build(&project);
+    assert!(
+        build_out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = build_dir.join("target/debug/uuid_test");
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .expect("failed to run uuid_test binary");
+    assert!(
+        run.status.success(),
+        "uuid_test exited non-zero:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("uuid ok"),
+        "expected 'uuid ok' in stdout, got: {}",
+        stdout,
+    );
+}

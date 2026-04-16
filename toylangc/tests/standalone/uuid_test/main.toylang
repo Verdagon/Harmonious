@@ -1,0 +1,11 @@
+use uuid::Uuid
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+use std::result::Result
+use std::io::Error
+
+fn main() {
+    let id = Uuid::new_v4();
+    Write::write_all(&stdout(), b"uuid ok\n");
+}

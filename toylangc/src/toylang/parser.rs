@@ -438,7 +438,11 @@ impl Parser {
         let mut stmts = Vec::new();
 
         loop {
-            // End of body
+            // End of body. Per @MBMRVZ, this `ret: None` branch is the
+            // escape hatch users rely on for void-tailed `fn main()`:
+            // terminating the last statement with `;` reaches `}` with
+            // no trailing expression, so the block's inferred return
+            // type is unit.
             if self.peek() == &Token::RBrace || self.peek() == &Token::Eof {
                 self.consume(); // consume '}'
                 return Ok(Block { stmts, ret: None });

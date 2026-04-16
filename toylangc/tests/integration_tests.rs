@@ -3361,3 +3361,191 @@ fn main() { __toylang_main(); }
     );
     assert!(output.contains("42"));
 }
+
+// ---- Phase 6: .unwrap() on Option / Result ----
+
+#[test]
+fn test_option_unwrap_basic() {
+    // Option::unwrap is #[inline(always)] — direct call would produce no
+    // external symbol. Phase 6 redirects to __toylang_option_unwrap wrapper
+    // in __lang_stubs (forced External by partitioning.rs patch).
+    let output = run_toylang_test(
+        r#"
+use std::option::Option
+
+fn make_some_i32(x: i32) -> Option<i32>
+fn println_i32(x: i32)
+
+fn main() {
+    let o = make_some_i32(42i32);
+    let v = o.unwrap();
+    println_i32(v)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn make_some_i32(x: i32) -> Option<i32> { Some(x) }
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_result_unwrap_basic() {
+    // Result::unwrap with E: Debug. Wrapper preserves the bound verbatim.
+    let output = run_toylang_test(
+        r#"
+use std::result::Result
+
+fn make_ok_i32(x: i32) -> Result<i32, i32>
+fn println_i32(x: i32)
+
+fn main() {
+    let r = make_ok_i32(7i32);
+    let v = r.unwrap();
+    println_i32(v)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn make_ok_i32(x: i32) -> Result<i32, i32> { Ok(x) }
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("7"));
+}
+
+#[test]
+fn test_option_unwrap_result_discarded() {
+    // Calling unwrap as ExprStmt — return value discarded. Exercises wrapper
+    // when it's not bound to a variable.
+    let output = run_toylang_test(
+        r#"
+use std::option::Option
+
+fn make_some_i32(x: i32) -> Option<i32>
+fn println_i32(x: i32)
+
+fn main() {
+    let o = make_some_i32(123i32);
+    o.unwrap();
+    println_i32(456i32)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn make_some_i32(x: i32) -> Option<i32> { Some(x) }
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("456"));
+}
+
+#[test]
+fn test_unwrap_arithmetic_chain() {
+    // unwrap() result used in an arithmetic expression — exercises the
+    // result-typed expression context.
+    let output = run_toylang_test(
+        r#"
+use std::option::Option
+
+fn make_some_i32(x: i32) -> Option<i32>
+fn println_i32(x: i32)
+
+fn main() {
+    let o = make_some_i32(40i32);
+    let v = o.unwrap() + 2i32;
+    println_i32(v)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn make_some_i32(x: i32) -> Option<i32> { Some(x) }
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_vec_pop_unwrap() {
+    // Vec::pop returns Option<T>, then unwrap. Nested MethodCall resolution.
+    // Also exercises push_arg_for_rust_call's per-arg ABI coercion: Vec::push
+    // takes value: i32 by Direct(i32), so the call site must pass the i32
+    // value (not a pointer to it).
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+use std::option::Option
+
+fn println_i32(x: i32)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(99i32);
+    let popped = v.pop();
+    let inner = popped.unwrap();
+    println_i32(inner)
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("99"));
+}
+
+#[test]
+fn test_unwrap_two_options_separately() {
+    // Two unwrap call sites — exercises wrapper symbol caching and the
+    // single-monomorphization path (both call __toylang_option_unwrap::<i32>).
+    let output = run_toylang_test(
+        r#"
+use std::option::Option
+
+fn make_some_i32(x: i32) -> Option<i32>
+fn println_i32(x: i32)
+
+fn main() {
+    let a = make_some_i32(10i32);
+    let b = make_some_i32(32i32);
+    let av = a.unwrap();
+    let bv = b.unwrap();
+    println_i32(av + bv)
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn make_some_i32(x: i32) -> Option<i32> { Some(x) }
+#[no_mangle]
+pub fn println_i32(x: i32) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert!(output.contains("42"));
+}

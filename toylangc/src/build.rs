@@ -77,6 +77,13 @@ fn write_cargo_toml(build_dir: &Path, manifest: &Manifest) -> Result<(), String>
         }
     }
 
+    // Mark the generated project as its own workspace root. Otherwise, if
+    // the user's project sits inside another cargo workspace (common for
+    // our own tests at toylangc/tests/standalone/*), cargo walks up, finds
+    // the parent [workspace] table, and errors with "current package
+    // believes it's in a workspace when it's not."
+    s.push_str("\n[workspace]\n");
+
     fs::write(build_dir.join("Cargo.toml"), s)
         .map_err(|e| format!("cannot write Cargo.toml: {}", e))
 }

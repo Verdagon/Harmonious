@@ -43,7 +43,7 @@ pub type LayoutOfFn = for<'tcx> fn(
 /// only reads CONFIG and DEFAULT_LAYOUT_OF (no lock). For consumer types,
 /// calls call_monomorphize_type (locks MUTABLE_STATE), but those are always
 /// cached from inner.codegen_crate.
-pub fn toy_layout_of<'tcx>(
+pub fn lang_layout_of<'tcx>(
     tcx: TyCtxt<'tcx>,
     query: PseudoCanonicalInput<'tcx, Ty<'tcx>>,
 ) -> Result<TyAndLayout<'tcx>, &'tcx LayoutError<'tcx>> {

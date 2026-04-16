@@ -1,0 +1,6 @@
+[project]
+name = "uuid_test"
+source = "main.toylang"
+
+[rust-dependencies]
+uuid = { version = "1", features = ["v4"] }

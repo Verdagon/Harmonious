@@ -31,7 +31,7 @@ pub type MirShimsFn = for<'tcx> fn(TyCtxt<'tcx>, ty::InstanceKind<'tcx>) -> Body
 /// type. Generates a MIR body that calls `__toylang_drop_TypeName(ptr)`.
 ///
 /// Per @GCMLZ, only reads CONFIG and DEFAULT_MIR_SHIMS (no mutex lock).
-pub fn toy_mir_shims<'tcx>(
+pub fn lang_mir_shims<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::InstanceKind<'tcx>,
 ) -> Body<'tcx> {

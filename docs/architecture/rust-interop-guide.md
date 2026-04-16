@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 110 integration tests + 4 standalone tests + 60 unit tests passing, 0 ignored.
+> **Current status:** 116 integration tests + 4 standalone tests + 60 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -22,8 +22,37 @@
 >   orchestrating cargo with `RUSTC_WORKSPACE_WRAPPER`; wrapper mode re-reads
 >   the manifest from `CARGO_MANIFEST_DIR/..` instead of using an env var
 >   side-channel (see @MRRIWMZ)
+> - Phase 6 (step 1): `.unwrap()` on `Result`/`Option` via `#[inline(never)]`
+>   wrappers in `__lang_stubs` that take the receiver by raw pointer. Wrapper
+>   redirect lives in `oracle::redirect_to_wrapper`, hooked into both
+>   dep-registration (`callbacks_impl::collect_toylang_fn_deps_inner`) and
+>   codegen (`llvm_gen::get_or_resolve_rust_method`) — see @SMINCZ for why
+>   both sites are required. Linkage is forced via a 14-line patch in the
+>   forked `rustc_monomorphize/src/partitioning.rs` that gives every
+>   `__lang_stubs` item `(Linkage::External, Visibility::Default)`. Also
+>   fixed a pre-existing latent bug in `push_arg_for_rust_call` where
+>   non-pair Direct(scalar) args were passed by pointer instead of value
+>   (corrupted every `Vec::push(int)` since toylang's inception, never
+>   noticed because no test read the stored value back).
 >
-> **Next milestone (Phase 6):** `.unwrap()` verification on `Result`/`Option`.
+> - Phase 6 (step 2): `visibility_override` callback replaces the
+>   inline `__lang_stubs` string match in the rustc fork. The fork
+>   exposes `rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK`
+>   (a `OnceLock<fn ptr>`); the facade installs a bridge fn at startup;
+>   toylang's impl walks DefPath data safely (per @DPSFDOZ). String
+>   `__lang_stubs` no longer appears in the rustc fork.
+> - Phase 6 (step 3): two-family callback split. `LangCallbacks` is now
+>   `LangCallbacks: LangPredicates`, with state-taking methods on the
+>   former and pure methods (including `visibility_override`) on the
+>   latter. Predicate trampolines have no `&mut state` parameter, so
+>   bridge fns for predicate hooks are structurally lock-free. The
+>   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
+>   is dissolved — the type system enforces the rule now. See Part 2.6
+>   for the family taxonomy.
+>
+> **Phase 6 complete.** Next milestones: Phase 7 (9 standalone test
+> projects linking against rand, regex, uuid, clap, serde, toml, glob,
+> indexmap, reqwest) and Phase 8 (test harness).
 >
 > **After Phase 6:** 9 standalone test projects linking against rand, regex,
 > uuid, clap, serde, toml, glob, indexmap, reqwest (Phase 7); test harness
@@ -146,6 +175,48 @@ Type args in symbols use `_LT_` / `_GT_` delimiters for collision safety:
 Builds a MIR body calling `__toylang_drop_TypeName(ptr)`. The consumer provides
 the destructor in its .o file. `set_required_consts` and `set_mentioned_items` must
 be called (with empty vecs) on shim bodies — `mir_promoted` doesn't run for shims.
+
+### 2.5 visibility_override (CGU partitioner hook)
+
+**Key:** `Instance<'tcx>` — per `MonoItem::Fn` during CGU partitioning.
+
+Returns `Option<(Linkage, Visibility)>`. `None` defers to rustc's
+default logic; `Some((linkage, vis))` forces an assignment and prevents
+internalization. Used to keep symbols in the consumer's `__lang_stubs`
+module visible to the externally-linked consumer .o file.
+
+Unlike the four query-provider hooks above, this one isn't a query
+override. The rustc fork exposes a `OnceLock<fn ptr>` static
+(`rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK`) that the
+facade fills at startup with a bridge fn. The fork itself knows nothing
+about the consumer. See §10.6.4 for the design.
+
+### 2.6 The two callback families
+
+The five hooks split into two trait families based on whether they
+need consumer state:
+
+**`LangPredicates`** (pure; no state, no lock):
+- `is_consumer_type`, `is_consumer_fn` — name predicates.
+- `generate_stubs` — produces the injected stub source once at startup.
+- `visibility_override` — partitioner-time linkage decision.
+
+**`LangCallbacks: LangPredicates`** (stateful; takes `&mut dyn Any`,
+locks `MUTABLE_STATE`):
+- `create_state` — constructor for the consumer state box.
+- `monomorphize_type`, `monomorphize_fn` — produce per-instantiation
+  data; mutate state during the deep dependency walk.
+- `after_rust_analysis` — validation after rustc's analysis phase.
+- `generate_and_compile` — runs the consumer's LLVM backend; holds the
+  lock for the entire duration of consumer codegen.
+
+The split is enforced by signature: predicate trampolines have no
+`&mut (dyn Any + Send + Sync)` parameter, so a hook in the predicate
+family literally cannot acquire the `MUTABLE_STATE` lock — it has no
+state to pass to a lock-acquiring helper. New hooks pick a family
+based on whether they need state; that choice surfaces the locking
+story up-front instead of leaving it to a prose invariant. See
+@GCMLZ for the locking history this split replaced.
 
 ---
 
@@ -521,7 +592,7 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 ---
 
-## Part 6: What Works (60 unit + 110 integration + 4 standalone = 174 tests)
+## Part 6: What Works (60 unit + 116 integration + 4 standalone = 180 tests)
 
 ### Struct types
 - Simple, generic, nested, mixed-field, large, single-field structs
@@ -598,7 +669,7 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 | File | Purpose |
 |------|---------|
-| `lib.rs` | `LangCallbacks` trait, split globals (`CONFIG`, `MUTABLE_STATE`, `DEFAULT_*` — see @GCMLZ), vtable + trampolines, `is_from_lang_stubs` |
+| `lib.rs` | `LangPredicates` + `LangCallbacks: LangPredicates` traits, split globals (`CONFIG`, `MUTABLE_STATE`, `DEFAULT_*` — see @GCMLZ), `PredicateVtable` + `StatefulVtable` + their trampolines, `facade_visibility_override` bridge fn (lock-free, see @GCMLZ), `is_from_lang_stubs` |
 | `queries/layout.rs` | layout_of override (reads CONFIG/DEFAULT_LAYOUT_OF without lock per @GCMLZ) |
 | `queries/per_instance.rs` | per_instance_mir provider |
 | `queries/symbol_name.rs` | symbol_name override (reads CONFIG/DEFAULT_SYMBOL_NAME without lock per @GCMLZ) |
@@ -855,6 +926,11 @@ only the primary crate goes through toylangc. See @MRRIWMZ for why the
 manifest is re-read in wrapper mode instead of carrying the source path via
 a `TOYLANG_INPUT` env var.
 
+The generated `Cargo.toml` includes an empty `[workspace]` table to mark
+itself as its own workspace root, preventing cargo from walking up into a
+parent workspace if the user's project happens to sit inside one (e.g.,
+checked-in test projects under `toylangc/tests/standalone/*/`).
+
 **Why `[rust-dependencies]` not `[dependencies]`?** Leaves room for
 `[toylang-dependencies]` when toylang has its own package ecosystem.
 
@@ -865,22 +941,273 @@ moves away from rustc someday, the user-facing contract doesn't change.
 See `docs/historical/plan-phase5-toylang-toml-build.md` for the full
 implementation history.
 
-### 10.6 Planned: Phase 6 — .unwrap() on Result/Option
+### 10.6 Done: Phase 6 — Wrappers for inline stdlib methods
 
-`.unwrap()` is an inherent method on both `Result<T, E>` and `Option<T>` —
-`find_inherent_method` should find it without needing trait resolution. With
-Phase 4's enum support in `find_reexported_type` and broadened type handling,
-this should work close to out-of-the-box. Phase 6 verifies it end-to-end and
-fixes any surprises.
+**Status**: All three steps done. 116 integration + 60 unit + 4
+standalone = 180 tests passing, 0 ignored. Step 1: `#[inline(never)]`
+wrappers in `__lang_stubs` + rustc-fork partitioner patch. Step 2:
+`visibility_override` callback replaces the inline `__lang_stubs` string
+match in the fork. Step 3: two-family trait split (`LangPredicates` +
+`LangCallbacks: LangPredicates`) dissolves the "partitioner-time lock"
+exception; also delivered via this refactor rather than the naming-only
+approach originally planned. Tech debt #6 (FnCall CoercedParam dispatch)
+and the `toy_*` → `lang_*` rename also landed alongside.
 
-This unlocks most Rust crate APIs:
-- `Regex::new("pattern").unwrap()` → `Regex`
-- `glob::glob("*.txt").unwrap()` → `Paths`
-- `toml::from_str::<Value>(text).unwrap()` → `Value`
+#### 10.6.1 The problem
 
-Full enum support (match expressions, variant construction) is a separate
-future feature. `.unwrap()` is sufficient for the "prove toylang can link
-against arbitrary crates" milestone.
+`Option::unwrap` and `Result::unwrap` are `#[inline(always)]`. Rustc never
+emits a callable symbol for them — they exist only as inlined IR at every
+Rust call site. Toylang compiles separately via Inkwell into `.o` files
+that rustc later links against; those `.o` files reference Rust by mangled
+symbol name. For inline-only methods, the symbol toylang declares
+(`extern "C" fn ..._unwrap(...)`) doesn't exist anywhere, and the linker
+fails with `undefined symbol`.
+
+The same blocker applies to ~100+ other inline stdlib functions and to
+`#[track_caller]` functions (whose hidden ABI parameter can't be supplied
+from external IR — see @TCHAPZ).
+
+Two prior attempts hit different failure modes. Their writeups are in
+`docs/historical/phase6-attempt1-mono-not-generated.md` and
+`docs/historical/phase6-attempt2-linkage-visibility.md`. The full design
+plan (now superseded by what's implemented) is at
+`docs/historical/plan-phase6-unwrap-wrappers-and-partitioner.md`.
+
+#### 10.6.2 Solution shape
+
+Generate a non-inline wrapper inside `__lang_stubs` for each blocked
+method. The wrapper:
+
+```rust
+#[inline(never)]
+pub unsafe fn __toylang_option_unwrap<T>(o: *mut core::option::Option<T>) -> T {
+    core::ptr::read(o).unwrap()
+}
+```
+
+Three load-bearing details:
+
+1. **`#[inline(never)]` is mandatory.** Without it, rustc may inline the
+   wrapper itself, putting us back at "no callable symbol." This is enforced
+   as LLVM `noinline`, not a hint.
+2. **Receiver is `*mut`, not `T` by value.** This sidesteps ABI
+   complications: for any T, the wrapper's first param is just a pointer
+   (Direct(ptr)), which matches toylang's existing MethodCall convention
+   of passing `recv_ptr` as the first call arg. A by-value wrapper would
+   force toylang to mirror rustc's PassMode for `Option<T>` (Pair, Direct,
+   or Indirect depending on T) at every call site.
+3. **`ptr::read` consumes the value.** Toylang doesn't track moves and
+   doesn't run drop glue, so this is sound for the simple T's we use today
+   (i32, u8). For wrappers around methods that consume self of types with
+   destructors, this design needs revisiting.
+
+Toylang dispatches `o.unwrap()` to the wrapper via a redirect helper:
+
+```rust
+// oracle::redirect_to_wrapper
+pub fn redirect_to_wrapper<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    type_name: &str,
+    method_name: &str,
+    type_args: &[ResolvedType],
+) -> Option<(DefId, ty::GenericArgsRef<'tcx>)>
+```
+
+Called from BOTH `callbacks_impl::collect_toylang_fn_deps_inner` (the
+dep-registration site that drives codegen) AND
+`llvm_gen::get_or_resolve_rust_method` (the symbol-string consumer). Both
+sites must produce the same Instance so the symbol the wrapper's body gets
+mangled with matches the symbol the LLVM IR declares.
+
+#### 10.6.3 Why both call sites are required (@SMINCZ)
+
+`tcx.symbol_name(instance)` and `Instance::expect_resolve(...)` are pure
+read queries. They return a v0-mangled string and a typed handle; they
+do NOT cause rustc to emit code for that Instance. The first attempt
+treated these as if they did, and produced clean compiles + broken links.
+
+Codegen is driven by rustc's mono collector walking ReifyFnPointer casts
+inside MIR bodies (`rustc_monomorphize/src/collector.rs:709-717`). The
+facade's `per_instance_mir` synthesizes a MIR body for each toylang
+function whose only purpose is to mention each Rust dep as a
+ReifyFnPointer (`rustc-lang-facade/src/queries/per_instance.rs:106-173`).
+Anything pushed into `rust_deps` becomes a ReifyFnPointer; the mono
+collector promotes it to `used_items` and rustc emits the symbol.
+
+So: dep registration in `collect_toylang_fn_deps_inner` is the codegen
+trigger. The `tcx.symbol_name` call in `llvm_gen` is a downstream
+consumer that only works if the matching dep was already registered.
+Skipping the dep-registration call but keeping the codegen call is the
+canonical Phase 6 trap. This is documented as @SMINCZ in
+`docs/arcana/SymbolManglingIsNotCodegen-SMINCZ.md`.
+
+#### 10.6.4 Forcing external linkage on the wrapper
+
+Even with the wrapper instantiated and codegen'd, the second attempt
+discovered that rustc's CGU partitioner internalized the symbol
+(`-Zprint-mono-items=lazy` showed `[Internal]`). For an executable crate
+(`local_crate_exports_generics() == false`), generic `#[inline(never)]`
+items default to `Visibility::Hidden + can_be_internalized = true`. Since
+the wrapper's only user — the synthesized MIR body of `__toylang_main` —
+landed in the same CGU as the wrapper itself, `internalize_symbols`
+flipped the wrapper to `Linkage::Internal`. Internal-linkage symbols are
+invisible to externally-linked `.o` files; the linker fails again.
+
+The fix has two halves: a small hook in the rustc fork, and a
+consumer-side callback on `LangCallbacks` that the hook calls into.
+
+**Rustc fork** (`rustc_monomorphize/src/partitioning.rs`) — exposes a
+`pub static VISIBILITY_OVERRIDE_HOOK: OnceLock<fn ptr>` (signature
+`for<'tcx> fn(TyCtxt<'tcx>, Instance<'tcx>) -> Option<(Linkage, Visibility)>`).
+`mono_item_linkage_and_visibility` calls the hook (if registered) right
+after the `explicit_linkage` fast-path; if it returns `Some`, sets
+`*can_be_internalized = false` and returns the override. Knows nothing
+about `__lang_stubs` or any other consumer-specific name.
+
+**Facade** (`rustc-lang-facade/src/lib.rs`) — adds `visibility_override`
+to the `LangPredicates` trait (with default impl returning `None`).
+Predicate trampolines do not take `&mut dyn Any state`, so the bridge
+fn `facade_visibility_override` is structurally lock-free — it dispatches
+through `PredicateVtable` and never touches `MUTABLE_STATE`. See @GCMLZ
+for the trait-family split that enforces this.
+
+**Toylang** (`toylangc/src/toylang/callbacks_impl.rs`) — implements
+`visibility_override` by walking `tcx.def_path(instance.def_id()).data`
+looking for `DefPathData::TypeNs("__lang_stubs")`. Returns
+`Some((External, Default))` for matches, `None` otherwise.
+
+Why `Visibility::Default` is sufficient on its own: the internalization
+candidate set at `partitioning.rs:254` is built only from items that have
+both `Visibility::Hidden` AND `can_be_internalized = true`. Returning
+`Default` fails the first conjunct, so the wrapper never enters the
+candidate set; no later pass can downgrade it. The
+`*can_be_internalized = false` is defense-in-depth for documentation.
+
+The DefPath walk uses `tcx.def_path(def_id).data`, NOT `tcx.def_path_str`.
+`def_path_str` is implemented in terms of `trimmed_def_paths` and ICEs
+during normal (non-diagnostic) compilation. This is documented as @DPSFDOZ
+in `docs/arcana/DefPathStrIsForDiagnosticsOnly-DPSFDOZ.md` — the existing
+facade `is_from_lang_stubs` uses `def_path_str` and is safe only because
+its callers happen to live inside `generate_and_compile`. The partitioner
+runs outside `generate_and_compile`, so toylang's `visibility_override`
+inlines the safe walk instead of calling `is_from_lang_stubs`.
+
+The check applies uniformly to generic and non-generic items. Per the
+project invariant "non-generic is the degenerate case of generic," there
+is no `is_generic` branch. Future non-generic items in `__lang_stubs`
+(accessor wrappers, static tables, anything) will get the same treatment.
+
+**Accessor wrappers are structurally immune** without needing a separate
+`visibility_override` case. The `__toylang_accessor_*` methods generated
+by `stub_gen.rs` live in impls on consumer types inside `__lang_stubs`,
+so they're already covered by the blanket DefPath check above. Belt and
+suspenders, though: `lang_symbol_name` (`queries/symbol_name.rs`)
+intercepts accessor instances via `is_consumer_accessor_pub` and rewrites
+their symbols to toylang-mangled names (`__toylang_accessor_<struct>_<field>`)
+before the partitioner ever sees the original rustc-mangled name. By the
+time partitioning runs, accessor callers reference an external-looking
+toylang symbol. The DefPath check in `visibility_override` is the backstop
+if symbol-name redirection is ever bypassed. No action needed; documented
+here so future devs don't re-derive it.
+
+Currently only `MonoItem::Fn` is forwarded to the hook. `MonoItem::Static`
+and `MonoItem::GlobalAsm` are skipped (toylang doesn't emit either into
+`__lang_stubs`). Widen the hook signature to take `&MonoItem<'tcx>` if a
+future consumer needs them.
+
+#### 10.6.5 Why this approach beat the alternatives
+
+Considered and rejected:
+
+- **Make ReifyShim WeakODR (rustc patch).** Breaks on macOS (no COMDAT
+  support) and doesn't solve `#[track_caller]`.
+- **`#[linkage = "external"]` on the wrapper.** Requires
+  `#![feature(linkage)]` at the crate root, which propagates a nightly
+  feature flag into user-controlled territory. Unacceptable for a general
+  consumer compiler.
+- **Per-instantiation `#[no_mangle]` non-generic shims.** Works in vanilla
+  Rust but requires knowing every `(wrapper, type_args)` tuple before
+  `generate_stubs()` fires, plus risks `#[no_mangle]` collisions across
+  workspace crates.
+- **`#[used]` and synthetic fn-pointer statics.** The first doesn't drive
+  monomorphization; the second ICE'd inside `per_instance_mir` (the hook
+  didn't expect a synthetic static referencing a wrapper). Both attempted
+  in the first prior attempt.
+
+The chosen approach (wrapper functions + partitioner patch) extends the
+existing fork-as-bridge architecture by exactly one mechanism (visibility
+override). The patch is consistent with the four existing query-provider
+hooks for layering. Step 2 will replace the inline `__lang_stubs` string
+match with a `lang_visibility_override` facade callback so the rustc fork
+is consumer-agnostic again.
+
+#### 10.6.6 Side fix: `push_arg_for_rust_call` ABI dispatch
+
+The new `test_vec_pop_unwrap` test exposed a pre-existing latent bug in
+`llvm_gen.rs::push_arg_for_rust_call`: every Rust method/trait-static arg
+that wasn't a ScalarPair was passed by pointer, regardless of whether
+rustc's ABI declared it as `PassMode::Direct(scalar)`. For
+`Vec::push(&mut self, value: i32)`, the LLVM declaration is `(ptr, i32, ptr)`
+but the call site passed `(ptr, ptr, ptr)`. LLVM's opaque-pointer mode
+accepts this silently; on AArch64 the pointer's low 32 bits land in `w1`
+and Vec::push stores them as the user's i32. The Vec ends up holding a
+stack-pointer fragment instead of `99`. Forty-plus existing
+`v.push(int)` test calls all suffered this corruption, but none of them
+ever read the stored value back (only `.len()`, `.capacity()`, or clone).
+
+Fix: `push_arg_for_rust_call` now dispatches per-arg on
+`&CoercedParam` from `info.coerced_params` (already cached in
+`RustMethodInfo` since Phase 3, but unused at call sites until now):
+
+- `Direct(llvm_ty_str)` → lower → into_value → `coerce_int_to_type` →
+  push as value.
+- `Pair(_, _)` → existing extract-and-split.
+- `Indirect` → existing into_ptr + push as ptr (now explicit, not the
+  unconditional fallback).
+- `Ignore` → lower for side effects, push nothing.
+
+The 4 call sites (StaticCall sret/non-sret, MethodCall sret/non-sret)
+clone `info.coerced_params`, then pass `&coerced_params[1 + i]` per
+arg (offset 1 because `coerced_params[0]` is `self`). Each adds a
+`debug_assert_eq!` matching `call_args.len()` against
+`func.get_type().count_param_types()` — mirrors the assertion FnCall has
+at line 1212.
+
+The FnCall path (lines 1100-1215) still routes pair detection on
+toylang's `is_scalar_pair_type(&a.ty)` rather than `coerced_params`.
+That's a parallel weaker oracle — works today because `&[u8]` is the
+only ScalarPair both sides know about. Migrating FnCall to the same
+per-variant dispatch (and deleting `is_scalar_pair_type` entirely) is
+known-tech-debt #6.
+
+#### 10.6.7 Tests added
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_option_unwrap_basic` | Option<i32>::unwrap from a shim, basic round-trip |
+| `test_result_unwrap_basic` | Result<i32, i32>::unwrap, two-arg generic wrapper |
+| `test_option_unwrap_result_discarded` | unwrap as ExprStmt (return value discarded) |
+| `test_unwrap_arithmetic_chain` | `o.unwrap() + 2i32` — result-typed expression |
+| `test_unwrap_two_options_separately` | Two unwrap call sites — wrapper symbol caching |
+| `test_vec_pop_unwrap` | Vec::pop().unwrap() — exercises both the wrapper AND the Vec::push ABI fix |
+
+#### 10.6.8 Files involved
+
+- `toylangc/src/oracle.rs` — `WRAPPERS` table, `wrapper_fn_name`,
+  `find_wrapper_fn_def_id`, `redirect_to_wrapper` helper.
+- `toylangc/src/toylang/callbacks_impl.rs::collect_toylang_fn_deps_inner` —
+  redirect injected before standard inherent-method dep building. This is
+  the codegen-driving site (per @SMINCZ).
+- `toylangc/src/llvm_gen.rs::get_or_resolve_rust_method` — same redirect
+  for extern declaration. Read-only with respect to codegen (per @SMINCZ).
+- `toylangc/src/llvm_gen.rs::push_arg_for_rust_call` — per-arg dispatch on
+  CoercedParam.
+- `toylangc/src/stub_gen.rs` — emits `__toylang_option_unwrap<T>` and
+  `__toylang_result_unwrap<T, E: Debug>` with `#[inline(never)]`.
+- `rustc-lang-facade/src/abi_helpers.rs` — `CoercedParam` derives
+  `Clone, Debug` (so `coerced_params` can be cloned out of cached info).
+- Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
+  — the visibility override for `__lang_stubs` items.
 
 ### 10.7 Planned: Phase 7 — Standalone test projects
 
@@ -971,3 +1298,11 @@ affected code sites):
   (`docs/arcana/ABICoercedReturnTypeInFunctionDeclarations-ACRTFDZ.md`)
 - `@MRRIWMZ` — Manifest Re-read In Wrapper Mode
   (`docs/arcana/ManifestReReadInWrapperMode-MRRIWMZ.md`)
+- `@SMINCZ` — Symbol Mangling Is Not Codegen
+  (`docs/arcana/SymbolManglingIsNotCodegen-SMINCZ.md`)
+- `@DPSFDOZ` — DefPathStr Is For Diagnostics Only
+  (`docs/arcana/DefPathStrIsForDiagnosticsOnly-DPSFDOZ.md`)
+- `@MBMRVZ` — Main Body Must Return Void
+  (`docs/arcana/MainBodyMustReturnVoid-MBMRVZ.md`)
+- `@RTMEIZ` — Rust Types Must Be Explicitly Imported
+  (`docs/arcana/RustTypesMustBeExplicitlyImported-RTMEIZ.md`)

@@ -25,8 +25,8 @@ pub fn lang_override_queries(
         providers.symbol_name,
     );
 
-    providers.layout_of        = layout::toy_layout_of;
-    providers.mir_shims        = drop_glue::toy_mir_shims;
+    providers.layout_of        = layout::lang_layout_of;
+    providers.mir_shims        = drop_glue::lang_mir_shims;
     providers.per_instance_mir = per_instance::lang_per_instance_mir;
     providers.symbol_name      = symbol_name::lang_symbol_name;
 }

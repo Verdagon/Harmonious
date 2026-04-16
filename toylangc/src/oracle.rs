@@ -108,6 +108,11 @@ pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::
                 "f32" => return ty::Ty::new_float(tcx, ty::FloatTy::F32),
                 _ => {}
             }
+            // Per @RTMEIZ, this panic fires when a Rust type reached
+            // the type system (as a trait-call Self, a tail return
+            // type, or a nested generic arg) without being `use`-imported
+            // in the toylang source. The fix is in user source, not
+            // here — see the arcana for the full resolution pattern.
             let def_id = find_rust_type_def_id(tcx, name)
                 .unwrap_or_else(|| panic!("Rust type '{}' not found", name));
             let adt_def = tcx.adt_def(def_id);
@@ -218,6 +223,63 @@ pub fn resolved_type_to_mangled_name(ty: &crate::toylang::typed_ast::ResolvedTyp
     }
 }
 
+/// Phase 6: Stdlib methods that can't be called directly because they are
+/// `#[inline(always)]` (no external symbol) or `#[track_caller]` (hidden ABI
+/// param). For each, stub_gen emits a `pub fn __toylang_*` wrapper in
+/// __lang_stubs that takes the receiver by raw pointer (so calling convention
+/// matches toylang's existing recv_ptr passing). Both dep registration and
+/// codegen redirect to the wrapper via `redirect_to_wrapper`.
+const WRAPPERS: &[(&str, &str, &str)] = &[
+    ("Option", "unwrap", "__toylang_option_unwrap"),
+    ("Result", "unwrap", "__toylang_result_unwrap"),
+];
+
+pub fn wrapper_fn_name(type_name: &str, method_name: &str) -> Option<&'static str> {
+    WRAPPERS.iter()
+        .find(|(t, m, _)| *t == type_name && *m == method_name)
+        .map(|(_, _, w)| *w)
+}
+
+pub fn all_wrappers() -> &'static [(&'static str, &'static str, &'static str)] {
+    WRAPPERS
+}
+
+/// Find a wrapper function in __lang_stubs by name.
+fn find_wrapper_fn_def_id(tcx: TyCtxt<'_>, wrapper_name: &str) -> Option<DefId> {
+    for local_def_id in tcx.hir_crate_items(()).definitions() {
+        let def_id = local_def_id.to_def_id();
+        if tcx.def_kind(def_id) != DefKind::Fn { continue; }
+        if tcx.item_name(def_id).as_str() != wrapper_name { continue; }
+        if rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+            return Some(def_id);
+        }
+    }
+    None
+}
+
+/// If (type_name, method_name) is in the wrapper table, build an Instance for
+/// the wrapper. The wrapper's generic shape mirrors the original method's, so
+/// type_args pass through unchanged.
+///
+/// Both `collect_toylang_fn_deps_inner` and `get_or_resolve_rust_method` MUST
+/// call this helper so that rust_deps registration and codegen agree on the
+/// wrapper symbol.
+pub fn redirect_to_wrapper<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    type_name: &str,
+    method_name: &str,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> Option<(DefId, ty::GenericArgsRef<'tcx>)> {
+    let wrapper_name = wrapper_fn_name(type_name, method_name)?;
+    let wrapper_def_id = find_wrapper_fn_def_id(tcx, wrapper_name)?;
+    let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+        .collect();
+    let expected_count = tcx.generics_of(wrapper_def_id).count();
+    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    Some((wrapper_def_id, args))
+}
+
 /// Query rustc for a Rust method's return type, converting to ResolvedType.
 pub fn rust_method_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -260,9 +322,13 @@ pub fn find_extern_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
 }
 
 pub fn find_rust_type_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
-    // All Rust types must be imported via `use` in toylang source.
-    // The stub generator emits `pub use` re-exports, and
-    // find_local_struct_def_id finds them via module_children_local.
+    // Per @RTMEIZ, all Rust types must be `use`-imported in the
+    // toylang source — including types the source never names
+    // explicitly (trait-call Self types, tail return types, nested
+    // generic args). The stub generator emits `pub use` re-exports
+    // from the source's `use` statements, and find_local_struct_def_id
+    // finds them via module_children_local. Types not `use`-imported
+    // return None here and the caller panics.
     find_local_struct_def_id(tcx, name)
 }
 
@@ -439,7 +505,10 @@ pub fn rust_trait_method_return_type<'tcx>(
 ) -> crate::toylang::typed_ast::ResolvedType {
     let trait_def_id = find_use_imported_trait_def_id(tcx, trait_name)
         .unwrap_or_else(|| panic!("trait '{}' not found", trait_name));
-    // Per @TVIMDGAZ, strip &ref to get Self and use the trait definition's method DefId
+    // Per @TVIMDGAZ, strip &ref to get Self and use the trait definition's method DefId.
+    // Per @RTMEIZ, the Self type of a trait call must be `use`-imported in the toylang
+    // source even though the source never names it — resolved_to_rustc_ty needs it
+    // findable in the type registry.
     let self_resolved = strip_ref(receiver_ty);
     let self_ty = resolved_to_rustc_ty(tcx, self_resolved);
 

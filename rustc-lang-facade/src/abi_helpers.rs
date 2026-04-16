@@ -93,6 +93,7 @@ pub fn coerced_return_type_for_instance<'tcx>(
 }
 
 /// Describes how a function parameter should be represented in LLVM IR.
+#[derive(Clone, Debug)]
 pub enum CoercedParam {
     /// Passed as the given LLVM type string (e.g. "i64" for a coerced struct,
     /// "i32" for a scalar). The consumer must convert to the internal type if different.

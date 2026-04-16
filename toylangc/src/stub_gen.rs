@@ -149,6 +149,11 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             Some(ty) => resolved_type_to_syn(ty),
             None => parse_quote!(()),
         };
+        // Per @MBMRVZ, `main` is renamed to `__toylang_main` so the
+        // hand-written Rust shim (`fn main() { __toylang_main(); }`)
+        // can call it with a fixed void-return signature. This is the
+        // reason toylang `fn main()` must have a void tail — the shim
+        // won't pass an sret buffer.
         let wrapper_name = if _name == "main" { crate::oracle::TOYLANG_MAIN } else { _name.as_str() };
         let wrapper_ident = format_ident!("{}", wrapper_name);
         let user_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
@@ -188,6 +193,25 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // Add wrapper functions and impl blocks
     items.extend(wrapper_fns);
     items.extend(impl_blocks);
+
+    // Phase 6: stdlib-method wrappers. Each takes the receiver by raw pointer
+    // (so toylang's existing recv_ptr calling convention matches verbatim) and
+    // uses ptr::read to consume the value before calling the inline method.
+    // #[inline(never)] is mandatory — without it rustc could inline the wrapper
+    // itself, putting us back at "no callable symbol." External linkage is
+    // forced by the rustc-fork patch in partitioning.rs (Phase 6 step 1).
+    items.push(parse_quote! {
+        #[inline(never)]
+        pub unsafe fn __toylang_option_unwrap<T>(o: *mut core::option::Option<T>) -> T {
+            core::ptr::read(o).unwrap()
+        }
+    });
+    items.push(parse_quote! {
+        #[inline(never)]
+        pub unsafe fn __toylang_result_unwrap<T, E: core::fmt::Debug>(r: *mut core::result::Result<T, E>) -> T {
+            core::ptr::read(r).unwrap()
+        }
+    });
 
     // Assemble, validate, and format
     let tokens = quote! { #(#items)* };

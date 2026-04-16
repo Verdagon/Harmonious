@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 
-use rustc_lang_facade::{LangCallbacks, MonomorphizeTypeResult, MonomorphizeFnResult};
+use rustc_lang_facade::{LangCallbacks, LangPredicates, MonomorphizeTypeResult, MonomorphizeFnResult};
 use crate::toylang::registry::ToylangRegistry;
 
 /// A structured log entry for each callback rustc makes into toylang.
@@ -123,11 +123,7 @@ impl ToylangCallbacks {
     }
 }
 
-impl LangCallbacks for ToylangCallbacks {
-    fn create_state(&self) -> Box<dyn Any + Send + Sync> {
-        Box::new(ToylangState::default())
-    }
-
+impl LangPredicates for ToylangCallbacks {
     fn is_consumer_type(&self, name: &str) -> bool {
         self.registry.structs.contains_key(name)
     }
@@ -139,6 +135,43 @@ impl LangCallbacks for ToylangCallbacks {
             return self.registry.functions.get("main").map_or(false, |f| f.body.is_some());
         }
         self.registry.functions.get(name).map_or(false, |f| f.body.is_some())
+    }
+
+    fn generate_stubs(&self) -> String {
+        crate::stub_gen::generate(&self.registry)
+    }
+
+    fn visibility_override<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        instance: ty::Instance<'tcx>,
+    ) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
+        use rustc_hir::definitions::DefPathData;
+        use rustc_middle::mir::mono::{Linkage, Visibility};
+        // Force `(External, Default)` for any item whose DefPath contains
+        // `__lang_stubs::`. Without this, the CGU partitioner internalizes
+        // generic `#[inline(never)]` wrappers (e.g. `__toylang_option_unwrap<T>`)
+        // because it can't see the references from the externally-linked
+        // toylang `.o` file.
+        //
+        // Walks `tcx.def_path(...).data` directly. Cannot use
+        // `rustc_lang_facade::is_from_lang_stubs` here — it calls `def_path_str`,
+        // which ICEs in normal (non-diagnostic) compilation contexts, and the
+        // partitioner runs outside `generate_and_compile` (see @DPSFDOZ).
+        let in_lang_stubs = tcx.def_path(instance.def_id()).data.iter().any(|d| {
+            matches!(d.data, DefPathData::TypeNs(name) if name.as_str() == "__lang_stubs")
+        });
+        if in_lang_stubs {
+            Some((Linkage::External, Visibility::Default))
+        } else {
+            None
+        }
+    }
+}
+
+impl LangCallbacks for ToylangCallbacks {
+    fn create_state(&self) -> Box<dyn Any + Send + Sync> {
+        Box::new(ToylangState::default())
     }
 
     fn after_rust_analysis<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) {
@@ -219,10 +252,6 @@ impl LangCallbacks for ToylangCallbacks {
             }
             panic!("[toylang] aborting due to validation errors");
         }
-    }
-
-    fn generate_stubs(&self) -> String {
-        crate::stub_gen::generate(&self.registry)
     }
 
     fn monomorphize_type<'tcx>(
@@ -393,6 +422,13 @@ fn compute_fn_symbol_from_type_args(
 
 /// Deep recursive walk: type-resolve a function body, collect transitive Rust deps,
 /// and stash discovered toylang instances in state. Only returns Rust deps to rustc.
+///
+/// Per @SMINCZ, this function is the codegen-driving site for every Rust
+/// callee toylang references. Each `(def_id, args)` pushed into `deps`
+/// becomes a `ReifyFnPointer` cast inside `per_instance_mir`'s synthesized
+/// MIR body, which forces rustc's mono collector to emit the symbol.
+/// llvm_gen.rs's `tcx.symbol_name` calls are read-only — they only work
+/// if the matching dep was registered here first.
 fn collect_toylang_fn_deps_inner<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
@@ -507,6 +543,18 @@ fn collect_toylang_fn_deps_inner<'tcx>(
                 continue;
             }
             // Fall through to inherent method lookup if trait not found
+        }
+
+        // Phase 6: redirect to wrapper if applicable. The wrapper Instance
+        // (not the inline stdlib method) lands in rust_deps so per_instance_mir
+        // reifies a fn-pointer to it, forcing rustc's mono collector to
+        // codegen the wrapper. Without this, `Option::unwrap` and friends
+        // produce no callable symbol.
+        if let Some((wdef, wargs)) = crate::oracle::redirect_to_wrapper(
+            tcx, &dep.type_name, &dep.method_name, &dep.type_args,
+        ) {
+            deps.push((wdef, wargs));
+            continue;
         }
 
         // Inherent method call

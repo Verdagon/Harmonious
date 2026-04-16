@@ -335,20 +335,34 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 (method_def_id, args)
             }
         } else {
-            // Inherent method call
-            let type_def_id = crate::oracle::find_rust_type_def_id(self.tcx, type_name)
-                .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
-            let method_def_id = crate::oracle::find_inherent_method(self.tcx, type_def_id, method_name)
-                .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
-            let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
-                .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
-                .collect();
-            let expected_count = self.tcx.generics_of(method_def_id).count();
-            let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
-            (method_def_id, args)
+            // Phase 6: redirect to wrapper if applicable. Must call the same
+            // helper as collect_toylang_fn_deps_inner so tcx.symbol_name
+            // produces identical output on the dep-registration and codegen
+            // paths.
+            if let Some((wdef, wargs)) = crate::oracle::redirect_to_wrapper(
+                self.tcx, type_name, method_name, type_args,
+            ) {
+                (wdef, wargs)
+            } else {
+                // Inherent method call
+                let type_def_id = crate::oracle::find_rust_type_def_id(self.tcx, type_name)
+                    .unwrap_or_else(|| panic!("Rust type '{}' not found", type_name));
+                let method_def_id = crate::oracle::find_inherent_method(self.tcx, type_def_id, method_name)
+                    .unwrap_or_else(|| panic!("method '{}' not found on '{}'", method_name, type_name));
+                let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
+                    .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
+                    .collect();
+                let expected_count = self.tcx.generics_of(method_def_id).count();
+                let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+                (method_def_id, args)
+            }
         };
 
-        // Build Instance for ABI query
+        // Build Instance for ABI query. Per @SMINCZ, expect_resolve and
+        // symbol_name are read-only — they don't drive codegen. Codegen
+        // is driven separately via `rust_deps` registration in
+        // collect_toylang_fn_deps_inner; both sites must produce the same
+        // Instance so the symbol string here matches what rustc emits.
         let instance = ty::Instance::expect_resolve(
             self.tcx,
             ty::TypingEnv::fully_monomorphized(),
@@ -464,38 +478,51 @@ impl<'ctx> ExprResult<'ctx> {
     }
 }
 
-/// Returns true if this resolved type is a ScalarPair at the Rust ABI level
-/// (i.e. it should be passed as two separate LLVM params, not one struct).
-///
-/// SYNC: This must stay in sync with `CoercedParam::Pair` in abi_helpers.rs.
-/// If you add a new type that rustc passes as ScalarPair (e.g. `&str`, `&[T]`),
-/// you must add it here too, or the call site will pass one struct arg where
-/// the Rust function expects two scalar args. The FnCall path asserts
-/// `call_args.len() == param_types.len()` to catch this.
-fn is_scalar_pair_type(ty: &ResolvedType) -> bool {
-    matches!(ty, ResolvedType::Ref { inner } if matches!(inner.as_ref(), ResolvedType::ByteSlice))
-}
-
-/// Push an argument to call_args, splitting ScalarPair types (like &[u8]) into
-/// two separate LLVM args (ptr, len) to match the Rust ABI declaration.
+/// Push an argument to call_args, dispatching on `CoercedParam` (the rustc-side
+/// ABI truth) rather than toylang's view of the arg type. Handles all four
+/// variants: Direct (value, coerced), Pair (extract+split), Indirect (ptr),
+/// Ignore (ZST — lower for side effects only).
 fn push_arg_for_rust_call<'ctx>(
     ctx: &mut CodegenCtx<'ctx, '_, '_>,
     arg_expr: &TypedExpr,
+    coerced_param: &rustc_lang_facade::abi_helpers::CoercedParam,
     call_args: &mut Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>,
 ) {
-    let arg = lower_typed_expr(ctx, arg_expr);
-    if is_scalar_pair_type(&arg_expr.ty) {
-        // Fat pointer — extract the two components and pass separately.
-        let val = arg.into_value(&ctx.builder);
-        let struct_val = val.into_struct_value();
-        let first = ctx.builder.build_extract_value(struct_val, 0, "pair_first").unwrap();
-        let second = ctx.builder.build_extract_value(struct_val, 1, "pair_second").unwrap();
-        call_args.push(first.into());
-        call_args.push(second.into());
-    } else {
-        let arg_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
-        let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
-        call_args.push(arg_ptr.into());
+    use rustc_lang_facade::abi_helpers::CoercedParam;
+    match coerced_param {
+        CoercedParam::Indirect => {
+            // Pass by pointer — the previous unconditional behavior, now
+            // explicit. Used for sret-like aggregates and any large value
+            // rustc passes via memory.
+            let arg = lower_typed_expr(ctx, arg_expr);
+            let arg_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
+            let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
+            call_args.push(arg_ptr.into());
+        }
+        CoercedParam::Pair(_a_str, _b_str) => {
+            // Fat pointer / two-scalar aggregate — extract and pass separately.
+            // Source of truth is rustc's coerced_param shape.
+            let val = lower_typed_expr(ctx, arg_expr).into_value(&ctx.builder);
+            let struct_val = val.into_struct_value();
+            let first = ctx.builder.build_extract_value(struct_val, 0, "pair_first").unwrap();
+            let second = ctx.builder.build_extract_value(struct_val, 1, "pair_second").unwrap();
+            call_args.push(first.into());
+            call_args.push(second.into());
+        }
+        CoercedParam::Direct(llvm_ty_str) => {
+            // Pass by value, coerced to the LLVM type rustc declared. For
+            // primitive scalars (i32, i64, etc.) this is the toylang value
+            // possibly width-adjusted; for `ptr`-typed Direct (e.g. `&T`),
+            // the toylang value is already a pointer.
+            let val = lower_typed_expr(ctx, arg_expr).into_value(&ctx.builder);
+            let target_ty = parse_coerced_type(ctx, llvm_ty_str);
+            let coerced = coerce_int_to_type(ctx, val, target_ty);
+            call_args.push(coerced.into());
+        }
+        CoercedParam::Ignore => {
+            // ZST — no LLVM param. Lower for side effects only.
+            let _ = lower_typed_expr(ctx, arg_expr);
+        }
     }
 }
 
@@ -619,6 +646,11 @@ fn codegen_internal_function<'ctx, 'tcx>(
     func: &crate::toylang::registry::ToyFunction,
     internal_symbol: &str,
 ) {
+    // Per @MBMRVZ, this function's return type is inferred from the
+    // body's tail expression. For `main`, that must be void, or the
+    // extern wrapper (whose signature is pinned to `fn __toylang_main()`
+    // by the Rust shim) will call us with a missing sret buffer and
+    // SIGBUS during our final return-value store.
     // Query rustc for Rust method return types
     let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> ResolvedType {
         if type_name.is_empty() {
@@ -763,6 +795,11 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     extern_symbol: &str,
     internal_symbol: &str,
 ) {
+    // Per @MBMRVZ, the extern wrapper for `main` is pinned by the Rust
+    // shim (`fn main() { __toylang_main(); }`) to a void return. If
+    // the internal form's body has a non-void tail, this wrapper will
+    // call internal with a missing sret pointer and the internal body
+    // will SIGBUS on its final sret store.
     // Resolve the return type for internal ABI decisions
     let ret_resolved = crate::toylang::type_resolve::resolve_return_type(ctx.registry, func)
         .expect("return type resolution should succeed (already validated)");
@@ -1177,8 +1214,10 @@ fn lower_typed_expr<'ctx>(
                 let callee = ctx.declare_external_fn(&symbol, &param_types, ret_type, sret_info);
                 ctx.rust_symbols.push(symbol);
 
-                // Build call args: pass values directly (matching coerced_params declaration),
-                // splitting ScalarPair types into two separate args.
+                // Build call args via the shared per-CoercedParam dispatcher
+                // (Direct/Pair/Indirect/Ignore). FnCall has no receiver, so
+                // coerced_params[i] aligns with args[i] naturally — no +1 offset
+                // like MethodCall/StaticCall need.
                 let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
 
                 if is_sret {
@@ -1187,21 +1226,13 @@ fn lower_typed_expr<'ctx>(
                     call_args.push(alloca.into());
                 }
 
-                for a in args {
-                    let val = lower_typed_expr(ctx, a).into_value(&ctx.builder);
-                    if is_scalar_pair_type(&a.ty) {
-                        let struct_val = val.into_struct_value();
-                        let first = ctx.builder.build_extract_value(struct_val, 0, "pair_first").unwrap();
-                        let second = ctx.builder.build_extract_value(struct_val, 1, "pair_second").unwrap();
-                        call_args.push(first.into());
-                        call_args.push(second.into());
-                    } else {
-                        call_args.push(val.into());
-                    }
+                let coerced_params_for_args = coerced_params.clone();
+                for (i, a) in args.iter().enumerate() {
+                    push_arg_for_rust_call(ctx, a, &coerced_params_for_args[i], &mut call_args);
                 }
                 assert_eq!(call_args.len(), param_types.len(),
                     "FnCall '{}': call_args count ({}) != param_types count ({}). \
-                     If you added a new ScalarPair type, update is_scalar_pair_type().",
+                     CoercedParam dispatch in push_arg_for_rust_call should keep these in sync.",
                     name, call_args.len(), param_types.len());
 
                 if is_sret {
@@ -1302,6 +1333,9 @@ fn lower_typed_expr<'ctx>(
             let func = info.func;
             let is_sret = info.is_sret;
             let has_track_caller = info.has_track_caller;
+            // Clone so we don't hold a borrow on ctx.rust_method_info while
+            // lowering args (which needs &mut ctx).
+            let coerced_params = info.coerced_params.clone();
 
             let is_trait_call = args.first().is_some()
                 && crate::oracle::find_use_imported_trait_def_id(ctx.tcx, ty).is_some();
@@ -1335,23 +1369,32 @@ fn lower_typed_expr<'ctx>(
                     let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, &format!("{}_trait", ty));
                     call_args.push(alloca.into());
                     call_args.push(recv_ptr.into());
-                    for arg_expr in &args[1..] {
-                        push_arg_for_rust_call(ctx, arg_expr, &mut call_args);
+                    for (i, arg_expr) in args[1..].iter().enumerate() {
+                        // coerced_params[0] is self; explicit args start at index 1.
+                        push_arg_for_rust_call(ctx, arg_expr, &coerced_params[1 + i], &mut call_args);
                     }
                     if has_track_caller {
                         call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
                     }
+                    debug_assert_eq!(
+                        call_args.len(), func.get_type().count_param_types() as usize,
+                        "trait sret call arg count mismatch for {}::{}", ty, method,
+                    );
                     ctx.builder.build_call(func, &call_args, "").unwrap();
                     let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
                     ExprResult::Ptr(alloca, opaque_ty)
                 } else {
                     call_args.push(recv_ptr.into());
-                    for arg_expr in &args[1..] {
-                        push_arg_for_rust_call(ctx, arg_expr, &mut call_args);
+                    for (i, arg_expr) in args[1..].iter().enumerate() {
+                        push_arg_for_rust_call(ctx, arg_expr, &coerced_params[1 + i], &mut call_args);
                     }
                     if has_track_caller {
                         call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
                     }
+                    debug_assert_eq!(
+                        call_args.len(), func.get_type().count_param_types() as usize,
+                        "trait call arg count mismatch for {}::{}", ty, method,
+                    );
                     let result = ctx.builder.build_call(func, &call_args, "trait_call").unwrap();
                     match result.try_as_basic_value() {
                         inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
@@ -1487,28 +1530,40 @@ fn lower_typed_expr<'ctx>(
             let func = info.func;
             let is_sret = info.is_sret;
             let has_track_caller = info.has_track_caller;
+            // Clone so we don't hold a borrow on ctx.rust_method_info while
+            // lowering args (which needs &mut ctx).
+            let coerced_params = info.coerced_params.clone();
             if is_sret {
                 // sret method call (constructor-like returning opaque type)
                 let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "method_sret");
                 let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
                 let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![alloca.into(), recv_ptr.into()];
-                for a in args {
-                    push_arg_for_rust_call(ctx, a, &mut call_args);
+                for (i, a) in args.iter().enumerate() {
+                    // coerced_params[0] is self; explicit args start at index 1.
+                    push_arg_for_rust_call(ctx, a, &coerced_params[1 + i], &mut call_args);
                 }
                 if has_track_caller { // @TCHAPZ: pass null for hidden Location param
                     call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
                 }
+                debug_assert_eq!(
+                    call_args.len(), func.get_type().count_param_types() as usize,
+                    "method sret call arg count mismatch for {}::{}", type_name, method,
+                );
                 ctx.builder.build_call(func, &call_args, "").unwrap();
                 ExprResult::Ptr(alloca, opaque_ty)
             } else {
                 // Non-sret method call
                 let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![recv_ptr.into()];
-                for a in args {
-                    push_arg_for_rust_call(ctx, a, &mut call_args);
+                for (i, a) in args.iter().enumerate() {
+                    push_arg_for_rust_call(ctx, a, &coerced_params[1 + i], &mut call_args);
                 }
                 if has_track_caller { // @TCHAPZ: pass null for hidden Location param
                     call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
                 }
+                debug_assert_eq!(
+                    call_args.len(), func.get_type().count_param_types() as usize,
+                    "method call arg count mismatch for {}::{}", type_name, method,
+                );
                 let result = ctx.builder.build_call(func, &call_args, "method_call").unwrap();
                 match result.try_as_basic_value() {
                     inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
@@ -1679,6 +1734,10 @@ fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> Struc
 // Helpers (kept from old llvm_gen.rs)
 // ============================================================================
 
+// Per @SMINCZ, this function is read-only — it computes a symbol name but
+// does NOT drive codegen of `def_id` with `args`. The caller must
+// independently register the dep so `per_instance_mir` reifies a
+// ReifyFnPointer to it; otherwise the linker fails on a missing symbol.
 fn resolve_rust_symbol<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: rustc_span::def_id::DefId,
