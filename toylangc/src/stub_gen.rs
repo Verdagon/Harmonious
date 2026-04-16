@@ -33,7 +33,9 @@ fn resolved_type_to_syn(ty: &ResolvedType) -> syn::Type {
             let inner_ty = resolved_type_to_syn(inner);
             parse_quote!(&#inner_ty)
         }
-        ResolvedType::Str => parse_quote!(&str),
+        // Per @UTAIRZ, Str and ByteSlice render as bare Rust types; the `&` comes
+        // from the `Ref` arm above when they're wrapped at use sites.
+        ResolvedType::Str => parse_quote!(str),
         ResolvedType::ByteSlice => parse_quote!([u8]),
     }
 }

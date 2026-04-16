@@ -179,7 +179,9 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
             let inner_ty = try_resolved_to_rustc_ty(tcx, inner, context)?;
             Ok(ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty))
         }
-        ResolvedType::Str => panic!("Str type should not need rustc Ty conversion"),
+        // Per @UTAIRZ, Str and ByteSlice round-trip through rustc identically;
+        // reverse maps at `rustc_ty_to_resolved_type` produce the matching variants.
+        ResolvedType::Str => Ok(tcx.types.str_),
         ResolvedType::ByteSlice => Ok(ty::Ty::new_slice(tcx, tcx.types.u8)),
         ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before rustc Ty conversion", name),
     }
@@ -233,6 +235,8 @@ pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> c
                 ResolvedType::RustType { name, type_args }
             }
         }
+        // Per @UTAIRZ, TyKind::Slice(u8) reverse-maps to ByteSlice, matching the
+        // forward map in `try_resolved_to_rustc_ty`.
         TyKind::Slice(elem_ty) => {
             if matches!(elem_ty.kind(), TyKind::Uint(ty::UintTy::U8)) {
                 ResolvedType::ByteSlice
@@ -243,7 +247,9 @@ pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> c
         // Types that may appear as type args in Rust generic types (e.g., inside
         // Result<(), Error> or HashMap internals). Toylang never inspects these —
         // they pass through as opaque RustType values.
-        TyKind::Str => ResolvedType::RustType { name: "str".to_string(), type_args: vec![] },
+        // Per @UTAIRZ, TyKind::Str reverse-maps to Str — NOT to RustType "str"
+        // (which would break type equality with the Ref-wrapped literal).
+        TyKind::Str => ResolvedType::Str,
         TyKind::Never => ResolvedType::RustType { name: "never".to_string(), type_args: vec![] },
         TyKind::RawPtr(inner, _) => ResolvedType::RustType {
             name: "raw_ptr".to_string(),

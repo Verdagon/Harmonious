@@ -299,11 +299,15 @@ fn resolve_expr(
             Ok(TypedExpr { kind: TypedExprKind::BoolLit(*b), ty: ResolvedType::Bool })
         }
 
+        // Per @UTAIRZ, string literals type as `Ref { Str }` — never bare Str —
+        // so they match `&str` param types and have a fat-pointer LLVM layout.
         Expr::StringLit(s) => Ok(TypedExpr {
             kind: TypedExprKind::StringLit(s.clone()),
-            ty: ResolvedType::Str,
+            ty: ResolvedType::Ref { inner: Box::new(ResolvedType::Str) },
         }),
 
+        // Per @UTAIRZ, byte string literals type as `Ref { ByteSlice }` — mirror
+        // of the Str wiring.
         Expr::ByteStringLit(bytes) => Ok(TypedExpr {
             kind: TypedExprKind::ByteStringLit(bytes.clone()),
             ty: ResolvedType::Ref { inner: Box::new(ResolvedType::ByteSlice) },
@@ -1697,5 +1701,25 @@ mod tests {
         let ret = typed.ret.unwrap();
         assert!(matches!(ret.kind, TypedExprKind::ByteStringLit(ref b) if b == &[104, 101, 108, 108, 111]));
         assert_eq!(ret.ty, ResolvedType::Ref { inner: Box::new(ResolvedType::ByteSlice) });
+    }
+
+    #[test]
+    fn test_resolve_string_lit() {
+        // Regression guard: "..." must type-resolve to Ref { Str } (sized fat pointer),
+        // not bare Str. Mirrors test_resolve_byte_string_lit for regular strings.
+        let reg = make_registry();
+        let func = ToyFunction {
+            type_params: vec![],
+            params: vec![],
+            return_ty: Some(ResolvedType::Ref { inner: Box::new(ResolvedType::Str) }),
+            body: Some(Block {
+                stmts: vec![],
+                ret: Some(Expr::StringLit("hello".to_string())),
+            }),
+        };
+        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types).unwrap();
+        let ret = typed.ret.unwrap();
+        assert!(matches!(ret.kind, TypedExprKind::StringLit(ref s) if s == "hello"));
+        assert_eq!(ret.ty, ResolvedType::Ref { inner: Box::new(ResolvedType::Str) });
     }
 }

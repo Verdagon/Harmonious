@@ -3267,6 +3267,135 @@ fn main() { let code = __toylang_main(); println!("{}", code); }
     assert_eq!(output.trim(), "5");
 }
 
+#[test]
+fn test_string_literal_let_binding() {
+    // Verify "hello" compiles and the program runs without crashing.
+    let output = run_toylang_test(
+        r#"
+fn main() -> i32 {
+    let x = "hello";
+    42i32
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { let code = __toylang_main(); println!("{}", code); }
+        "#,
+    );
+    assert_eq!(output.trim(), "42");
+}
+
+#[test]
+fn test_string_literal_passed_to_rust_fn() {
+    // Mirrors test_byte_string_passed_to_rust_fn but for regular string literals.
+    // Pass "hello" (should be &str: ScalarPair { ptr, len }) to a Rust function
+    // taking &str. Exercises the &str ABI path that will unblock clap/regex/
+    // toml/serde_json smoke tests in Phase 7.
+    let output = run_toylang_test(
+        r#"
+fn check_str(data: &str) -> i32
+
+fn main() -> i32 {
+    check_str("hello")
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+#[no_mangle]
+pub fn check_str(data: &str) -> i32 {
+    data.len() as i32
+}
+
+fn main() { let code = __toylang_main(); println!("{}", code); }
+        "#,
+    );
+    assert_eq!(output.trim(), "5");
+}
+
+#[test]
+fn test_string_literal_empty() {
+    // Edge case: "" has len 0. Verifies the len field is computed per-literal.
+    let output = run_toylang_test(
+        r#"
+fn check_str(data: &str) -> i32
+
+fn main() -> i32 {
+    check_str("")
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+#[no_mangle]
+pub fn check_str(data: &str) -> i32 {
+    data.len() as i32
+}
+
+fn main() { let code = __toylang_main(); println!("{}", code); }
+        "#,
+    );
+    assert_eq!(output.trim(), "0");
+}
+
+#[test]
+fn test_string_literal_with_escapes() {
+    // Proves the lexer interprets \n, \t inside regular strings (not
+    // literal backslashes). "hello\nworld" has len 11 after escape
+    // expansion.
+    let output = run_toylang_test(
+        r#"
+fn check_str(data: &str) -> i32
+
+fn main() -> i32 {
+    check_str("hello\nworld")
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+#[no_mangle]
+pub fn check_str(data: &str) -> i32 {
+    data.len() as i32
+}
+
+fn main() { let code = __toylang_main(); println!("{}", code); }
+        "#,
+    );
+    assert_eq!(output.trim(), "11");
+}
+
+#[test]
+fn test_multiple_string_literals() {
+    // Two distinct literals in the same fn must get two distinct global
+    // byte arrays. Guards against codegen reusing a shared global.
+    let output = run_toylang_test(
+        r#"
+fn check_str(data: &str) -> i32
+
+fn main() -> i32 {
+    check_str("abc") + check_str("de")
+}
+        "#,
+        r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+
+#[no_mangle]
+pub fn check_str(data: &str) -> i32 {
+    data.len() as i32
+}
+
+fn main() { let code = __toylang_main(); println!("{}", code); }
+        "#,
+    );
+    assert_eq!(output.trim(), "5");
+}
+
 // ── Phase 4: I/O integration ────────────────────────────────────────
 
 #[test]

@@ -40,8 +40,11 @@ pub enum ResolvedType {
     Ref {
         inner: Box<ResolvedType>,
     },
+    /// The unsized string type `str`. Always appears inside `Ref` as `&str`.
+    /// Per @UTAIRZ, Str mirrors ByteSlice's six-touchpoint wiring exactly.
     Str,
     /// The unsized byte slice type `[u8]`. Always appears inside `Ref` as `&[u8]`.
+    /// Per @UTAIRZ, ByteSlice is the template that Str follows.
     ByteSlice,
 }
 

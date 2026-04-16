@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 118 integration tests + 6 standalone tests + 60 unit tests passing, 0 ignored.
+> **Current status:** 123 integration tests + 7 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -52,14 +52,24 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (in progress, 1/9 done): standalone test projects under
+> - Phase 7 (in progress, 2/9 done): standalone test projects under
 >   `toylangc/tests/standalone/<crate>_test/` proving toylang links
 >   against and calls into arbitrary crates.io Rust deps. `uuid_test`
->   landed as the smoke test (commit `df696c1` + follow-ups); 8 crates
->   remaining (`indexmap`, `rand`, `regex`, `clap`, `glob`, `toml`,
->   `serde_json`, `reqwest`). See `handoff.md` at the repo root for
->   the junior-engineer handoff on the remaining 8. Each project is a
+>   landed as the smoke test (commit `df696c1` + follow-ups);
+>   `indexmap_test` landed as the second smoke test (2026-04-16)
+>   exercising 3-arg explicit generics via
+>   `IndexMap::new<i32, i32, RandomState>()`. 7 crates remaining
+>   (`rand`, `regex`, `clap`, `glob`, `toml`, `serde_json`,
+>   `reqwest`). See `handoff.md` at the repo root for the
+>   junior-engineer handoff on the remaining 7. Each project is a
 >   10-20 line toylang program that prints `"<crate> ok\n"`.
+> - String-literal `&str` ABI fix (2026-04-16): `ResolvedType::Str`
+>   rewired to mirror `ByteSlice`'s six-touchpoint pattern exactly.
+>   `"..."` string literals now type as `Ref { Str }` and lower to a
+>   `{ ptr, i64 }` fat pointer matching rustc's ScalarPair ABI for
+>   `&str`. Lexer gained escape-sequence support for regular strings
+>   (previously byte-strings only). Unblocks `regex`, `toml`,
+>   `serde_json` Phase 7 smoke tests. See `@UTAIRZ`.
 > - Error-quality polish (commit `0b1432e`): tech-debt #26 and #27.
 >   Missing-import panics at `oracle.rs:112` converted into structured
 >   `TypeResolveError::RustTypeNotImported { name, context }` with a
@@ -70,7 +80,7 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–6. Phase 7 in progress (1/9).** Remaining: 8
+> **Phases done: 1–6. Phase 7 in progress (2/9).** Remaining: 7
 > standalone test projects (see `handoff.md`); Phase 8 (test harness
 > polish — reduce per-crate boilerplate in `standalone_tests.rs`).
 
@@ -608,7 +618,7 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 ---
 
-## Part 6: What Works (60 unit + 118 integration + 6 standalone = 184 tests)
+## Part 6: What Works (67 unit + 123 integration + 7 standalone = 197 tests)
 
 ### Struct types
 - Simple, generic, nested, mixed-field, large, single-field structs
@@ -674,10 +684,13 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 - Dependency crates compile via `rustc_driver::RunCompiler` with
   `NoopCallbacks`; only the primary crate (`CARGO_PRIMARY_PACKAGE=1`) goes
   through toylang processing
-- 6 standalone tests: minimal project, project with Rust dep, invalid
+- 7 standalone tests: minimal project, project with Rust dep, invalid
   manifest, missing source, workspace-nested project
-  (`test_build_inside_another_workspace`), and the uuid smoke test
-  (Phase 7's first crate) calling `Uuid::new_v4()` end-to-end
+  (`test_build_inside_another_workspace`), the uuid smoke test
+  (Phase 7's first crate) calling `Uuid::new_v4()`, and the indexmap
+  smoke test (Phase 7's second crate) calling
+  `IndexMap::new<i32, i32, RandomState>()` — the latter exercises
+  3-arg explicit generics end-to-end
 
 ---
 
@@ -1229,28 +1242,37 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 In progress: Phase 7 — Standalone test projects (1/9 done)
+### 10.7 In progress: Phase 7 — Standalone test projects (2/9 done)
 
 Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
 each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
 Each project proves toylang can link against and call into a specific
 Rust crate from crates.io via `toylangc build`.
 
-**Done (1 crate):**
+**Done (2 crates):**
 
 - `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
   Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
   `Write::write_all(&stdout(), b"uuid ok\n");`. Shipped in commit
   `df696c1` + follow-ups; surfaced three latent issues that landed as
   @MBMRVZ, @RTMEIZ, and the `[workspace]` note in §10.5.
+- `indexmap_test` — second smoke test, chosen to exercise a different
+  shape (generic API with 3 explicit type args). Program:
+  `IndexMap::new<i32, i32, RandomState>();` then
+  `Write::write_all(&stdout(), b"indexmap ok\n");`. Landed
+  2026-04-16; passed first-try with no source changes. The pre-execution
+  risk that indexmap's `new()` lives on an S-fixed impl block (not the
+  open `impl<K, V, S>`) dissolved — supplying `RandomState` explicitly
+  matched rustc's elided default, and `Instance::expect_resolve`
+  handled impl-block selection. First test to exercise a 3-arg
+  generic method call; parsing worked the same path as the 2-arg
+  Vec case at `integration_tests.rs:410`.
 
-**Remaining (8 crates, see `handoff.md`):**
+**Remaining (7 crates, see `handoff.md`):**
 
 | Crate | Imperative API used for smoke test | Notes |
 |-------|-----------------------------------|-------|
-| indexmap | Constructor | `IndexMap::new<K, V, S>()` — gate for the remaining 7 |
 | rand | Free fn | `thread_rng()` |
-| uuid | Static method | **DONE** (see above) |
 | regex | Static method + `.unwrap()` | `Regex::new(pat).unwrap()` — uses Phase 6 unwrap wrappers |
 | clap | Builder | `Command::new("app")` |
 | glob | Free function | `glob::glob("*.txt")` — first pass omits `.unwrap()` |
@@ -1337,3 +1359,5 @@ affected code sites):
   (`docs/arcana/MainBodyMustReturnVoid-MBMRVZ.md`)
 - `@RTMEIZ` — Rust Types Must Be Explicitly Imported
   (`docs/arcana/RustTypesMustBeExplicitlyImported-RTMEIZ.md`)
+- `@UTAIRZ` — Unsized Types Appear Inside Ref
+  (`docs/arcana/UnsizedTypesAppearInsideRef-UTAIRZ.md`)

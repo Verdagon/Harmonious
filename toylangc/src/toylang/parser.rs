@@ -174,12 +174,24 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
         // String literals
         if chars[i] == '"' {
             i += 1; // skip opening quote
-            let start = i;
+            let mut s = String::new();
             while i < chars.len() && chars[i] != '"' {
-                i += 1;
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    match chars[i + 1] {
+                        'n' => { s.push('\n'); i += 2; }
+                        't' => { s.push('\t'); i += 2; }
+                        '\\' => { s.push('\\'); i += 2; }
+                        '0' => { s.push('\0'); i += 2; }
+                        '"' => { s.push('"'); i += 2; }
+                        ch => return Err(ParseError::UnknownEscape { ch }),
+                    }
+                } else {
+                    s.push(chars[i]);
+                    i += 1;
+                }
             }
-            let s: String = chars[start..i].iter().collect();
-            if i < chars.len() { i += 1; } // skip closing quote
+            if i >= chars.len() { return Err(ParseError::UnterminatedString); }
+            i += 1; // skip closing quote
             tokens.push(Token::StringLit(s));
             continue;
         }
@@ -804,7 +816,8 @@ impl Parser {
                 Ok(ResolvedType::Ref { inner: Box::new(inner) })
             }
             Token::LBracket => {
-                // [u8] → ByteSlice
+                // Per @UTAIRZ, `[u8]` parses to the unsized ByteSlice variant;
+                // the `Ref` wrapper comes from the enclosing `&` in `&[u8]`.
                 self.consume();
                 let elem = self.expect_ident()?;
                 if elem != "u8" {
@@ -843,6 +856,9 @@ impl Parser {
                     "f64"   => Ok(ResolvedType::F64),
                     "bool"  => Ok(ResolvedType::Bool),
                     "usize" => Ok(ResolvedType::Usize),
+                    // Per @UTAIRZ, `str` parses to the unsized Str variant;
+                    // the `Ref` wrapper comes from the enclosing `&` in `&str`.
+                    "str"   => Ok(ResolvedType::Str),
                     _ if type_params.contains(&s) => Ok(ResolvedType::TypeParam(s)),
                     _ if struct_names.contains(&s) => Ok(ResolvedType::StructRef {
                         name: s, type_args: vec![],
@@ -975,6 +991,43 @@ mod tests {
     #[test]
     fn test_lex_byte_string_unknown_escape() {
         let result = tokenize(r#"b"\q""#);
+        let Err(ParseError::UnknownEscape { ch }) = result else { panic!("expected UnknownEscape") };
+        assert_eq!(ch, 'q');
+    }
+
+    #[test]
+    fn test_lex_string() {
+        let tokens = tokenize(r#""hello""#).unwrap();
+        assert_eq!(tokens[0], Token::StringLit("hello".to_string()));
+    }
+
+    #[test]
+    fn test_lex_string_escapes() {
+        let tokens = tokenize(r#""hello\n\t\0""#).unwrap();
+        assert_eq!(tokens[0], Token::StringLit("hello\n\t\0".to_string()));
+    }
+
+    #[test]
+    fn test_lex_string_escaped_quote() {
+        let tokens = tokenize(r#""say \"hi\"""#).unwrap();
+        assert_eq!(tokens[0], Token::StringLit("say \"hi\"".to_string()));
+    }
+
+    #[test]
+    fn test_lex_string_empty() {
+        let tokens = tokenize(r#""""#).unwrap();
+        assert_eq!(tokens[0], Token::StringLit(String::new()));
+    }
+
+    #[test]
+    fn test_lex_string_unterminated() {
+        let result = tokenize("\"hello");
+        assert!(matches!(result, Err(ParseError::UnterminatedString)));
+    }
+
+    #[test]
+    fn test_lex_string_unknown_escape() {
+        let result = tokenize(r#""\q""#);
         let Err(ParseError::UnknownEscape { ch }) = result else { panic!("expected UnknownEscape") };
         assert_eq!(ch, 'q');
     }

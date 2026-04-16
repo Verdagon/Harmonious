@@ -131,10 +131,16 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 self.context.struct_type(&fields, false).into()
             }
             ResolvedType::RustType { .. } => self.rust_ty_to_llvm_opaque(ty).0,
-            ResolvedType::Str => self.context.ptr_type(AddressSpace::default()).into(),
+            // Per @UTAIRZ, bare Str/ByteSlice are unsized and have no LLVM layout;
+            // they must be wrapped in Ref before reaching codegen.
+            ResolvedType::Str => panic!("bare Str should not appear without Ref wrapper"),
             ResolvedType::ByteSlice => panic!("bare ByteSlice should not appear without Ref wrapper"),
-            ResolvedType::Ref { inner } if matches!(inner.as_ref(), ResolvedType::ByteSlice) => {
-                // &[u8] is a fat pointer: { ptr, i64 } (pointer + length)
+            // Per @UTAIRZ, &str and &[u8] share the ScalarPair layout { ptr, i64 };
+            // this single arm handles both.
+            ResolvedType::Ref { inner } if matches!(
+                inner.as_ref(),
+                ResolvedType::ByteSlice | ResolvedType::Str,
+            ) => {
                 let ptr_ty = self.context.ptr_type(AddressSpace::default());
                 let len_ty = self.context.i64_type();
                 self.context.struct_type(&[ptr_ty.into(), len_ty.into()], false).into()
@@ -1419,14 +1425,48 @@ fn lower_typed_expr<'ctx>(
         }
 
         TypedExprKind::StringLit(s) => {
-            let ptr = ctx.builder.build_global_string_ptr(s, "str_lit")
-                .unwrap()
-                .as_pointer_value();
-            ExprResult::Value(ptr.into())
+            // Per @UTAIRZ, string literals codegen mirrors ByteStringLit: emit a
+            // global byte array and build the { ptr, i64 } fat pointer that matches
+            // `resolved_to_inkwell(Ref { Str })`.
+            let bytes = s.as_bytes();
+            let array_val = ctx.context.const_string(bytes, false);
+            let array_type = array_val.get_type();
+            let global = ctx.module.add_global(array_type, None, "str_lit");
+            global.set_initializer(&array_val);
+            global.set_constant(true);
+
+            // GEP to get pointer to first element
+            let ptr = unsafe {
+                ctx.builder.build_gep(
+                    array_type,
+                    global.as_pointer_value(),
+                    &[ctx.context.i64_type().const_zero(), ctx.context.i64_type().const_zero()],
+                    "str_ptr",
+                ).unwrap()
+            };
+
+            // Build fat pointer struct { ptr, i64 }.
+            // Must match resolved_to_inkwell(Ref { inner: Str }).
+            let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
+            let len_ty = ctx.context.i64_type();
+            let struct_ty = ctx.context.struct_type(&[ptr_ty.into(), len_ty.into()], false);
+            debug_assert_eq!(
+                BasicTypeEnum::StructType(struct_ty),
+                ctx.resolved_to_inkwell(&expr.ty),
+                "StringLit struct type doesn't match resolved_to_inkwell for {:?}", expr.ty,
+            );
+            let len_val = ctx.context.i64_type().const_int(bytes.len() as u64, false);
+            let mut fat_ptr = struct_ty.get_undef();
+            fat_ptr = ctx.builder.build_insert_value(fat_ptr, ptr, 0, "fat_ptr_data")
+                .unwrap().into_struct_value();
+            fat_ptr = ctx.builder.build_insert_value(fat_ptr, len_val, 1, "fat_ptr_len")
+                .unwrap().into_struct_value();
+            ExprResult::Value(fat_ptr.into())
         }
 
         TypedExprKind::ByteStringLit(bytes) => {
-            // Create a global constant byte array [N x i8]
+            // Per @UTAIRZ, byte string literals emit the same { ptr, i64 } fat
+            // pointer shape as string literals; this is the template StringLit mirrors.
             let array_val = ctx.context.const_string(bytes, false);
             let array_type = array_val.get_type();
             let global = ctx.module.add_global(array_type, None, "byte_str_lit");
