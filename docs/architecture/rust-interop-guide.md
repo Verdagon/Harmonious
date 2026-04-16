@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 116 integration tests + 4 standalone tests + 60 unit tests passing, 0 ignored.
+> **Current status:** 118 integration tests + 6 standalone tests + 60 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -9,7 +9,10 @@
 > `ResolvedType` everywhere. Explicit typed literals. Typed error enums.
 > Full ABI coverage including ABI-coerced return types for function declarations
 > (see @ACRTFDZ). Generic functions with explicit type args. Mutable assignment,
-> else if, boolean operators (&&/||), unary negation.
+> else if, boolean operators (&&/||), unary negation. Structured error
+> messages for missing-import failures (see @RTMEIZ) and a type-resolve-time
+> rejection of non-void `fn main()` tails (see @MBMRVZ) replace what used
+> to be panics and SIGBUSes.
 >
 > **Phases done:**
 > - Phase 1: Explicit trait method calls (`Trait::method(receiver, args)`)
@@ -49,14 +52,27 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
+> - Phase 7 (in progress, 1/9 done): standalone test projects under
+>   `toylangc/tests/standalone/<crate>_test/` proving toylang links
+>   against and calls into arbitrary crates.io Rust deps. `uuid_test`
+>   landed as the smoke test (commit `df696c1` + follow-ups); 8 crates
+>   remaining (`indexmap`, `rand`, `regex`, `clap`, `glob`, `toml`,
+>   `serde_json`, `reqwest`). See `handoff.md` at the repo root for
+>   the junior-engineer handoff on the remaining 8. Each project is a
+>   10-20 line toylang program that prints `"<crate> ok\n"`.
+> - Error-quality polish (commit `0b1432e`): tech-debt #26 and #27.
+>   Missing-import panics at `oracle.rs:112` converted into structured
+>   `TypeResolveError::RustTypeNotImported { name, context }` with a
+>   7-variant `RustTypeLookupContext` enum whose `Display` impl
+>   produces actionable messages like "as Self of trait call
+>   \`Write::write_all\`" (see @RTMEIZ). `fn main()` with a non-void
+>   tail expression — previously a SIGBUS at runtime during teardown
+>   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
+>   time (see @MBMRVZ).
 >
-> **Phase 6 complete.** Next milestones: Phase 7 (9 standalone test
-> projects linking against rand, regex, uuid, clap, serde, toml, glob,
-> indexmap, reqwest) and Phase 8 (test harness).
->
-> **After Phase 6:** 9 standalone test projects linking against rand, regex,
-> uuid, clap, serde, toml, glob, indexmap, reqwest (Phase 7); test harness
-> (Phase 8).
+> **Phases done: 1–6. Phase 7 in progress (1/9).** Remaining: 8
+> standalone test projects (see `handoff.md`); Phase 8 (test harness
+> polish — reduce per-crate boilerplate in `standalone_tests.rs`).
 
 ## Overview
 
@@ -592,7 +608,7 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 ---
 
-## Part 6: What Works (60 unit + 116 integration + 4 standalone = 180 tests)
+## Part 6: What Works (60 unit + 118 integration + 6 standalone = 184 tests)
 
 ### Struct types
 - Simple, generic, nested, mixed-field, large, single-field structs
@@ -658,8 +674,10 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 - Dependency crates compile via `rustc_driver::RunCompiler` with
   `NoopCallbacks`; only the primary crate (`CARGO_PRIMARY_PACKAGE=1`) goes
   through toylang processing
-- 4 standalone tests: minimal project, project with Rust dep, invalid
-  manifest, missing source
+- 6 standalone tests: minimal project, project with Rust dep, invalid
+  manifest, missing source, workspace-nested project
+  (`test_build_inside_another_workspace`), and the uuid smoke test
+  (Phase 7's first crate) calling `Uuid::new_v4()` end-to-end
 
 ---
 
@@ -943,8 +961,10 @@ implementation history.
 
 ### 10.6 Done: Phase 6 — Wrappers for inline stdlib methods
 
-**Status**: All three steps done. 116 integration + 60 unit + 4
-standalone = 180 tests passing, 0 ignored. Step 1: `#[inline(never)]`
+**Status**: All three steps done. At the time Phase 6 closed: 116
+integration + 60 unit + 4 standalone = 180 tests passing, 0 ignored.
+(Current totals are higher due to Phase 7 smoke test and error-quality
+work — see the front-matter status above.) Step 1: `#[inline(never)]`
 wrappers in `__lang_stubs` + rustc-fork partitioner patch. Step 2:
 `visibility_override` callback replaces the inline `__lang_stubs` string
 match in the fork. Step 3: two-family trait split (`LangPredicates` +
@@ -1209,28 +1229,39 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 Planned: Phase 7 — Standalone test projects
+### 10.7 In progress: Phase 7 — Standalone test projects (1/9 done)
 
-Standalone test projects under `tests/standalone/`, each with a `toylang.toml`
-and `main.toylang`. No Rust files, no glue. Each project proves toylang can
-link against and call a specific Rust crate.
+Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
+each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
+Each project proves toylang can link against and call into a specific
+Rust crate from crates.io via `toylangc build`.
 
-Every target crate has an imperative API that avoids derive macros:
+**Done (1 crate):**
 
-| Crate | Imperative API | Example |
-|-------|---------------|---------|
-| rand | Free fn + trait method | `thread_rng().gen::<i32>()` |
-| uuid | Static method | `Uuid::new_v4()` |
-| indexmap | Constructor + methods | `IndexMap::new()`, `.insert()`, `.len()` |
-| regex | Method calls | `Regex::new(pat).unwrap().is_match(text)` |
-| clap | Builder pattern | `Command::new("app").arg(Arg::new("input"))` |
-| glob | Free function | `glob::glob("*.txt").unwrap()` |
-| reqwest | Free function | `reqwest::blocking::get(url).unwrap()` |
-| toml | `toml::Value` | `toml::from_str::<Value>(text).unwrap()` |
-| serde_json | `serde_json::Value` | `serde_json::from_str::<Value>(json).unwrap()` |
+- `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
+  Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
+  `Write::write_all(&stdout(), b"uuid ok\n");`. Shipped in commit
+  `df696c1` + follow-ups; surfaced three latent issues that landed as
+  @MBMRVZ, @RTMEIZ, and the `[workspace]` note in §10.5.
 
-Derive macros are syntactic sugar for trait impls. The underlying APIs are
-always available imperatively.
+**Remaining (8 crates, see `handoff.md`):**
+
+| Crate | Imperative API used for smoke test | Notes |
+|-------|-----------------------------------|-------|
+| indexmap | Constructor | `IndexMap::new<K, V, S>()` — gate for the remaining 7 |
+| rand | Free fn | `thread_rng()` |
+| uuid | Static method | **DONE** (see above) |
+| regex | Static method + `.unwrap()` | `Regex::new(pat).unwrap()` — uses Phase 6 unwrap wrappers |
+| clap | Builder | `Command::new("app")` |
+| glob | Free function | `glob::glob("*.txt")` — first pass omits `.unwrap()` |
+| reqwest | Free function | `reqwest::blocking::get` (no network call on smoke test) |
+| toml | Free fn + `Value` | `toml::from_str<Value>(...)` — turbofish-free syntax |
+| serde_json | Free fn + `Value` | `serde_json::from_str<Value>(...)` |
+
+Derive macros are syntactic sugar for trait impls. The underlying APIs
+are always available imperatively. Each remaining crate is a 10-20 line
+toylang program that prints `"<crate> ok\n"`. See `handoff.md` for the
+junior-engineer handoff covering all 8.
 
 ### 10.8 Planned: Phase 8 — Test harness
 
