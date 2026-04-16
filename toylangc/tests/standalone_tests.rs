@@ -273,3 +273,49 @@ fn test_standalone_indexmap() {
         stdout,
     );
 }
+
+// Per @IVTDBTZ — exercises four features in composition: Phase 5 build,
+// @UTAIRZ &str ABI, Phase 6 .unwrap() wrappers (first non-stdlib
+// Result<T, E>), Phase 4 I/O. First Phase 7 smoke test whose
+// RustStruct::method(args) shape tripped both the dispatch classifier
+// and the inherent StaticCall codegen; see
+// docs/arcana/InherentVsTraitDispatchByType-IVTDBTZ.md.
+#[test]
+fn test_standalone_regex() {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/standalone/regex_test");
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let build_out = run_build(&project);
+    assert!(
+        build_out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = build_dir.join("target/debug/regex_test");
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .expect("failed to run regex_test binary");
+    assert!(
+        run.status.success(),
+        "regex_test exited non-zero:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("regex ok"),
+        "expected 'regex ok' in stdout, got: {}",
+        stdout,
+    );
+}

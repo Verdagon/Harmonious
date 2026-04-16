@@ -46,3 +46,9 @@ types for `Self`). These are different items in the HIR with different DefIds
 and different generic parameter counts. The consumer must use the right DefId
 for the operation: trait definition for ABI/signature queries and
 `Instance::expect_resolve`, not the impl's DefId.
+
+## See also
+
+- `docs/arcana/InherentVsTraitDispatchByType-IVTDBTZ.md` — governs the
+  upstream decision of *whether* a call goes through the trait path
+  (and therefore whether this arcana applies) vs. the inherent path.

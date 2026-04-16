@@ -22,6 +22,16 @@ pub enum RustTypeLookupContext {
     NestedGenericArg { parent_type: String },
     StructField { struct_name: String },
     Codegen,
+    // Per @IVTDBTZ — when dispatch classifies a `Name::method(args)` call as
+    // a trait call (because `is_rust_trait(Name)` returned true), but the
+    // trait name itself isn't findable via `find_use_imported_trait_def_id`
+    // at resolve time. Typically a missing `use` line or typo. `name` on
+    // the surrounding UnresolvedRustType holds the trait name.
+    TraitCallName { method: String },
+    // Per @IVTDBTZ — trait was found, but the method name isn't an
+    // associated item on the trait. Typically a typo at the call site.
+    // `name` on the surrounding UnresolvedRustType holds the method name.
+    TraitMethodName { trait_name: String },
 }
 
 impl std::fmt::Display for RustTypeLookupContext {
@@ -41,6 +51,10 @@ impl std::fmt::Display for RustTypeLookupContext {
                 write!(f, "as field type in struct `{}`", struct_name),
             Self::Codegen =>
                 write!(f, "during codegen"),
+            Self::TraitCallName { method } =>
+                write!(f, "as trait name in trait call `::{}`", method),
+            Self::TraitMethodName { trait_name } =>
+                write!(f, "as method name on trait `{}`", trait_name),
         }
     }
 }
@@ -596,8 +610,17 @@ pub fn rust_trait_method_return_type<'tcx>(
     receiver_ty: &crate::toylang::typed_ast::ResolvedType,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
+    // Per @IVTDBTZ, this lookup can legitimately fail when the dispatch
+    // classifier misfires or when the trait isn't `use`-imported; return
+    // a structured error instead of panicking so the user sees an
+    // actionable message at the call site.
     let trait_def_id = find_use_imported_trait_def_id(tcx, trait_name)
-        .unwrap_or_else(|| panic!("trait '{}' not found", trait_name));
+        .ok_or_else(|| UnresolvedRustType {
+            name: trait_name.to_string(),
+            context: RustTypeLookupContext::TraitCallName {
+                method: method_name.to_string(),
+            },
+        })?;
     // Per @TVIMDGAZ, strip &ref to get Self and use the trait definition's method DefId.
     // Per @RTMEIZ, the Self type of a trait call must be `use`-imported in the toylang
     // source even though the source never names it — try_resolved_to_rustc_ty needs it
@@ -608,6 +631,8 @@ pub fn rust_trait_method_return_type<'tcx>(
     };
     let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx)?;
 
+    // Per @IVTDBTZ, method-not-found on an imported trait is a source-level
+    // error (typo at the call site), not an invariant violation.
     let trait_method_def_id = {
         let mut found = None;
         for &item_id in tcx.associated_item_def_ids(trait_def_id) {
@@ -616,7 +641,12 @@ pub fn rust_trait_method_return_type<'tcx>(
                 break;
             }
         }
-        found.unwrap_or_else(|| panic!("method '{}' not defined on trait '{}'", method_name, trait_name))
+        found.ok_or_else(|| UnresolvedRustType {
+            name: method_name.to_string(),
+            context: RustTypeLookupContext::TraitMethodName {
+                trait_name: trait_name.to_string(),
+            },
+        })?
     };
 
     // Per @TVIMDGAZ, args are [Self, ...explicit] for the trait definition's method DefId

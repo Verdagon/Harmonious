@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 123 integration tests + 7 standalone tests + 67 unit tests passing, 0 ignored.
+> **Current status:** 129 integration tests + 8 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -52,16 +52,17 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (in progress, 2/9 done): standalone test projects under
+> - Phase 7 (in progress, 3/9 done): standalone test projects under
 >   `toylangc/tests/standalone/<crate>_test/` proving toylang links
 >   against and calls into arbitrary crates.io Rust deps. `uuid_test`
 >   landed as the smoke test (commit `df696c1` + follow-ups);
 >   `indexmap_test` landed as the second smoke test (2026-04-16)
 >   exercising 3-arg explicit generics via
->   `IndexMap::new<i32, i32, RandomState>()`. 7 crates remaining
->   (`rand`, `regex`, `clap`, `glob`, `toml`, `serde_json`,
+>   `IndexMap::new<i32, i32, RandomState>()`. `regex_test` landed
+>   (2026-04-16) after surfacing and fixing @IVTDBTZ. 6 crates
+>   remaining (`rand`, `clap`, `glob`, `toml`, `serde_json`,
 >   `reqwest`). See `handoff.md` at the repo root for the
->   junior-engineer handoff on the remaining 7. Each project is a
+>   junior-engineer handoff on the remaining 6. Each project is a
 >   10-20 line toylang program that prints `"<crate> ok\n"`.
 > - String-literal `&str` ABI fix (2026-04-16): `ResolvedType::Str`
 >   rewired to mirror `ByteSlice`'s six-touchpoint pattern exactly.
@@ -70,6 +71,38 @@
 >   `&str`. Lexer gained escape-sequence support for regular strings
 >   (previously byte-strings only). Unblocks `regex`, `toml`,
 >   `serde_json` Phase 7 smoke tests. See `@UTAIRZ`.
+> - Trait-vs-inherent dispatch fix (2026-04-16): `regex_test` surfaced
+>   a latent dispatch gap — `RustStruct::method(args)` with non-empty
+>   args misrouted to the trait path because the classifier used
+>   `!typed_args.is_empty()` as a proxy for "has a receiver". Fix
+>   replaces the heuristic with a predicate callback
+>   `is_rust_trait(&str) -> bool` backed by
+>   `find_use_imported_trait_def_id`, and two `panic!` sites at
+>   `oracle.rs:600` and `:619` were converted to structured
+>   `UnresolvedRustType` errors with new `RustTypeLookupContext`
+>   variants `TraitCallName` and `TraitMethodName`. The sibling
+>   latent bug — inherent StaticCall codegen hardcoded
+>   `build_call(func, &[])` and silently discarded all args — was
+>   fixed in the same pass. See `@IVTDBTZ`. Unblocks `regex_test`,
+>   `clap` (partially — still blocked on `impl Into<Str>`), and any
+>   future `String::from(x)` / `Vec::with_capacity(n)` /
+>   `Box::new(x)` shape.
+> - Trait-vs-inherent dispatch fix (2026-04-16): `regex_test` surfaced
+>   a latent dispatch gap — `RustStruct::method(args)` with non-empty
+>   args misrouted to the trait path because the classifier used
+>   `!typed_args.is_empty()` as a proxy for "has a receiver". Fix
+>   replaces the heuristic with a predicate callback
+>   `is_rust_trait(&str) -> bool` backed by
+>   `find_use_imported_trait_def_id`, and two `panic!` sites at
+>   `oracle.rs:600` and `:619` were converted to structured
+>   `UnresolvedRustType` errors with new `RustTypeLookupContext`
+>   variants `TraitCallName` and `TraitMethodName`. The sibling
+>   latent bug — inherent StaticCall codegen hardcoded
+>   `build_call(func, &[])` and silently discarded all args — was
+>   fixed in the same pass. See `@IVTDBTZ`. Unblocks `regex_test`,
+>   `clap` (partially — still blocked on `impl Into<Str>`), and any
+>   future `String::from(x)` / `Vec::with_capacity(n)` /
+>   `Box::new(x)` shape.
 > - Error-quality polish (commit `0b1432e`): tech-debt #26 and #27.
 >   Missing-import panics at `oracle.rs:112` converted into structured
 >   `TypeResolveError::RustTypeNotImported { name, context }` with a
@@ -80,7 +113,7 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–6. Phase 7 in progress (2/9).** Remaining: 7
+> **Phases done: 1–6. Phase 7 in progress (3/9).** Remaining: 6
 > standalone test projects (see `handoff.md`); Phase 8 (test harness
 > polish — reduce per-crate boilerplate in `standalone_tests.rs`).
 
@@ -177,6 +210,24 @@ walk**:
 
 Only Rust deps are returned to rustc. Internal toylang functions never appear in
 rustc's MonoItems. The consumer discovers them independently during codegen.
+
+**Design-space note:** this is a new query rather than an override of rustc's
+existing `optimized_mir`, but that choice was pragmatic rather than
+technically necessary. `optimized_mir` is DefId-keyed (not Instance-keyed
+like `per_instance_mir`), but the collector substitutes the Instance's
+type args into the body during its walk — the same substitution machinery
+it applies to every generic Rust function. So the *effect* is per-Instance
+even though the query itself is DefId-keyed. An `override_queries` approach
+on `optimized_mir` would reach the same dep-discovery behavior with fewer
+fork patches; it would not, on its own, eliminate fork patch 3 (codegen
+skip) — that requires either a separate patch equivalent or a paired
+`CodegenBackend` plugin. See `docs/reasoning/rustc-fork-design-space.md`
+Parts 2 and 4.1–4.2 for the honest accounting of why a new query was
+picked, what an `optimized_mir` override would and wouldn't replace, and
+why zero fork requires combining the override with a plugin rather than
+either alone. The deeper question — why the facade must interleave with
+rustc's monomorphization phase at all, rather than running as a pre-pass
+or post-pass — is answered in Part 1 of that document.
 
 ### 2.3 symbol_name
 
@@ -797,11 +848,50 @@ Reporting real field counts in `FieldsShape` caused ABI code to index into the
 ADT's stub fields (which are dummy types). With 0 fields, the ABI code treats
 consumer types as opaque memory blobs.
 
+### Why the facade interleaves with rustc's monomorphization phase
+
+The facade's query providers hook into rustc during monomorphization rather
+than as a pre-pass (e.g., `Callbacks::after_analysis`) or a post-pass
+(e.g., a `CodegenBackend` plugin receiving CGUs). This is not a stylistic
+choice — it's the only phase where the handoff the facade needs to perform
+is actually possible.
+
+**The one-way handoff.** Rustc's monomorphization collector walks reachable
+items from entry points outward, discovering generic instantiations as it
+goes. When consumer code calls a Rust generic function (`use_it<i32>(x)` →
+`rust_fn<i32>(x)`), the edge from the consumer caller to the Rust callee
+lives entirely inside consumer source — rustc never parses it. Without
+facade intervention, rustc's collector never sees that `rust_fn<i32>` is
+reachable, never queues it for codegen, and the link step fails with an
+undefined symbol.
+
+The facade's job is narrow: **tell rustc the leaves** — the concrete
+type-argument tuples for every Rust item called directly from consumer code
+for each consumer Instance. Rustc walks the transitive closure from there
+(trait resolution, associated types, nested generics, drop glue). This is
+why the synthetic MIR body that `per_instance_mir` returns enumerates Rust
+deps as `ReifyFnPointer` casts: the collector sees them and queues them as
+part of its normal walk.
+
+The alternative — have the facade reimplement trait impl resolution, generic
+argument substitution, blanket/conditional impls, etc. — is tens of thousands
+of lines of rustc internals reimplemented. The interleaving is how the facade
+**avoids** that reimplementation.
+
 ### Why per_instance_mir (rustc fork) instead of mir_built
 
 `mir_built` fires once per function DEFINITION, not per instantiation. For generic
 functions, rustc calls `mir_built` once for the generic definition and substitutes
 internally. `per_instance_mir` fires per concrete `Instance<'tcx>`.
+
+**But why a new query vs overriding `optimized_mir`?** `optimized_mir` is also
+Instance-keyed and also fires during monomorphization — so the "Instance-keying"
+framing was never the discriminator. The honest answer is that a new query was
+picked for taste reasons: "consumer owns its own query" felt cleaner than
+"consumer intercepts a query rustc's normal MIR pipeline uses too." That
+preference carries a fork-patch cost that was acceptable for toylang but is
+the wrong trade-off for a consumer with a zero-fork target. See
+`docs/reasoning/rustc-fork-design-space.md` Parts 2 and 4.1.
 
 ### Why explicit type args instead of inference
 
@@ -1157,7 +1247,13 @@ Considered and rejected:
 - **`#[linkage = "external"]` on the wrapper.** Requires
   `#![feature(linkage)]` at the crate root, which propagates a nightly
   feature flag into user-controlled territory. Unacceptable for a general
-  consumer compiler.
+  consumer compiler. *(Rejection nuance: the technical mechanism works —
+  `explicit_linkage` takes a fast-path before the internalization logic.
+  The rejection is specific to toylang's `FileLoader` stub injection
+  model, which puts `__lang_stubs.rs` into the user's test crate. A
+  consumer architecture where stubs live in their own rlib would keep
+  the feature flag inside generated code and could use this path fork-free.
+  See `docs/reasoning/rustc-fork-design-space.md` Part 3 + §4.3.)*
 - **Per-instantiation `#[no_mangle]` non-generic shims.** Works in vanilla
   Rust but requires knowing every `(wrapper, type_args)` tuple before
   `generate_stubs()` fires, plus risks `#[no_mangle]` collisions across
@@ -1242,14 +1338,14 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 In progress: Phase 7 — Standalone test projects (2/9 done)
+### 10.7 In progress: Phase 7 — Standalone test projects (3/9 done)
 
 Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
 each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
 Each project proves toylang can link against and call into a specific
 Rust crate from crates.io via `toylangc build`.
 
-**Done (2 crates):**
+**Done (3 crates):**
 
 - `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
   Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
@@ -1267,14 +1363,26 @@ Rust crate from crates.io via `toylangc build`.
   handled impl-block selection. First test to exercise a 3-arg
   generic method call; parsing worked the same path as the 2-arg
   Vec case at `integration_tests.rs:410`.
+- `regex_test` — third smoke test. Program:
+  `let re = Regex::new("\\d+").unwrap();` then
+  `Write::write_all(&stdout(), b"regex ok\n");`. Landed 2026-04-16
+  after surfacing **two** latent compiler gaps that required a fix
+  before the test could pass: (1) the dispatch classifier at
+  `type_resolve.rs:~487` misrouted every `RustStruct::method(args)`
+  with non-empty args to the trait path (ICE at `oracle.rs:600`);
+  (2) the inherent StaticCall codegen at `llvm_gen.rs:~1414`
+  hardcoded `build_call(func, &[])`, silently discarding every arg
+  (SIGSEGV on the fat-pointer `&str`). Both fixed — see @IVTDBTZ.
+  First Phase 7 test to stress-test four features in composition:
+  Phase 5 build, @UTAIRZ `&str` ABI, Phase 6 `.unwrap()` wrapper
+  (first non-stdlib `Result<T, E>`), and Phase 4 I/O.
 
-**Remaining (7 crates, see `handoff.md`):**
+**Remaining (6 crates, see `handoff.md`):**
 
 | Crate | Imperative API used for smoke test | Notes |
 |-------|-----------------------------------|-------|
 | rand | Free fn | `thread_rng()` |
-| regex | Static method + `.unwrap()` | `Regex::new(pat).unwrap()` — uses Phase 6 unwrap wrappers |
-| clap | Builder | `Command::new("app")` |
+| clap | Builder | `Command::new("app")` — still blocked on `impl Into<Str>` synthetic generic |
 | glob | Free function | `glob::glob("*.txt")` — first pass omits `.unwrap()` |
 | reqwest | Free function | `reqwest::blocking::get` (no network call on smoke test) |
 | toml | Free fn + `Value` | `toml::from_str<Value>(...)` — turbofish-free syntax |
@@ -1301,6 +1409,48 @@ let users write `out.write_all(bytes)` instead of `Write::write_all(&out, bytes)
 cleaner syntax at the cost of searching potentially thousands of traits.
 Deferred because explicit qualification is simpler and avoids ambiguity when
 multiple traits define the same method name.
+
+### 10.10 Deferred: zero-fork design space
+
+The current 5-patch rustc fork is the shipping implementation, but most
+of what it achieves is reachable through sanctioned rustc extension
+points. A fork-reduction effort has not been undertaken for toylang
+(the fork-maintenance cost is acceptable given toylang's research-project
+deployment model), but the design space is mapped in
+`docs/reasoning/rustc-fork-design-space.md`. Summary of alternatives:
+
+| Fork patch(es) | Zero-fork alternative | Evidence level |
+|---|---|---|
+| Patches 1, 2, 4 (query definition, collector hook, default provider) | `rustc_interface::Config::override_queries` on `optimized_mir` returning a synthetic generic body | Mechanism-verified |
+| Patch 3 (codegen skip for consumer stubs) | `-Zcodegen-backend=consumer` plugin paired with the above override — plugin declines to emit stub bodies while emitting real impls separately, avoiding the symbol conflict that bare `override_queries` would produce | Mechanism-verified; plugin integration never prototyped |
+| Patch 5 (partitioner visibility hook) | `#[linkage = "external"]` + separate-crate stub model | Mechanism-verified; separate-crate model never prototyped |
+| Consumer-side churn reduction (orthogonal) | `rustc_public` for oracle / ABI / symbol-name call sites — covers ~40-50% of rustc-internal surface | Feasible today |
+
+Note: patches 1-4 cannot be eliminated by `override_queries` alone —
+only patches 1, 2, 4 go away with that one change. Patch 3 requires
+pairing with the `CodegenBackend` plugin to resolve cleanly; otherwise
+either a patch-3-equivalent stays, or the trampoline body emitted by
+rustc collides at the linker with the consumer's separately-emitted
+real implementation. The reasoning doc's §4.1 and §4.2 walk through
+why this is a two-piece problem, not a one-piece one.
+
+Not in scope: eliminating MIR-construction churn. That ~250 LoC of
+synthetic body building in `queries/per_instance.rs` + `mir_helpers.rs`
+stays on rustc-internal APIs regardless of fork choice. `rustc_public`
+covers MIR reading, not construction.
+
+For a consumer with a deployment story where user installation friction
+is a real cost (e.g., shipping a language as a precompiled binary to
+non-Rust-native users), the math favors zero-fork even at the cost of
+a 4-8 week migration plus ongoing `Config::override_queries` API churn
+surface. For toylang's deployment story, the fork's ~2-3 days-per-bump
+rebase cost is smaller than the zero-fork migration would be.
+
+See `docs/reasoning/rustc-fork-design-space.md` for the full
+investigation, including the honest accounting of which current design
+choices were technical necessities vs pragmatic picks, why the facade
+must interleave with monomorphization regardless of fork status, and
+which alternatives were never seriously evaluated.
 
 ---
 
@@ -1361,3 +1511,5 @@ affected code sites):
   (`docs/arcana/RustTypesMustBeExplicitlyImported-RTMEIZ.md`)
 - `@UTAIRZ` — Unsized Types Appear Inside Ref
   (`docs/arcana/UnsizedTypesAppearInsideRef-UTAIRZ.md`)
+- `@IVTDBTZ` — Inherent Vs Trait Dispatch By Type
+  (`docs/arcana/InherentVsTraitDispatchByType-IVTDBTZ.md`)

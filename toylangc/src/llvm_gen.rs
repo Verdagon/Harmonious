@@ -679,7 +679,11 @@ fn codegen_internal_function<'ctx, 'tcx>(
             crate::oracle::rust_method_param_types(ctx.tcx, type_name, method, type_args)
         }
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret, &rust_param_types)
+    // Per @IVTDBTZ, trait-vs-inherent dispatch predicate.
+    let is_rust_trait = |name: &str| {
+        crate::oracle::find_use_imported_trait_def_id(ctx.tcx, name).is_some()
+    };
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait)
         .expect("type resolution should succeed (already validated)");
 
     // Resolve any Rust method symbols used in this function by walking the typed body
@@ -1408,14 +1412,44 @@ fn lower_typed_expr<'ctx>(
                     }
                 }
             } else {
-                // Inherent static call (e.g., Vec::new) — no args
+                // Per @IVTDBTZ — inherent static call (e.g., Vec::new,
+                // Vec::with_capacity(n), Regex::new(pat)). Unlike the trait
+                // branch above there's no receiver at args[0], so args and
+                // coerced_params align directly (no +1 offset).
+                // Previously this branch hardcoded `build_call(func, &[])`
+                // which silently discarded every arg, producing garbage in
+                // the called fn's params and SIGSEGVing for any non-zero-arg
+                // inherent static call. Mirrors the trait branch's arg loop,
+                // sret-prepend, track_caller tail, and debug_assert on count.
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
                 if is_sret {
                     let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, &format!("{}_new", ty));
+                    call_args.push(alloca.into());
+                    for (i, arg_expr) in args.iter().enumerate() {
+                        push_arg_for_rust_call(ctx, arg_expr, &coerced_params[i], &mut call_args);
+                    }
+                    if has_track_caller {
+                        call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
+                    }
+                    debug_assert_eq!(
+                        call_args.len(), func.get_type().count_param_types() as usize,
+                        "inherent sret static call arg count mismatch for {}::{}", ty, method,
+                    );
+                    ctx.builder.build_call(func, &call_args, "").unwrap();
                     let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
-                    ctx.builder.build_call(func, &[alloca.into()], "").unwrap();
                     ExprResult::Ptr(alloca, opaque_ty)
                 } else {
-                    let result = ctx.builder.build_call(func, &[], "static_call").unwrap();
+                    for (i, arg_expr) in args.iter().enumerate() {
+                        push_arg_for_rust_call(ctx, arg_expr, &coerced_params[i], &mut call_args);
+                    }
+                    if has_track_caller {
+                        call_args.push(ctx.context.ptr_type(AddressSpace::default()).const_null().into());
+                    }
+                    debug_assert_eq!(
+                        call_args.len(), func.get_type().count_param_types() as usize,
+                        "inherent static call arg count mismatch for {}::{}", ty, method,
+                    );
+                    let result = ctx.builder.build_call(func, &call_args, "static_call").unwrap();
                     match result.try_as_basic_value() {
                         inkwell::values::ValueKind::Basic(val) => ExprResult::Value(val),
                         _ => ExprResult::Value(ctx.context.i32_type().const_zero().into()),

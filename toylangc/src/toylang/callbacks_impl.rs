@@ -240,7 +240,12 @@ impl LangCallbacks for ToylangCallbacks {
                     crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
                 }
             };
-            match crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret, &rust_param_types) {
+            // Per @IVTDBTZ, trait-vs-inherent dispatch predicate — asks the
+            // oracle directly whether `name` is a `use`-imported Rust trait.
+            let is_rust_trait = |name: &str| {
+                crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
+            };
+            match crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait) {
                 Err(e) => errors.push(format!("function '{}': {:?}", name, e)),
                 Ok(typed) => {
                     // Per @MBMRVZ, if main has no declared return type (so its
@@ -479,7 +484,12 @@ fn collect_toylang_fn_deps_inner<'tcx>(
             crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
         }
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, resolved_fn, &rust_method_ret, &rust_param_types)
+    // Per @IVTDBTZ, trait-vs-inherent dispatch predicate — asks the oracle
+    // directly whether `name` is a `use`-imported Rust trait.
+    let is_rust_trait = |name: &str| {
+        crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
+    };
+    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, resolved_fn, &rust_method_ret, &rust_param_types, &is_rust_trait)
         .unwrap_or_else(|e| panic!("[toylang] type error in '{}': {:?}", fn_name, e));
 
     // Walk typed body for fn_calls and rust_method_deps

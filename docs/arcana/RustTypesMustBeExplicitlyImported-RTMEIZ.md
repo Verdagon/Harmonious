@@ -131,3 +131,8 @@ tests in `toylangc/tests/integration_tests.rs` (see
   to this rule even when the tail has `;` (discarded but still typed).
 - `docs/architecture/known-tech-debt.md` — resolved entry #26 for the
   structured-error conversion; auto-registration was rejected.
+- `docs/arcana/InherentVsTraitDispatchByType-IVTDBTZ.md` — extended
+  the `RustTypeLookupContext` enum with `TraitCallName` and
+  `TraitMethodName` variants when trait-path lookup failures were
+  converted from `panic!` to `UnresolvedRustType`, per the @RTMEIZ
+  playbook.

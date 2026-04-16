@@ -3763,3 +3763,266 @@ fn main() { __toylang_main(); }
     );
     assert!(output.contains("42"));
 }
+
+// ============================================================================
+// Per @IVTDBTZ — inherent-vs-trait dispatch is type-kind based, not arg-count
+// based. The following tests are regression guards for the dispatch fix and
+// its sibling codegen fix (inherent StaticCall iterates args). See
+// docs/arcana/InherentVsTraitDispatchByType-IVTDBTZ.md.
+// ============================================================================
+
+#[test]
+fn test_static_call_zero_args_is_inherent() {
+    // Regression guard. Before @IVTDBTZ the classifier short-circuited
+    // zero-arg static calls to the inherent path via `!typed_args.is_empty()`.
+    // After the fix dispatch is pure `is_rust_trait(ty)`, so zero-arg calls
+    // must continue routing to inherent purely because `Vec` isn't a trait.
+    // Fails loudly if someone re-introduces an arg-count check as a
+    // "perf optimization".
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    println_usize(v.capacity())
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_usize(x: usize) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert_eq!(output.trim(), "0");
+}
+
+#[test]
+fn test_static_call_nonempty_args_rust_struct() {
+    // Positive test for @IVTDBTZ. `Vec::with_capacity<T, A>(n: usize)` is
+    // an inherent static method on a Rust struct with a non-zero-arg list.
+    // Before the fix, dispatch misrouted this to the trait path (panicking
+    // at oracle.rs:600 because `Vec` isn't a trait). Even after fixing
+    // dispatch, the inherent StaticCall codegen used to hardcode
+    // `build_call(func, &[])` and discard the arg — making this test
+    // double-duty: it verifies dispatch routes correctly AND that the arg
+    // actually flows through to the Rust function (observable via
+    // .capacity() returning the value we passed).
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::with_capacity<i32, Global>(5usize);
+    println_usize(v.capacity())
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_usize(x: usize) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert_eq!(output.trim(), "5");
+}
+
+#[test]
+fn test_static_call_nonempty_args_trait() {
+    // Regression guard: the trait-call path must still work after the
+    // dispatch change. `Clone::clone(&v)` routes via is_rust_trait == true,
+    // __trait::Clone prefix, rust_trait_method_return_type. Mirrors
+    // test_trait_static_call_clone_vec but named to make its post-@IVTDBTZ
+    // intent explicit.
+    let output = run_toylang_test(
+        r#"
+use std::alloc::Global
+use std::vec::Vec
+use std::clone::Clone
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(7i32);
+    let v2 = Clone::clone(&v);
+    println_usize(v2.len())
+}
+        "#,
+        r#"
+#![feature(allocator_api)]
+mod __lang_stubs;
+use __lang_stubs::*;
+#[no_mangle]
+pub fn println_usize(x: usize) { println!("{}", x); }
+fn main() { __toylang_main(); }
+        "#,
+    );
+    assert_eq!(output.trim(), "1");
+}
+
+#[test]
+fn test_static_call_undefined_type_gives_structured_error() {
+    // Per @IVTDBTZ: an unknown `Name::method(args)` where `Name` is neither
+    // a use-imported trait nor a use-imported Rust struct/enum must yield
+    // a structured error, not an ICE. Dispatch falls through to the
+    // inherent path since `is_rust_trait("UndefinedThing") == false`;
+    // try_resolved_to_rustc_ty then emits RustTypeNotImported with a
+    // structured context.
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+
+    std::fs::write(&toylang_path, r#"
+fn main() {
+    UndefinedThing::method(42i32)
+}
+    "#).unwrap();
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { __toylang_main(); }
+    "#).unwrap();
+
+    let compile = Command::new(toylangc_bin())
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .args(&[
+            "--edition", "2021",
+            "--toylang-input", toylang_path.to_str().unwrap(),
+            rust_path.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run toylangc");
+
+    assert!(!compile.status.success(),
+        "compilation should have failed for UndefinedThing::method, but succeeded");
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(stderr.contains("RustTypeNotImported"),
+        "stderr should mention structured 'RustTypeNotImported'; got: {}", stderr);
+    assert!(stderr.contains("UndefinedThing"),
+        "stderr should mention 'UndefinedThing'; got: {}", stderr);
+    // The pre-@IVTDBTZ panic was `panic!("trait '{}' not found", ...)` — that
+    // exact phrasing must not appear post-fix.
+    assert!(!stderr.contains("trait 'UndefinedThing' not found"),
+        "regression: pre-@IVTDBTZ panic string surfaced. stderr: {}", stderr);
+}
+
+#[test]
+fn test_trait_call_unknown_trait_name_gives_structured_error() {
+    // Per @IVTDBTZ / @RTMEIZ: trait dispatch is via is_rust_trait predicate.
+    // A name not imported as a trait (typo or missing use) returns false
+    // from the predicate → dispatch goes inherent → inherent lookup also
+    // fails → structured RustTypeNotImported. This covers the dispatch-
+    // falls-through-cleanly path; the next test covers the path where the
+    // trait IS imported but the method name is typo'd.
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+
+    std::fs::write(&toylang_path, r#"
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let out = stdout();
+    Writ::write_all(&out, b"hello\n");
+}
+    "#).unwrap();
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { __toylang_main(); }
+    "#).unwrap();
+
+    let compile = Command::new(toylangc_bin())
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .args(&[
+            "--edition", "2021",
+            "--toylang-input", toylang_path.to_str().unwrap(),
+            rust_path.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run toylangc");
+
+    assert!(!compile.status.success(),
+        "compilation should have failed for typo'd trait name, but succeeded");
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(stderr.contains("RustTypeNotImported"),
+        "stderr should mention structured 'RustTypeNotImported'; got: {}", stderr);
+    assert!(stderr.contains("Writ"),
+        "stderr should mention 'Writ'; got: {}", stderr);
+    assert!(!stderr.contains("trait 'Writ' not found"),
+        "regression: pre-@IVTDBTZ panic string surfaced. stderr: {}", stderr);
+}
+
+#[test]
+fn test_trait_call_unknown_method_name_gives_structured_error() {
+    // Per @IVTDBTZ part 6b: trait imported correctly, but method name typo.
+    // is_rust_trait("Write") == true → dispatch goes trait → oracle finds
+    // trait DefId but can't find `writ_all` as an associated item → the
+    // formerly-panicking path at oracle.rs:619 now returns
+    // UnresolvedRustType with a TraitMethodName context. Structured error,
+    // no ICE.
+    let dir = tempfile::tempdir().unwrap();
+    let toylang_path = dir.path().join("input.toylang");
+    let rust_path = dir.path().join("test.rs");
+    let bin_path = dir.path().join("test_bin");
+
+    std::fs::write(&toylang_path, r#"
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let out = stdout();
+    Write::writ_all(&out, b"hello\n");
+}
+    "#).unwrap();
+    std::fs::write(&rust_path, r#"
+mod __lang_stubs;
+use __lang_stubs::*;
+fn main() { __toylang_main(); }
+    "#).unwrap();
+
+    let compile = Command::new(toylangc_bin())
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .args(&[
+            "--edition", "2021",
+            "--toylang-input", toylang_path.to_str().unwrap(),
+            rust_path.to_str().unwrap(),
+            "-o", bin_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run toylangc");
+
+    assert!(!compile.status.success(),
+        "compilation should have failed for typo'd method name, but succeeded");
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(stderr.contains("RustTypeNotImported"),
+        "stderr should mention structured 'RustTypeNotImported'; got: {}", stderr);
+    assert!(stderr.contains("writ_all"),
+        "stderr should mention 'writ_all'; got: {}", stderr);
+    // The TraitMethodName variant's Display produces "as method name on
+    // trait `Write`" — confirms we routed through the new 6b error path
+    // rather than the inherent fallback.
+    assert!(stderr.contains("as method name on trait"),
+        "stderr should reference the TraitMethodName Display output; got: {}", stderr);
+    assert!(!stderr.contains("method 'writ_all' not defined on trait"),
+        "regression: pre-@IVTDBTZ panic string surfaced. stderr: {}", stderr);
+}
