@@ -1,0 +1,6 @@
+[project]
+name = "indexmap_test"
+source = "main.toylang"
+
+[rust-dependencies]
+indexmap = "2"

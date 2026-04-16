@@ -1,0 +1,10 @@
+use indexmap::IndexMap
+use std::collections::hash_map::RandomState
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let m = IndexMap::new<i32, i32, RandomState>();
+    Write::write_all(&stdout(), b"indexmap ok\n");
+}
