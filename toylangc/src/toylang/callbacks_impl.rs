@@ -17,7 +17,12 @@ use rustc_lang_facade::{LangCallbacks, LangPredicates, MonomorphizeTypeResult, M
 use crate::toylang::registry::ToylangRegistry;
 
 /// A structured log entry for each callback rustc makes into toylang.
+/// The `name` fields are consumed via `{:?}` formatting when
+/// `TOYLANG_LOG_PATH` is set (see `generate_and_compile`); rustc's
+/// dead-code analysis doesn't see through Debug derives, so the
+/// `allow` is required.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum CallbackLog {
     MonomorphizeType { name: String },
     MonomorphizeFn { name: String },
@@ -28,7 +33,6 @@ pub enum CallbackLog {
 /// A toylang function instance discovered during the deep monomorphization walk.
 #[derive(Clone)]
 pub struct ToylangInstance {
-    pub registry_name: String,
     pub extern_symbol: String,
     pub resolved_func: crate::toylang::registry::ToyFunction,
 }
@@ -103,7 +107,6 @@ impl ToylangCallbacks {
 
                 state.visited_symbols.insert(extern_symbol.clone());
                 state.toylang_instances.push(ToylangInstance {
-                    registry_name: registry_name.to_string(),
                     extern_symbol: extern_symbol.clone(),
                     resolved_func: resolved_caller.clone(),
                 });
@@ -536,7 +539,6 @@ fn collect_toylang_fn_deps_inner<'tcx>(
 
                 // Stash for generate_with_tcx
                 state.toylang_instances.push(ToylangInstance {
-                    registry_name: callee_name.clone(),
                     extern_symbol: callee_symbol,
                     resolved_func: resolved_callee,
                 });

@@ -20,7 +20,6 @@ pub enum RustTypeLookupContext {
     InherentMethodTypeArg { type_name: String, method: String },
     FreeFunctionTypeArg { function_name: String },
     NestedGenericArg { parent_type: String },
-    StructField { struct_name: String },
     Codegen,
     // Per @IVTDBTZ — when dispatch classifies a `Name::method(args)` call as
     // a trait call (because `is_rust_trait(Name)` returned true), but the
@@ -47,8 +46,6 @@ impl std::fmt::Display for RustTypeLookupContext {
                 write!(f, "as type arg of free function `{}`", function_name),
             Self::NestedGenericArg { parent_type } =>
                 write!(f, "as generic arg inside `{}`", parent_type),
-            Self::StructField { struct_name } =>
-                write!(f, "as field type in struct `{}`", struct_name),
             Self::Codegen =>
                 write!(f, "during codegen"),
             Self::TraitCallName { method } =>
@@ -320,10 +317,6 @@ pub fn wrapper_fn_name(type_name: &str, method_name: &str) -> Option<&'static st
     WRAPPERS.iter()
         .find(|(t, m, _)| *t == type_name && *m == method_name)
         .map(|(_, _, w)| *w)
-}
-
-pub fn all_wrappers() -> &'static [(&'static str, &'static str, &'static str)] {
-    WRAPPERS
 }
 
 /// Find a wrapper function in __lang_stubs by name.
@@ -626,26 +619,6 @@ pub fn rust_trait_method_param_types<'tcx>(
     let sig = tcx.fn_sig(trait_method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
     Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
-}
-
-/// Find a trait method's DefId given a trait and the receiver's concrete type.
-/// Searches all impls of the trait that match `self_ty`.
-pub fn find_trait_method<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    trait_def_id: DefId,
-    self_ty: ty::Ty<'tcx>,
-    method: &str,
-) -> Option<DefId> {
-    let mut result = None;
-    tcx.for_each_relevant_impl(trait_def_id, self_ty, |impl_def_id| {
-        if result.is_some() { return; }
-        for &item_id in tcx.associated_item_def_ids(impl_def_id) {
-            if tcx.item_name(item_id).as_str() == method {
-                result = Some(item_id);
-            }
-        }
-    });
-    result
 }
 
 /// Strip `Ref` wrappers from a ResolvedType to get the underlying type.

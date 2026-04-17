@@ -172,7 +172,6 @@ use std::sync::OnceLock;
 struct PredicateVtable {
     is_consumer_type: fn(&(dyn Any + Send + Sync), &str) -> bool,
     is_consumer_fn: fn(&(dyn Any + Send + Sync), &str) -> bool,
-    generate_stubs: fn(&(dyn Any + Send + Sync)) -> String,
 
     visibility_override: for<'tcx> fn(
         &(dyn Any + Send + Sync),
@@ -271,12 +270,6 @@ static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock:
 pub(crate) fn is_consumer_type(name: &str) -> bool {
     let c = CONFIG.get().expect("config not installed");
     (c.predicate_vtable.is_consumer_type)(&*c.callbacks, name)
-}
-
-/// Generate the consumer's stub source. Predicate (lock-free).
-pub(crate) fn generate_stubs() -> String {
-    let c = CONFIG.get().expect("config not installed");
-    (c.predicate_vtable.generate_stubs)(&*c.callbacks)
 }
 
 /// Check if a DefId is from the __lang_stubs module (the consumer's injected stubs).
@@ -424,12 +417,6 @@ fn trampoline_is_consumer_fn<C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().is_consumer_fn(name)
 }
 
-fn trampoline_generate_stubs<C: LangCallbacks + 'static>(
-    data: &(dyn Any + Send + Sync),
-) -> String {
-    data.downcast_ref::<C>().unwrap().generate_stubs()
-}
-
 fn trampoline_visibility_override<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
@@ -485,7 +472,6 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         predicate_vtable: PredicateVtable {
             is_consumer_type: trampoline_is_consumer_type::<C>,
             is_consumer_fn: trampoline_is_consumer_fn::<C>,
-            generate_stubs: trampoline_generate_stubs::<C>,
             visibility_override: trampoline_visibility_override::<C>,
         },
         stateful_vtable: StatefulVtable {
