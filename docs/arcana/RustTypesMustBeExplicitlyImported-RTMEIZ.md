@@ -80,7 +80,8 @@ any other validation errors in `after_rust_analysis`:
 The `context` field names the variant of `RustTypeLookupContext` that
 triggered the lookup — `TraitCallSelf`, `TraitMethodTypeArg`,
 `InherentMethodTypeArg`, `FreeFunctionTypeArg`, `NestedGenericArg`,
-`StructField`, or `Codegen`. Each renders via a `Display` impl into a
+`TraitCallName`, `TraitMethodName` (the last two added by @IVTDBTZ),
+or `Codegen`. Each renders via a `Display` impl into a
 human-readable suffix (e.g., `"as Self of trait call \`Write::write_all\`"`).
 
 For codegen-path lookups that slip through validation (rare), the

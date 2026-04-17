@@ -939,18 +939,36 @@ plan preserved in git history (pre-commit `0b1432e`) if needed.
 
 ---
 
-## Phase 8: Test Harness — PARTIALLY DONE (file exists, harness helper sketch deferred)
+## Phase 8: Test Harness — DONE
 
-**Status**: The file `toylangc/tests/standalone_tests.rs` already
-exists with 10 tests (4 build-mechanism + `test_build_inside_another_workspace`
-+ `test_standalone_uuid` + `test_standalone_indexmap` +
-`test_standalone_regex` + `test_standalone_toml` +
-`test_standalone_serde_json`). Remaining harness polish (a
-`run_standalone_test(name, expected)` helper so each crate is
-one-liner `#[test] fn test_standalone_<crate>()`) is a nice-to-have
-but deferred until the 6 remaining Phase 7 crates land — the helper
-is easier to design once we have 14 concrete test functions to
-deduplicate.
+**Status**: The file `toylangc/tests/standalone_tests.rs` has a
+`run_standalone_test(project_name: &str, expected: &str)` helper
+and all ten standalone tests (9 Phase 7 crates + reqwest_get
+follow-up) reduced to one-line calls. Landed 2026-04-17 in commit
+`13c016c` after Phase 7 completion provided the full design corpus.
+
+### What landed
+
+**The helper** at `toylangc/tests/standalone_tests.rs` enforces the
+project-dir-name = `[project].name` = binary-name convention (all
+ten existing projects already matched) and absorbs the ~40-line
+boilerplate that had been copy-pasted nine times as Phase 7 crates
+landed incrementally: build-dir cleanup, `run_build` invocation,
+binary path join, `Command::new(&bin)` with
+`DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH` inheritance, stdout
+containment check. Each test is now `run_standalone_test(name,
+expected);` preceded by the test's explanatory comment block.
+
+**Net change**: 596 → 334 lines in `standalone_tests.rs` (-44%).
+Explanatory comments on each test are preserved — they document
+**why** each test exists (which compiler gap or Rust API shape it
+probes), which is load-bearing context.
+
+**Second-order effect**: adding a future standalone test now costs
+one line + comment + two files (`tests/standalone/<crate>_test/{toylang.toml,
+main.toylang}` + the `#[test]` block). Demonstrated immediately
+by `reqwest_get_test` — retired a deferred follow-up risk in one
+commit that would have been ~50 lines of boilerplate pre-dedup.
 
 **Goal**: `cargo +rustc-fork test` builds and verifies all standalone test projects.
 
@@ -1038,8 +1056,11 @@ chain `| grep` onto the same line.
 # Full test suite:
 cargo +rustc-fork test -p toylangc 2>&1 | tee /tmp/erw-quest.txt
 grep "test result:" /tmp/erw-quest.txt
-# Current expected: 67 unit + 129 integration + 14 standalone = 210 tests, 0 failed, 0 ignored
-# Phase 7 complete at 9/9.
+# Current expected: 67 unit + 129 integration + 15 standalone = 211 tests, 0 failed, 0 ignored
+# Phase 7 complete at 9/9. Phase 8 (harness dedup) also complete.
+# +1 standalone from the reqwest_get_test follow-up probe (same reqwest
+# crate as reqwest_test, different API shape — `blocking::get<&str>("")`
+# retiring the deferred &T-type-arg risk).
 
 # Just the standalone suite:
 cargo +rustc-fork test -p toylangc --test standalone_tests 2>&1 | tee /tmp/erw-quest.txt

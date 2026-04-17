@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 129 integration tests + 14 standalone tests + 67 unit tests passing, 0 ignored.
+> **Current status:** 129 integration tests + 15 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -136,8 +136,7 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–7.** Phase 8 (test harness polish — reduce
-> per-crate boilerplate in `standalone_tests.rs`) remains.
+> **Phases done: 1–8.** All planned phases complete.
 
 ## Overview
 
@@ -1513,16 +1512,50 @@ Rust crate from crates.io via `toylangc build`.
   uniform slot treatment must not be special-cased; Rule 3 in
   `docs/usage/writing-main.md` added with the clap worked
   example. No remaining Phase 7 crates.
+- `reqwest_get_test` — follow-up probe retiring the deferred
+  "novel `&T`-type-arg shape" risk from `reqwest_test`'s commit.
+  Program: `let result = get<&str>("");` then
+  `Write::write_all(&stdout(), b"reqwest_get ok\n");`. Landed
+  2026-04-17; passed first-try with no compiler-source changes.
+  `reqwest::blocking::get<T: IntoUrl>(url: T)` uses an explicit
+  named `T` (not synthetic `impl Trait`), so this is strictly
+  simpler than clap — turbofish for a named generic. Uses an
+  empty-string URL so `IntoUrl::into_url` / `Url::parse("")`
+  fails synchronously with `RelativeUrlWithoutBase` before any
+  network activity; Result is bound but not unwrapped. Same crate
+  as `reqwest_test` (both use `features = ["blocking"]`) but
+  different API shape. Sixth consecutive first-try Phase 7–style
+  test (toml → glob → rand → reqwest → clap → reqwest_get) —
+  reinforces the @ELASZ meta-lesson about empirical probes
+  beating reasoning-to-conclusion.
 
 Derive macros are syntactic sugar for trait impls. The underlying APIs
 are always available imperatively. Each remaining crate is a 10-20 line
 toylang program that prints `"<crate> ok\n"`. See `handoff.md` for the
 junior-engineer handoff covering the remaining 4.
 
-### 10.8 Planned: Phase 8 — Test harness
+### 10.8 Done: Phase 8 — Test harness dedup
 
 `toylangc/tests/standalone_tests.rs` builds each standalone project via
-`toylangc build` and asserts expected output. One test function per project.
+`toylangc build` and asserts expected output. Collapsed nine
+near-identical `test_standalone_*` function bodies behind a single
+`run_standalone_test(project_name: &str, expected: &str)` helper.
+Each test is now a one-line call (`run_standalone_test("uuid_test",
+"uuid ok");`) preceded by its explanatory comment block; the
+~40-line boilerplate per test — build-dir cleanup, `run_build`
+invocation, binary path join, `Command::new(&bin)` with
+`DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH` inheritance, stdout
+containment check — lives in the helper. Net 596 → 334 lines
+(-44%). The helper enforces the project-dir-name =
+`[project].name` = binary-name convention in its doc comment; all
+existing standalone crates already followed it, so the dedup
+needed no changes to any of the 10 projects' `toylang.toml`
+files. Explanatory comments on each test are preserved — they
+document **why** each test exists (which compiler gap or Rust API
+shape it probes), which is load-bearing context for future
+maintainers. Second-order effect: adding a future standalone test
+costs one line + comment + two files (demonstrated immediately
+by `reqwest_get_test` in §10.7).
 
 ### 10.9 Deferred: duck-typed method resolution
 
