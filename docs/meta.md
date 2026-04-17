@@ -165,4 +165,4 @@ The following existing documents should be reclassified under this scheme:
 - **Inventories/catalogs** of structs, functions, or types. These are derivable from code and go stale.
 - **Anything derivable from `git log` or `git blame`.**
 - **Debugging solutions or fix recipes.** The fix is in the code; the commit message has the context.
-- **Plans and proposals.** These live in `quest.md` or get deleted/graduated into architecture (#5) once implemented.
+- **Plans and proposals.** Historical phase-by-phase planning lives in `docs/historical/quest.md` (archived diary); ongoing investigation maps live in `future-architecture-investigations.md` at repo root. Plans that graduate into implementation get summarized into architecture (#5) docs.

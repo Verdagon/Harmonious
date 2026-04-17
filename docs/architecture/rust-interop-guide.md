@@ -52,24 +52,19 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (complete, 9/9): standalone test projects under
->   `toylangc/tests/standalone/<crate>_test/` proving toylang links
->   against and calls into arbitrary crates.io Rust deps. `uuid_test`
->   landed as the smoke test (commit `df696c1` + follow-ups);
->   `indexmap_test` landed as the second smoke test (2026-04-16)
->   exercising 3-arg explicit generics via
->   `IndexMap::new<i32, i32, RandomState>()`. `regex_test` landed
->   (2026-04-16) after surfacing and fixing @IVTDBTZ. `toml_test`
->   landed (2026-04-16) as the first integration test of a
->   use-imported generic free function with an explicit type arg:
->   `from_str<Value>("").unwrap()`. `serde_json_test` landed
->   (2026-04-16) after surfacing and fixing @ELASZ — the first
->   integration test of a Rust item with an early-bound lifetime
->   parameter (`serde_json::from_str<'a, T: Deserialize<'a>>`). 4
->   crates remaining (`rand`, `clap`, `glob`, `reqwest`). See
->   `handoff.md` at the repo root for the junior-engineer handoff
->   on the remaining 4. Each project is a 10-20 line toylang
->   program that prints `"<crate> ok\n"`.
+> - Phase 7 (complete, 9/9 + 1 follow-up): standalone test projects
+>   under `toylangc/tests/standalone/<crate>_test/` proving toylang
+>   links against and calls into arbitrary crates.io Rust deps.
+>   All nine smoke tests landed (`uuid`, `indexmap`, `regex`, `toml`,
+>   `serde_json`, `glob`, `rand`, `reqwest`, `clap`) plus a
+>   `reqwest_get_test` follow-up. The final test totals reflect
+>   this (see status line above). Detailed per-crate history in
+>   `docs/historical/quest.md` Phase 7 section.
+> - Phase 8 (complete): test-harness dedup. `standalone_tests.rs`
+>   collapsed from 596 → 334 lines behind a `run_standalone_test(
+>   name, expected)` helper; each test is now a one-liner plus its
+>   explanatory comment. Adding a new standalone test costs one
+>   line plus two files.
 > - String-literal `&str` ABI fix (2026-04-16): `ResolvedType::Str`
 >   rewired to mirror `ByteSlice`'s six-touchpoint pattern exactly.
 >   `"..."` string literals now type as `Ref { Str }` and lower to a
@@ -1530,9 +1525,9 @@ Rust crate from crates.io via `toylangc build`.
   beating reasoning-to-conclusion.
 
 Derive macros are syntactic sugar for trait impls. The underlying APIs
-are always available imperatively. Each remaining crate is a 10-20 line
-toylang program that prints `"<crate> ok\n"`. See `handoff.md` for the
-junior-engineer handoff covering the remaining 4.
+are always available imperatively. All standalone tests follow the same
+10-20 line pattern printing `"<crate> ok\n"`. Phase 7 is complete;
+per-crate history is in `docs/historical/quest.md`.
 
 ### 10.8 Done: Phase 8 — Test harness dedup
 

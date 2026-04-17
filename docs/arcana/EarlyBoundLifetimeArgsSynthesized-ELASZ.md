@@ -125,9 +125,9 @@ and any builder-pattern API that accepts `impl Into<T>` /
 in toylang's call-site turbofish with the argument's concrete type.
 
 **Meta-lesson this surfaced:** `clap_test` was documented in
-`quest.md` and `docs/architecture/rust-interop-guide.md` for weeks
-as "blocked on `impl Into<Str>` synthetic generic — requires
-compiler work." The empirical probe (write the test and run it)
+`docs/historical/quest.md` and `docs/architecture/rust-interop-guide.md`
+for weeks as "blocked on `impl Into<Str>` synthetic generic —
+requires compiler work." The empirical probe (write the test and run it)
 took 4 seconds and passed first-try. The "blocker" was a prior
 author's reasoning-to-conclusion that encoded a presumed solution
 shape (inference-based infrastructure) as a problem description.
