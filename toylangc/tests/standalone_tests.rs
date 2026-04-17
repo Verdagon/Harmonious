@@ -24,6 +24,57 @@ fn run_build(project_dir: &std::path::Path) -> std::process::Output {
         .expect("failed to run toylangc build")
 }
 
+/// Standard harness for Phase 7 standalone smoke tests.
+///
+/// Each standalone crate lives at `tests/standalone/<project_name>/`
+/// with a `toylang.toml` whose `[project].name` is `<project_name>`.
+/// The produced binary at `.toylang-build/target/debug/<project_name>`
+/// is expected to print `expected` (usually `"<crate> ok"`) and exit
+/// zero. The build dir is wiped before each run so tests are hermetic.
+fn run_standalone_test(project_name: &str, expected: &str) {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/standalone")
+        .join(project_name);
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let build_out = run_build(&project);
+    assert!(
+        build_out.status.success(),
+        "{} toylangc build failed:\nstdout: {}\nstderr: {}",
+        project_name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = build_dir.join("target/debug").join(project_name);
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {} binary: {}", project_name, e));
+    assert!(
+        run.status.success(),
+        "{} exited non-zero:\nstdout: {}\nstderr: {}",
+        project_name,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains(expected),
+        "expected '{}' in stdout of {}, got: {}",
+        expected,
+        project_name,
+        stdout,
+    );
+}
+
 #[test]
 fn test_build_minimal_project() {
     let dir = tempfile::tempdir().unwrap();
@@ -192,271 +243,60 @@ source = "main.toylang"
     );
 }
 
+// Phase 7 crate #1: uuid — smoke test bridging Phase 5 (cargo
+// resolves deps) to Phase 7 (toylang calls into deps). Shipped with
+// @MBMRVZ (main must return void) and @RTMEIZ (every Rust type
+// flowing through the type system must be use-imported).
 #[test]
 fn test_standalone_uuid() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/uuid_test");
-
-    // Clean any previous build output so the test is hermetic.
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/uuid_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run uuid_test binary");
-    assert!(
-        run.status.success(),
-        "uuid_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("uuid ok"),
-        "expected 'uuid ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("uuid_test", "uuid ok");
 }
 
+// Phase 7 crate #2: indexmap — first 3-arg generic method call
+// (IndexMap::new<i32, i32, RandomState>) via an S-fixed impl block.
 #[test]
 fn test_standalone_indexmap() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/indexmap_test");
-
-    // Clean any previous build output so the test is hermetic.
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/indexmap_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run indexmap_test binary");
-    assert!(
-        run.status.success(),
-        "indexmap_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("indexmap ok"),
-        "expected 'indexmap ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("indexmap_test", "indexmap ok");
 }
 
-// Per @IVTDBTZ — exercises four features in composition: Phase 5 build,
-// @UTAIRZ &str ABI, Phase 6 .unwrap() wrappers (first non-stdlib
-// Result<T, E>), Phase 4 I/O. First Phase 7 smoke test whose
-// RustStruct::method(args) shape tripped both the dispatch classifier
-// and the inherent StaticCall codegen; see
-// docs/arcana/InherentVsTraitDispatchByType-IVTDBTZ.md.
+// Phase 7 crate #3: regex — exercises four features in composition:
+// Phase 5 build, @UTAIRZ &str ABI, Phase 6 .unwrap() wrappers (first
+// non-stdlib Result<T, E>), Phase 4 I/O. First Phase 7 smoke test
+// whose RustStruct::method(args) shape tripped both the dispatch
+// classifier and the inherent StaticCall codegen; fixed as @IVTDBTZ.
 #[test]
 fn test_standalone_regex() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/regex_test");
-
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/regex_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run regex_test binary");
-    assert!(
-        run.status.success(),
-        "regex_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("regex ok"),
-        "expected 'regex ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("regex_test", "regex ok");
 }
 
 // Phase 7 crate #5: serde_json — first integration test of a Rust
-// free fn with an early-bound lifetime parameter.
-// `serde_json::from_str<'a, T: Deserialize<'a>>(s: &'a str)` ICEd
-// rustc until @ELASZ: oracle's five `.instantiate()` sites were
-// building GenericArgs from user type args only, dropping lifetime
-// slots. Replaced with a shared helper using
-// `ty::GenericArgs::for_item` that synthesizes `re_erased` for
+// free fn with an early-bound lifetime parameter. `from_str<'a, T:
+// Deserialize<'a>>(s: &'a str)` ICEd rustc until @ELASZ centralized
+// GenericArgs construction in `oracle::build_generic_args_for_item`
+// with `ty::GenericArgs::for_item` synthesizing `re_erased` for
 // lifetime slots.
 #[test]
 fn test_standalone_serde_json() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/serde_json_test");
-
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/serde_json_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run serde_json_test binary");
-    assert!(
-        run.status.success(),
-        "serde_json_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("serde_json ok"),
-        "expected 'serde_json ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("serde_json_test", "serde_json ok");
 }
 
-// Phase 7 crate #4: toml — first integration test of a generic free
-// function call with an explicit type arg: `from_str<Value>("")`.
+// Phase 7 crate #4: toml — first integration test of the `name<T>(args)`
+// shape (use-imported generic free fn with an explicit type arg).
 // Composes Phase 5 (build), Phase 2 (use-imported free fn), @UTAIRZ
-// (&str ABI via string literal), Phase 6 (unwrap wrapper on non-stdlib
-// Result), and Phase 4 (Write::write_all). Prior Phase 7 tests
-// exercised `Name::method<T>()` (IndexMap) and `Name::method(args)`
-// (Regex) but not `name<T>(args)` on a use-imported free fn.
+// (&str via string literal), Phase 6 (unwrap on non-stdlib Result),
+// and Phase 4 (Write::write_all).
 #[test]
 fn test_standalone_toml() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/toml_test");
-
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/toml_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run toml_test binary");
-    assert!(
-        run.status.success(),
-        "toml_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("toml ok"),
-        "expected 'toml ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("toml_test", "toml ok");
 }
 
 // Phase 7 crate #6: glob — free fn taking &str, returning Result
 // without unwrap. First Phase 7 test to bind a Result and NOT call
-// .unwrap() on it. Exercises @UTAIRZ `&str` ABI via string literal
+// .unwrap() on it. Exercises @UTAIRZ &str ABI via string literal
 // and Phase 2 free-fn dispatch.
 #[test]
 fn test_standalone_glob() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/glob_test");
-
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/glob_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run glob_test binary");
-    assert!(
-        run.status.success(),
-        "glob_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("glob ok"),
-        "expected 'glob ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("glob_test", "glob ok");
 }
 
 // Phase 7 crate #7: rand — zero-arg free fn returning an opaque
@@ -465,132 +305,30 @@ fn test_standalone_glob() {
 // end-of-main.
 #[test]
 fn test_standalone_rand() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/rand_test");
-
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/rand_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run rand_test binary");
-    assert!(
-        run.status.success(),
-        "rand_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("rand ok"),
-        "expected 'rand ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("rand_test", "rand ok");
 }
 
 // Phase 7 crate #8: reqwest — first standalone test to exercise
-// Phase 5's detailed-dep path end-to-end (features = ["blocking"]).
-// Uses `Client::new()` rather than `blocking::get(url)` to avoid a
+// Phase 5's detailed-dep path end-to-end (features = ["blocking"]
+// gates an entire module, unlike uuid's cosmetic ["v4"]). Uses
+// `Client::new()` rather than `blocking::get(url)` to avoid a
 // novel generic-with-reference-type-arg shape and a network call;
 // shape-identical to Uuid::new_v4() and thread_rng().
 #[test]
 fn test_standalone_reqwest() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/reqwest_test");
-
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/reqwest_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run reqwest_test binary");
-    assert!(
-        run.status.success(),
-        "reqwest_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("reqwest ok"),
-        "expected 'reqwest ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("reqwest_test", "reqwest ok");
 }
 
-// Phase 7 crate #9: clap — probe test for the "explicit synthetic
-// generic slot" hypothesis. Command::new takes `impl Into<Str>`,
-// which desugars to a synthetic type param. Named as any other
-// slot: `Command::new<&str>("app")`. If this works, clap was never
-// blocked on compiler work — it was blocked on an unverified
-// assumption about how synthetic params interact with toylang's
-// explicit-args discipline.
+// Phase 7 crate #9: clap — disproved the multi-week "blocked on
+// impl Into<Str> synthetic generic" assumption. Command::new takes
+// `impl Into<Str>`, which desugars to a synthetic type param that
+// rustc exposes in `generics_of` alongside named ones. The call
+// site names it explicitly — `Command::new<&str>("app")` — matching
+// turbofish order. See @ELASZ's "Synthetic `impl Trait` slots"
+// section for why the uniform-slot treatment in
+// `build_generic_args_for_item` makes this work without special-
+// casing.
 #[test]
 fn test_standalone_clap() {
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/standalone/clap_test");
-
-    let build_dir = project.join(".toylang-build");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).unwrap();
-    }
-
-    let build_out = run_build(&project);
-    assert!(
-        build_out.status.success(),
-        "toylangc build failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&build_out.stdout),
-        String::from_utf8_lossy(&build_out.stderr),
-    );
-
-    let bin = build_dir.join("target/debug/clap_test");
-    assert!(bin.exists(), "expected binary at {}", bin.display());
-
-    let run = Command::new(&bin)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .output()
-        .expect("failed to run clap_test binary");
-    assert!(
-        run.status.success(),
-        "clap_test exited non-zero:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(
-        stdout.contains("clap ok"),
-        "expected 'clap ok' in stdout, got: {}",
-        stdout,
-    );
+    run_standalone_test("clap_test", "clap ok");
 }
