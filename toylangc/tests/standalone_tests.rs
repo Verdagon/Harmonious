@@ -502,3 +502,48 @@ fn test_standalone_rand() {
         stdout,
     );
 }
+
+// Phase 7 crate #8: reqwest — first standalone test to exercise
+// Phase 5's detailed-dep path end-to-end (features = ["blocking"]).
+// Uses `Client::new()` rather than `blocking::get(url)` to avoid a
+// novel generic-with-reference-type-arg shape and a network call;
+// shape-identical to Uuid::new_v4() and thread_rng().
+#[test]
+fn test_standalone_reqwest() {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/standalone/reqwest_test");
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let build_out = run_build(&project);
+    assert!(
+        build_out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = build_dir.join("target/debug/reqwest_test");
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .expect("failed to run reqwest_test binary");
+    assert!(
+        run.status.success(),
+        "reqwest_test exited non-zero:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("reqwest ok"),
+        "expected 'reqwest ok' in stdout, got: {}",
+        stdout,
+    );
+}

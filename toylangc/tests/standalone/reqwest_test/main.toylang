@@ -1,0 +1,9 @@
+use reqwest::blocking::Client
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let client = Client::new();
+    Write::write_all(&stdout(), b"reqwest ok\n");
+}

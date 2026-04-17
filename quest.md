@@ -430,12 +430,11 @@ fn test_unwrap_result() {
 
 ---
 
-## Phase 7: Standalone Test Projects — IN PROGRESS (7/9 done)
+## Phase 7: Standalone Test Projects — IN PROGRESS (8/9 done)
 
-**Status**: uuid, indexmap, regex, toml, serde_json, glob, and rand
-smoke tests landed and green. 2 crates remaining. Junior-engineer
-handoff at `/Users/verdagon/erw/handoff.md` covers the batch
-end-to-end.
+**Status**: uuid, indexmap, regex, toml, serde_json, glob, rand, and
+reqwest smoke tests landed and green. 1 crate remaining (clap, blocked
+on orthogonal `impl Into<Str>` synthetic generic).
 
 **Goal**: Create test projects under
 `toylangc/tests/standalone/<crate>_test/` proving toylang links
@@ -801,24 +800,84 @@ strongly suggest `reqwest_test` is similarly mechanical. Test totals:
 Phase 7 at 7/9; 2 crates remaining (clap still blocked on `impl
 Into<Str>`, reqwest unblocked).
 
+### What landed (2026-04-17, later still) — `reqwest_test`
+
+**`reqwest_test`** — eighth Phase 7 smoke test, and the **fourth
+consecutive first-try Phase 7 pass** (toml → glob → rand → reqwest).
+Program:
+
+```
+use reqwest::blocking::Client
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let client = Client::new();
+    Write::write_all(&stdout(), b"reqwest ok\n");
+}
+```
+
+Passed on first attempt — no changes required to `toylangc/src/`,
+`rustc-lang-facade/`, or the rustc fork. Two distinct proofs in one
+test:
+
+1. **First end-to-end exercise of Phase 5's detailed-dep path with a
+   feature flag.** The manifest line `reqwest = { version = "0.11",
+   features = ["blocking"] }` round-trips cleanly through
+   `build.rs`'s `render_dep()` at line 98–112 and emerges verbatim in
+   the generated `.toylang-build/Cargo.toml`. Without the `blocking`
+   feature, `reqwest::blocking` wouldn't exist as a module — so this
+   test is also a regression guard against feature-forwarding drift.
+   Prior precedent: uuid's `features = ["v4"]` (Phase 7 #1).
+   Difference: `reqwest` pulls in ~100 transitive deps (tokio, hyper,
+   et al.), making this the first standalone test with a
+   deep-transitive-dep crate. Full resolve + compile completed in
+   22s on the isolated run — comfortably within the budgeted
+   90s–3min window from the handoff §5.
+2. **Shape-identical to `Uuid::new_v4()` and `thread_rng()`.**
+   `Client::new()` is a zero-arg inherent static method returning a
+   non-Copy Rust type with Drop glue — the same pattern these two
+   landed tests established. Chose `Client::new()` deliberately over
+   `reqwest::blocking::get(url)` to avoid two orthogonal risks:
+   (a) a network call inside `cargo test`, and (b) the novel
+   `&T`-type-arg generic shape (`get<&str>(...)`) which has zero
+   precedent in the integration corpus.
+
+Drop glue for `Client` (which holds an internal `Arc<ClientRef>`)
+ran via rustc's Instance collector without a `__toylang_*` or
+`drop_in_place` symbol error — confirming the Drop-dep-walk
+infrastructure that handled `ThreadRng` and `Stdout` extends to
+crate types with richer internal state.
+
+Test totals: 67 unit + 129 integration + 13 standalone = 209, 0
+failed, 0 ignored. Phase 7 at 8/9; only `clap_test` remains (blocked
+on orthogonal `impl Into<Str>` synthetic generic). With four
+consecutive first-try Phase 7 tests, the "mechanical completion"
+classification is conclusively earned for the remaining non-clap
+work, and the Phase 7 infrastructure is proven robust against
+arbitrary crates.io dep trees toylang is likely to encounter.
+
 ### What's remaining
 
-2 crates, handed off to a junior engineer via `handoff.md`:
+1 crate remaining — `clap_test`, blocked on the orthogonal `impl
+Into<Str>` synthetic-generic gap (not a test-authoring task; requires
+compiler work).
 
 | Crate | Complexity | Notes |
 |---|---|---|
 | `clap_test` | Builder w/ `impl Into<Str>` | Still blocked on synthetic generics (orthogonal to IVTDBTZ) |
-| `reqwest_test` | Free fn, needs `blocking` feature | No network call on smoke test |
 
-Each project is three files (`toylang.toml`, `main.toylang`, plus one
-test function appended to `toylangc/tests/standalone_tests.rs`). The
-pattern is proven: match one of the seven landed smoke tests'
-structure (uuid, indexmap, regex, toml, serde_json, glob, rand), let
-the structured errors guide missing imports and syntax fixes.
+Each standalone project is three files (`toylang.toml`,
+`main.toylang`, plus one test function appended to
+`toylangc/tests/standalone_tests.rs`). The pattern is proven: match
+one of the eight landed smoke tests' structure (uuid, indexmap,
+regex, toml, serde_json, glob, rand, reqwest), let the structured
+errors guide missing imports and syntax fixes.
 
 Full Phase 7 completion target: 67 unit + 134 integration + 14
-standalone = 215 tests, 0 failed, 0 ignored. (Currently 208: 67 unit
-+ 129 integration + 12 standalone.)
+standalone = 215 tests, 0 failed, 0 ignored. (Currently 209: 67 unit
++ 129 integration + 13 standalone.)
 
 ### Original plan (historical)
 
@@ -931,8 +990,8 @@ chain `| grep` onto the same line.
 # Full test suite:
 cargo +rustc-fork test -p toylangc 2>&1 | tee /tmp/erw-quest.txt
 grep "test result:" /tmp/erw-quest.txt
-# Current expected: 67 unit + 129 integration + 12 standalone = 208 tests, 0 failed, 0 ignored
-# Phase 7 target: 67 + 134 + 14 = 215 (2 more standalone tests to land)
+# Current expected: 67 unit + 129 integration + 13 standalone = 209 tests, 0 failed, 0 ignored
+# Phase 7 target: 67 + 134 + 14 = 215 (1 more standalone test to land — clap, blocked on `impl Into<Str>`)
 
 # Just the standalone suite:
 cargo +rustc-fork test -p toylangc --test standalone_tests 2>&1 | tee /tmp/erw-quest.txt

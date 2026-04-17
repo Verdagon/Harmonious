@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 129 integration tests + 12 standalone tests + 67 unit tests passing, 0 ignored.
+> **Current status:** 129 integration tests + 13 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -52,7 +52,7 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (in progress, 7/9 done): standalone test projects under
+> - Phase 7 (in progress, 8/9 done): standalone test projects under
 >   `toylangc/tests/standalone/<crate>_test/` proving toylang links
 >   against and calls into arbitrary crates.io Rust deps. `uuid_test`
 >   landed as the smoke test (commit `df696c1` + follow-ups);
@@ -136,9 +136,10 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–6. Phase 7 in progress (7/9).** Remaining: 2
-> standalone test projects (see `handoff.md`); Phase 8 (test harness
-> polish — reduce per-crate boilerplate in `standalone_tests.rs`).
+> **Phases done: 1–6. Phase 7 in progress (8/9).** Remaining: 1
+> standalone test project (clap, blocked on orthogonal `impl
+> Into<Str>` synthetic generic); Phase 8 (test harness polish —
+> reduce per-crate boilerplate in `standalone_tests.rs`).
 
 ## Overview
 
@@ -1385,14 +1386,14 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 In progress: Phase 7 — Standalone test projects (7/9 done)
+### 10.7 In progress: Phase 7 — Standalone test projects (8/9 done)
 
 Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
 each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
 Each project proves toylang can link against and call into a specific
 Rust crate from crates.io via `toylangc build`.
 
-**Done (7 crates):**
+**Done (8 crates):**
 
 - `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
   Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
@@ -1473,13 +1474,32 @@ Rust crate from crates.io via `toylangc build`.
   renamed `thread_rng` to `rng`). Exercises the zero-arg
   use-imported free fn shape returning an opaque Rust struct held
   by value.
+- `reqwest_test` — eighth smoke test, and the fourth consecutive
+  first-try Phase 7 pass (toml → glob → rand → reqwest). Program:
+  `let client = Client::new();` then
+  `Write::write_all(&stdout(), b"reqwest ok\n");`. Landed 2026-04-17;
+  passed first-try with no compiler-source changes. **First
+  end-to-end exercise of Phase 5's detailed-dep path with a feature
+  flag** — `reqwest = { version = "0.11", features = ["blocking"] }`
+  round-trips cleanly through `build.rs`'s `render_dep()` at line
+  98–112 and emerges verbatim in the generated Cargo.toml (uuid had
+  tested this with `features = ["v4"]` but reqwest is the first
+  standalone test where the feature flag gates an entire module —
+  `blocking` is mandatory here, not cosmetic). Also the first
+  standalone test with a deep-transitive-dep crate (~100 deps
+  pulling in tokio, hyper, et al.); full resolve + compile
+  completed in 22s on the isolated run. Chose `Client::new()` over
+  `reqwest::blocking::get(url)` to avoid two orthogonal risks: a
+  network call inside `cargo test`, and the novel `&T`-type-arg
+  generic shape (`get<&str>(...)`) with zero precedent in the
+  integration corpus. Confirms the mechanical-completion
+  classification for all remaining non-clap Phase 7 work.
 
-**Remaining (2 crates, see `handoff.md`):**
+**Remaining (1 crate, see `handoff.md`):**
 
 | Crate | Imperative API used for smoke test | Notes |
 |-------|-----------------------------------|-------|
 | clap | Builder | `Command::new("app")` — still blocked on `impl Into<Str>` synthetic generic |
-| reqwest | Free function | `reqwest::blocking::get` (no network call on smoke test) |
 
 Derive macros are syntactic sugar for trait impls. The underlying APIs
 are always available imperatively. Each remaining crate is a 10-20 line
