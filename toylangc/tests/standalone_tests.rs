@@ -332,3 +332,17 @@ fn test_standalone_reqwest() {
 fn test_standalone_clap() {
     run_standalone_test("clap_test", "clap ok");
 }
+
+// Phase 7 follow-up probe: reqwest::blocking::get<T: IntoUrl>(url).
+// Retires the "novel &T-type-arg shape deferred as follow-up" note
+// from reqwest_test's commit bfa7355. `get` has an explicit named
+// T: IntoUrl (not synthetic, unlike clap's `impl Into<Str>`), so the
+// call site writes `get<&str>("")` as any other generic free fn —
+// strictly simpler than clap's synthetic-slot case. Uses an empty
+// string URL so IntoUrl's `Url::parse` fails synchronously with
+// RelativeUrlWithoutBase before any network activity; the Result
+// is bound but not unwrapped, matching glob's scope discipline.
+#[test]
+fn test_standalone_reqwest_get() {
+    run_standalone_test("reqwest_get_test", "reqwest_get ok");
+}

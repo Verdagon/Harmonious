@@ -1,0 +1,12 @@
+use reqwest::blocking::get
+use reqwest::blocking::Response
+use reqwest::Error
+use std::result::Result
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let result = get<&str>("");
+    Write::write_all(&stdout(), b"reqwest_get ok\n");
+}
