@@ -430,10 +430,10 @@ fn test_unwrap_result() {
 
 ---
 
-## Phase 7: Standalone Test Projects — IN PROGRESS (5/9 done)
+## Phase 7: Standalone Test Projects — IN PROGRESS (6/9 done)
 
-**Status**: uuid, indexmap, regex, toml, and serde_json smoke tests
-landed and green. 4 crates remaining. Junior-engineer handoff at
+**Status**: uuid, indexmap, regex, toml, serde_json, and glob smoke
+tests landed and green. 3 crates remaining. Junior-engineer handoff at
 `/Users/verdagon/erw/handoff.md` covers the batch end-to-end.
 
 **Goal**: Create test projects under
@@ -734,26 +734,57 @@ future Rust API with an early-bound lifetime — `serde_json::from_slice`,
 `Visitor<'de>` impls, and anything with the shape
 `fn foo<'a, T: SomeTrait<'a>>(...)`.
 
+### What landed (2026-04-17) — `glob_test`
+
+**`glob_test`** — sixth Phase 7 smoke test. Program:
+
+```
+use glob::glob
+use glob::Paths
+use glob::PatternError
+use std::result::Result
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let result = glob("*.rs");
+    Write::write_all(&stdout(), b"glob ok\n");
+}
+```
+
+Passed on first attempt — no changes required to `toylangc/src/`,
+`rustc-lang-facade/`, or the rustc fork. First Phase 7 test to bind
+a `Result` without calling `.unwrap()` on it (the `Paths` iterator
+is intentionally left unconsumed — first-pass scope discipline).
+Composes four features in one 12-line program: Phase 5 (build),
+Phase 2 (use-imported free fn `glob::glob`), @UTAIRZ (`&str` ABI via
+string literal `"*.rs"`), and Phase 4 (I/O via `Write::write_all`).
+
+Confirms the mechanical-completion prediction for the remaining
+Phase 7 crates — the handoff's 90% case (three files, first-try
+pass) held. Tests: 67 unit + 129 integration + 11 standalone = 207.
+
 ### What's remaining
 
-4 crates, handed off to a junior engineer via `handoff.md`:
+3 crates, handed off to a junior engineer via `handoff.md` /
+`handoff-glob-rand.md`:
 
 | Crate | Complexity | Notes |
 |---|---|---|
 | `rand_test` | Free fn + trait | Skip `Rng::gen` on first pass |
 | `clap_test` | Builder w/ `impl Into<Str>` | Still blocked on synthetic generics (orthogonal to IVTDBTZ) |
-| `glob_test` | Free fn taking `&str` | Unblocked (UTAIRZ) |
 | `reqwest_test` | Free fn, needs `blocking` feature | No network call on smoke test |
 
 Each project is three files (`toylang.toml`, `main.toylang`, plus one
 test function appended to `toylangc/tests/standalone_tests.rs`). The
 pattern is proven: match `uuid_test` / `indexmap_test` / `regex_test`
-/ `toml_test` / `serde_json_test`'s structure, let the structured
-errors guide missing imports and syntax fixes.
+/ `toml_test` / `serde_json_test` / `glob_test`'s structure, let the
+structured errors guide missing imports and syntax fixes.
 
 Full Phase 7 completion target: 67 unit + 134 integration + 14
-standalone = 215 tests, 0 failed, 0 ignored. (Currently 206: 67 unit
-+ 129 integration + 10 standalone.)
+standalone = 215 tests, 0 failed, 0 ignored. (Currently 207: 67 unit
++ 129 integration + 11 standalone.)
 
 ### Original plan (historical)
 
@@ -866,8 +897,8 @@ chain `| grep` onto the same line.
 # Full test suite:
 cargo +rustc-fork test -p toylangc 2>&1 | tee /tmp/erw-quest.txt
 grep "test result:" /tmp/erw-quest.txt
-# Current expected: 67 unit + 129 integration + 10 standalone = 206 tests, 0 failed, 0 ignored
-# Phase 7 target: 67 + 134 + 14 = 215 (4 more standalone tests to land)
+# Current expected: 67 unit + 129 integration + 11 standalone = 207 tests, 0 failed, 0 ignored
+# Phase 7 target: 67 + 134 + 14 = 215 (3 more standalone tests to land)
 
 # Just the standalone suite:
 cargo +rustc-fork test -p toylangc --test standalone_tests 2>&1 | tee /tmp/erw-quest.txt

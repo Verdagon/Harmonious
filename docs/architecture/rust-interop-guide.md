@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 129 integration tests + 10 standalone tests + 67 unit tests passing, 0 ignored.
+> **Current status:** 129 integration tests + 11 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -52,7 +52,7 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (in progress, 5/9 done): standalone test projects under
+> - Phase 7 (in progress, 6/9 done): standalone test projects under
 >   `toylangc/tests/standalone/<crate>_test/` proving toylang links
 >   against and calls into arbitrary crates.io Rust deps. `uuid_test`
 >   landed as the smoke test (commit `df696c1` + follow-ups);
@@ -136,7 +136,7 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–6. Phase 7 in progress (5/9).** Remaining: 4
+> **Phases done: 1–6. Phase 7 in progress (6/9).** Remaining: 3
 > standalone test projects (see `handoff.md`); Phase 8 (test harness
 > polish — reduce per-crate boilerplate in `standalone_tests.rs`).
 
@@ -1385,14 +1385,14 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 In progress: Phase 7 — Standalone test projects (5/9 done)
+### 10.7 In progress: Phase 7 — Standalone test projects (6/9 done)
 
 Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
 each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
 Each project proves toylang can link against and call into a specific
 Rust crate from crates.io via `toylangc build`.
 
-**Done (5 crates):**
+**Done (6 crates):**
 
 - `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
   Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
@@ -1452,14 +1452,23 @@ Rust crate from crates.io via `toylangc build`.
   integration test of a Rust item with an early-bound lifetime;
   unblocks any future Rust API of the same shape (`serde_json::from_slice`,
   `Visitor<'de>` impls, etc.).
+- `glob_test` — sixth smoke test. Program:
+  `let result = glob("*.rs");` then
+  `Write::write_all(&stdout(), b"glob ok\n");`. Landed 2026-04-17;
+  passed first-try with no compiler-source changes. First Phase 7
+  test to bind a `Result` without calling `.unwrap()` on it — the
+  `Paths` iterator is intentionally left unconsumed (first-pass
+  scope discipline). Composes Phase 5 (build), Phase 2 (use-imported
+  free fn `glob::glob`), @UTAIRZ (`&str` via string literal), and
+  Phase 4 (I/O). Confirms the mechanical-completion prediction for
+  the remaining Phase 7 crates.
 
-**Remaining (4 crates, see `handoff.md`):**
+**Remaining (3 crates, see `handoff.md` / `handoff-glob-rand.md`):**
 
 | Crate | Imperative API used for smoke test | Notes |
 |-------|-----------------------------------|-------|
 | rand | Free fn | `thread_rng()` |
 | clap | Builder | `Command::new("app")` — still blocked on `impl Into<Str>` synthetic generic |
-| glob | Free function | `glob::glob("*.txt")` — first pass omits `.unwrap()` |
 | reqwest | Free function | `reqwest::blocking::get` (no network call on smoke test) |
 
 Derive macros are syntactic sugar for trait impls. The underlying APIs

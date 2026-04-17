@@ -1,0 +1,12 @@
+use glob::glob
+use glob::Paths
+use glob::PatternError
+use std::result::Result
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let result = glob("*.rs");
+    Write::write_all(&stdout(), b"glob ok\n");
+}

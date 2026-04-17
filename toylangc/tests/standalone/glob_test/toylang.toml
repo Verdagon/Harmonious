@@ -1,0 +1,6 @@
+[project]
+name = "glob_test"
+source = "main.toylang"
+
+[rust-dependencies]
+glob = "0.3"
