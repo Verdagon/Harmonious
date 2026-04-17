@@ -27,114 +27,44 @@ post-pass tool. The one-sentence answer:
 > to inject the consumer's concrete type-argument tuples into that
 > walk.
 
-The longer argument, using a worked example that captures the shape:
+**For the full argument — including a seven-case taxonomy of consumer
+architectures showing precisely which cases pre-pass can handle and
+which force interleaving, with complete code examples for each, and
+the generic-method-on-generic-trait case that kills the last
+over-approximation workaround — see
+`docs/reasoning/why-interleaved-monomorphization.md`.**
+This reasoning doc takes the "interleaving is required" conclusion
+as given from here; the rest of this doc is about *which rustc-side
+mechanism* implements interleaving (specifically, whether the current
+forked `per_instance_mir` query can be replaced by sanctioned
+extension points).
 
-### The motivating case
+The shortest useful summary for readers who just need the setup to
+follow Parts 2–4:
 
-```
-toylang:  fn use_it<T>(x: T)                calls rust_fn<T>(x)
-rust:     fn rust_fn<T: SomeTrait>(x: T)  { x.some_method() }
-toylang:  fn main() { use_it<i32>(42) }
-```
-
-For the final binary to link:
-
-1. Code for `rust_fn<i32>` must exist. Rustc generates this.
-2. Code for `<i32 as SomeTrait>::some_method` must exist. Rustc
-   generates this.
-3. Code for toylang's `use_it<i32>` must exist. Toylang generates
-   this; it calls into `rust_fn<i32>`.
-
-For (1), rustc's monomorphization collector walks from entry points
-outward via direct calls, `ReifyFnPointer` casts, drop glue, etc.
-The edge `use_it<i32> → rust_fn<i32>` lives entirely inside toylang
-source; rustc never parses or walks it. Without facade intervention,
-rustc never sees that `rust_fn<i32>` is reachable, the collector
-never queues it for codegen, and the link step fails with an
-undefined symbol.
-
-For (2), once (1) happens it's automatic. Rustc walks `rust_fn<i32>`'s
-body, sees `x.some_method()`, resolves `<T as SomeTrait>::some_method`
-with `T=i32`, queues `<i32 as SomeTrait>::some_method` for codegen.
-Rustc's normal generic-trait resolution handles this — **as long as
-rustc knows about the caller**.
-
-### The one-way handoff
-
-The facade's job, in this framing, is narrow: **tell rustc the
-leaves** — the concrete-type-args tuples for every Rust item
-directly called from consumer code. Rustc walks the transitive
-closure from there.
-
-Mechanically, this is what `per_instance_mir` + the `ReifyFnPointer`
-statements it emits do. Each consumer instance's synthetic MIR body
-enumerates "here are the Rust items I need for this concrete
-instantiation", as `ReifyFnPointer` casts of their DefIds with
-substituted generic args. The collector visits those casts during its
-normal walk and adds the referenced items to the reachable set.
-Transitively-reachable items cascade through rustc's own machinery
-without further facade involvement.
-
-### Why the alternative doesn't work
-
-The apparent alternative — have the facade do its own monomorphization
-walk of Rust deps ahead of codegen — rules itself out once you try to
-build it. To discover `<i32 as SomeTrait>::some_method` without
-rustc's collector, the facade would need to reimplement:
-
-- Rust MIR walking
-- Trait impl candidate resolution (`for_each_relevant_impl` +
-  `Instance::expect_resolve`)
-- Associated-type projections + normalization
-- Default trait methods, blanket impls, conditional impls,
-  specialization
-- Generic argument substitution across the transitive call graph
-
-That's tens of thousands of lines of rustc internals reimplemented.
-The interleaving isn't a coordination between two monomorphizers —
-it's a way to **not** reimplement rustc's trait/generic machinery.
-The facade defers to rustc for all generic resolution and only
-supplies rustc with the concrete type tuples it can't see otherwise.
-
-### Subtler cases the mechanism also covers
-
-The same one-way-handoff model handles:
-
-- **Nested generics.** Consumer calls `Vec::extend<i32, Global, I>(v, iter)`
-  with I concrete (e.g., `Range<i32>`); rustc walks from there into
-  `<Range<i32> as IntoIterator>::into_iter` and all trait chain
-  downstream.
-- **Consumer type parameters flowing into Rust generics.** Consumer
-  holds a `HashMap<K, V>` where K/V are consumer type parameters; at
-  instantiation these become concrete, and rustc walks every
-  `<HashMap<K,V> as _>::method` call the consumer or Rust deps make.
-- **Drop glue.** The `mir_shims` provider constructs
-  `InstanceKind::DropGlue(_, Some(Vec<i32>))` so rustc walks the
-  destructor chain for concrete instantiated types.
-
-Each of these is "consumer supplies the concrete tuple, rustc walks
-from there." No separate mechanism is needed — the same monomorphization
-handoff drives all of them.
-
-### Phase timing: why not before or after
-
-**Before monomorphization (e.g., `Callbacks::after_analysis`).** The
-facade would need `fn_abi_of_instance` and full trait resolution for
-concrete type args — both only available during codegen, not after
-analysis. An `after_analysis` pre-pass has access to type-checking
-results but not to the monomorphization machinery.
-
-**After monomorphization (e.g., `CodegenBackend` plugin receiving
-CGUs).** By this phase rustc has already walked the reachable set. If
-the edge from consumer code into a Rust generic was invisible during
-that walk, the target item is not in the CGU list — and no amount of
-codegen cleverness can retroactively add it. (A CodegenBackend plugin
-*combined with* query overrides can still work, because the query
-overrides fire during the walk; see Part 4.)
+- Rustc's monomorphization collector is the only entity with
+  visibility into both Rust source *and* (via the facade) consumer
+  source. The collector's walk is the one place where the full
+  reachable set of generic instantiations gets discovered.
+- The facade's job is to **tell rustc the leaves** — the concrete
+  type-argument tuples for every Rust item called directly from
+  consumer code. Rustc walks the transitive closure from there
+  (trait resolution, associated types, nested generics, drop glue).
+- The alternative — the facade reimplementing trait impl candidate
+  resolution, associated-type projection, blanket impls,
+  specialization, etc. — is tens of thousands of lines of rustc
+  internals reimplemented, and over-approximation doesn't rescue
+  the pre-pass approach once you include generic methods on generic
+  traits.
+- Pre-monomorphization (`Callbacks::after_analysis`) lacks rustc's
+  concrete-arg machinery; post-monomorphization (pure
+  `CodegenBackend` plugin receiving CGUs) arrives after the walk
+  is complete. Either position loses the cases where Rust code
+  originates the concrete instantiation of a consumer item.
 
 These timing constraints are why monomorphization is the one correct
-phase for the handoff — it's the phase where rustc is doing the walk
-the facade needs to participate in.
+phase for the handoff. *What* hook fires during monomorphization is
+separately negotiable — Parts 2–4 explore that design space.
 
 ---
 
@@ -335,7 +265,7 @@ Each alternative is marked with its evidence level:
   reading, no consumer-side prototype yet
 - **Proposed**: plausible from first principles but unchecked
 
-### 4.1 `override_queries` on `optimized_mir` (mechanism-verified)
+### 4.1 `override_queries` on `optimized_mir` (prototype-verified)
 
 Instead of adding `per_instance_mir` as a new query (fork patches
 1–4), override `optimized_mir` via
@@ -345,6 +275,32 @@ DefIds; fall through to rustc's default for everything else. The
 collector substitutes per-Instance during its walk, exactly as it
 does for every other generic Rust function — which gives us the same
 dep-discovery behavior `per_instance_mir` produces today.
+
+**Prototype verification (2026-04-16).** This alternative was run
+end-to-end on a branch (`poc/optimized-mir-override` in the erw
+repo, commits `b425094` → `1ee3800` → `119d287` → `e597fdd`) under
+an env-var gate `ERW_POC_OPTIMIZED_MIR=1`. Findings in that branch's
+`findings.md`. Key confirmations:
+
+- **Dep discovery works through the collector.** The consumer
+  callback under the POC reported identical Rust-dep counts to the
+  current `per_instance_mir` path. Exp 5 of the POC inspected
+  rustc's emitted LLVM IR and confirmed the expected `declare`
+  lines for transitively-reachable Rust items (e.g. for the `uuid`
+  standalone: `declare ... stdout`, `declare ... Uuid::new_v4`,
+  `declare ... <Stdout as Write>::write_all`). The collector
+  substituted per-caller Params in our generic body and queued the
+  concrete Rust items exactly as predicted.
+- **Link fails with duplicate symbols, as predicted.** Across the
+  POC's full-suite run: 257 linker errors across 117 failing
+  integration tests (+ 6 failing standalone tests), split into
+  56 unique `__toylang_impl_*` collisions and 19 unique
+  `__toylang_accessor_*` collisions. Every test that reached
+  codegen hit the same failure shape. `__toylang_internal_*`
+  symbols were unaffected (as expected: rustc never emits those).
+- **Release-mode and LTO don't help.** `--release` produces
+  identical duplicate-symbol errors; LTO can't DCE the bodies in
+  time to prevent link conflict.
 
 What this eliminates:
 
@@ -358,33 +314,135 @@ What this eliminates:
 **What it does NOT eliminate — and this is important:**
 
 - **Fork patch 3 (codegen skip)** is *not* a "nice to have" under this
-  approach; it's load-bearing for linker correctness. Here's why:
-  rustc will compile whatever body `optimized_mir` returns at whatever
-  symbol `symbol_name` assigns. Without a skip, rustc emits a
-  trampoline function at the consumer's symbol. The consumer's backend
-  separately emits the *real* implementation at the same symbol. At
-  link time: duplicate definitions. Linker error.
+  approach; it's load-bearing for linker correctness. Rustc will
+  compile whatever body `optimized_mir` returns at whatever symbol
+  `symbol_name` assigns. Without a skip, rustc emits a trampoline
+  function at the consumer's symbol. The consumer's backend separately
+  emits the *real* implementation at the same symbol. At link time:
+  duplicate definitions.
+
+  POC #2 (`poc/separate-crate-stubs`) surfaced a second instance of
+  this same "patch 3 is load-bearing" problem, in a different crate:
+  under the separate-crate stub model (§4.3), the *stub rlib's*
+  compile also needs patch-3-equivalent behavior to skip
+  `unreachable!()` bodies that plain rustc would otherwise codegen
+  into the rlib. So patch 3's purpose applies at both crate compile
+  sites under separate-crate, not just the user-bin compile under
+  single-crate.
 
   Three ways to resolve this, none of which is pure `override_queries`:
   1. Keep a fork patch equivalent to patch 3 (reduce 5 patches to 1,
      not 0).
   2. Route calls and emissions to *different* symbols via a carefully-
-     designed trampoline structure (tried several formulations; each
-     collapses back to option 1 because the trampoline body still
-     needs to live somewhere).
+     designed trampoline structure (tried several formulations during
+     the reasoning-doc review; each collapses back to option 1 because
+     the trampoline body still needs to live somewhere).
   3. Pair with a `CodegenBackend` plugin (§4.2) that declines to emit
-     the stub body. The plugin's emission control replaces patch 3.
+     the stub body. The plugin's emission control replaces patch 3 —
+     and, per POC #2, plugin mode naturally subsumes the stub-rlib
+     version of the problem too, because the plugin IS the codegen
+     backend for each crate compile and decides what to emit in both.
 
   So `override_queries` alone is a **3-patch reduction, not a
-  zero-fork solution**. Zero fork requires pairing with §4.2.
+  zero-fork solution**. Zero fork requires pairing with §4.2. The
+  plugin path retires patch 3 across all compile sites; any non-plugin
+  path leaves a patch-3-equivalent somewhere.
+
+- **The consumer-callback boundary needs a job-split.** This is a
+  facade-side issue the POC surfaced that's not apparent from the
+  rustc-side mechanism alone. Today's callback
+  (`monomorphize_fn_inner`) is Instance-keyed and does two jobs at
+  once inside a single call:
+
+  1. **External Rust-dep registration.** Walks the consumer body,
+     collects `(DefId, GenericArgsRef)` pairs for Rust items called
+     directly from consumer source, returns them to the facade.
+     These become `ReifyFnPointer` casts in the synthetic MIR body
+     the facade constructs; rustc's collector substitutes per-caller
+     and queues the concrete Rust items.
+  2. **Internal-callee stashing.** Walks the same body, finds
+     consumer-side (toylang→toylang) callees, recursively walks
+     *their* bodies with substituted args, accumulates into
+     `state.toylang_instances`. This list drives the consumer's
+     own codegen in `generate_and_compile` — rustc never sees these
+     functions at all.
+
+  A DefId-keyed `optimized_mir` override can drive job 1 naturally
+  (emit a generic body with Param-typed `ReifyFnPointer` statements;
+  rustc's collector substitutes as it walks). It **cannot** drive
+  job 2 from a DefId-keyed context — job 2 needs concrete
+  `instance.args` to walk internal bodies with real type information,
+  and an `optimized_mir` override only has the generic DefId.
+
+  The natural redesign is a **trait-level job-split across two
+  queries that already fire at the right keying**:
+
+  ```rust
+  trait LangCallbacks {
+      // DefId-keyed: called from optimized_mir override. Emits
+      // Rust-dep references with Param placeholders intact. Does NOT
+      // populate state.toylang_instances, does NOT compute symbols.
+      fn collect_generic_rust_deps<'tcx>(
+          &self, state: &mut dyn Any,
+          tcx: TyCtxt<'tcx>, def_id: LocalDefId,
+      ) -> Vec<(DefId, GenericArgsRef<'tcx>)>;
+
+      // Instance-keyed: called from symbol_name override for
+      // concrete consumer entry-point Instances. Recursive internal-
+      // callee walk + stashing. Returns extern symbol name.
+      fn notify_concrete_entry_point<'tcx>(
+          &self, state: &mut dyn Any,
+          tcx: TyCtxt<'tcx>, instance: Instance<'tcx>,
+      ) -> String;
+  }
+  ```
+
+  Credit: this split shape was proposed in the POC's round-2
+  writeup (commit `119d287`); the recursive-walk cascade and
+  drop-glue bounds were confirmed in round-3 (`e597fdd`).
+
+  Properties of the split:
+
+  - **Uses queries that already fire.** `optimized_mir` is overridable
+    via `Config::override_queries`. `symbol_name` is already overridden
+    today. No new rustc-exposed hook is required.
+  - **Recursive internal-callee walk is unchanged.** Under the split,
+    `notify_concrete_entry_point` keeps walking transitively:
+    entry-point → internal → internal → internal. Entry points are
+    the Instances rustc queries `symbol_name` for (they're what Rust
+    callers reference from outside the consumer stub module);
+    internal callees are discovered purely consumer-side via the
+    recursion, not via rustc-query triggering. The existing
+    `state.visited_symbols` dedup set handles repeat walks. The split
+    is a conceptual separation of which query's side-effect does
+    which job, not a rewrite of the walker.
+  - **Drop-glue path is untouched.** The `mir_shims` override
+    (`InstanceKind::DropGlue(_, Some(ty))`-keyed) and the
+    `monomorphize_type` callback (`Ty<'tcx>`-keyed) both already
+    receive concrete args at every invocation. They don't have the
+    DefId-keyed-query-needs-Instance-keyed-callback mismatch that the
+    function-body path has, because their queries themselves key on
+    concrete things. The job-split applies only to the function-body
+    path.
+  - **One subtlety worth flagging.** Under the split, the call to
+    `monomorphize_fn_inner` from `symbol_name` must NOT also accumulate
+    `rust_deps` — those flow through `collect_generic_rust_deps` +
+    rustc's collector substitution. Double-registration would
+    double-code the deps. A small change to the existing walker on
+    the Instance-keyed path.
+
+  The redesign is conceptually smaller than "new callback entry
+  point" reads as, but it is a genuine trait-level change that a
+  consumer adopting the zero-fork path must absorb. Cost is covered
+  in §4.2's estimate.
 
 - Fork patch 5 (partitioner visibility hook). Orthogonal; see §4.3.
 
-Implementation cost estimate (from the investigation): 1-2 weeks for
-the query override itself. The additional cost of pairing with a
-backend plugin is covered in §4.2.
-Most of the MIR construction code in `mir_helpers.rs` carries over
-unchanged.
+Implementation cost estimate (from the investigation + POC): 1-2
+weeks for the query override itself; +2-3 weeks for the
+`LangCallbacks` trait job-split and its consumer-side adoption;
++ the plugin integration in §4.2. Most of the MIR construction
+code in `mir_helpers.rs` carries over unchanged.
 
 ### 4.2 `-Zcodegen-backend=consumer` plugin + `override_queries` (proposed)
 
@@ -426,38 +484,169 @@ Known complications:
   `codegen_crate` method, which interacts with rustc's Rayon-threaded
   compilation in non-obvious ways.
 
-Implementation cost estimate: 2–4 weeks of architecture work from
-the current wrapper baseline.
+Implementation cost estimate (revised after §4.1 POC): **4–8 weeks**
+from the current wrapper baseline, broken down approximately as:
 
-### 4.3 Separate-crate stub model (proposed)
+- 1–2 weeks: `optimized_mir` override plumbing (§4.1's rustc-side half)
+- 2–3 weeks: `LangCallbacks` trait job-split and consumer-side adoption
+  (the §4.1 callback-redesign half, surfaced by the POC — this was
+  the line item the earlier 2–4 week estimate elided)
+- 2–3 weeks: plugin integration, including resolving the `ModuleLlvm`
+  `pub(crate)` wall (upstream contribution or type-erasure) and the
+  `rustc_driver::Callbacks` → backend-lifecycle reconciliation
+
+The earlier 2–4 week figure costed only the plugin half (treating the
+query override as a drop-in replacement for `per_instance_mir`
+requiring no facade-side reshaping). The POC's prototype run surfaced
+that the facade's Instance-keyed callback contract doesn't fit a
+DefId-keyed override without the job-split, which is where the extra
+2–3 weeks lives.
+
+**Plugin mode absorbs the separate-crate integration work at
+approximately zero marginal cost.** POC #2 (§4.3) surfaced that a
+greenfield consumer adopting the plugin path for zero-fork naturally
+handles the stub-rlib emission-skip problem (plugin is the codegen
+backend, decides what to emit), the cross-crate consumer DefId
+handling (plugin fires per crate-compile), and the generic-wrapper
+mono routing (~5 LoC of `override_queries` on
+`upstream_monomorphization` returning None for consumer DefIds).
+The 4-8 week estimate therefore covers both `#[linkage]`-based patch-5
+elimination AND the plugin work; a consumer isn't paying separately
+for each. See §4.3 for the detailed subsumption argument.
+
+### 4.3 Separate-crate stub model (prototyped, with caveats)
 
 Place `__lang_stubs.rs` in its own rlib, compiled separately from
-user code. This unlocks two things:
+user code. The original framing for this section — "apply
+`#[linkage = "external"]` in a different integration location" —
+is correct but under-specifies the cost for brownfield consumers.
+The separate-crate alternative was prototyped on branch
+`poc/separate-crate-stubs` (commits `2463248` → `acc62d2` →
+`2c004a6`) under an env-var gate `ERW_POC_SEPARATE_STUBS=1`. The
+POC's `findings.md` has the full writeup; highlights below.
 
-- **`#[linkage = "external"]` usage** (Part 3). `#![feature(linkage)]`
-  stays inside the stub rlib's root, never reaches user code. The
-  partitioner hook (fork patch 5) becomes unnecessary.
-- **Cross-crate linkage defaults.** Wrappers in an rlib, compiled as
-  `CrateType::Rlib` (which sets `local_crate_exports_generics() == true`),
-  default to `Visibility::Default + can_be_internalized = false` for
-  generic `#[inline(never)]` items — the opposite of the executable-crate
-  default that motivated the visibility hook.
+**Mechanism confirmation (positive):**
 
-This alternative was **never explored for toylang**. The only mention
-in historical docs was a passing note in
-`docs/historical/report-stub-approaches.md` listing "cross-crate
-scenarios" as a known-unknown. The Phase 5 build flow
-(stubs injected into user crate via `FileLoader`) made splitting
-architecturally awkward; nobody prototyped it.
+- **`#![feature(linkage)]` at a real crate root works** as Part 3
+  predicted. The stub rlib compiles cleanly with `#[linkage = "external"]`
+  on the generic wrappers; no E0658 "experimental feature" error
+  that triggers under the single-crate FileLoader model. Step 3
+  of the POC confirmed this mechanically with `nm` inventory of
+  the produced rlib.
+- **Cargo orchestration is clean.** ~100 LoC of `build.rs`
+  produces a two-member workspace (stub rlib + user bin) with a
+  path dep. `RUSTC_WORKSPACE_WRAPPER` dispatches correctly per
+  crate; `rust-toolchain.toml` at workspace root applies uniformly.
+  No cargo wrinkles surfaced. Prediction 3 of the POC held.
 
-Caveats:
+**Blockers for a toylang-brownfield retrofit:**
 
-- The cross-crate linkage defaults claim above needs empirical
-  verification. The mechanism sounds right; nobody has run it.
-- Cargo orchestration: the consumer's build flow (`toylangc build`
-  in toylang's case) would need to compile the stub rlib as a
-  separate step and wire it as a dependency of the main crate.
-  Not complicated, but distinct from the current single-crate flow.
+The POC surfaced three architectural blockers that block a working
+binary without substantial backend work. All three stem from
+single-crate-compile assumptions in toylang's LLVM backend (FileLoader
+injection enforces the model, but the assumptions live in the backend,
+not the injection mechanism).
+
+- **Risk #1** (predicted pre-POC, empirically confirmed): a generic
+  `#[inline(never)]` wrapper in an rlib with no local caller is
+  defined in rlib metadata only, never codegenned, because rustc's
+  mono collector walks from rlib-local roots and finds none. The
+  downstream bin's `Instance::upstream_monomorphization` returns
+  `Some(rlib_cnum)` due to `InlineAttr::Never`, routing link to the
+  rlib's non-existent mono. `#[linkage = "external"]` is an attribute
+  on the eventual monomorphization, not a forced-codegen directive,
+  so it doesn't rescue.
+- **Risk #8** (surfaced by the POC): plain rustc compiling the stub
+  rlib codegens every `unreachable!()` body, because fork patch 3's
+  `codegen_instance` skip is useless when toylang processing isn't
+  installed for that compile. These bodies win at link time over
+  anything the consumer's backend might provide at the same Rust-mangled
+  symbol.
+- **Risk #9** (surfaced by the POC): `llvm_gen::generate_with_tcx`'s
+  MonoItems walk filters with `def_id.as_local()`. Under the single-crate
+  model, all consumer DefIds are local to the user bin's compile;
+  under separate-crate they're in the stub rlib. User bin compile
+  skips them, backend emits no extern wrappers, the rlib's forwarding
+  bodies dangle. *This is a property of the single-crate-compile
+  integration model, not of FileLoader specifically*: any separate-crate
+  architecture would trip the same filter unless the backend is
+  designed cross-crate from day one.
+
+**Brownfield vs greenfield cost split:**
+
+These blockers are toylang-brownfield-specific. They don't block a
+consumer designed for separate-crate from day one.
+
+*Toylang brownfield (retrofit):* ~1-2 weeks of backend surgery.
+Three remediation paths:
+
+- **A. Dual-crate backend split.** Distribute toylang's LLVM codegen
+  across both the stub rlib and user bin compiles. Clean but
+  substantial — requires role-aware codegen in each compile, careful
+  dedup at link. ~1-2 weeks.
+- **B. Relax `as_local()` filter.** Make the MonoItems walk at
+  `llvm_gen.rs:1896` accept non-local consumer DefIds. Interacts
+  with every ABI query call site (`fn_abi_of_instance`, etc.) —
+  they may behave differently for non-local instances. ~3-5 days.
+- **C. In-Rust forwarding bodies in stub_gen.** Generate real
+  forwarding bodies (`extern "C" { fn __toylang_impl_X(...) -> T; } {
+  unsafe { __toylang_impl_X(...) } }`) for non-generic items.
+  Dismisses the patch-3-skip reliance. For generics, needs
+  per-T forwarding + anchor generation. ~1-2 weeks for generic
+  support.
+
+Plus ~1 week for risk #1's anchor generation (requires rerunning
+toylang's deep walk ahead of stub-gen, with latent `TyCtxt`-ordering
+concerns).
+
+Total for toylang brownfield: ~1-2 weeks of architecture work,
+substantially more than fork patch 5's ~2-3 day per-bump
+maintenance cost. The POC recommends leaving patch 5 in place for
+toylang.
+
+*Greenfield consumer with plugin path (§4.2):* approximately free.
+
+- **D. Plugin mode subsumes risks #8 and #9 natively.** Under
+  `-Zcodegen-backend=consumer` + `override_queries`, the plugin
+  is the codegen backend for each crate compile. Risk #8 disappears
+  because the plugin decides what to emit per compile and can skip
+  `unreachable!()` bodies. Risk #9 disappears because the plugin
+  fires per crate-compile, so consumer DefIds are always local to
+  whichever compile is processing them — the `as_local()` filter
+  becomes moot. Essentially plugin mode IS remediation A (dual-crate
+  codegen split) expressed through rustc's sanctioned API, at no
+  additional cost beyond the plugin work itself.
+- **Risk #1 reduces to ~5 LoC** of `override_queries` on
+  `upstream_monomorphization`, returning None for consumer DefIds
+  so the downstream bin mono'd the wrapper locally. The plugin's
+  downstream-compile codegen then emits the wrapper directly. No
+  stub-gen-time T-harvest, no anchor bookkeeping.
+
+For a greenfield consumer like Vale that's already doing the plugin
+work (§4.2), separate-crate integration is absorbed at approximately
+zero marginal cost. The §4.2 cost estimate (4-8 weeks) already covers
+it. See POC commit `2c004a6` §4.3.D for the full argument.
+
+**Summary table:**
+
+| Consumer shape | Separate-crate cost | Notes |
+|---|---|---|
+| Toylang brownfield | ~1-2 weeks backend surgery (remediations A/B/C) | More expensive than maintaining patch 5; recommendation is to leave the fork in place |
+| Greenfield + plugin | ~0 (absorbed into plugin work) | Plugin mode subsumes #8/#9 natively; #1 is ~5 LoC of upstream_monomorphization override |
+| Greenfield + `per_instance_mir`-equivalent | ~1-3 days upfront design | Backend designed for cross-crate consumer DefIds from day one; no retrofit |
+
+**Design-space gap the POC closed:**
+
+Before the POC, this section said the separate-crate model was
+"proposed; not prototyped." The POC shows that framing was incomplete
+in two directions. The mechanical part (`#[linkage = "external"]`
+at a real crate root + clean cargo orchestration) genuinely works as
+predicted. But the integration cost for a consumer retrofitting
+separate-crate onto a single-crate-compile backend was
+under-specified; and the plugin-mode subsumption (which drops that
+cost to zero for greenfield) was not identified until the POC
+surfaced it. The reasoning doc now distinguishes these paths
+explicitly.
 
 ### 4.4 `rustc_public` (formerly `stable_mir`) for consumer-side code
 

@@ -506,7 +506,9 @@ fn collect_toylang_fn_deps_inner<'tcx>(
                 let ty_arg_refs: Vec<ty::GenericArg<'_>> = type_args.iter()
                     .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(tcx, ta)))
                     .collect();
-                deps.push((def_id, tcx.mk_args(&ty_arg_refs)));
+                // @ELASZ
+                let args = crate::oracle::build_generic_args_for_item(tcx, def_id, &ty_arg_refs);
+                deps.push((def_id, args));
             }
             continue;
         };
@@ -566,8 +568,8 @@ fn collect_toylang_fn_deps_inner<'tcx>(
                 for ta in &dep.type_args {
                     all_ty_args.push(ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(tcx, ta)));
                 }
-                let expected_count = tcx.generics_of(trait_method_def_id).count();
-                let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+                // @ELASZ
+                let args = crate::oracle::build_generic_args_for_item(tcx, trait_method_def_id, &all_ty_args);
                 deps.push((trait_method_def_id, args));
                 continue;
             }
@@ -595,8 +597,8 @@ fn collect_toylang_fn_deps_inner<'tcx>(
         let all_ty_args: Vec<ty::GenericArg<'tcx>> = dep.type_args.iter()
             .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(tcx, ta)))
             .collect();
-        let expected_count = tcx.generics_of(method_def_id).count();
-        let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+        // @ELASZ
+        let args = crate::oracle::build_generic_args_for_item(tcx, method_def_id, &all_ty_args);
         deps.push((method_def_id, args));
     }
 

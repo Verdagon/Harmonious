@@ -324,8 +324,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 for ta in type_args {
                     all_ty_args.push(GenericArg::from(self.resolved_type_to_rustc_ty(ta)));
                 }
-                let expected_count = self.tcx.generics_of(trait_method_def_id).count();
-                let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+                // @ELASZ
+                let args = crate::oracle::build_generic_args_for_item(self.tcx, trait_method_def_id, &all_ty_args);
                 (trait_method_def_id, args)
             } else {
                 // Fall through to inherent lookup
@@ -336,8 +336,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
                     .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
                     .collect();
-                let expected_count = self.tcx.generics_of(method_def_id).count();
-                let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+                // @ELASZ
+                let args = crate::oracle::build_generic_args_for_item(self.tcx, method_def_id, &all_ty_args);
                 (method_def_id, args)
             }
         } else {
@@ -358,8 +358,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 let all_ty_args: Vec<GenericArg<'tcx>> = type_args.iter()
                     .map(|ta| GenericArg::from(self.resolved_type_to_rustc_ty(ta)))
                     .collect();
-                let expected_count = self.tcx.generics_of(method_def_id).count();
-                let args = self.tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+                // @ELASZ
+                let args = crate::oracle::build_generic_args_for_item(self.tcx, method_def_id, &all_ty_args);
                 (method_def_id, args)
             }
         };
@@ -1166,7 +1166,8 @@ fn lower_typed_expr<'ctx>(
                 let ty_arg_refs: Vec<ty::GenericArg<'_>> = type_args.iter()
                     .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(ctx.tcx, ta)))
                     .collect();
-                let args_ref = ctx.tcx.mk_args(&ty_arg_refs);
+                // @ELASZ
+                let args_ref = crate::oracle::build_generic_args_for_item(ctx.tcx, def_id, &ty_arg_refs);
                 let instance = ty::Instance::new(def_id, args_ref);
                 let symbol = resolve_rust_symbol(ctx.tcx, def_id, args_ref);
 

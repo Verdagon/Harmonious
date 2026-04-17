@@ -4,55 +4,15 @@ Good writeup. Spent a couple hours digging through the actual code + every histo
 
 ---
 
-## Before I answer your six questions: the load-bearing thing the architecture guide doesn't spell out
+## Before I answer your six questions: the architectural principle to separate from the implementation
 
-The guide describes *what* `per_instance_mir` does but not *why it has to fire during monomorphization specifically*. That's the piece that changes the framing of your whole investigation, so putting it here first.
+One framing point up front, because it reshapes how to read everything below.
 
-**The core reason the facade interleaves with rustc's monomorphization phase is that monomorphization is where rustc is actively discovering transitively-reachable generic instantiations, and we need to inject toylang's concrete type-argument tuples into that walk.**
+**The load-bearing thing is interleaving with rustc's monomorphization phase, not the specific `per_instance_mir` query we added to do it.** Rustc's collector is the one entity that walks Rust source. When consumer code calls a Rust generic, that call edge lives inside consumer source, which rustc never parses. Something has to inject the consumer's concrete type-argument tuples into the collector's walk so that rustc's own trait resolution and generic substitution machinery can discover everything transitively reachable. The facade's job is narrow — tell rustc the leaves, let rustc walk the rest — and doing that job requires firing per-Instance during monomorphization. Any fork-reduction path has to preserve this interleaving, or it loses the capability.
 
-Concrete motivating shape. This is the one where the interleaving stops being optional:
+**What this means for your investigation specifically:** both of your proposed alternatives do preserve interleaving, which is why they're genuinely viable rather than sleight-of-hand. `override_queries` on `optimized_mir` fires during monomorphization (the whole point of `optimized_mir` is that rustc's collector calls it while walking); a `CodegenBackend` plugin alone doesn't (CGUs arrive post-walk), which is why plugin-alone fails, but plugin *paired with* an `override_queries` installation covers both monomorphization-time injection (query side) and post-monomorphization emission control (plugin side). Interleaving is the invariant; which specific rustc hook implements it is the implementation decision, and your proposed swap is valid because it preserves the invariant while replacing the mechanism.
 
-```
-toylang:  fn use_it<T>(x: T)               calls rust_fn<T>(x)
-rust:     fn rust_fn<T: SomeTrait>(x: T) { x.some_method() }
-toylang:  fn main() { use_it<i32>(42) }
-```
-
-At link time the binary needs:
-
-1. Code for `rust_fn<i32>` — rustc must generate this.
-2. Code for `<i32 as SomeTrait>::some_method` — rustc must generate this.
-3. Toylang's `use_it<i32>` — toylang generates this, calls `rust_fn<i32>`.
-
-For (1), rustc's mono collector needs to *discover* `rust_fn<i32>` is reachable. It walks from entry points outward via direct calls, `ReifyFnPointer` casts, etc. But `use_it<i32>` is toylang's — rustc never parses it, never walks it. Without intervention, the edge `use_it<i32> → rust_fn<i32>` is invisible, and the link fails with an undefined symbol.
-
-For (2), once (1) happens, it's automatic. Rustc walks `rust_fn<i32>`'s body, sees `x.some_method()`, resolves `<T as SomeTrait>::some_method` with `T=i32`, queues `<i32 as SomeTrait>::some_method` for codegen. This is rustc's normal generic-trait resolution — it just works, as long as rustc knows about the caller.
-
-So the handoff is **one-way and minimal**: toylang tells rustc the *leaves* (specifically, the Rust items directly called from toylang with concrete type args), rustc walks everything transitively reachable from there. That's all `per_instance_mir` + the `ReifyFnPointer` statements do — each toylang instance's synthetic MIR body enumerates "here are the Rust items I need for this concrete instantiation", and the collector picks up from there.
-
-**The alternative rules itself out once you try to do it.** To discover `<i32 as SomeTrait>::some_method` without rustc's collector, toylang would have to:
-
-- Walk Rust MIR itself
-- Resolve trait impl candidates (the `for_each_relevant_impl` + `Instance::expect_resolve` machinery)
-- Handle associated-type projections + normalization
-- Handle default trait methods, blanket impls, conditional impls, specialization
-- Re-derive generic arg substitution across the whole transitive call graph
-
-That's tens of thousands of lines of rustc internals reimplemented. The interleaving isn't a coordination between two monomorphizers — it's a way to **not** reimplement rustc's trait/generic machinery. We defer to rustc for all generic resolution; we only supply the concrete type tuples it can't see otherwise.
-
-Why this changes the framing of your investigation:
-
-- **It reinforces Alternative A (the `optimized_mir` override).** `optimized_mir` also fires during monomorphization, also per-Instance. The interleaving requirement doesn't push you away from that path — it just rules out pre-pass or post-pass alternatives, of which there are none among your proposals.
-- **It's the real objection to the pure CodegenBackend plugin route.** A `-Zcodegen-backend=foo` plugin receives CGUs post-monomorphization. At that point rustc has already walked the reachable set; if `use_it<i32> → rust_fn<i32>` was invisible during that walk, `rust_fn<i32>` isn't in the CGU list, and you can't codegen it from the backend no matter how clever you are. The plugin-only route is structurally incompatible with this model. **But** — and this is the thing worth underscoring — being a CodegenBackend *and* installing query overrides via `Config::override_queries` lets you have both: the emit-time control of a backend plus the monomorphization-time injection of a query provider. That combination, not either alone, is the zero-fork target.
-- **It's silent in the current arch guide and it shouldn't be.** "Why the interleaving" is the answer I'd want if I were you, and it's not spelled out. I'll add a subsection capturing this after I hear back from you on which direction you're taking; what I write will depend on whether you're going fork-reduction or pure-plugin.
-
-The subtler cases this mechanism also handles, in case they matter to Vale's roadmap:
-
-- **Nested generics**: toylang calls `Vec::extend<i32, Global, I>(v, iter)` with I concrete (e.g., `Range<i32>`) — rustc walks from there into `<Range<i32> as IntoIterator>::into_iter` and all the downstream trait chain.
-- **Type args introduced by Rust types that cross the boundary**: toylang holds a `HashMap<K, V>` where K/V become concrete at instantiation; rustc walks `<HashMap<K,V> as _>::method` for everything anyone calls on that HashMap.
-- **Drop glue**: the `mir_shims` provider constructs `InstanceKind::DropGlue(_, Some(Vec<i32>))` so rustc walks the destructor chain for concrete instantiated types.
-
-Every one of these is "toylang supplies concrete type args, rustc walks from there." If Vale types ever need to participate in Rust generic machinery on the callee side (which your framing implies they will, once Vale-in-Rust lands and you want Vale closures flowing into Rust generic APIs), this interleaving is how you get that for free.
+The full taxonomy of when interleaving is required — a seven-case analysis covering which consumer architectures pre-pass can handle, which require interleaving, and why — is in `docs/reasoning/why-interleaved-monomorphization.md` in the erw repo. It explicitly names Vale's planned interop model as an example of the cases that require interleaving (Vale types participating in Rust trait systems, Vale closures flowing into Rust generic APIs, both of which land in Cases 4 and 6 of that doc's taxonomy). That doc is the canonical statement of *why* this architecture exists; the response you're reading is specifically about fork-reduction tactics that preserve the architecture. If you haven't read the taxonomy yet, it's worth the ~20 minutes before you commit to a specific zero-fork path — both for validating the invariant and for confirming your planned interop genuinely sits where the doc predicts it does.
 
 ---
 
@@ -86,6 +46,14 @@ The clean resolutions:
 
 What pushed toward a new query specifically, if I'm being honest: `optimized_mir` came with a vague sense of "we'd be intercepting rustc's normal MIR pipeline for existing DefIds, and that's scary," whereas a new query "owned" by the consumer felt cleaner. That's a taste preference, not a technical requirement. For your distribution constraints (zero-fork target), that taste is the wrong tradeoff — but you need the plugin in the mix too, not just the override.
 
+**POC update (2026-04-16).** Built and ran a scaffolding-grade prototype of Alternative A against the erw repo on branch `poc/optimized-mir-override` (commits `b425094` → `1ee3800` → `119d287` → `e597fdd`). Env-var gated via `ERW_POC_OPTIMIZED_MIR=1`; gate-off path is a no-op. Confirmed predictions:
+
+- **Dep discovery works end-to-end.** Collector substituted per-caller Params into our generic body; the `declare` lines for transitively-reachable Rust items (e.g. `stdout`, `Uuid::new_v4`, `<Stdout as Write>::write_all` for the uuid standalone) showed up in rustc's emitted LLVM IR. Every case today's `per_instance_mir` handles, including the trait-generic-callback shape, carried over.
+- **Link fails with duplicate symbols.** 257 linker errors across 117 failing integration tests + 6 failing standalone tests, partitioned into 56 unique `__toylang_impl_*` collisions and 19 unique `__toylang_accessor_*` collisions. `__toylang_internal_*` symbols unaffected. Release + LTO doesn't help. Failure was uniform — not a grab-bag of different issues.
+- **One second-order finding worth calling out.** The POC surfaced a facade-side wrinkle I hadn't anticipated: the consumer's current `monomorphize_fn` callback is Instance-keyed and does *two* jobs simultaneously — external Rust-dep registration AND internal-callee stashing into `state.toylang_instances`. A DefId-keyed `optimized_mir` override can drive job 1 (via generic ReifyFnPointer + collector substitution) but not job 2 (needs concrete `instance.args`, which a DefId-keyed context doesn't have). The natural redesign splits the callback trait across two queries that *already* exist and *already* fire at the right keying: `optimized_mir` drives `collect_generic_rust_deps(def_id)` (Param-typed), `symbol_name` drives `notify_concrete_entry_point(instance)` (concrete, does the recursive internal walk). No new rustc-exposed hook. Details in the reasoning doc's §4.1.
+
+For Vale specifically this matters because I'd initially costed the zero-fork migration at 2–4 weeks; the POC surfaced the callback-boundary redesign as a line item that wasn't in the earlier number. Revised estimate: 4–8 weeks. Updated numbers below.
+
 ## 2. What did the `CodegenBackend` route look like when evaluated?
 
 **It wasn't evaluated as the integration mode** — and there's an important framing point here that connects to question 1.
@@ -105,7 +73,7 @@ What the investigation found about the combination's implementation:
 - **Delegating to `rustc_codegen_llvm` as a library is fragile.** `ModuleLlvm` and several associated types are `pub(crate)` in `rustc_codegen_llvm`. The current wrapper works because it delegates *everything*; selective interception (skip consumer stubs, emit Rust deps via LLVM, emit consumer real-impls via your own path) would require either upstream changes to expose those types or type-erasure hacks. This is the one real wall in this approach.
 - **The facade's current `rustc_driver::Callbacks` integration** (`install_callbacks` at startup, `after_analysis` for validation) doesn't map directly to a backend plugin's lifecycle. The plugin would need to install callbacks from within its `init` or `codegen_crate` method, which interacts with rustc's Rayon-threaded compilation in non-obvious ways.
 
-**Verdict: the `-Zcodegen-backend=valec` + `override_queries` combination is viable in principle**, but I haven't built it. The honest framing is: the current architecture could have been built this way, and the only reason it wasn't is that when I started, the `rustc_driver::Callbacks` path was the documented one and I followed it — at that point, the query-override alternative also wasn't explicitly on my radar, so the combination never got framed as a possibility.
+**Verdict: the `-Zcodegen-backend=valec` + `override_queries` combination is viable in principle**, with the `override_queries` half confirmed by the POC detailed in §1 and the plugin half still unbuilt. The honest framing is: the current architecture could have been built this way, and the only reason it wasn't is that when I started, the `rustc_driver::Callbacks` path was the documented one and I followed it — at that point, the query-override alternative also wasn't explicitly on my radar, so the combination never got framed as a possibility. The POC work this week closes the query-override-half unknown; the plugin integration stays as the one remaining architectural spike before this combination is fully de-risked.
 
 ## 3. `#[linkage = "external"]` — concrete failure beyond feature-flag propagation?
 
@@ -152,15 +120,16 @@ If Vale's goal is "reduce churn exposure for the Vale-specific consumer code," `
 
 ## 6. Am I underestimating the cost of the trampoline / backend-plugin approaches?
 
-**Cost I'd budget for the zero-fork target architecture (as you outlined):**
+**Cost I'd budget for the zero-fork target architecture (as you outlined), revised after the 2026-04-16 POC:**
 
-- **`-Zcodegen-backend=valec` + `rustc_codegen_llvm` delegation:** probably 2-4 weeks of architecture work if you're starting from the current wrapper. The associated-type visibility issue on `ModuleLlvm` is the one real wall — you'd either cap what you intercept or upstream a small rustc change (which isn't a fork but is contribution cost).
-- **`optimized_mir` override with trampoline bodies:** maybe 1-2 weeks to build and validate. The MIR construction code mostly carries over.
-- **`#[linkage = "external"]` in generated stubs:** a few hours, given your separate-crate architecture.
+- **`optimized_mir` override with trampoline bodies:** 1-2 weeks for the query-override plumbing itself. Confirmed straightforward — the POC hit no rustc-side walls in the override installation. The MIR construction code mostly carries over.
+- **`LangCallbacks` trait job-split + consumer-side adoption:** 2-3 weeks. This is the line item my earlier estimate elided. The POC surfaced that the current Instance-keyed callback contract can't be driven from a DefId-keyed override without reshaping the trait — specifically, splitting `monomorphize_fn` into a DefId-keyed `collect_generic_rust_deps` (for external Rust-dep registration, consumed by the collector) and an Instance-keyed `notify_concrete_entry_point` (for internal-callee walking + stashing, keyed off `symbol_name`). Conceptual split, not a new rustc-exposed hook; consumer-side work of rewiring the callback implementations + verifying `state.toylang_instances` coverage under the split.
+- **`-Zcodegen-backend=valec` + `rustc_codegen_llvm` delegation:** 2-3 weeks of architecture work. The associated-type visibility issue on `ModuleLlvm` is the one real wall — you'd either cap what you intercept or upstream a small rustc change (which isn't a fork but is contribution cost). Plugin integration also has to reconcile with the facade's current `rustc_driver::Callbacks` entry points. **Note: this line item also absorbs the separate-crate integration work** that would otherwise sit under patch-5 elimination — plugin mode subsumes the stub-rlib codegen-skip problem and the cross-crate consumer-DefId handling naturally, per POC #2 (§4.3 of the reasoning doc).
+- **`#[linkage = "external"]` in generated stubs + `upstream_monomorphization` override:** ~5 LoC of query override on top of the plugin work. Effectively a rounding error once the plugin is in place. The feature-gate-at-crate-root mechanics are confirmed to work (POC #2 Step 3). For a greenfield consumer designing separate-crate from day one, this isn't a separate line item — it's absorbed into the plugin integration.
 - **Migrating consumer read-surface to `rustc_public`:** 1-2 weeks. Pure win on churn reduction.
 - **Risk contingency** — MIR construction API surface churning between rustc versions: budget ~1 week per 6-month bump regardless.
 
-**Total rough estimate for zero-fork: 4-8 weeks engineering + ongoing 1 week per rustc bump.** Vs maintaining a 5-patch fork: ~2-3 days per rustc bump (patches are small and stable in shape).
+**Total rough estimate for zero-fork: 4-8 weeks engineering + ongoing 1 week per rustc bump.** (Revised up from 2-4 weeks after the POC surfaced the callback-boundary work.) Vs maintaining a 5-patch fork: ~2-3 days per rustc bump (patches are small and stable in shape).
 
 The math only favors zero-fork if you're doing many rustc bumps per year and user installation friction is a real cost to you. If you're bumping twice a year and `rustup toolchain link vale-fork` is acceptable in your installer — the fork is probably still cheaper over a 2-year horizon. For a "just install valec" distribution story targeting non-Rust-native users, the calculus flips.
 
@@ -168,19 +137,25 @@ The math only favors zero-fork if you're doing many rustc bumps per year and use
 
 ## Bottom line for Vale
 
-1. **The fork is less load-bearing than I framed it, but the zero-fork target needs *two* pieces, not one.** `override_queries` on `optimized_mir` alone handles dep discovery completely — every case today's `per_instance_mir` handles, including your trait-generic-callback example. On its own, though, it can't replace fork patch 3 (codegen skip) because rustc will still compile whatever body the override returns and that collides with the consumer's real implementation at the linker. The combination `override_queries` + `-Zcodegen-backend=consumer` is what actually gets you to zero fork patches: the query covers pre-codegen injection, the plugin covers post-monomorphization emission control. Either alone is insufficient.
-2. **Your `#[linkage]` alternative (patch 5) probably works for your architecture specifically.** Independent of the query/plugin discussion. The toylang rejection was integration-specific.
-3. **What I actually did vs what I claimed I did are different in a few places.** The architecture guide's framing — "the query is needed because of per-Instance keying" and "we rejected `#[linkage]`" — undersells the design space. I wrote that guide after the decisions were made, and "what we picked" drifted into "what was necessary" in the prose. I've updated the guide and written a dedicated reasoning doc (`docs/reasoning/rustc-fork-design-space.md`) with the honest accounting.
-4. **The genuinely unexplored alternative is the separate-crate stub model (your §Patch-5 B).** Nobody tried it. I think it works. If you're going zero-fork, it's independent of the query/plugin work and is likely the cheapest single win on patch 5.
+1. **The principle to preserve is interleaving; the specific fork patches aren't load-bearing.** The architectural invariant (see `why-interleaved-monomorphization.md`) is that *some* rustc-side hook must fire per-Instance during monomorphization to supply consumer bodies — today that's `per_instance_mir`, but it could equivalently be `override_queries` on `optimized_mir` paired with a `CodegenBackend` plugin for emission control. Your proposed swap preserves the invariant, which is why it's viable. `override_queries` alone handles dep discovery (every case including your trait-generic-callback example); pairing with a plugin handles the emission-skip problem that dep discovery alone leaves behind. Either alone is insufficient — together they replace all five fork patches. **Confirmed by prototype** (branch `poc/optimized-mir-override`, see the reasoning doc's §4.1 for specifics).
+2. **Your `#[linkage]` alternative (patch 5) works for a greenfield separate-crate architecture, and it's absorbed into the plugin work — not a separate line item.** POC #2 on branch `poc/separate-crate-stubs` prototyped this; the mechanical part works (feature-gate at a real crate root, `#[linkage = "external"]` on wrappers), but it surfaced that a toylang-brownfield retrofit hits architectural assumptions in the single-crate-compile backend that cost ~1-2 weeks to unwind. For Vale-greenfield with the plugin path, those assumptions don't exist from day one, so the integration cost drops to approximately zero + ~5 lines of `upstream_monomorphization` override. The rejection in the arch guide was specific to the single-crate-compile integration model, not universal. See `rustc-fork-design-space.md` §4.3 for the full brownfield/greenfield cost split.
+3. **What I actually did vs what I claimed I did are different in a few places.** The architecture guide's framing — "the query is needed because of per-Instance keying" and "we rejected `#[linkage]`" — undersells the design space. I wrote that guide after the decisions were made, and "what we picked" drifted into "what was necessary" in the prose. I've updated the guide and written a dedicated reasoning doc (`docs/reasoning/rustc-fork-design-space.md`) with the honest accounting. Both POCs' findings are incorporated.
+4. **The separate-crate stub model works mechanically; integration cost depends on your starting architecture.** POC #2 confirmed `#![feature(linkage)]` at a real crate root + `#[linkage = "external"]` on wrappers are sufficient for the CGU-partitioner-internalization problem (patch 5's purpose). The POC also surfaced three secondary blockers (`upstream_monomorphization` routing, `unreachable!()` body emission in the stub rlib, single-crate-compile assumptions in the backend's MonoItems walk) that bite a brownfield retrofit but dissolve under a greenfield plugin-mode design. For Vale, this means: if you're already doing plugin mode, add separate-crate for approximately free; if you're skipping plugin mode, add ~1-3 days of upfront design to handle cross-crate consumer DefIds in your backend.
 5. **`rustc_public` helps with consumer code, not the framework.** Useful for Vale's Vale-facing oracle, not useful for the integration layer.
-6. **If you go zero-fork, budget for MIR-construction churn.** That's the biggest recurring cost; neither the query override nor the plugin route escapes it, because both still synthesize MIR bodies using rustc-internal construction APIs.
+6. **If you go zero-fork, budget for MIR-construction churn + the callback-boundary job-split.** The POC surfaced that the current Instance-keyed callback contract can't be driven by a DefId-keyed override without splitting the trait across two queries (`optimized_mir` + `symbol_name`). This is why the estimate moved 2–4 → 4–8 weeks. Trait-level work, but no new rustc hooks needed — the job-split rides on queries that already fire at the right keying.
 
 Order of operations I'd recommend if you commit to zero-fork:
 
-1. Prototype `override_queries` on `optimized_mir` on a toy reproducer. Verify dep discovery works (walk through a `use_it<i32> → rust_fn<i32: SomeTrait>` case) and confirm the emission conflict actually manifests. Low risk, cheap — mostly validates the claims in this document.
-2. Build the `CodegenBackend` plugin integration to resolve the emission problem. The `pub(crate)` issue on `ModuleLlvm` is the one place I'd expect to hit a real wall; worth a spike early.
-3. Separately, try the separate-crate stub model for patch 5. Orthogonal; can run in parallel with the above.
+1. **Replicate the POC on your side** or read through `poc/optimized-mir-override` branch in erw. The POC confirms (a) dep discovery works and (b) emission conflict is the one remaining blocker for pure `override_queries`. Rerun is `ERW_POC_OPTIMIZED_MIR=1 cargo +rustc-fork test -p toylangc`; findings.md on that branch has the full writeup.
+2. **Build the `CodegenBackend` plugin integration** to resolve the emission problem. The `pub(crate)` issue on `ModuleLlvm` is the one place I'd expect to hit a real wall; worth a spike early. The reasoning doc's §4.2 has the specific known complications.
+3. **Rework the `LangCallbacks` trait to the job-split shape** (`collect_generic_rust_deps` + `notify_concrete_entry_point`) before wiring the plugin. This is the facade-side change the POC surfaced — not a new rustc hook, just a trait reshape. Details in the reasoning doc's §4.1.
+4. **The separate-crate stub model is absorbed into step 2's plugin work**, not a separate step. POC #2 confirmed that plugin mode subsumes the stub-rlib emission problem and cross-crate consumer DefId handling natively. Only additional cost is ~5 LoC of `upstream_monomorphization` override for generic-wrapper mono routing. See POC branch `poc/separate-crate-stubs` (commits `2463248` → `acc62d2` → `2c004a6`) for the full analysis.
 
-If it'd help, I can put ~4 hours into step 1 as a proof-of-concept inside erw — just to nail down whether there's a blocker I'm missing. Let me know.
+The POC branch is at `poc/optimized-mir-override` on the erw repo; the env-var gate is `ERW_POC_OPTIMIZED_MIR=1`. Code is scaffolding-grade (~90-100 real code lines across 4 files in `rustc-lang-facade/src/`, or 137 insertions per `git diff --stat`; the remainder of the new file is doc-comment scaffolding). Gated so gate-off path is identical to current behavior. Not to be merged; kept as a reference for reproduction.
+
+Two canonical references in the erw repo if you want to dig further:
+
+- **`docs/reasoning/why-interleaved-monomorphization.md`** — the architectural rationale for interleaving with a seven-case taxonomy of consumer architectures. Read this first if you're deciding whether the facade is the right fit for your interop model.
+- **`docs/reasoning/rustc-fork-design-space.md`** — takes "interleaving is required" as given and analyzes fork-reduction alternatives. Parts 2–4 cover `override_queries` on `optimized_mir`, `CodegenBackend` plugins, the separate-crate stub model, and `rustc_public` for churn reduction. Read this after committing to interleaving, when you're choosing the specific rustc hooks.
 
 — e

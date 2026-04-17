@@ -430,10 +430,10 @@ fn test_unwrap_result() {
 
 ---
 
-## Phase 7: Standalone Test Projects — IN PROGRESS (3/9 done)
+## Phase 7: Standalone Test Projects — IN PROGRESS (5/9 done)
 
-**Status**: uuid, indexmap, and regex smoke tests landed and green. 6
-crates remaining. Junior-engineer handoff at
+**Status**: uuid, indexmap, regex, toml, and serde_json smoke tests
+landed and green. 4 crates remaining. Junior-engineer handoff at
 `/Users/verdagon/erw/handoff.md` covers the batch end-to-end.
 
 **Goal**: Create test projects under
@@ -624,28 +624,136 @@ synthetic-generic gap were resolved (orthogonal, still blocked).
 Mechanical for `toml_test`, `serde_json_test`, `glob_test` (all
 free-fn) and `rand_test`.
 
+### What landed (2026-04-16, later still) — `toml_test`
+
+**`toml_test`** — fourth Phase 7 smoke test. Program:
+
+```
+use toml::from_str
+use toml::Value
+use toml::de::Error
+use std::result::Result
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let val = from_str<Value>("").unwrap();
+    Write::write_all(&stdout(), b"toml ok\n");
+}
+```
+
+Passed on first attempt — no changes required to `toylangc/src/`,
+`rustc-lang-facade/`, or the rustc fork. First integration test of a
+use-imported **generic free function with an explicit type arg**
+(`name<T>(args)` shape). Prior tests covered `name()` (free fn, no
+generics — `stdout()`) and `Name::method<T>(args)` (static method
+with generics — `Vec::new<i32, Global>()`, `IndexMap::new<i32, i32,
+RandomState>()`), but not the combination. Unit-tested indirectly via
+`test_arg_type_mismatch_generic_fn`; no integration test had
+exercised it end-to-end until now.
+
+Composed six features in one 12-line program: Phase 5 (build),
+Phase 2 (use-imported free fn), @UTAIRZ (`&str` ABI via string
+literal), Phase 6 (unwrap wrapper on non-stdlib `Result<Value,
+toml::de::Error>` — second `.unwrap()` test after regex to exercise
+the non-stdlib Result path), Phase 4 (I/O via `Write::write_all`),
+plus the new generic-free-fn shape.
+
+First-try success confirms Phase 7's remaining crates
+(`serde_json_test` especially — same shape with `serde_json::Value`
+replacing `toml::Value`) should be mechanical.
+
+### What landed (2026-04-16, later still) — `serde_json_test` + `@ELASZ`
+
+**`serde_json_test`** — fifth Phase 7 smoke test. Program:
+
+```
+use serde_json::from_str
+use serde_json::Value
+use serde_json::Error
+use std::result::Result
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let val = from_str<Value>("null").unwrap();
+    Write::write_all(&stdout(), b"serde_json ok\n");
+}
+```
+
+The "mechanical mirror of toml" prediction was wrong. serde_json's
+`from_str` is `fn from_str<'a, T: Deserialize<'a>>(s: &'a str) -> Result<T>`
+— `'a` is **early-bound** (appears in the `where T: Deserialize<'a>`
+bound, so it lands in `generics_of`). toml's is
+`fn from_str<T: DeserializeOwned>(s: &str) -> Result<T, Error>` —
+no lifetime parameter at all. The one-character difference from
+toml's signature surfaced a latent compiler gap.
+
+Every site in toylangc that built a `GenericArgs` from user type
+args only — 10 sites across `oracle.rs`, `callbacks_impl.rs`, and
+`llvm_gen.rs` — was hand-rolling the args, passing exactly the
+type args the user supplied and silently truncating to
+`generics_of(def_id).count()`. With only type parameters in the
+wild, this happened to produce correct args. With an early-bound
+lifetime in the generics list, `EarlyBinder::instantiate` expected
+a region in slot 0 and found a type, so rustc ICEd:
+
+```
+expected region for `'a/#0` ('a/#0/0) but found Type(serde_json::Value)
+when instantiating args=[serde_json::Value]
+```
+
+**Fix shipped as `@ELASZ`** (Early-bound Lifetime Args are
+Synthesized):
+
+- New helper `oracle::build_generic_args_for_item` using
+  `ty::GenericArgs::for_item(tcx, def_id, |param, _| ...)`. Rustc
+  drives the per-param walk; the callback fills `Lifetime` slots
+  with `tcx.lifetimes.re_erased` (the post-borrowck placeholder
+  used by rustc internally during monomorphization), consumes
+  user-supplied types for `Type` slots in declaration order, and
+  panics for `Const` slots (not yet needed).
+- All 10 sites swapped from the hand-rolled `mk_args(&all_ty_args[..count.min(len)])`
+  pattern to a single line calling the helper.
+- `@ELASZ` markers at all 10 call sites plus the helper itself.
+- Documented in detail at
+  `docs/arcana/EarlyBoundLifetimeArgsSynthesized-ELASZ.md`.
+
+Tests: no new unit test — unit tests mock the oracle callbacks, so
+they can't exercise `build_generic_args_for_item` directly.
+`test_standalone_serde_json` is the regression guard; it exercises
+the full oracle → callbacks → llvm_gen → rustc pipeline end-to-end
+with an early-bound lifetime.
+
+Third instance of the "latent until the right crate shape surfaces
+it" pattern after @UTAIRZ (first `&str`-accepting Rust fn) and
+@IVTDBTZ (first inherent static call with args). Unblocks any
+future Rust API with an early-bound lifetime — `serde_json::from_slice`,
+`Visitor<'de>` impls, and anything with the shape
+`fn foo<'a, T: SomeTrait<'a>>(...)`.
+
 ### What's remaining
 
-6 crates, handed off to a junior engineer via `handoff.md`:
+4 crates, handed off to a junior engineer via `handoff.md`:
 
 | Crate | Complexity | Notes |
 |---|---|---|
 | `rand_test` | Free fn + trait | Skip `Rng::gen` on first pass |
 | `clap_test` | Builder w/ `impl Into<Str>` | Still blocked on synthetic generics (orthogonal to IVTDBTZ) |
 | `glob_test` | Free fn taking `&str` | Unblocked (UTAIRZ) |
-| `toml_test` | Free fn + `Value`, takes `&str` | Unblocked (UTAIRZ) |
-| `serde_json_test` | Free fn + `Value`, takes `&str` | Unblocked (UTAIRZ) |
 | `reqwest_test` | Free fn, needs `blocking` feature | No network call on smoke test |
 
 Each project is three files (`toylang.toml`, `main.toylang`, plus one
 test function appended to `toylangc/tests/standalone_tests.rs`). The
-pattern is proven: match `uuid_test` / `indexmap_test` / `regex_test`'s
-structure, let the structured errors guide missing imports and syntax
-fixes.
+pattern is proven: match `uuid_test` / `indexmap_test` / `regex_test`
+/ `toml_test` / `serde_json_test`'s structure, let the structured
+errors guide missing imports and syntax fixes.
 
 Full Phase 7 completion target: 67 unit + 134 integration + 14
-standalone = 215 tests, 0 failed, 0 ignored. (Currently 204: 67 unit
-+ 129 integration + 8 standalone.)
+standalone = 215 tests, 0 failed, 0 ignored. (Currently 206: 67 unit
++ 129 integration + 10 standalone.)
 
 ### Original plan (historical)
 
@@ -662,9 +770,10 @@ plan preserved in git history (pre-commit `0b1432e`) if needed.
 ## Phase 8: Test Harness — PARTIALLY DONE (file exists, harness helper sketch deferred)
 
 **Status**: The file `toylangc/tests/standalone_tests.rs` already
-exists with 8 tests (4 build-mechanism + `test_build_inside_another_workspace`
+exists with 10 tests (4 build-mechanism + `test_build_inside_another_workspace`
 + `test_standalone_uuid` + `test_standalone_indexmap` +
-`test_standalone_regex`). Remaining harness polish (a
+`test_standalone_regex` + `test_standalone_toml` +
+`test_standalone_serde_json`). Remaining harness polish (a
 `run_standalone_test(name, expected)` helper so each crate is
 one-liner `#[test] fn test_standalone_<crate>()`) is a nice-to-have
 but deferred until the 6 remaining Phase 7 crates land — the helper
@@ -757,8 +866,8 @@ chain `| grep` onto the same line.
 # Full test suite:
 cargo +rustc-fork test -p toylangc 2>&1 | tee /tmp/erw-quest.txt
 grep "test result:" /tmp/erw-quest.txt
-# Current expected: 67 unit + 129 integration + 8 standalone = 204 tests, 0 failed, 0 ignored
-# Phase 7 target: 67 + 134 + 14 = 215 (6 more standalone tests to land)
+# Current expected: 67 unit + 129 integration + 10 standalone = 206 tests, 0 failed, 0 ignored
+# Phase 7 target: 67 + 134 + 14 = 215 (4 more standalone tests to land)
 
 # Just the standalone suite:
 cargo +rustc-fork test -p toylangc --test standalone_tests 2>&1 | tee /tmp/erw-quest.txt

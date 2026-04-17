@@ -1,0 +1,6 @@
+[project]
+name = "toml_test"
+source = "main.toylang"
+
+[rust-dependencies]
+toml = "0.8"

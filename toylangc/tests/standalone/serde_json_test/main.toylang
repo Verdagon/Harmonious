@@ -1,0 +1,12 @@
+use serde_json::from_str
+use serde_json::Value
+use serde_json::Error
+use std::result::Result
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let val = from_str<Value>("null").unwrap();
+    Write::write_all(&stdout(), b"serde_json ok\n");
+}

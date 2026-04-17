@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 129 integration tests + 8 standalone tests + 67 unit tests passing, 0 ignored.
+> **Current status:** 129 integration tests + 10 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -52,18 +52,24 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (in progress, 3/9 done): standalone test projects under
+> - Phase 7 (in progress, 5/9 done): standalone test projects under
 >   `toylangc/tests/standalone/<crate>_test/` proving toylang links
 >   against and calls into arbitrary crates.io Rust deps. `uuid_test`
 >   landed as the smoke test (commit `df696c1` + follow-ups);
 >   `indexmap_test` landed as the second smoke test (2026-04-16)
 >   exercising 3-arg explicit generics via
 >   `IndexMap::new<i32, i32, RandomState>()`. `regex_test` landed
->   (2026-04-16) after surfacing and fixing @IVTDBTZ. 6 crates
->   remaining (`rand`, `clap`, `glob`, `toml`, `serde_json`,
->   `reqwest`). See `handoff.md` at the repo root for the
->   junior-engineer handoff on the remaining 6. Each project is a
->   10-20 line toylang program that prints `"<crate> ok\n"`.
+>   (2026-04-16) after surfacing and fixing @IVTDBTZ. `toml_test`
+>   landed (2026-04-16) as the first integration test of a
+>   use-imported generic free function with an explicit type arg:
+>   `from_str<Value>("").unwrap()`. `serde_json_test` landed
+>   (2026-04-16) after surfacing and fixing @ELASZ — the first
+>   integration test of a Rust item with an early-bound lifetime
+>   parameter (`serde_json::from_str<'a, T: Deserialize<'a>>`). 4
+>   crates remaining (`rand`, `clap`, `glob`, `reqwest`). See
+>   `handoff.md` at the repo root for the junior-engineer handoff
+>   on the remaining 4. Each project is a 10-20 line toylang
+>   program that prints `"<crate> ok\n"`.
 > - String-literal `&str` ABI fix (2026-04-16): `ResolvedType::Str`
 >   rewired to mirror `ByteSlice`'s six-touchpoint pattern exactly.
 >   `"..."` string literals now type as `Ref { Str }` and lower to a
@@ -103,6 +109,23 @@
 >   `clap` (partially — still blocked on `impl Into<Str>`), and any
 >   future `String::from(x)` / `Vec::with_capacity(n)` /
 >   `Box::new(x)` shape.
+> - Early-bound lifetime synthesis (2026-04-16): `serde_json_test`
+>   surfaced a latent gap where every `.instantiate()` site in
+>   `oracle.rs`, `callbacks_impl.rs`, and `llvm_gen.rs` (ten in
+>   total) hand-built `GenericArgs` from user type args only,
+>   dropping lifetime slots. `serde_json::from_str<'a, T: Deserialize<'a>>`
+>   ICEd rustc with `expected region for 'a/#0 but found Type(Value)`.
+>   Fix replaces the hand-rolled pattern with a shared helper
+>   `oracle::build_generic_args_for_item` using
+>   `ty::GenericArgs::for_item` — lifetime slots are filled with
+>   `tcx.lifetimes.re_erased` (the post-borrowck placeholder);
+>   user-supplied types fill Type slots in declaration order;
+>   extras beyond the item's Type slots are truncated (matches
+>   toylang's convention of naming type-level defaulted params at
+>   the call site, e.g. `Vec::new<T, Global>()` where Global lives
+>   on the parent type). See `@ELASZ`. Unblocks `serde_json_test`;
+>   preventive for any future Rust API with early-bound lifetimes
+>   (any `fn foo<'a, T: SomeTrait<'a>>(...)` shape).
 > - Error-quality polish (commit `0b1432e`): tech-debt #26 and #27.
 >   Missing-import panics at `oracle.rs:112` converted into structured
 >   `TypeResolveError::RustTypeNotImported { name, context }` with a
@@ -113,7 +136,7 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–6. Phase 7 in progress (3/9).** Remaining: 6
+> **Phases done: 1–6. Phase 7 in progress (5/9).** Remaining: 4
 > standalone test projects (see `handoff.md`); Phase 8 (test harness
 > polish — reduce per-crate boilerplate in `standalone_tests.rs`).
 
@@ -856,27 +879,22 @@ than as a pre-pass (e.g., `Callbacks::after_analysis`) or a post-pass
 choice — it's the only phase where the handoff the facade needs to perform
 is actually possible.
 
-**The one-way handoff.** Rustc's monomorphization collector walks reachable
-items from entry points outward, discovering generic instantiations as it
-goes. When consumer code calls a Rust generic function (`use_it<i32>(x)` →
-`rust_fn<i32>(x)`), the edge from the consumer caller to the Rust callee
-lives entirely inside consumer source — rustc never parses it. Without
-facade intervention, rustc's collector never sees that `rust_fn<i32>` is
-reachable, never queues it for codegen, and the link step fails with an
-undefined symbol.
+Short form: rustc's monomorphization collector is the only entity that
+walks both Rust and (via the facade) consumer source. Letting the
+collector drive discovery lets the facade **tell rustc the leaves** —
+the concrete type-argument tuples for every Rust item called directly
+from consumer code — and rustc walks the transitive closure from there
+(trait resolution, associated types, nested generics, drop glue). The
+alternative — the facade reimplementing rustc's trait/generic resolution
+machinery — is tens of thousands of lines of rustc internals reimplemented.
+The interleaving is how the facade *avoids* that reimplementation.
 
-The facade's job is narrow: **tell rustc the leaves** — the concrete
-type-argument tuples for every Rust item called directly from consumer code
-for each consumer Instance. Rustc walks the transitive closure from there
-(trait resolution, associated types, nested generics, drop glue). This is
-why the synthetic MIR body that `per_instance_mir` returns enumerates Rust
-deps as `ReifyFnPointer` casts: the collector sees them and queues them as
-part of its normal walk.
-
-The alternative — have the facade reimplement trait impl resolution, generic
-argument substitution, blanket/conditional impls, etc. — is tens of thousands
-of lines of rustc internals reimplemented. The interleaving is how the facade
-**avoids** that reimplementation.
+**For the full argument** with a seven-case taxonomy of consumer
+architectures (which cases pre-pass can handle, which force
+interleaving, and why) — including complete code examples and the
+generic-method-on-generic-trait case that kills the last
+over-approximation workaround — see
+`docs/reasoning/why-interleaved-monomorphization.md`.
 
 ### Why per_instance_mir (rustc fork) instead of mir_built
 
@@ -1220,10 +1238,11 @@ project invariant "non-generic is the degenerate case of generic," there
 is no `is_generic` branch. Future non-generic items in `__lang_stubs`
 (accessor wrappers, static tables, anything) will get the same treatment.
 
-**Accessor wrappers are structurally immune** without needing a separate
-`visibility_override` case. The `__toylang_accessor_*` methods generated
-by `stub_gen.rs` live in impls on consumer types inside `__lang_stubs`,
-so they're already covered by the blanket DefPath check above. Belt and
+**Accessor wrappers are structurally immune to the partitioner
+visibility problem** without needing a separate `visibility_override`
+case. The `__toylang_accessor_*` methods generated by `stub_gen.rs`
+live in impls on consumer types inside `__lang_stubs`, so they're
+already covered by the blanket DefPath check above. Belt and
 suspenders, though: `lang_symbol_name` (`queries/symbol_name.rs`)
 intercepts accessor instances via `is_consumer_accessor_pub` and rewrites
 their symbols to toylang-mangled names (`__toylang_accessor_<struct>_<field>`)
@@ -1232,6 +1251,27 @@ time partitioning runs, accessor callers reference an external-looking
 toylang symbol. The DefPath check in `visibility_override` is the backstop
 if symbol-name redirection is ever bypassed. No action needed; documented
 here so future devs don't re-derive it.
+
+**Scope of "structurally immune" — partitioner only, not codegen
+emission.** The immunity claim above is specifically about CGU-partitioner
+behavior: accessors don't enter the internalization candidate set
+because `lang_symbol_name` has already rewritten their symbols by the
+time partitioning runs, and `visibility_override`'s DefPath check backs
+it up. **Under the current `per_instance_mir` architecture this is the
+complete picture, because patch 3 (codegen skip) prevents rustc from
+emitting bodies for consumer items at all.** Under a hypothetical
+`optimized_mir`-override alternative (`docs/reasoning/rustc-fork-design-space.md`
+§4.1), rustc *would* emit trampoline bodies for accessors at the
+rewritten toylang symbols, and those bodies would collide with
+Inkwell's real accessor implementations at link time. The 2026-04-16
+POC on branch `poc/optimized-mir-override` confirmed 19 unique
+`__toylang_accessor_*` collisions across 117 failing tests — same
+emission-conflict shape as consumer entry-point functions.
+If you're reading this §10.6.4 in the context of evaluating fork-reduction
+paths, the accessor immunity does NOT generalize to the
+override-queries-alone design — it survives only because patch 3 keeps
+rustc out of the emission business. See the reasoning doc for the
+full design-space analysis.
 
 Currently only `MonoItem::Fn` is forwarded to the hook. `MonoItem::Static`
 and `MonoItem::GlobalAsm` are skipped (toylang doesn't emit either into
@@ -1248,12 +1288,19 @@ Considered and rejected:
   `#![feature(linkage)]` at the crate root, which propagates a nightly
   feature flag into user-controlled territory. Unacceptable for a general
   consumer compiler. *(Rejection nuance: the technical mechanism works —
-  `explicit_linkage` takes a fast-path before the internalization logic.
-  The rejection is specific to toylang's `FileLoader` stub injection
-  model, which puts `__lang_stubs.rs` into the user's test crate. A
-  consumer architecture where stubs live in their own rlib would keep
-  the feature flag inside generated code and could use this path fork-free.
-  See `docs/reasoning/rustc-fork-design-space.md` Part 3 + §4.3.)*
+  `explicit_linkage` takes a fast-path before the internalization logic,
+  confirmed mechanically by POC #2. The rejection is specific to the
+  **single-crate-compile integration model** — which toylang's
+  `FileLoader` stub injection enforces as the canonical example, by
+  putting `__lang_stubs.rs` into the user's test crate. A consumer
+  architecture where stubs live in their own rlib (greenfield) would
+  keep the feature flag inside generated code and could use this path
+  fork-free. See `docs/reasoning/rustc-fork-design-space.md` Part 3 +
+  §4.3. Note: for toylang brownfield, retrofitting separate-crate onto
+  the existing single-crate-compile backend costs ~1-2 weeks of
+  architecture work — more than patch 5's maintenance — so the fork
+  stays. For a greenfield consumer pairing separate-crate with the
+  §4.2 plugin path, the integration cost is approximately zero.)*
 - **Per-instantiation `#[no_mangle]` non-generic shims.** Works in vanilla
   Rust but requires knowing every `(wrapper, type_args)` tuple before
   `generate_stubs()` fires, plus risks `#[no_mangle]` collisions across
@@ -1338,14 +1385,14 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 In progress: Phase 7 — Standalone test projects (3/9 done)
+### 10.7 In progress: Phase 7 — Standalone test projects (5/9 done)
 
 Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
 each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
 Each project proves toylang can link against and call into a specific
 Rust crate from crates.io via `toylangc build`.
 
-**Done (3 crates):**
+**Done (5 crates):**
 
 - `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
   Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
@@ -1376,8 +1423,37 @@ Rust crate from crates.io via `toylangc build`.
   First Phase 7 test to stress-test four features in composition:
   Phase 5 build, @UTAIRZ `&str` ABI, Phase 6 `.unwrap()` wrapper
   (first non-stdlib `Result<T, E>`), and Phase 4 I/O.
+- `toml_test` — fourth smoke test. Program:
+  `let val = from_str<Value>("").unwrap();` then
+  `Write::write_all(&stdout(), b"toml ok\n");`. Landed 2026-04-16;
+  passed first-try with no compiler-source changes, confirming the
+  mechanical path for the remaining Phase 7 crates. First
+  integration test of a use-imported **generic free function with
+  an explicit type arg** (`name<T>(args)` shape) — no prior Phase
+  1–7 integration test had exercised this. Composed six features
+  in one 12-line program: Phase 5 (build), Phase 2 (use-imported
+  free fn), @UTAIRZ (`&str` via string literal), Phase 6 (unwrap
+  on non-stdlib `Result<Value, toml::de::Error>`), Phase 4 (I/O),
+  plus the new generic-free-fn shape.
+- `serde_json_test` — fifth smoke test. Program:
+  `let val = from_str<Value>("null").unwrap();` then
+  `Write::write_all(&stdout(), b"serde_json ok\n");`. Landed
+  2026-04-16 after surfacing and fixing **@ELASZ** — the latent
+  gap where toylang's ten `GenericArgs`-building sites hand-rolled
+  the args from user type args only, dropping lifetime slots.
+  `serde_json::from_str<'a, T: Deserialize<'a>>` has an early-bound
+  lifetime `'a` (appears in a `where` bound, so it lands in
+  `generics_of`); rustc ICEd with
+  `expected region for 'a/#0 but found Type(Value)`. Fix replaces
+  the hand-rolled pattern with a shared helper
+  `oracle::build_generic_args_for_item` using
+  `ty::GenericArgs::for_item`, which fills lifetime slots with
+  `tcx.lifetimes.re_erased` at monomorphization time. First
+  integration test of a Rust item with an early-bound lifetime;
+  unblocks any future Rust API of the same shape (`serde_json::from_slice`,
+  `Visitor<'de>` impls, etc.).
 
-**Remaining (6 crates, see `handoff.md`):**
+**Remaining (4 crates, see `handoff.md`):**
 
 | Crate | Imperative API used for smoke test | Notes |
 |-------|-----------------------------------|-------|
@@ -1385,13 +1461,11 @@ Rust crate from crates.io via `toylangc build`.
 | clap | Builder | `Command::new("app")` — still blocked on `impl Into<Str>` synthetic generic |
 | glob | Free function | `glob::glob("*.txt")` — first pass omits `.unwrap()` |
 | reqwest | Free function | `reqwest::blocking::get` (no network call on smoke test) |
-| toml | Free fn + `Value` | `toml::from_str<Value>(...)` — turbofish-free syntax |
-| serde_json | Free fn + `Value` | `serde_json::from_str<Value>(...)` |
 
 Derive macros are syntactic sugar for trait impls. The underlying APIs
 are always available imperatively. Each remaining crate is a 10-20 line
 toylang program that prints `"<crate> ok\n"`. See `handoff.md` for the
-junior-engineer handoff covering all 8.
+junior-engineer handoff covering the remaining 4.
 
 ### 10.8 Planned: Phase 8 — Test harness
 
@@ -1513,3 +1587,7 @@ affected code sites):
   (`docs/arcana/UnsizedTypesAppearInsideRef-UTAIRZ.md`)
 - `@IVTDBTZ` — Inherent Vs Trait Dispatch By Type
   (`docs/arcana/InherentVsTraitDispatchByType-IVTDBTZ.md`)
+- `@ELASZ` — Early-bound Lifetime Args Are Synthesized
+  (`docs/arcana/EarlyBoundLifetimeArgsSynthesized-ELASZ.md`)
+- `@ETASTZ` — Extra Type Args Are Silently Truncated
+  (`docs/arcana/ExtraTypeArgsSilentlyTruncated-ETASTZ.md`)

@@ -357,8 +357,8 @@ pub fn redirect_to_wrapper<'tcx>(
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
         .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
         .collect();
-    let expected_count = tcx.generics_of(wrapper_def_id).count();
-    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    // @ELASZ
+    let args = build_generic_args_for_item(tcx, wrapper_def_id, &all_ty_args);
     Some((wrapper_def_id, args))
 }
 
@@ -386,8 +386,8 @@ pub fn rust_method_return_type<'tcx>(
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
         .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_count = tcx.generics_of(method_def_id).count();
-    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    // @ELASZ
+    let args = build_generic_args_for_item(tcx, method_def_id, &all_ty_args);
 
     // Query fn_sig and extract return type
     let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
@@ -468,6 +468,57 @@ pub fn find_use_imported_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId>
     None
 }
 
+/// @ELASZ — Build a `GenericArgs` for `def_id` by letting rustc drive the
+/// per-param walk. `resolved_types` supplies the `Type` slots in
+/// declaration order (for trait methods the caller prepends `Self`;
+/// for free fns and inherent methods it's just user-supplied type args
+/// pre-resolved via `try_resolved_to_rustc_ty`). Lifetime slots are
+/// filled with `re_erased` (post-borrowck placeholder — borrow-checking
+/// already happened during stub typecheck, so lifetimes are semantically
+/// irrelevant at our phase). Const slots panic (not yet supported; no
+/// test in the corpus exercises them). Replaces five hand-rolled
+/// `mk_args` sites that silently dropped lifetime slots and ICEd rustc
+/// whenever a Rust item had an early-bound lifetime parameter (e.g.,
+/// `serde_json::from_str<'a, T: Deserialize<'a>>`).
+pub fn build_generic_args_for_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    resolved_types: &[ty::GenericArg<'tcx>],
+) -> ty::GenericArgsRef<'tcx> {
+    let mut types_iter = resolved_types.iter().copied();
+    let args = ty::GenericArgs::for_item(tcx, def_id, |param, _| {
+        match param.kind {
+            ty::GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+            ty::GenericParamDefKind::Type { .. } => {
+                types_iter.next().unwrap_or_else(|| {
+                    panic!(
+                        "oracle: insufficient type args for {:?} (param {:?}) — \
+                         type_resolve should have caught this upstream",
+                        def_id, param.name,
+                    )
+                })
+            }
+            ty::GenericParamDefKind::Const { .. } => {
+                panic!(
+                    "oracle: const generic params not yet supported ({:?} on {:?})",
+                    param.name, def_id,
+                )
+            }
+        }
+    });
+    // @ETASTZ — extras beyond the item's `Type` slots are silently
+    // truncated. Toylang's call-site syntax names the type's
+    // generics (`Vec::new<I32, Global>()` names A=Global even
+    // though `Vec::new`'s own generics are just `[T]` — A is
+    // fixed by the impl block). In the common case rustc's
+    // impl-block defaults match the user-supplied extra, so the
+    // truncation is correct. If toylang ever names a non-default
+    // parent-type arg (a custom allocator, hasher, etc.) that
+    // would be silently dropped — latent soundness hole tracked
+    // as tech debt.
+    args
+}
+
 /// Instantiate a free function's fn_sig with given type args.
 /// Non-generic functions pass an empty slice — same code path, no special-casing.
 fn try_instantiate_free_fn_sig<'tcx>(
@@ -482,8 +533,8 @@ fn try_instantiate_free_fn_sig<'tcx>(
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
         .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_count = tcx.generics_of(def_id).count();
-    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    // @ELASZ
+    let args = build_generic_args_for_item(tcx, def_id, &all_ty_args);
     let sig = tcx.fn_sig(def_id).instantiate(tcx, args);
     Ok(tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig))
 }
@@ -528,8 +579,8 @@ pub fn rust_method_param_types<'tcx>(
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
         .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_count = tcx.generics_of(method_def_id).count();
-    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    // @ELASZ
+    let args = build_generic_args_for_item(tcx, method_def_id, &all_ty_args);
     let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
     Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
@@ -562,8 +613,8 @@ pub fn rust_trait_method_param_types<'tcx>(
     for ta in type_args {
         all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?));
     }
-    let expected_count = tcx.generics_of(trait_method_def_id).count();
-    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    // @ELASZ
+    let args = build_generic_args_for_item(tcx, trait_method_def_id, &all_ty_args);
     let sig = tcx.fn_sig(trait_method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
     Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
@@ -657,8 +708,8 @@ pub fn rust_trait_method_return_type<'tcx>(
     for ta in type_args {
         all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?));
     }
-    let expected_count = tcx.generics_of(trait_method_def_id).count();
-    let args = tcx.mk_args(&all_ty_args[..expected_count.min(all_ty_args.len())]);
+    // @ELASZ
+    let args = build_generic_args_for_item(tcx, trait_method_def_id, &all_ty_args);
 
     let sig = tcx.fn_sig(trait_method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(

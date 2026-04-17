@@ -24,6 +24,55 @@ C++ templates).
 
 ---
 
+## 28. Silent Truncation Hides Non-Default Parent-Type Args (@ETASTZ)
+
+### Problem
+
+`oracle::build_generic_args_for_item` silently discards user-supplied
+type args that exceed the item's `Type` slot count. This is load-bearing
+for toylang's call-site convention, where `Name::method<T1, T2, ...>()`
+names the **type's** generics (not the method's). When the method's impl
+block fixes a parent-type arg — `Vec::new` lives on `impl<T> Vec<T, Global>`
+with A baked in — the user-supplied value for that slot gets dropped,
+and rustc substitutes the impl-block default.
+
+In the common case the default matches what the user wrote: `Vec::new<I32, Global>()`
+truncates `Global` and rustc supplies `Global` from the impl. Harmless.
+
+But: if toylang ever gains a way to name a **non-default** parent-type arg
+(a custom `Allocator` for `Vec`, a non-default `BuildHasher` for `HashMap`,
+or any other type-level generic fixed by its method's impl), the silent
+truncation becomes a real bug. `Vec::new<I32, MyAllocator>()` would
+silently produce a `Vec<I32, Global>` — the user's intent is lost with
+no error. Every test today passes only because toylang has no syntax for
+naming a non-default allocator/hasher/etc., so the collision is
+unreachable.
+
+### Fix
+
+Either:
+
+1. **Validate truncation at the truncation site.** Query
+   `generics_of(parent_def_id).params[i].default_value(tcx)` for each
+   slot the user's extras would fill. If the extra matches the default,
+   truncate as before. If not, emit a structured error ("you asked for
+   `MyAllocator` but `Vec::new` only supports `Global`; use a different
+   Vec method or path").
+
+2. **Separate the type-name and method-name at parse/type-resolve.**
+   Require toylang source to write `Vec<I32, MyAllocator>::new()` (two
+   levels of generics), with the parser producing distinct type-level
+   and method-level arg lists. Feed them through separately. More
+   invasive, but matches Rust's own turbofish semantics.
+
+Deferred until toylang gains non-default parent-type arg naming or a
+standard library Rust API surfaces one (reqwest's future-feature gates
+are a candidate; custom allocators are not on the near roadmap).
+
+See the full arcana at `docs/arcana/ExtraTypeArgsSilentlyTruncated-ETASTZ.md`.
+
+---
+
 ## Resolved Items (sessions 1–8)
 
 | # | Item | Session | Resolution |

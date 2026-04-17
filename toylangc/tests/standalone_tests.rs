@@ -319,3 +319,98 @@ fn test_standalone_regex() {
         stdout,
     );
 }
+
+// Phase 7 crate #5: serde_json — first integration test of a Rust
+// free fn with an early-bound lifetime parameter.
+// `serde_json::from_str<'a, T: Deserialize<'a>>(s: &'a str)` ICEd
+// rustc until @ELASZ: oracle's five `.instantiate()` sites were
+// building GenericArgs from user type args only, dropping lifetime
+// slots. Replaced with a shared helper using
+// `ty::GenericArgs::for_item` that synthesizes `re_erased` for
+// lifetime slots.
+#[test]
+fn test_standalone_serde_json() {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/standalone/serde_json_test");
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let build_out = run_build(&project);
+    assert!(
+        build_out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = build_dir.join("target/debug/serde_json_test");
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .expect("failed to run serde_json_test binary");
+    assert!(
+        run.status.success(),
+        "serde_json_test exited non-zero:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("serde_json ok"),
+        "expected 'serde_json ok' in stdout, got: {}",
+        stdout,
+    );
+}
+
+// Phase 7 crate #4: toml — first integration test of a generic free
+// function call with an explicit type arg: `from_str<Value>("")`.
+// Composes Phase 5 (build), Phase 2 (use-imported free fn), @UTAIRZ
+// (&str ABI via string literal), Phase 6 (unwrap wrapper on non-stdlib
+// Result), and Phase 4 (Write::write_all). Prior Phase 7 tests
+// exercised `Name::method<T>()` (IndexMap) and `Name::method(args)`
+// (Regex) but not `name<T>(args)` on a use-imported free fn.
+#[test]
+fn test_standalone_toml() {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/standalone/toml_test");
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let build_out = run_build(&project);
+    assert!(
+        build_out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = build_dir.join("target/debug/toml_test");
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .expect("failed to run toml_test binary");
+    assert!(
+        run.status.success(),
+        "toml_test exited non-zero:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("toml ok"),
+        "expected 'toml ok' in stdout, got: {}",
+        stdout,
+    );
+}
