@@ -11,9 +11,10 @@ registry) influences the classification.
 
 - `toylangc/src/toylang/type_resolve.rs:~487` — `StaticCall` arm
   dispatches on `is_rust_trait(ty)`, a callback predicate.
-- `toylangc/src/toylang/callbacks_impl.rs:~245` (Check 5) and `~487`
-  (`collect_toylang_fn_deps_inner`) — build the `is_rust_trait`
-  closure over `find_use_imported_trait_def_id`.
+- `toylangc/src/toylang/callbacks_impl.rs` (Check 5 in
+  `after_rust_analysis`) and the `type_resolve_body` helper shared by
+  the two walkers — build the `is_rust_trait` closure over
+  `find_use_imported_trait_def_id`.
 - `toylangc/src/llvm_gen.rs:~682` — third call site for
   `resolve_fn_body`, builds its own `is_rust_trait` closure over
   the same oracle helper.

@@ -83,8 +83,9 @@ impl rustc_driver::Callbacks for LangDriver {
 
         // Phase 3 (generate_and_compile) is called later, from
         // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
-        // This ensures the consumer has seen all monomorphize_fn callbacks
-        // and can compile with full knowledge of what deps exist.
+        // This ensures the consumer has seen all collect_generic_rust_deps /
+        // notify_concrete_entry_point callbacks and can compile with full
+        // knowledge of what deps exist.
 
         Compilation::Continue
     }

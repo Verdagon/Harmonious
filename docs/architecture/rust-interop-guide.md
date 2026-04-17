@@ -214,15 +214,20 @@ Four-patch fork of rustc:
 3. Codegen skip in `rustc_codegen_ssa/src/mono_item.rs` (if Some, skip `codegen_instance`)
 4. Default provider in `rustc_mir_transform/src/shim.rs` (returns None)
 
-The provider calls `monomorphize_fn` which triggers the **deep monomorphization
-walk**:
+The provider calls `collect_generic_rust_deps` which:
 1. Substitutes type params with concrete args from the Instance
 2. Type-resolves the body
 3. Walks the typed AST for deps
-4. For toylang callees: recursively walks their bodies (stashes them in
-   `ToylangState.toylang_instances`)
-5. For Rust deps (extern fns, Rust methods): returns them to rustc
-6. The `visited_symbols` set in ToylangState prevents re-walking shared callees
+4. For toylang callees: recursively walks their bodies using a **local cycle
+   guard** (not persistent state) so transitively-reached deps are collected
+   on every call.
+5. For Rust deps (extern fns, Rust methods): returns them to rustc.
+
+This callback is side-effect-free with respect to consumer codegen state —
+internal-callee stashing is the separate job of `notify_concrete_entry_point`
+(§2.3). Splitting the two jobs removes the old undocumented ordering
+dependency between `per_instance_mir` and `symbol_name` and leaves each hook
+with a single responsibility.
 
 Only Rust deps are returned to rustc. Internal toylang functions never appear in
 rustc's MonoItems. The consumer discovers them independently during codegen.
@@ -249,9 +254,16 @@ or post-pass — is answered in Part 1 of that document.
 
 **Key:** `Instance<'tcx>` — maps consumer instances to consumer symbol names.
 
-Calls `monomorphize_fn` to get the extern symbol. On repeated calls (e.g., after
-`per_instance_mir` already processed the function), the `visited_symbols` cache
-causes an early return with zero work — no re-walking.
+Calls `notify_concrete_entry_point` to get the extern symbol. This is also the
+hook that drives **internal consumer→consumer discovery + stashing** into
+`ToylangState.toylang_instances`. The `walked_entry_points` set in `ToylangState`
+dedups across calls so a shared internal callee reached from multiple entry
+points is walked + stashed exactly once.
+
+Because `collect_generic_rust_deps` (§2.2) is Rust-deps-only and
+`notify_concrete_entry_point` is symbol + internal-walk, the old ordering
+dependency between `per_instance_mir` and `symbol_name` is gone — each hook now
+does exactly one of the two jobs the former unified `monomorphize_fn` conflated.
 
 Symbol examples:
 - Concrete: `__toylang_impl_make_counter`
@@ -297,8 +309,12 @@ need consumer state:
 **`LangCallbacks: LangPredicates`** (stateful; takes `&mut dyn Any`,
 locks `MUTABLE_STATE`):
 - `create_state` — constructor for the consumer state box.
-- `monomorphize_type`, `monomorphize_fn` — produce per-instantiation
-  data; mutate state during the deep dependency walk.
+- `monomorphize_type` — produces per-instantiation type-layout data.
+- `collect_generic_rust_deps` — returns the Rust items a consumer function
+  transitively depends on; called from `per_instance_mir`.
+- `notify_concrete_entry_point` — returns the extern symbol for a concrete
+  consumer entry-point Instance and drives internal-callee stashing; called
+  from `symbol_name`.
 - `after_rust_analysis` — validation after rustc's analysis phase.
 - `generate_and_compile` — runs the consumer's LLVM backend; holds the
   lock for the entire duration of consumer codegen.
@@ -409,19 +425,33 @@ all errors before aborting.
 
 ### 4.4 Deep dependency discovery
 
-`collect_toylang_fn_deps_inner` runs `resolve_fn_body` on a function body, then
-walks the typed AST for deps. The walk collects:
+Two walkers sit behind the two callbacks, sharing
+`walk_typed_body_for_deps` (the typed-AST traversal primitive) and
+`type_resolve_body`. The split mirrors the trait split.
 
-- **Toylang function calls:** `(name, type_args)` pairs. For each, if the callee
-  has a body: substitute type params, recurse, stash as `ToylangInstance`.
-  Do NOT report to rustc.
+`collect_rust_deps_recursive` (driven by `collect_generic_rust_deps`):
+
+- **Toylang function calls:** recurse into the callee's body under a **local
+  cycle guard** (a fresh `HashSet<String>` per outer call). Do NOT stash. Do
+  NOT report the toylang callee to rustc.
 - **Extern function calls:** Report `(DefId, GenericArgsRef)` to rustc.
-- **Rust method calls:** `find_inherent_method` for DefId + generic args → report
-  to rustc.
+- **Rust method calls:** `find_inherent_method` / trait / wrapper dispatch →
+  report to rustc.
 
-The `visited_symbols: HashSet<String>` in `ToylangState` persists across all
-`monomorphize_fn` calls. Each function body is walked exactly once, regardless of
-how many entry points reach it or how many times rustc calls `monomorphize_fn`.
+`walk_and_stash_internal_callees` (driven by `notify_concrete_entry_point`):
+
+- **Toylang function calls:** stash the callee in `state.toylang_instances`
+  and recurse. Uses `state.walked_entry_points` as persistent dedup so
+  shared internal callees are stashed exactly once per compilation.
+- **Everything else:** ignored — Rust deps flow through the other walker.
+
+The two dedup structures are intentionally separate. `walked_entry_points`
+persists across `notify_concrete_entry_point` calls so internal-callee
+codegen isn't duplicated. The Rust-deps walker's cycle guard is local so that
+a shared internal helper reached from two entry points still gets its Rust
+deps collected both times — rustc's mono collector dedups Rust items
+independently, so duplicated dep registration is harmless, whereas a missed
+registration would produce unresolved-symbol link failures.
 
 ### 4.5 Inkwell codegen
 
@@ -488,7 +518,8 @@ Stdout alloca contained garbage that `Write::write_all` then dereferenced.
 When toylang defines `fn main()`, the stub wrapper is renamed to `__toylang_main`
 to avoid conflicting with Rust's `main`. The mapping flows through:
 - `is_consumer_fn` returns true for both `"main"` and `"__toylang_main"`
-- `monomorphize_fn` maps `"__toylang_main"` → `"main"` for registry lookup
+- `collect_generic_rust_deps` / `notify_concrete_entry_point` both map
+  `"__toylang_main"` → `"main"` for registry lookup
 - `compute_fn_symbol` → extern symbol `__toylang_impl_main`
 
 ### 4.8 `use` imports
@@ -628,10 +659,10 @@ reading config/defaults never touch `MUTABLE_STATE`, so they can freely execute
 during `generate_and_compile`.
 
 Residual risk (documented but not currently hit): if a query provider calls
-`call_monomorphize_fn` for an uncached consumer item during
-`generate_and_compile`, it would try to lock `MUTABLE_STATE` and deadlock.
-This is prevented in practice because all consumer items are cached during
-`inner.codegen_crate`.
+`call_collect_generic_rust_deps` or `call_notify_concrete_entry_point` for an
+uncached consumer item during `generate_and_compile`, it would try to lock
+`MUTABLE_STATE` and deadlock. This is prevented in practice because all
+consumer items are cached during `inner.codegen_crate`.
 
 ### 5.3 Locking protocol
 
@@ -639,7 +670,7 @@ This is prevented in practice because all consumer items are cached during
 |----------|-------|-------|
 | `is_consumer_type` / `is_consumer_fn` | `CONFIG` | none |
 | `default_layout_of` / `default_mir_shims` / `default_symbol_name` | `DEFAULT_*` | none |
-| `call_monomorphize_type` / `call_monomorphize_fn` | `CONFIG` | `MUTABLE_STATE` |
+| `call_monomorphize_type` / `call_collect_generic_rust_deps` / `call_notify_concrete_entry_point` | `CONFIG` | `MUTABLE_STATE` |
 | `call_after_rust_analysis` / `call_generate_and_compile` | `CONFIG` | `MUTABLE_STATE` |
 | `set_lang_obj_path` / `get_lang_obj_path` | — | `MUTABLE_STATE` (brief) |
 
@@ -650,9 +681,11 @@ are lock-free; only callbacks that need `&mut consumer_state` serialize.
 ### 5.4 Reentrancy avoidance
 
 `generate_and_compile` calls `generate_with_tcx` which calls
-`callbacks.monomorphize_fn_inner()` — this is NOT the trait method (which would
-re-lock). It's a direct method on `ToylangCallbacks` that takes `&mut ToylangState`
-as a parameter, bypassing the mutex entirely.
+`callbacks.notify_concrete_entry_point_inner()` — this is NOT the trait method
+(which would re-lock). It's a direct method on `ToylangCallbacks` that takes
+`&mut ToylangState` as a parameter, bypassing the mutex entirely. Used for
+accessor symbol lookup during codegen (the consumer already holds the mutable
+state mutex for the duration of `generate_and_compile`, per @GCMLZ).
 
 ### 5.5 Consumer state (`ToylangState`)
 
@@ -660,13 +693,17 @@ as a parameter, bypassing the mutex entirely.
 pub struct ToylangState {
     pub log: Vec<CallbackLog>,
     pub toylang_instances: Vec<ToylangInstance>,
-    pub visited_symbols: HashSet<String>,
+    pub walked_entry_points: HashSet<String>,
 }
 ```
 
 - `log` — structured record of every callback from rustc (for test assertions)
-- `toylang_instances` — functions discovered during deep walk (for codegen)
-- `visited_symbols` — deduplication across all `monomorphize_fn` calls
+- `toylang_instances` — functions discovered during the internal-callee walk
+  (consumed by `generate_with_tcx`)
+- `walked_entry_points` — persistent dedup set for the internal-callee walk
+  so shared internal callees are stashed exactly once per compilation.
+  **Not** shared with the Rust-deps walker — that walker uses a local cycle
+  guard per call (see §4.4).
 
 ### 5.6 Callback log
 
@@ -674,14 +711,18 @@ pub struct ToylangState {
 ```rust
 pub enum CallbackLog {
     MonomorphizeType { name: String },
-    MonomorphizeFn { name: String },
+    CollectGenericRustDeps { name: String },
+    NotifyConcreteEntryPoint { name: String },
     AfterRustAnalysis,
     GenerateAndCompile,
 }
 ```
 
 Tests can set `TOYLANG_LOG_PATH` env var to dump the log to a file, then assert
-that internal functions do NOT appear in `MonomorphizeFn` entries.
+that internal functions do NOT appear in either per-entry-point variant. A
+helper at the top of `toylangc/tests/integration_tests.rs` —
+`log_mentions_callback_for(log, name)` — treats the two variants as
+equivalent from the test's standpoint, since both fire per entry point.
 
 ---
 
@@ -734,7 +775,7 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 - Deep chains (a→b→c→Rust), diamond patterns, shared callees
 - Generic deep walks with type substitution
 - Two entry points sharing internal functions
-- `visited_symbols` prevents redundant walks across calls
+- `walked_entry_points` prevents redundant internal-callee walks across calls
 
 ### Validation
 - Parser: duplicate names, reserved `__toylang_` prefix, all error variants tested
@@ -804,10 +845,12 @@ that internal functions do NOT appear in `MonomorphizeFn` entries.
 
 Previously, `collect_toylang_fn_deps` reported toylang callees to rustc, causing
 rustc to process internal functions through `per_instance_mir` / `symbol_name`.
-The deep walk eliminates this: `collect_toylang_fn_deps_inner` recursively walks
-toylang callees, only returning Rust deps. Internal functions are stashed in
-`ToylangState.toylang_instances` for direct codegen. Each function body is walked
-exactly once via `visited_symbols`.
+The deep walk eliminates this: the two walkers (`collect_rust_deps_recursive`
+and `walk_and_stash_internal_callees`, §4.4) cooperatively handle Rust-dep
+discovery and internal-callee stashing without exposing internal callees to
+rustc. Internal functions live in `ToylangState.toylang_instances` and get
+codegenned directly; `walked_entry_points` keeps each internal function body
+walked-and-stashed exactly once per compilation.
 
 ### Why split globals (immutable OnceLock + mutable Mutex)
 

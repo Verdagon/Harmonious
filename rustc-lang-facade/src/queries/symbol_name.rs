@@ -55,11 +55,11 @@ pub fn lang_symbol_name<'tcx>(
                     name_str.clone()
                 };
 
-                if let Some(local_def_id) = def_id.as_local() {
-                    let result = crate::call_monomorphize_fn(
-                        &callback_name, tcx, local_def_id, instance,
+                if def_id.as_local().is_some() {
+                    let symbol = crate::call_notify_concrete_entry_point(
+                        &callback_name, tcx, instance,
                     );
-                    return ty::SymbolName::new(tcx, &result.extern_symbol);
+                    return ty::SymbolName::new(tcx, &symbol);
                 }
             }
         }

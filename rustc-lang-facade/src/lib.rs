@@ -31,7 +31,7 @@ pub mod queries;
 use std::path::PathBuf;
 
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
 
 /// Result of monomorphizing a consumer type for a specific set of type args.
@@ -40,20 +40,6 @@ pub struct MonomorphizeTypeResult<'tcx> {
     /// The library calls tcx.layout_of() on each to compute struct layout.
     /// E.g. for MyStruct<i32>: field_types might be [tcx.types.i32, Vec<i32>].
     pub field_types: Vec<Ty<'tcx>>,
-}
-
-/// Result of monomorphizing a consumer function for a specific set of type args.
-pub struct MonomorphizeFnResult<'tcx> {
-    /// The extern symbol name for this monomorphized function.
-    /// The library builds a MIR call stub that calls this symbol.
-    /// E.g. "__mylang_impl_make_counter" or "__mylang_impl_wrap_i32".
-    pub extern_symbol: String,
-    /// Rust generic instantiations (types or functions) this body depends on.
-    /// The library emits phantom casts in the MIR stub so rustc's
-    /// monomorphizer will stamp these out. Can include both Rust function
-    /// instantiations (e.g. Vec::push<i32>) and Rust type instantiations
-    /// (e.g. HashMap<MyKey, MyValue>).
-    pub rust_deps: Vec<(DefId, ty::GenericArgsRef<'tcx>)>,
 }
 
 /// The main interface between the library and a consumer language.
@@ -136,15 +122,43 @@ pub trait LangCallbacks: LangPredicates {
         ty: Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx>;
 
-    /// Monomorphize a consumer function for a concrete instantiation.
-    fn monomorphize_fn<'tcx>(
+    /// Called from the `per_instance_mir` query provider for each consumer
+    /// function Instance. Returns the Rust items this consumer function
+    /// transitively depends on, as `(DefId, GenericArgsRef)` pairs.
+    ///
+    /// Because rustc does not see internal consumer→consumer callees, the
+    /// implementation must walk the consumer side transitively to gather
+    /// deps reachable through those callees.
+    ///
+    /// Must NOT populate consumer state related to internal-callee codegen.
+    /// Internal-callee discovery is the job of `notify_concrete_entry_point`
+    /// instead. For cycle-breaking during recursive traversal, use a local
+    /// `HashSet` — do not reuse persistent dedup state from
+    /// `notify_concrete_entry_point`.
+    fn collect_generic_rust_deps<'tcx>(
         &self,
         state: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
         instance: ty::Instance<'tcx>,
-    ) -> MonomorphizeFnResult<'tcx>;
+    ) -> Vec<(DefId, GenericArgsRef<'tcx>)>;
+
+    /// Called from the `symbol_name` query provider for each concrete
+    /// consumer entry-point Instance. Returns the extern symbol the consumer
+    /// has chosen for this Instance.
+    ///
+    /// May mutate state — specifically, this is the hook that drives internal
+    /// consumer→consumer transitive discovery and stashing into codegen state.
+    /// Implementations must dedup across calls so shared internal callees are
+    /// stashed exactly once per compilation.
+    fn notify_concrete_entry_point<'tcx>(
+        &self,
+        state: &mut dyn Any,
+        name: &str,
+        tcx: TyCtxt<'tcx>,
+        instance: ty::Instance<'tcx>,
+    ) -> String;
 
     /// Called after rustc's analysis phase completes.
     fn after_rust_analysis<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>);
@@ -192,14 +206,22 @@ struct StatefulVtable {
         Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx>,
 
-    monomorphize_fn: for<'tcx> fn(
+    collect_generic_rust_deps: for<'tcx> fn(
         &(dyn Any + Send + Sync),
         &mut (dyn Any + Send + Sync),
         &str,
         TyCtxt<'tcx>,
         LocalDefId,
         ty::Instance<'tcx>,
-    ) -> MonomorphizeFnResult<'tcx>,
+    ) -> Vec<(DefId, GenericArgsRef<'tcx>)>,
+
+    notify_concrete_entry_point: for<'tcx> fn(
+        &(dyn Any + Send + Sync),
+        &mut (dyn Any + Send + Sync),
+        &str,
+        TyCtxt<'tcx>,
+        ty::Instance<'tcx>,
+    ) -> String,
 
     after_rust_analysis: for<'tcx> fn(
         &(dyn Any + Send + Sync),
@@ -309,19 +331,35 @@ pub(crate) fn call_monomorphize_type<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, ty)
 }
 
-/// Call the consumer's monomorphize_fn. Holds the mutable state mutex for the entire call.
-pub(crate) fn call_monomorphize_fn<'tcx>(
+/// Call the consumer's collect_generic_rust_deps. Holds the mutable state mutex
+/// for the entire call.
+pub(crate) fn call_collect_generic_rust_deps<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     instance: ty::Instance<'tcx>,
-) -> MonomorphizeFnResult<'tcx> {
+) -> Vec<(DefId, GenericArgsRef<'tcx>)> {
     let c = CONFIG.get().expect("config not installed");
-    let func = c.stateful_vtable.monomorphize_fn;
+    let func = c.stateful_vtable.collect_generic_rust_deps;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
     let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, def_id, instance)
+}
+
+/// Call the consumer's notify_concrete_entry_point. Holds the mutable state
+/// mutex for the entire call.
+pub(crate) fn call_notify_concrete_entry_point<'tcx>(
+    name: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> String {
+    let c = CONFIG.get().expect("config not installed");
+    let func = c.stateful_vtable.notify_concrete_entry_point;
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
+    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance)
 }
 
 /// Call the consumer's after_rust_analysis. Holds the mutable state mutex for the entire call.
@@ -435,15 +473,25 @@ fn trampoline_monomorphize_type<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().monomorphize_type(state, name, tcx, ty)
 }
 
-fn trampoline_monomorphize_fn<'tcx, C: LangCallbacks + 'static>(
+fn trampoline_collect_generic_rust_deps<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     state: &mut (dyn Any + Send + Sync),
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
     instance: ty::Instance<'tcx>,
-) -> MonomorphizeFnResult<'tcx> {
-    data.downcast_ref::<C>().unwrap().monomorphize_fn(state, name, tcx, def_id, instance)
+) -> Vec<(DefId, GenericArgsRef<'tcx>)> {
+    data.downcast_ref::<C>().unwrap().collect_generic_rust_deps(state, name, tcx, def_id, instance)
+}
+
+fn trampoline_notify_concrete_entry_point<'tcx, C: LangCallbacks + 'static>(
+    data: &(dyn Any + Send + Sync),
+    state: &mut (dyn Any + Send + Sync),
+    name: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> String {
+    data.downcast_ref::<C>().unwrap().notify_concrete_entry_point(state, name, tcx, instance)
 }
 
 fn trampoline_after_rust_analysis<'tcx, C: LangCallbacks + 'static>(
@@ -476,7 +524,8 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         },
         stateful_vtable: StatefulVtable {
             monomorphize_type: trampoline_monomorphize_type::<C>,
-            monomorphize_fn: trampoline_monomorphize_fn::<C>,
+            collect_generic_rust_deps: trampoline_collect_generic_rust_deps::<C>,
+            notify_concrete_entry_point: trampoline_notify_concrete_entry_point::<C>,
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
             generate_and_compile: trampoline_generate_and_compile::<C>,
         },

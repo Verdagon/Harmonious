@@ -350,7 +350,26 @@ What this eliminates:
 
 - **The consumer-callback boundary needs a job-split.** This is a
   facade-side issue the POC surfaced that's not apparent from the
-  rustc-side mechanism alone. Today's callback
+  rustc-side mechanism alone.
+
+  **Status update (post-split):** the trait-level job-split described
+  below has been landed. `LangCallbacks` now exposes
+  `collect_generic_rust_deps` (Rust-deps-only, called from
+  `per_instance_mir`) and `notify_concrete_entry_point` (symbol +
+  internal-callee stashing, called from `symbol_name`), and
+  toylang's concrete implementations split the former
+  `monomorphize_fn_inner` walker into `collect_rust_deps_recursive`
+  (local cycle guard) and `walk_and_stash_internal_callees`
+  (persistent `walked_entry_points` dedup). The `ToylangState` field
+  `visited_symbols` was renamed to `walked_entry_points` to reflect
+  its new single-purpose role. The zero-fork migration described in
+  §4.1/§4.2 can assume this shape already exists in the facade. All
+  211 tests pass post-split.
+
+  The rest of this bullet documents the pre-split reasoning as it
+  appeared in the POC writeup that motivated the change; it's kept
+  for historical context on why the split was worth doing before the
+  larger fork-reduction effort. Today's callback
   (`monomorphize_fn_inner`) is Instance-keyed and does two jobs at
   once inside a single call:
 

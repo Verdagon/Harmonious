@@ -1909,10 +1909,10 @@ pub fn generate_with_tcx<'tcx>(
                         let field_name = tcx.item_name(def_id).to_string();
                         if let Some(field_index) = toy_struct.fields.iter().position(|f| f.name == field_name) {
                             let callback_name = format!("{}.{}", struct_name, field_name);
-                            let result = callbacks.monomorphize_fn_inner(state, &callback_name, tcx, local_def_id, instance);
-                            if seen_symbols.insert(result.extern_symbol.clone()) {
+                            let extern_symbol = callbacks.notify_concrete_entry_point_inner(state, &callback_name, tcx, local_def_id, instance);
+                            if seen_symbols.insert(extern_symbol.clone()) {
                                 let struct_ty = ctx.struct_type_for_instance(toy_struct, instance);
-                                codegen_accessor_inline(&mut ctx, &result.extern_symbol, struct_ty, field_index);
+                                codegen_accessor_inline(&mut ctx, &extern_symbol, struct_ty, field_index);
                             }
                         }
                     }
@@ -1922,7 +1922,8 @@ pub fn generate_with_tcx<'tcx>(
 
             // For regular consumer functions from MonoItems: record the Instance
             // so we can generate an extern wrapper. The resolved_func comes from
-            // toylang_instances (populated during the deep walk in monomorphize_fn).
+            // toylang_instances (populated by walk_and_stash_internal_callees,
+            // driven by notify_concrete_entry_point).
             let name = tcx.item_name(def_id).to_string();
             let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main".to_string() } else { name.clone() };
             if registry.functions.get(&registry_name).is_none() { continue; }

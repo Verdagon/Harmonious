@@ -10,10 +10,12 @@
 
 `after_rust_analysis` skips generic functions during validation because
 `resolve_fn_body` can't resolve unsubstituted `TypeParam` variants. Generic
-functions are validated at monomorphization time instead — `collect_toylang_fn_deps`
-substitutes concrete type args and runs `resolve_fn_body`, panicking with a
-typed `TypeResolveError` if it fails. This gives decent error messages but means
-a generic function with a bug that's never called won't be caught.
+functions are validated at monomorphization time instead — the two walkers
+(`collect_rust_deps_recursive` and `walk_and_stash_internal_callees`) share
+the `type_resolve_body` helper, which substitutes concrete type args and runs
+`resolve_fn_body`, panicking with a typed `TypeResolveError` if it fails.
+This gives decent error messages but means a generic function with a bug
+that's never called won't be caught.
 
 ### Fix — blocked on trait bounds
 
@@ -90,7 +92,7 @@ See the full arcana at `docs/arcana/ExtraTypeArgsSilentlyTruncated-ETASTZ.md`.
 | 23 | Facade stores copies of consumer name sets | 8 | Replaced `type_names()`/`fn_names()` with `is_consumer_type()`/`is_consumer_fn()` callbacks through vtable; removed `CONSUMER_TYPE_NAMES`/`CONSUMER_FN_NAMES` globals and `HashSet` fields from `FacadeGlobals` |
 | 6 | FnCall path uses `is_scalar_pair_type` instead of `CoercedParam` | 9 | Migrated FnCall arg loop to `push_arg_for_rust_call` (same per-variant dispatch MethodCall/StaticCall already use). Deleted `is_scalar_pair_type`. FnCall now indexes `coerced_params[i]` (no receiver offset). |
 | 7 | Phase 6 partitioner check is inline string-match | 9 | Replaced with `visibility_override` callback on `LangCallbacks`. Rustc fork exposes `rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK: OnceLock<fn ptr>`; facade installs the bridge fn in `install_callbacks`; toylang's impl walks `tcx.def_path(...).data` for `__lang_stubs`. String `__lang_stubs` no longer appears in the rustc fork. |
-| 24 | Redundant `monomorphize_fn` calls / shallow dep walk | 8 | Deep monomorphization walk: `collect_toylang_fn_deps_inner` recursively walks toylang callees, only returns Rust deps to rustc. Internal toylang instances stashed in `ToylangState.toylang_instances`. `generate_with_tcx` uses stashed instances instead of MonoItems for toylang functions. Entry-point fns get extern wrappers, internal fns get only internal ABI. Deleted `resolve_function_for_instance` from llvm_gen.rs. |
+| 24 | Redundant `monomorphize_fn` calls / shallow dep walk | 8 | Deep monomorphization walk split into two walkers: `collect_rust_deps_recursive` (local cycle guard; driven by `collect_generic_rust_deps`) returns Rust deps only; `walk_and_stash_internal_callees` (persistent `walked_entry_points` dedup; driven by `notify_concrete_entry_point`) stashes internal toylang instances in `ToylangState.toylang_instances`. `generate_with_tcx` uses stashed instances instead of MonoItems for toylang functions. Entry-point fns get extern wrappers, internal fns get only internal ABI. Deleted `resolve_function_for_instance` from llvm_gen.rs. |
 | 1 | Hardcoded `Vec::new` in type resolver | 6 | Replaced with `rust_method_ret` callback |
 | 2 | Method arg inference uses `type_args[0]` | 6 | Explicit typed literals; `expected_ty` eliminated for literals |
 | 3 | `mangle_ty_for_symbol` Debug fallback | 6 | Extended match for Str, Ref, RawPtr, Slice, Tuple |

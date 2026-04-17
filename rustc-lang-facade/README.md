@@ -15,7 +15,7 @@ Your language compiles through rustc by:
 Implement the `LangCallbacks` trait and call `run_compiler`:
 
 ```rust
-use rustc_lang_facade::{LangCallbacks, MonomorphizeTypeResult, MonomorphizeFnResult};
+use rustc_lang_facade::{LangCallbacks, MonomorphizeTypeResult};
 
 struct MyLang { /* your compiler state */ }
 
@@ -35,9 +35,21 @@ impl LangCallbacks for MyLang {
     fn monomorphize_type<'tcx>(&self, name: &str, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>)
         -> MonomorphizeTypeResult<'tcx> { ... }
 
-    // Monomorphize a function — return extern symbol name + Rust generic deps
-    fn monomorphize_fn<'tcx>(&self, name: &str, tcx: TyCtxt<'tcx>, def_id: LocalDefId)
-        -> MonomorphizeFnResult<'tcx> { ... }
+    // Return the Rust items this consumer function transitively depends on.
+    // Called from per_instance_mir. Must NOT populate state used for internal
+    // consumer-callee codegen — use notify_concrete_entry_point for that.
+    fn collect_generic_rust_deps<'tcx>(
+        &self, state: &mut dyn Any, name: &str, tcx: TyCtxt<'tcx>,
+        def_id: LocalDefId, instance: Instance<'tcx>,
+    ) -> Vec<(DefId, GenericArgsRef<'tcx>)> { ... }
+
+    // Return the extern symbol for a concrete entry-point Instance. This is
+    // the hook that drives internal consumer→consumer transitive discovery
+    // and stashing. Called from symbol_name.
+    fn notify_concrete_entry_point<'tcx>(
+        &self, state: &mut dyn Any, name: &str, tcx: TyCtxt<'tcx>,
+        instance: Instance<'tcx>,
+    ) -> String { ... }
 
     // Compile function bodies to a .o file (has full tcx for symbol resolution)
     fn generate_and_compile<'tcx>(&self, tcx: TyCtxt<'tcx>)
@@ -64,8 +76,11 @@ Phase 1.5 — after_rust_analysis(tcx)
 Phase 2 — During rustc's monomorphization (on demand)
   monomorphize_type: rustc needs the layout of your type with concrete args.
     Return the field types (as rustc Ty values).
-  monomorphize_fn: rustc needs MIR for your function with concrete args.
-    Return the extern symbol name + any Rust generic deps to monomorphize.
+  collect_generic_rust_deps: rustc needs MIR for your function with concrete
+    args. Return the Rust generic deps to monomorphize.
+  notify_concrete_entry_point: rustc needs the extern symbol for an Instance
+    that's about to be linked. Return the symbol; drive internal consumer-
+    callee discovery if this entry point hasn't been seen before.
 
 Phase 3 — generate_and_compile(tcx)
   Compile all your function bodies (e.g. to LLVM IR → .o file).
@@ -103,11 +118,15 @@ The layout is fully opaque to rustc: `BackendRepr::Memory { sized: true }` with 
 
 **Gotcha: module check.** The library also verifies that the type's DefId comes from the `__lang_stubs` module (via `is_from_lang_stubs`). Without this, user-defined types that happen to share a name with one of your types will get their layouts overridden, causing crashes in codegen.
 
-### 2. `mir_built` — MIR body construction
+### 2. `per_instance_mir` — MIR body construction
 
-When rustc needs the MIR for your function, the library calls your `monomorphize_fn` to get the extern symbol name and Rust generic deps. It then builds a MIR call stub that:
+When rustc needs the MIR for your function, the library calls your
+`collect_generic_rust_deps` to get the Rust generic deps, and then calls
+`notify_concrete_entry_point` (from `symbol_name`) to get the extern
+symbol. It builds a MIR stub that:
 - Calls your extern symbol (the externally-compiled function body)
-- Includes phantom `ReifyFnPointer` casts for each Rust dep, which triggers rustc's monomorphizer to stamp out those generic instantiations
+- Includes phantom `ReifyFnPointer` casts for each Rust dep, which triggers
+  rustc's monomorphizer to stamp out those generic instantiations
 
 ### 3. `mir_borrowck` — selective borrow check skip
 
@@ -119,7 +138,7 @@ When rustc generates `drop_in_place::<YourType>()`, the library intercepts it an
 
 ### 5. Type oracle (consumer-side)
 
-To resolve Rust generic APIs (e.g. "what's the DefId of `Vec::push`?"), query `tcx` directly. The library provides `tcx` in `after_rust_analysis`, `monomorphize_fn`, and `generate_and_compile`. Common patterns:
+To resolve Rust generic APIs (e.g. "what's the DefId of `Vec::push`?"), query `tcx` directly. The library provides `tcx` in `after_rust_analysis`, `collect_generic_rust_deps`, `notify_concrete_entry_point`, and `generate_and_compile`. Common patterns:
 
 ```rust
 // Find Vec's DefId

@@ -91,8 +91,10 @@ codebase.
 
 ## Why it exists
 
-The facade needs global mutable state for consumer callbacks (`monomorphize_fn`,
-etc.) and also needs to intercept rustc's query providers (which are plain
+The facade needs global mutable state for consumer callbacks
+(`collect_generic_rust_deps`, `notify_concrete_entry_point`, `monomorphize_type`,
+`after_rust_analysis`, `generate_and_compile`) and also needs to intercept
+rustc's query providers (which are plain
 function pointers with no way to pass state). The global mutex serializes all
 access. But `generate_and_compile` runs for the entire duration of consumer
 codegen (building LLVM IR, running llc), and any tcx query during that time

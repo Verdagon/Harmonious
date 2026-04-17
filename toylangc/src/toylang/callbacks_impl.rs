@@ -6,14 +6,14 @@ extern crate rustc_middle;
 extern crate rustc_span;
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 
-use rustc_lang_facade::{LangCallbacks, LangPredicates, MonomorphizeTypeResult, MonomorphizeFnResult};
+use rustc_lang_facade::{LangCallbacks, LangPredicates, MonomorphizeTypeResult};
 use crate::toylang::registry::ToylangRegistry;
 
 /// A structured log entry for each callback rustc makes into toylang.
@@ -25,7 +25,8 @@ use crate::toylang::registry::ToylangRegistry;
 #[allow(dead_code)]
 pub enum CallbackLog {
     MonomorphizeType { name: String },
-    MonomorphizeFn { name: String },
+    CollectGenericRustDeps { name: String },
+    NotifyConcreteEntryPoint { name: String },
     AfterRustAnalysis,
     GenerateAndCompile,
 }
@@ -43,12 +44,17 @@ pub struct ToylangInstance {
 #[derive(Default)]
 pub struct ToylangState {
     pub log: Vec<CallbackLog>,
-    /// Toylang function instances discovered during deep monomorphization walk.
-    /// Populated by collect_toylang_fn_deps_inner, consumed by generate_with_tcx.
+    /// Toylang function instances discovered during the internal-callee walk.
+    /// Populated by `walk_and_stash_internal_callees`, consumed by
+    /// `generate_with_tcx`.
     pub toylang_instances: Vec<ToylangInstance>,
-    /// Extern symbols already visited during deep walks. Persists across
-    /// monomorphize_fn calls so shared callees are only walked once.
-    pub visited_symbols: std::collections::HashSet<String>,
+    /// Extern symbols already walked for internal-callee stashing. Persists
+    /// across `notify_concrete_entry_point` calls so shared internal callees
+    /// are stashed exactly once per compilation. The `collect_generic_rust_deps`
+    /// path does NOT share this set — it uses a local cycle guard per call so
+    /// transitively-reached deps from a second entry point are re-collected
+    /// rather than silently skipped.
+    pub walked_entry_points: HashSet<String>,
 }
 
 pub struct ToylangCallbacks {
@@ -63,18 +69,67 @@ fn state(s: &mut dyn Any) -> &mut ToylangState {
 }
 
 impl ToylangCallbacks {
-    /// The actual monomorphize_fn logic. No locking — caller must hold the lock.
-    /// Called by the trait entry point (which locks) and by generate_with_tcx
-    /// (which is already inside generate_and_compile's lock).
-    pub fn monomorphize_fn_inner<'tcx>(
+    /// Rust-dep discovery for a consumer function Instance. Pure read with
+    /// respect to `ToylangState` (only `log` is appended); internal-callee
+    /// stashing happens in `notify_concrete_entry_point_inner`.
+    ///
+    /// Per @SMINCZ, the returned `(DefId, GenericArgsRef)` pairs become
+    /// `ReifyFnPointer` casts in `per_instance_mir`'s synthesized body,
+    /// which is what forces rustc's mono collector to emit the Rust symbols.
+    pub fn collect_generic_rust_deps_inner<'tcx>(
         &self,
         state: &mut ToylangState,
         name: &str,
         tcx: TyCtxt<'tcx>,
         _def_id: LocalDefId,
         instance: ty::Instance<'tcx>,
-    ) -> MonomorphizeFnResult<'tcx> {
-        state.log.push(CallbackLog::MonomorphizeFn { name: name.to_string() });
+    ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
+        state.log.push(CallbackLog::CollectGenericRustDeps { name: name.to_string() });
+
+        // Accessor methods ("StructName.field_name") have no body and no deps.
+        if name.contains('.') {
+            return vec![];
+        }
+
+        let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main" } else { name };
+        let toy_fn = self.registry.functions.get(registry_name)
+            .unwrap_or_else(|| panic!("[toylang] collect_generic_rust_deps: function '{}' not in registry", registry_name));
+
+        // Extern declarations (body-less) have no walkable body.
+        if toy_fn.body.is_none() {
+            return vec![];
+        }
+
+        let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
+        let extern_symbol = compute_fn_symbol(registry_name, tcx, instance);
+        // Local cycle guard — prevents infinite recursion on cyclic consumer
+        // code. Intentionally NOT shared with `state.walked_entry_points`; see
+        // @GCMLZ context and the commit introducing the callback split for the
+        // rationale.
+        let mut cycle_guard: HashSet<String> = HashSet::new();
+        cycle_guard.insert(extern_symbol);
+        collect_rust_deps_recursive(
+            tcx, &self.registry, &resolved_caller, registry_name, &mut cycle_guard,
+        )
+    }
+
+    /// Concrete-entry-point notification. Drives internal consumer→consumer
+    /// discovery + stashing into `state.toylang_instances`, and returns the
+    /// extern symbol the consumer has chosen for this Instance.
+    ///
+    /// Called from the trait impl (holding the facade mutex) and also directly
+    /// from `generate_with_tcx` for accessor symbol lookup (already inside
+    /// `generate_and_compile`'s lock; see @GCMLZ).
+    pub fn notify_concrete_entry_point_inner<'tcx>(
+        &self,
+        state: &mut ToylangState,
+        name: &str,
+        tcx: TyCtxt<'tcx>,
+        _def_id: LocalDefId,
+        instance: ty::Instance<'tcx>,
+    ) -> String {
+        state.log.push(CallbackLog::NotifyConcreteEntryPoint { name: name.to_string() });
+
         // Accessor methods come in as "StructName.field_name"
         if let Some((struct_name, field_name)) = name.split_once('.') {
             let mut sym = format!("__toylang_accessor_{}_{}", struct_name, field_name);
@@ -84,45 +139,32 @@ impl ToylangCallbacks {
                     sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
                 }
             }
-            return MonomorphizeFnResult {
-                extern_symbol: sym,
-                rust_deps: vec![],
-            };
+            return sym;
         }
 
         let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main" } else { name };
         let toy_fn = self.registry.functions.get(registry_name)
-            .unwrap_or_else(|| panic!("[toylang] monomorphize_fn: function '{}' not in registry", registry_name));
+            .unwrap_or_else(|| panic!("[toylang] notify_concrete_entry_point: function '{}' not in registry", registry_name));
 
         let extern_symbol = compute_fn_symbol(registry_name, tcx, instance);
 
-        let rust_deps = if toy_fn.body.is_some() {
-            if state.visited_symbols.contains(&extern_symbol) {
-                // Already walked this function (e.g., symbol_name re-calling after
-                // per_instance_mir). Rust deps were reported on the first call.
-                vec![]
-            } else {
-                // First time seeing this entry point. Resolve and deep walk.
-                let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
-
-                state.visited_symbols.insert(extern_symbol.clone());
-                state.toylang_instances.push(ToylangInstance {
-                    extern_symbol: extern_symbol.clone(),
-                    resolved_func: resolved_caller.clone(),
-                });
-
-                collect_toylang_fn_deps_inner(
-                    tcx, &self.registry, &resolved_caller, registry_name, state,
-                )
-            }
-        } else {
-            vec![]
-        };
-
-        MonomorphizeFnResult {
-            extern_symbol,
-            rust_deps,
+        // Extern declarations — symbol only, no body to walk, no stashing.
+        if toy_fn.body.is_none() {
+            return extern_symbol;
         }
+
+        if state.walked_entry_points.insert(extern_symbol.clone()) {
+            let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
+            state.toylang_instances.push(ToylangInstance {
+                extern_symbol: extern_symbol.clone(),
+                resolved_func: resolved_caller.clone(),
+            });
+            walk_and_stash_internal_callees(
+                tcx, &self.registry, &resolved_caller, registry_name, state,
+            );
+        }
+
+        extern_symbol
     }
 }
 
@@ -316,15 +358,27 @@ impl LangCallbacks for ToylangCallbacks {
         }
     }
 
-    fn monomorphize_fn<'tcx>(
+    fn collect_generic_rust_deps<'tcx>(
         &self,
         s: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
         instance: ty::Instance<'tcx>,
-    ) -> MonomorphizeFnResult<'tcx> {
-        self.monomorphize_fn_inner(state(s), name, tcx, def_id, instance)
+    ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
+        self.collect_generic_rust_deps_inner(state(s), name, tcx, def_id, instance)
+    }
+
+    fn notify_concrete_entry_point<'tcx>(
+        &self,
+        s: &mut dyn Any,
+        name: &str,
+        tcx: TyCtxt<'tcx>,
+        instance: ty::Instance<'tcx>,
+    ) -> String {
+        let def_id = instance.def_id().as_local()
+            .expect("notify_concrete_entry_point: consumer instance must have local def_id");
+        self.notify_concrete_entry_point_inner(state(s), name, tcx, def_id, instance)
     }
 
     fn generate_and_compile<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)> {
@@ -447,25 +501,15 @@ fn compute_fn_symbol_from_type_args(
     sym
 }
 
-/// Deep recursive walk: type-resolve a function body, collect transitive Rust deps,
-/// and stash discovered toylang instances in state. Only returns Rust deps to rustc.
-///
-/// Per @SMINCZ, this function is the codegen-driving site for every Rust
-/// callee toylang references. Each `(def_id, args)` pushed into `deps`
-/// becomes a `ReifyFnPointer` cast inside `per_instance_mir`'s synthesized
-/// MIR body, which forces rustc's mono collector to emit the symbol.
-/// llvm_gen.rs's `tcx.symbol_name` calls are read-only — they only work
-/// if the matching dep was registered here first.
-fn collect_toylang_fn_deps_inner<'tcx>(
+/// Type-resolve a consumer function body given its already-substituted
+/// `ToyFunction`. Shared primitive for both walkers below; kept read-only
+/// with respect to `ToylangState`.
+fn type_resolve_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
     resolved_fn: &crate::toylang::registry::ToyFunction,
     fn_name: &str,
-    state: &mut ToylangState,
-) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
-    let _body = resolved_fn.body.as_ref().expect("collect_toylang_fn_deps_inner called on extern fn");
-
-    // Type-resolve the already-substituted body
+) -> crate::toylang::typed_ast::TypedBlock {
     let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
         if type_name.is_empty() {
             crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
@@ -492,19 +536,55 @@ fn collect_toylang_fn_deps_inner<'tcx>(
     let is_rust_trait = |name: &str| {
         crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(registry, resolved_fn, &rust_method_ret, &rust_param_types, &is_rust_trait)
-        .unwrap_or_else(|e| panic!("[toylang] type error in '{}': {:?}", fn_name, e));
+    crate::toylang::type_resolve::resolve_fn_body(registry, resolved_fn, &rust_method_ret, &rust_param_types, &is_rust_trait)
+        .unwrap_or_else(|e| panic!("[toylang] type error in '{}': {:?}", fn_name, e))
+}
 
-    // Walk typed body for fn_calls and rust_method_deps
+/// Substitute a toylang callee's body given call-site type args.
+fn resolve_toylang_callee(
+    callee_fn: &crate::toylang::registry::ToyFunction,
+    type_args: &[crate::toylang::typed_ast::ResolvedType],
+) -> crate::toylang::registry::ToyFunction {
+    if callee_fn.type_params.is_empty() {
+        callee_fn.clone()
+    } else {
+        let subst: std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType> =
+            callee_fn.type_params.iter().zip(type_args.iter())
+                .map(|(param, arg)| (param.clone(), arg.clone()))
+                .collect();
+        resolve_caller_from_type_args(callee_fn, &subst)
+    }
+}
+
+/// Walker A: collect the transitive Rust deps of a consumer function body.
+/// Recurses into consumer→consumer callees with a local cycle guard; does NOT
+/// mutate `ToylangState`.
+///
+/// Per @SMINCZ, each returned `(def_id, args)` pair is what ends up as a
+/// `ReifyFnPointer` cast inside `per_instance_mir`'s synthesized body. That's
+/// the mechanism that forces rustc's mono collector to emit the Rust symbol.
+/// `llvm_gen.rs`'s `tcx.symbol_name` reads are only valid if the matching dep
+/// was registered here first.
+fn collect_rust_deps_recursive<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    registry: &ToylangRegistry,
+    resolved_fn: &crate::toylang::registry::ToyFunction,
+    fn_name: &str,
+    cycle_guard: &mut HashSet<String>,
+) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
+    let _body = resolved_fn.body.as_ref()
+        .expect("collect_rust_deps_recursive called on extern fn");
+
+    let typed_body = type_resolve_body(tcx, registry, resolved_fn, fn_name);
+
     let mut deps = Vec::new();
     let mut fn_calls = Vec::new();
     let mut rust_method_deps = Vec::new();
     walk_typed_body_for_deps(&typed_body, &mut fn_calls, &mut rust_method_deps);
 
-    // Process function call deps
     for (callee_name, type_args) in &fn_calls {
         let Some(callee_fn) = registry.functions.get(callee_name.as_str()) else {
-            // Not a toylang fn — check if it's a use-imported free function
+            // Not a toylang fn — use-imported free function.
             if let Some(def_id) = crate::oracle::find_use_imported_fn_def_id(tcx, callee_name) {
                 let ty_arg_refs: Vec<ty::GenericArg<'_>> = type_args.iter()
                     .map(|ta| ty::GenericArg::from(crate::oracle::resolved_to_rustc_ty(tcx, ta)))
@@ -517,31 +597,19 @@ fn collect_toylang_fn_deps_inner<'tcx>(
         };
 
         if callee_fn.body.is_some() {
-            // Toylang callee — recurse instead of reporting to rustc
+            // Toylang callee — recurse to find its transitive Rust deps. Use
+            // the local cycle guard to avoid infinite loops on cyclic code;
+            // do NOT share with `walked_entry_points` (that's for the stashing
+            // walker) — two entry points reaching the same internal helper
+            // must each collect its deps, since rustc's collector dedups Rust
+            // items independently.
             let callee_symbol = compute_fn_symbol_from_type_args(callee_name, type_args);
-            if state.visited_symbols.insert(callee_symbol.clone()) {
-                // Substitute type params in callee's body
-                let resolved_callee = if !callee_fn.type_params.is_empty() {
-                    let subst: std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType> =
-                        callee_fn.type_params.iter().zip(type_args.iter())
-                            .map(|(param, arg)| (param.clone(), arg.clone()))
-                            .collect();
-                    resolve_caller_from_type_args(callee_fn, &subst)
-                } else {
-                    callee_fn.clone()
-                };
-
-                // Recurse to find transitive Rust deps
-                let transitive_deps = collect_toylang_fn_deps_inner(
-                    tcx, registry, &resolved_callee, callee_name, state,
+            if cycle_guard.insert(callee_symbol) {
+                let resolved_callee = resolve_toylang_callee(callee_fn, type_args);
+                let transitive_deps = collect_rust_deps_recursive(
+                    tcx, registry, &resolved_callee, callee_name, cycle_guard,
                 );
                 deps.extend(transitive_deps);
-
-                // Stash for generate_with_tcx
-                state.toylang_instances.push(ToylangInstance {
-                    extern_symbol: callee_symbol,
-                    resolved_func: resolved_callee,
-                });
             }
         } else {
             // Extern function — report to rustc
@@ -551,7 +619,6 @@ fn collect_toylang_fn_deps_inner<'tcx>(
         }
     }
 
-    // Resolve Rust method deps (inherent and trait)
     for dep in &rust_method_deps {
         if let Some(receiver_ty) = &dep.receiver_ty {
             // Trait static call: look up trait, find impl for receiver type
@@ -605,6 +672,48 @@ fn collect_toylang_fn_deps_inner<'tcx>(
     }
 
     deps
+}
+
+/// Walker B: stash consumer→consumer internal callees into
+/// `state.toylang_instances` so `generate_and_compile` can emit them. Recurses
+/// transitively using `state.walked_entry_points` as persistent dedup so
+/// shared callees are stashed exactly once per compilation. Ignores Rust
+/// dependencies — those flow through `collect_rust_deps_recursive` instead.
+fn walk_and_stash_internal_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    registry: &ToylangRegistry,
+    resolved_fn: &crate::toylang::registry::ToyFunction,
+    fn_name: &str,
+    state: &mut ToylangState,
+) {
+    let _body = resolved_fn.body.as_ref()
+        .expect("walk_and_stash_internal_callees called on extern fn");
+
+    let typed_body = type_resolve_body(tcx, registry, resolved_fn, fn_name);
+
+    let mut fn_calls = Vec::new();
+    let mut rust_method_deps = Vec::new();
+    walk_typed_body_for_deps(&typed_body, &mut fn_calls, &mut rust_method_deps);
+
+    for (callee_name, type_args) in &fn_calls {
+        let Some(callee_fn) = registry.functions.get(callee_name.as_str()) else {
+            continue; // Rust free fn — not our concern.
+        };
+        if callee_fn.body.is_none() {
+            continue; // Extern fn — not our concern.
+        }
+        let callee_symbol = compute_fn_symbol_from_type_args(callee_name, type_args);
+        if state.walked_entry_points.insert(callee_symbol.clone()) {
+            let resolved_callee = resolve_toylang_callee(callee_fn, type_args);
+            state.toylang_instances.push(ToylangInstance {
+                extern_symbol: callee_symbol,
+                resolved_func: resolved_callee.clone(),
+            });
+            walk_and_stash_internal_callees(
+                tcx, registry, &resolved_callee, callee_name, state,
+            );
+        }
+    }
 }
 
 /// A Rust method dependency: (type_name, method_name, type_args of the receiver's RustType)

@@ -67,16 +67,18 @@ pub fn lang_per_instance_mir<'tcx>(
         name.clone()
     };
 
-    // Call the consumer's monomorphize_fn callback.
+    // Ask the consumer for the Rust deps of this function Instance. The
+    // deep-walk over internal consumer callees + stashing happens instead in
+    // `notify_concrete_entry_point`, triggered by the `symbol_name` query.
     let local_def_id = def_id.as_local()?;
-    let result = crate::call_monomorphize_fn(&callback_name, tcx, local_def_id, instance);
+    let rust_deps = crate::call_collect_generic_rust_deps(&callback_name, tcx, local_def_id, instance);
 
-    eprintln!("[toylang] per_instance_mir for: {} → symbol='{}', {} rust deps",
-        callback_name, result.extern_symbol, result.rust_deps.len());
+    eprintln!("[toylang] per_instance_mir for: {} → {} rust deps",
+        callback_name, rust_deps.len());
 
     // Build a MIR body that references dependencies (for the collector)
     // and ends with a panic (never executed — consumer .o provides real code).
-    let body = build_dependency_body(tcx, instance, &result.rust_deps);
+    let body = build_dependency_body(tcx, instance, &rust_deps);
     Some(tcx.arena.alloc(body))
 }
 

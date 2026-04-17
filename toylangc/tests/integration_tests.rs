@@ -29,6 +29,16 @@ fn toylangc_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_toylangc"))
 }
 
+/// Returns true if the callback log shows rustc asked the consumer about
+/// `name` via either of the two per-entry-point callbacks. The split between
+/// `CollectGenericRustDeps` and `NotifyConcreteEntryPoint` is a
+/// facade-internal detail; tests care about "did rustc callback for X" and
+/// either variant counts.
+fn log_mentions_callback_for(log: &str, name: &str) -> bool {
+    log.contains(&format!("CollectGenericRustDeps {{ name: \"{}\" }}", name))
+        || log.contains(&format!("NotifyConcreteEntryPoint {{ name: \"{}\" }}", name))
+}
+
 /// Compile and run a toylang + rust test. Returns stdout.
 /// Panics if compilation or execution fails.
 fn run_toylang_test(toylang_src: &str, rust_src: &str) -> String {
@@ -2719,9 +2729,9 @@ fn main() {
 
     // Read the callback log and verify rustc never asked us to monomorphize bork.
     let log = std::fs::read_to_string(&log_path).expect("callback log not written");
-    assert!(log.contains("MonomorphizeFn { name: \"spork\" }"),
+    assert!(log_mentions_callback_for(&log, "spork"),
         "expected spork to be monomorphized, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"bork\" }"),
+    assert!(!log_mentions_callback_for(&log, "bork"),
         "bork should NOT be monomorphized by rustc — it's internal to toylang, log:\n{}", log);
 }
 
@@ -2767,11 +2777,11 @@ fn main() {
     assert!(output.contains("ok"));
 
     let log = std::fs::read_to_string(&log_path).expect("callback log not written");
-    assert!(log.contains("MonomorphizeFn { name: \"a\" }"),
+    assert!(log_mentions_callback_for(&log, "a"),
         "expected a to be monomorphized, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"b\" }"),
+    assert!(!log_mentions_callback_for(&log, "b"),
         "b should NOT be monomorphized by rustc, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"c\" }"),
+    assert!(!log_mentions_callback_for(&log, "c"),
         "c should NOT be monomorphized by rustc, log:\n{}", log);
 }
 
@@ -2821,13 +2831,13 @@ fn main() {
     assert!(output.contains("ok"));
 
     let log = std::fs::read_to_string(&log_path).expect("callback log not written");
-    assert!(log.contains("MonomorphizeFn { name: \"entry\" }"),
+    assert!(log_mentions_callback_for(&log, "entry"),
         "expected entry to be monomorphized, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"left\" }"),
+    assert!(!log_mentions_callback_for(&log, "left"),
         "left should NOT be monomorphized by rustc, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"right\" }"),
+    assert!(!log_mentions_callback_for(&log, "right"),
         "right should NOT be monomorphized by rustc, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"bottom\" }"),
+    assert!(!log_mentions_callback_for(&log, "bottom"),
         "bottom should NOT be monomorphized by rustc, log:\n{}", log);
 }
 
@@ -2870,9 +2880,9 @@ fn main() {
     assert!(output.contains("ok"));
 
     let log = std::fs::read_to_string(&log_path).expect("callback log not written");
-    assert!(log.contains("MonomorphizeFn { name: \"entry\" }"),
+    assert!(log_mentions_callback_for(&log, "entry"),
         "expected entry to be monomorphized, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"helper\" }"),
+    assert!(!log_mentions_callback_for(&log, "helper"),
         "helper should NOT be monomorphized by rustc, log:\n{}", log);
 }
 
@@ -2919,11 +2929,11 @@ fn main() {
     assert!(output.contains("ok"));
 
     let log = std::fs::read_to_string(&log_path).expect("callback log not written");
-    assert!(log.contains("MonomorphizeFn { name: \"entry_a\" }"),
+    assert!(log_mentions_callback_for(&log, "entry_a"),
         "expected entry_a to be monomorphized, log:\n{}", log);
-    assert!(log.contains("MonomorphizeFn { name: \"entry_b\" }"),
+    assert!(log_mentions_callback_for(&log, "entry_b"),
         "expected entry_b to be monomorphized, log:\n{}", log);
-    assert!(!log.contains("MonomorphizeFn { name: \"internal_helper\" }"),
+    assert!(!log_mentions_callback_for(&log, "internal_helper"),
         "internal_helper should NOT be monomorphized by rustc, log:\n{}", log);
 }
 

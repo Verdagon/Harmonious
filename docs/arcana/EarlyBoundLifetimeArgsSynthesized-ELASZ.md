@@ -34,12 +34,13 @@ truncate behaviour.
 - `toylangc/src/oracle.rs:~571` — `rust_trait_method_param_types`
   (args are `[Self, ...user_types]` per @TVIMDGAZ).
 - `toylangc/src/oracle.rs:~665` — `rust_trait_method_return_type`.
-- `toylangc/src/toylang/callbacks_impl.rs:~510` — free-fn dep
-  registration during `collect_toylang_fn_deps_inner`.
-- `toylangc/src/toylang/callbacks_impl.rs:~571` — trait-method dep
-  registration (args are `[Self, ...]` per @TVIMDGAZ).
-- `toylangc/src/toylang/callbacks_impl.rs:~601` — inherent-method
-  dep registration.
+- `toylangc/src/toylang/callbacks_impl.rs` — free-fn dep
+  registration during `collect_rust_deps_recursive`.
+- `toylangc/src/toylang/callbacks_impl.rs` — trait-method dep
+  registration in `collect_rust_deps_recursive` (args are
+  `[Self, ...]` per @TVIMDGAZ).
+- `toylangc/src/toylang/callbacks_impl.rs` — inherent-method
+  dep registration in `collect_rust_deps_recursive`.
 - `toylangc/src/llvm_gen.rs:~328` — trait static call codegen path.
 - `toylangc/src/llvm_gen.rs:~340` — trait-fallback inherent static
   call codegen path.

@@ -103,19 +103,24 @@ solution**. Pair with the plugin (see 3.3) to eliminate patch 3.
 
 **Key positive surprise:** the POC author's initial prediction that
 the callback-boundary issue would block the whole approach turned
-out to reshape into a clean design instead. The current Instance-keyed
-`monomorphize_fn` callback does two jobs (external-dep registration
+out to reshape into a clean design instead. The old Instance-keyed
+`monomorphize_fn` callback did two jobs (external-dep registration
 + internal-callee stashing), only one of which a DefId-keyed override
-can drive. The natural redesign splits the trait across two queries
-that *already* fire at the right keying:
+can drive. The redesign split the trait across two queries that
+*already* fire at the right keying:
 
-- `collect_generic_rust_deps(def_id)` — called from `optimized_mir`,
-  DefId-keyed, returns Param-typed Rust deps.
+- `collect_generic_rust_deps` — called from `per_instance_mir`,
+  returns the Rust deps the consumer body references. Today takes an
+  Instance argument (so the existing Instance-keyed walker works
+  unchanged); if/when migrating to `optimized_mir`, the argument
+  drops to just `def_id`.
 - `notify_concrete_entry_point(instance)` — called from `symbol_name`,
   Instance-keyed, drives the recursive internal-callee walk.
 
-No new rustc-exposed hook needed. Trait-level reshape, ~2-3 weeks
-of consumer-side work.
+No new rustc-exposed hook needed. This trait-level reshape **has
+landed** as a standalone refactor (2026-04, all 211 tests pass);
+the zero-fork migration (§3.x) can now assume the facade already
+has the right callback shape.
 
 **Cost estimate impact:** bumped the zero-fork estimate from 2-4
 weeks to 4-8 weeks, because the callback-redesign line item wasn't

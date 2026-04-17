@@ -76,8 +76,9 @@ impl CodegenBackend for LangCodegenBackend {
         need_metadata_module: bool,
     ) -> Box<dyn Any> {
         // Phase 1: inner.codegen_crate runs monomorphization (collect_and_partition_mono_items)
-        // then compiles Rust code to LLVM. Our monomorphize_fn/monomorphize_type callbacks
-        // fire during this phase. Query providers (symbol_name, layout_of, etc.) also fire
+        // then compiles Rust code to LLVM. Our collect_generic_rust_deps /
+        // notify_concrete_entry_point / monomorphize_type callbacks fire during
+        // this phase. Query providers (symbol_name, layout_of, etc.) also fire
         // here — their results get cached in rustc's query system.
         let result = self.inner.codegen_crate(tcx, metadata, need_metadata_module);
 

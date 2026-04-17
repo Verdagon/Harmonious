@@ -23,11 +23,15 @@ that drives codegen of a generic Instance that toylang references.
   `tcx.symbol_name(instance)` call in `toylangc/src/llvm_gen.rs` and
   `toylangc/src/oracle.rs`. Also every `ty::Instance::expect_resolve(...)`
   call in those files. None of these drive codegen on their own.
-- **Fix site (where codegen actually gets driven):** the `rust_deps`
-  vector populated in
-  `toylangc/src/toylang/callbacks_impl.rs::collect_toylang_fn_deps_inner`,
-  which feeds into `per_instance_mir`'s synthesized MIR body via
+- **Fix site (where codegen actually gets driven):** the Rust-deps vector
+  returned by
+  `toylangc/src/toylang/callbacks_impl.rs::collect_rust_deps_recursive`
+  (driven by the `collect_generic_rust_deps` callback), which feeds into
+  `per_instance_mir`'s synthesized MIR body via
   `rustc-lang-facade/src/queries/per_instance.rs::build_dependency_body`.
+  (Pre-2026-04 this was `collect_toylang_fn_deps_inner`; the callback
+  job-split renamed + specialized the walker but the codegen-driving
+  property is identical.)
 - **Anti-pattern that masks the bug:** non-generic items get codegen'd
   unconditionally if they exist in the crate (no mono gate). Per-type
   monomorphic shims like `__toylang_option_unwrap_i32` "work" without
