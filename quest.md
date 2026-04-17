@@ -430,11 +430,12 @@ fn test_unwrap_result() {
 
 ---
 
-## Phase 7: Standalone Test Projects — IN PROGRESS (8/9 done)
+## Phase 7: Standalone Test Projects — DONE (9/9)
 
-**Status**: uuid, indexmap, regex, toml, serde_json, glob, rand, and
-reqwest smoke tests landed and green. 1 crate remaining (clap, blocked
-on orthogonal `impl Into<Str>` synthetic generic).
+**Status**: all nine smoke tests landed and green (uuid, indexmap,
+regex, toml, serde_json, glob, rand, reqwest, clap). The previously-
+documented "clap blocked on `impl Into<Str>` synthetic generic" was
+never a real blocker — see 2026-04-17 entry below.
 
 **Goal**: Create test projects under
 `toylangc/tests/standalone/<crate>_test/` proving toylang links
@@ -851,33 +852,80 @@ infrastructure that handled `ThreadRng` and `Stdout` extends to
 crate types with richer internal state.
 
 Test totals: 67 unit + 129 integration + 13 standalone = 209, 0
-failed, 0 ignored. Phase 7 at 8/9; only `clap_test` remains (blocked
-on orthogonal `impl Into<Str>` synthetic generic). With four
-consecutive first-try Phase 7 tests, the "mechanical completion"
-classification is conclusively earned for the remaining non-clap
-work, and the Phase 7 infrastructure is proven robust against
-arbitrary crates.io dep trees toylang is likely to encounter.
+failed, 0 ignored. Phase 7 at 8/9; only `clap_test` remains (at the
+time of this entry believed blocked on `impl Into<Str>` — turned
+out to not be blocked; see the next "what landed" entry).
+
+### What landed (2026-04-17, same day) — `clap_test`, Phase 7 complete
+
+**`clap_test`** — ninth and final Phase 7 smoke test, completing
+the phase. The "blocker" framing in prior docs was wrong; the test
+passed first-try with zero compiler changes. Program:
+
+```
+use clap::Command
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let cmd = Command::new<&str>("app");
+    Write::write_all(&stdout(), b"clap ok\n");
+}
+```
+
+**What was assumed to block this:** `Command::new`'s Rust signature
+is `fn new(name: impl Into<Str>) -> Self`. `impl Trait` in argument
+position desugars to a synthetic type parameter. Prior docs stated
+in ~8 places across `quest.md` and the architecture guide that clap
+required a compiler mini-phase to add "synthetic generic inference"
+infrastructure. Estimated 1–3 days of focused compiler work.
+
+**What actually works:** fill the synthetic slot like any other
+generic slot. `Command::new<&str>("app")` — the user names the
+synthetic slot (which lives in `generics_of` alongside named params)
+with the argument's concrete type (`&str`). Rustc handles the
+`Into::into` conversion during monomorphization. Five consecutive
+first-try Phase 7 tests: toml → glob → rand → reqwest → clap.
+
+**Why the prior docs were wrong:** reasoning-to-conclusion without
+empirical verification. The minimal probe (write the test, run it)
+took 4 seconds and disproved the premise.
+
+**What was actually extended, not built:** nothing in
+`toylangc/src/` changed. `build_generic_args_for_item` (the @ELASZ
+helper) already handled synthetic slots correctly because it treats
+all `Type` slots uniformly — consumes user-supplied types in
+declaration order, doesn't care whether rustc marks the slot
+`synthetic: true`. This is load-bearing — @ELASZ was extended with
+a "Synthetic `impl Trait` slots" section documenting why the
+uniformity must not be special-cased. `docs/usage/writing-main.md`
+gained a "Rule 3: Fill `impl Trait` parameter slots explicitly"
+section with the clap worked example.
+
+**Meta-lesson carried forward:** when a future doc describes
+something as "blocked on compiler support," prefer writing the
+minimal failing test to writing the infrastructure plan. The test
+is faster, more accurate, and more durable than the analysis.
+
+Test totals: 67 unit + 129 integration + 14 standalone = 210, 0
+failed, 0 ignored. Phase 7 complete. Natural next step: Phase 8
+(harness dedup — collapse the 9 near-identical `test_standalone_*`
+functions behind a `run_standalone_test(name, expected)` helper),
+now that the full corpus exists to design the signature
+confidently.
 
 ### What's remaining
 
-1 crate remaining — `clap_test`, blocked on the orthogonal `impl
-Into<Str>` synthetic-generic gap (not a test-authoring task; requires
-compiler work).
+Phase 7 is complete. All nine smoke tests landed and green.
 
-| Crate | Complexity | Notes |
-|---|---|---|
-| `clap_test` | Builder w/ `impl Into<Str>` | Still blocked on synthetic generics (orthogonal to IVTDBTZ) |
-
-Each standalone project is three files (`toylang.toml`,
-`main.toylang`, plus one test function appended to
-`toylangc/tests/standalone_tests.rs`). The pattern is proven: match
-one of the eight landed smoke tests' structure (uuid, indexmap,
-regex, toml, serde_json, glob, rand, reqwest), let the structured
-errors guide missing imports and syntax fixes.
-
-Full Phase 7 completion target: 67 unit + 134 integration + 14
-standalone = 215 tests, 0 failed, 0 ignored. (Currently 209: 67 unit
-+ 129 integration + 13 standalone.)
+Final totals: 67 unit + 129 integration + 14 standalone = 210
+tests, 0 failed, 0 ignored. (Original Phase 7 target estimate
+from the original plan was 67 + 134 + 14 = 215; the 5 additional
+integration tests anticipated for compiler fixes didn't need to
+be written, because the last five Phase 7 tests — toml, glob,
+rand, reqwest, clap — all landed first-try with no compiler
+changes.)
 
 ### Original plan (historical)
 
@@ -990,8 +1038,8 @@ chain `| grep` onto the same line.
 # Full test suite:
 cargo +rustc-fork test -p toylangc 2>&1 | tee /tmp/erw-quest.txt
 grep "test result:" /tmp/erw-quest.txt
-# Current expected: 67 unit + 129 integration + 13 standalone = 209 tests, 0 failed, 0 ignored
-# Phase 7 target: 67 + 134 + 14 = 215 (1 more standalone test to land — clap, blocked on `impl Into<Str>`)
+# Current expected: 67 unit + 129 integration + 14 standalone = 210 tests, 0 failed, 0 ignored
+# Phase 7 complete at 9/9.
 
 # Just the standalone suite:
 cargo +rustc-fork test -p toylangc --test standalone_tests 2>&1 | tee /tmp/erw-quest.txt

@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 129 integration tests + 13 standalone tests + 67 unit tests passing, 0 ignored.
+> **Current status:** 129 integration tests + 14 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -52,7 +52,7 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (in progress, 8/9 done): standalone test projects under
+> - Phase 7 (complete, 9/9): standalone test projects under
 >   `toylangc/tests/standalone/<crate>_test/` proving toylang links
 >   against and calls into arbitrary crates.io Rust deps. `uuid_test`
 >   landed as the smoke test (commit `df696c1` + follow-ups);
@@ -136,10 +136,8 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–6. Phase 7 in progress (8/9).** Remaining: 1
-> standalone test project (clap, blocked on orthogonal `impl
-> Into<Str>` synthetic generic); Phase 8 (test harness polish —
-> reduce per-crate boilerplate in `standalone_tests.rs`).
+> **Phases done: 1–7.** Phase 8 (test harness polish — reduce
+> per-crate boilerplate in `standalone_tests.rs`) remains.
 
 ## Overview
 
@@ -1386,14 +1384,14 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 In progress: Phase 7 — Standalone test projects (8/9 done)
+### 10.7 Done: Phase 7 — Standalone test projects (9/9)
 
 Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
 each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
 Each project proves toylang can link against and call into a specific
 Rust crate from crates.io via `toylangc build`.
 
-**Done (8 crates):**
+**Done (9 crates):**
 
 - `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
   Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
@@ -1495,11 +1493,26 @@ Rust crate from crates.io via `toylangc build`.
   integration corpus. Confirms the mechanical-completion
   classification for all remaining non-clap Phase 7 work.
 
-**Remaining (1 crate, see `handoff.md`):**
-
-| Crate | Imperative API used for smoke test | Notes |
-|-------|-----------------------------------|-------|
-| clap | Builder | `Command::new("app")` — still blocked on `impl Into<Str>` synthetic generic |
+- `clap_test` — ninth and final smoke test, completing Phase 7.
+  Program: `let cmd = Command::new<&str>("app");` then
+  `Write::write_all(&stdout(), b"clap ok\n");`. Landed 2026-04-17;
+  passed first-try with no compiler-source changes. The prior
+  "blocked on `impl Into<Str>` synthetic generic" framing was
+  reasoning-to-conclusion without empirical verification — the
+  minimal probe took 4 seconds and disproved the premise. Rust's
+  `impl Trait` in argument position desugars to a synthetic type
+  parameter that rustc exposes in `generics_of` alongside named
+  params; toylang's `build_generic_args_for_item` (the @ELASZ
+  helper) already consumed synthetic slots uniformly as `Type`
+  slots in declaration order. User names the slot with the
+  argument's concrete type (`&str` for a string literal per
+  @UTAIRZ); rustc handles the `Into::into` conversion during
+  monomorphization. Five consecutive first-try Phase 7 tests
+  (toml → glob → rand → reqwest → clap). @ELASZ arcana extended
+  with a "Synthetic `impl Trait` slots" section documenting why
+  uniform slot treatment must not be special-cased; Rule 3 in
+  `docs/usage/writing-main.md` added with the clap worked
+  example. No remaining Phase 7 crates.
 
 Derive macros are syntactic sugar for trait impls. The underlying APIs
 are always available imperatively. Each remaining crate is a 10-20 line
