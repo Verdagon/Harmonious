@@ -458,3 +458,47 @@ fn test_standalone_glob() {
         stdout,
     );
 }
+
+// Phase 7 crate #7: rand — zero-arg free fn returning an opaque
+// ThreadRng. First Phase 7 test to return a non-Copy non-Result
+// Rust type from a free fn and let Drop glue run naturally at
+// end-of-main.
+#[test]
+fn test_standalone_rand() {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/standalone/rand_test");
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let build_out = run_build(&project);
+    assert!(
+        build_out.status.success(),
+        "toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = build_dir.join("target/debug/rand_test");
+    assert!(bin.exists(), "expected binary at {}", bin.display());
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .expect("failed to run rand_test binary");
+    assert!(
+        run.status.success(),
+        "rand_test exited non-zero:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("rand ok"),
+        "expected 'rand ok' in stdout, got: {}",
+        stdout,
+    );
+}

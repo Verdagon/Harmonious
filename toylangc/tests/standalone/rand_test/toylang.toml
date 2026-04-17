@@ -1,0 +1,6 @@
+[project]
+name = "rand_test"
+source = "main.toylang"
+
+[rust-dependencies]
+rand = "0.8"

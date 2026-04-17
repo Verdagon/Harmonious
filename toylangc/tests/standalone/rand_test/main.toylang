@@ -1,0 +1,10 @@
+use rand::thread_rng
+use rand::rngs::ThreadRng
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let rng = thread_rng();
+    Write::write_all(&stdout(), b"rand ok\n");
+}

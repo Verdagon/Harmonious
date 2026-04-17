@@ -1,6 +1,6 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 129 integration tests + 11 standalone tests + 67 unit tests passing, 0 ignored.
+> **Current status:** 129 integration tests + 12 standalone tests + 67 unit tests passing, 0 ignored.
 > Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
@@ -52,7 +52,7 @@
 >   "partitioner-time hooks may lock MUTABLE_STATE" exception in @GCMLZ
 >   is dissolved — the type system enforces the rule now. See Part 2.6
 >   for the family taxonomy.
-> - Phase 7 (in progress, 6/9 done): standalone test projects under
+> - Phase 7 (in progress, 7/9 done): standalone test projects under
 >   `toylangc/tests/standalone/<crate>_test/` proving toylang links
 >   against and calls into arbitrary crates.io Rust deps. `uuid_test`
 >   landed as the smoke test (commit `df696c1` + follow-ups);
@@ -136,7 +136,7 @@
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
 >
-> **Phases done: 1–6. Phase 7 in progress (6/9).** Remaining: 3
+> **Phases done: 1–6. Phase 7 in progress (7/9).** Remaining: 2
 > standalone test projects (see `handoff.md`); Phase 8 (test harness
 > polish — reduce per-crate boilerplate in `standalone_tests.rs`).
 
@@ -1385,14 +1385,14 @@ known-tech-debt #6.
 - Forked rustc: `rustc_monomorphize/src/partitioning.rs::mono_item_linkage_and_visibility`
   — the visibility override for `__lang_stubs` items.
 
-### 10.7 In progress: Phase 7 — Standalone test projects (6/9 done)
+### 10.7 In progress: Phase 7 — Standalone test projects (7/9 done)
 
 Standalone test projects under `toylangc/tests/standalone/<crate>_test/`,
 each with a `toylang.toml` and `main.toylang`. No Rust files, no glue.
 Each project proves toylang can link against and call into a specific
 Rust crate from crates.io via `toylangc build`.
 
-**Done (6 crates):**
+**Done (7 crates):**
 
 - `uuid_test` — smoke test bridging Phase 5 (cargo resolves deps) to
   Phase 7 (toylang calls into deps). Program: `Uuid::new_v4();` then
@@ -1462,12 +1462,22 @@ Rust crate from crates.io via `toylangc build`.
   free fn `glob::glob`), @UTAIRZ (`&str` via string literal), and
   Phase 4 (I/O). Confirms the mechanical-completion prediction for
   the remaining Phase 7 crates.
+- `rand_test` — seventh smoke test. Program:
+  `let rng = thread_rng();` then
+  `Write::write_all(&stdout(), b"rand ok\n");`. Landed 2026-04-17;
+  passed first-try with no compiler-source changes. First Phase 7
+  test to bind a non-Copy, non-Result Rust type (`ThreadRng`) as an
+  unused let-binding and let rustc's Drop-glue codegen run naturally
+  at end-of-`main` — the Drop-dep risk flagged in the handoff's
+  Failure Class 5 did not fire. Pinned to `rand = "0.8"` (0.9
+  renamed `thread_rng` to `rng`). Exercises the zero-arg
+  use-imported free fn shape returning an opaque Rust struct held
+  by value.
 
-**Remaining (3 crates, see `handoff.md` / `handoff-glob-rand.md`):**
+**Remaining (2 crates, see `handoff.md`):**
 
 | Crate | Imperative API used for smoke test | Notes |
 |-------|-----------------------------------|-------|
-| rand | Free fn | `thread_rng()` |
 | clap | Builder | `Command::new("app")` — still blocked on `impl Into<Str>` synthetic generic |
 | reqwest | Free function | `reqwest::blocking::get` (no network call on smoke test) |
 

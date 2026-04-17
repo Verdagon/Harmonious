@@ -430,11 +430,12 @@ fn test_unwrap_result() {
 
 ---
 
-## Phase 7: Standalone Test Projects — IN PROGRESS (6/9 done)
+## Phase 7: Standalone Test Projects — IN PROGRESS (7/9 done)
 
-**Status**: uuid, indexmap, regex, toml, serde_json, and glob smoke
-tests landed and green. 3 crates remaining. Junior-engineer handoff at
-`/Users/verdagon/erw/handoff.md` covers the batch end-to-end.
+**Status**: uuid, indexmap, regex, toml, serde_json, glob, and rand
+smoke tests landed and green. 2 crates remaining. Junior-engineer
+handoff at `/Users/verdagon/erw/handoff.md` covers the batch
+end-to-end.
 
 **Goal**: Create test projects under
 `toylangc/tests/standalone/<crate>_test/` proving toylang links
@@ -765,26 +766,59 @@ Confirms the mechanical-completion prediction for the remaining
 Phase 7 crates — the handoff's 90% case (three files, first-try
 pass) held. Tests: 67 unit + 129 integration + 11 standalone = 207.
 
+### What landed (2026-04-17, later) — `rand_test`
+
+**`rand_test`** — seventh Phase 7 smoke test. Program:
+
+```
+use rand::thread_rng
+use rand::rngs::ThreadRng
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let rng = thread_rng();
+    Write::write_all(&stdout(), b"rand ok\n");
+}
+```
+
+Passed on first attempt — no changes required to `toylangc/src/`,
+`rustc-lang-facade/`, or the rustc fork. First Phase 7 test to bind
+a non-Copy, non-Result Rust type (`ThreadRng`) as an unused
+let-binding and let rustc's normal Drop-glue codegen run at
+end-of-`main`. Pinned to `rand = "0.8"` (0.9 renamed `thread_rng` to
+`rng`). Exercises the zero-arg use-imported free fn (`thread_rng()`)
+returning an opaque Rust struct held by value — the Drop-dep risk
+flagged in the handoff's Failure Class 5 did not fire, confirming
+rustc's collector handles `drop_in_place::<ThreadRng>` via the same
+code path that already worked for `Stdout` (used in `&stdout()`) in
+earlier Phase 7 tests.
+
+Two sequential first-try passes (glob then rand) in the same session
+strongly suggest `reqwest_test` is similarly mechanical. Test totals:
+67 unit + 129 integration + 12 standalone = 208, 0 failed, 0 ignored.
+Phase 7 at 7/9; 2 crates remaining (clap still blocked on `impl
+Into<Str>`, reqwest unblocked).
+
 ### What's remaining
 
-3 crates, handed off to a junior engineer via `handoff.md` /
-`handoff-glob-rand.md`:
+2 crates, handed off to a junior engineer via `handoff.md`:
 
 | Crate | Complexity | Notes |
 |---|---|---|
-| `rand_test` | Free fn + trait | Skip `Rng::gen` on first pass |
 | `clap_test` | Builder w/ `impl Into<Str>` | Still blocked on synthetic generics (orthogonal to IVTDBTZ) |
 | `reqwest_test` | Free fn, needs `blocking` feature | No network call on smoke test |
 
 Each project is three files (`toylang.toml`, `main.toylang`, plus one
 test function appended to `toylangc/tests/standalone_tests.rs`). The
-pattern is proven: match `uuid_test` / `indexmap_test` / `regex_test`
-/ `toml_test` / `serde_json_test` / `glob_test`'s structure, let the
-structured errors guide missing imports and syntax fixes.
+pattern is proven: match one of the seven landed smoke tests'
+structure (uuid, indexmap, regex, toml, serde_json, glob, rand), let
+the structured errors guide missing imports and syntax fixes.
 
 Full Phase 7 completion target: 67 unit + 134 integration + 14
-standalone = 215 tests, 0 failed, 0 ignored. (Currently 207: 67 unit
-+ 129 integration + 11 standalone.)
+standalone = 215 tests, 0 failed, 0 ignored. (Currently 208: 67 unit
++ 129 integration + 12 standalone.)
 
 ### Original plan (historical)
 
@@ -897,8 +931,8 @@ chain `| grep` onto the same line.
 # Full test suite:
 cargo +rustc-fork test -p toylangc 2>&1 | tee /tmp/erw-quest.txt
 grep "test result:" /tmp/erw-quest.txt
-# Current expected: 67 unit + 129 integration + 11 standalone = 207 tests, 0 failed, 0 ignored
-# Phase 7 target: 67 + 134 + 14 = 215 (3 more standalone tests to land)
+# Current expected: 67 unit + 129 integration + 12 standalone = 208 tests, 0 failed, 0 ignored
+# Phase 7 target: 67 + 134 + 14 = 215 (2 more standalone tests to land)
 
 # Just the standalone suite:
 cargo +rustc-fork test -p toylangc --test standalone_tests 2>&1 | tee /tmp/erw-quest.txt
