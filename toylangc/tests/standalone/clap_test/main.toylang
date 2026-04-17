@@ -1,0 +1,9 @@
+use clap::Command
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let cmd = Command::new<&str>("app");
+    Write::write_all(&stdout(), b"clap ok\n");
+}

@@ -1,0 +1,6 @@
+[project]
+name = "clap_test"
+source = "main.toylang"
+
+[rust-dependencies]
+clap = "4"

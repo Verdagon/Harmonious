@@ -88,6 +88,53 @@ it" pattern in Phase 7 — after @UTAIRZ (`&str` ABI surfaced by the
 first `&str`-accepting Rust fn) and @IVTDBTZ (trait-vs-inherent
 dispatch surfaced by the first inherent static call with args).
 
+## Synthetic `impl Trait` slots
+
+Rust's `impl Trait` in argument position desugars to a synthetic
+early-bound type parameter. rustc exposes these in `generics_of`
+alongside named params (they carry `param.kind = Type { synthetic:
+true, .. }`). The helper makes no distinction: all `Type` slots —
+synthetic or named — consume from the user's supplied type-args
+list in declaration order. Named slots come first, synthetic slots
+come second, matching rustc's turbofish convention.
+
+This uniform treatment is **load-bearing**. If the helper were
+"simplified" by special-casing synthetic slots (e.g., adding an
+"infer from argument type" branch), two things would break:
+
+1. Toylang's explicit-everywhere rule becomes inconsistent — named
+   slots require user args, synthetic slots silently infer. Users
+   would have to learn which shape they're calling.
+2. `build_generic_args_for_item`'s single-pass walk via
+   `ty::GenericArgs::for_item` would need access to function
+   argument types (which it currently has no need for) to do the
+   synthetic inference.
+
+The clap smoke test (`toylangc/tests/standalone/clap_test/`) is the
+canonical in-tree demonstration: `Command::new<&str>("app")` where
+`Command::new`'s signature is `fn new(name: impl Into<Str>) -> Self`.
+The synthetic slot takes `&str` (the **argument's concrete type**,
+not the bound's target `Str`), and rustc handles the `Into::into`
+conversion during monomorphization via the blanket `impl<T: Into<U>>`
+chain it resolves itself.
+
+This generalizes to every `impl Trait` arg across the Rust
+ecosystem — `String::from(x)`, `PathBuf::from(x)`, `Box::new(x)`,
+and any builder-pattern API that accepts `impl Into<T>` /
+`impl AsRef<T>` / `impl Fn(...)`. All of them fill one extra slot
+in toylang's call-site turbofish with the argument's concrete type.
+
+**Meta-lesson this surfaced:** `clap_test` was documented in
+`quest.md` and `docs/architecture/rust-interop-guide.md` for weeks
+as "blocked on `impl Into<Str>` synthetic generic — requires
+compiler work." The empirical probe (write the test and run it)
+took 4 seconds and passed first-try. The "blocker" was a prior
+author's reasoning-to-conclusion that encoded a presumed solution
+shape (inference-based infrastructure) as a problem description.
+When a future doc describes something as "blocked on compiler
+support," prefer writing the minimal failing test to writing the
+infrastructure plan.
+
 ## Cross-cutting effect
 
 Every call site that builds a `GenericArgs` for a Rust item now
@@ -120,3 +167,5 @@ that case arises.
 - @TVIMDGAZ — governs Self-arg placement for trait method calls;
   the `[Self, ...user_types]` ordering ELASZ consumes at the two
   trait-call sites.
+- `docs/usage/writing-main.md` Rule 3 — user-facing companion:
+  how to fill synthetic `impl Trait` slots at the call site.

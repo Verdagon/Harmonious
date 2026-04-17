@@ -103,6 +103,65 @@ The `context` field tells you which kind of usage triggered the
 lookup — trait-call Self, trait/method/free-fn type arg, nested
 generic arg, struct field — so you know which `use` to add.
 
+## Rule 3: Fill `impl Trait` parameter slots explicitly
+
+Rust's `impl Trait` in argument position desugars to a synthetic
+type parameter. Toylang does not treat synthetic params specially —
+they occupy a slot in the function's generic list just like named
+params, and toylang's explicit-everywhere rule applies: name the
+slot at the call site.
+
+**Wrong** — omitting the slot because `impl Trait` *looks* like it
+has no type param:
+
+```
+// Rust: fn new(name: impl Into<Str>) -> Command
+Command::new("app")
+```
+
+This errors at dispatch time — toylang walks `generics_of`, finds
+one `Type` slot (the synthetic desugar of `impl Into<Str>`), and
+has nothing from the user to fill it with.
+
+**Right** — name the slot with the argument's concrete type:
+
+```
+use clap::Command
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+
+fn main() {
+    let cmd = Command::new<&str>("app");
+    Write::write_all(&stdout(), b"clap ok\n");
+}
+```
+
+The synthetic slot takes the **argument's concrete type**, not the
+bound's target type. String literals produce `&str` (per `@UTAIRZ`),
+so `<&str>` is what goes in the slot. Rustc handles the `Into::into`
+conversion from `&str` to `clap::builder::Str` during monomorphization —
+toylang does not need to know the trait-bound target.
+
+### Slot ordering: named first, synthetic second
+
+When a function has both kinds of params, fill them in declaration
+order — exactly as rustc's turbofish would:
+
+```
+// Rust: fn foo<T: Bar>(x: T, y: impl Baz) -> ()
+foo<I32, ConcreteBaz>(some_t, some_baz)  // T=I32, synthetic=ConcreteBaz
+```
+
+This generalizes across the ecosystem: `String::from(x)`,
+`PathBuf::from(x)`, `Box::new(x)`, and any builder-pattern API that
+accepts `impl Into<T>` / `impl AsRef<T>` fills one extra slot with
+the argument's concrete type.
+
+See `docs/arcana/EarlyBoundLifetimeArgsSynthesized-ELASZ.md` for
+why the uniform `Type`-slot handling that makes this work is
+load-bearing — don't special-case synthetic slots.
+
 ## Pre-flight checklist for a new toylang program
 
 Before running `toylangc build`, walk the body and answer:
@@ -113,8 +172,11 @@ Before running `toylangc build`, walk the body and answer:
 3. For every expression that returns a Rust generic type
    (`Result<T, E>`, `Option<T>`, etc.): are `T` and `E` — and the
    generic type itself — all `use`-imported?
+4. For every Rust call whose signature has `impl Trait` in argument
+   position: is the synthetic slot filled at the call site with the
+   argument's concrete type?
 
-If the answer to any of (2)-(3) is "I don't know what `typeof(...)` is",
+If the answer to any of (2)-(4) is "I don't know what `typeof(...)` is",
 build-and-fail is faster than staring at the source. The error names
 the type and tells you where it came from — add the import and rerun.
 
@@ -124,8 +186,16 @@ the type and tells you where it came from — add the import and rerun.
   explanation for rule 1.
 - `docs/arcana/RustTypesMustBeExplicitlyImported-RTMEIZ.md` — full
   type-registry explanation for rule 2.
+- `docs/arcana/EarlyBoundLifetimeArgsSynthesized-ELASZ.md` — full
+  generic-slot-handling explanation for rule 3 (synthetic `impl
+  Trait` slots are handled identically to named slots; don't
+  special-case).
+- `docs/arcana/UnsizedTypesAppearInsideRef-UTAIRZ.md` — why string
+  literals produce `&str` (used in the rule-3 worked example).
 - `toylangc/tests/integration_tests.rs::test_stdout_write_all`,
   `test_write_all_result_bound` — canonical working patterns for
   I/O in toylang.
 - `toylangc/tests/standalone/uuid_test/main.toylang` — canonical
-  standalone project.
+  zero-generics standalone project.
+- `toylangc/tests/standalone/clap_test/main.toylang` — canonical
+  `impl Trait` synthetic-slot standalone project.

@@ -444,7 +444,7 @@ weeks for the query override itself; +2-3 weeks for the
 + the plugin integration in §4.2. Most of the MIR construction
 code in `mir_helpers.rs` carries over unchanged.
 
-### 4.2 `-Zcodegen-backend=consumer` plugin + `override_queries` (proposed)
+### 4.2 `-Zcodegen-backend=consumer` plugin + `override_queries` (prototype-characterized)
 
 The `rustc_codegen_cranelift` / `rustc_codegen_gcc` integration model:
 replace rustc's default codegen backend wholesale via
@@ -470,37 +470,111 @@ plugin doesn't emit them. The consumer's real implementation is
 emitted separately via the plugin's own IR-producing path. No symbol
 conflict, no patch needed.
 
-Known complications:
+#### How the plugin intercepts codegen
 
-- `ModuleLlvm` and several associated types in `rustc_codegen_llvm`
-  are `pub(crate)`. The existing `codegen_wrapper.rs` works because
-  it delegates *everything* to the inner backend; selective
-  interception would require either upstream changes to make these
-  types public, or type-erasure hacks.
+A spike on branch `spike/modulellvm-wall` characterized the specific
+mechanism the plugin uses. Two design options exist, with the first
+being the recommended primary path:
+
+**Primary: partitioner-override at CGU granularity.** Override the
+existing `collect_and_partition_mono_items` query via
+`rustc_interface::Config::override_queries`. The override delegates
+to upstream's partitioner (via `OnceLock<DefaultPartitionerFn>`
+mirroring the facade's existing `DEFAULT_OPTIMIZED_MIR` / `DEFAULT_*`
+pattern), then filters consumer DefIds from the returned CGU list.
+Rust CGUs go to `LlvmCodegenBackend::codegen_crate` unchanged;
+consumer items are codegenned via the plugin's own path (toylang-style
+Inkwell backend, or Vale's equivalent). Outputs combine at
+`join_codegen`.
+
+This path uses only sanctioned extension points — no rustc changes,
+no `unsafe`, no `pub(crate)` bypasses. The partitioner is a standard
+query; overriding it is mechanically identical to overriding
+`optimized_mir`. The spike's findings document (`findings.md` on
+`spike/modulellvm-wall`, §4.1) walks through the cross-boundary
+references (`Vec<ConsumerStruct>::drop_in_place` example) showing
+how this stacks cleanly on top of §4.1's existing query overrides.
+
+**Alternative: item-level interception inside LLVM's CGU codegen.**
+This would require wrapping `LlvmCodegenBackend` and intercepting
+`compile_codegen_unit` calls per-MonoItem. Blocked today by a cluster
+of `pub(crate)` types in `rustc_codegen_llvm` (notably `CodegenCx`,
+`Builder`, and `ModuleLlvm`'s constructors). Finer control than the
+primary path, but not required — CGU-level sufficiency is proven for
+the consumer architecture.
+
+An upstream PR exposing 3 specific items (empty-ifying the
+`LlvmCodegenBackend(())` tuple field; `pub` on `ModuleLlvm::new` and
+`ModuleLlvm::llmod`) would unblock this path. The spike's writeup
+drafts the PR with rationales aligned to rust-lang/rust#45274's stated
+long-term direction. Confidence intervals: **item 1 (tuple field)
+~80–85% weeks-level acceptance; items 2 and 3 ~25–35% weeks-level
+acceptance / ~60–70% within 6 months** (items 2 and 3 touch LLVM
+handle-lifetime `unsafe` invariants, likely drawing reviewer pushback
+toward a sanctioned wrapper trait rather than bare `pub`).
+
+**Practical guidance.** Ship on the primary path. Do NOT put the
+upstream PR on the critical path. If a Vale engineer wants to drive
+the PR in parallel, the highest-probability single change is item 1
+(the tuple field) alone — low risk, direction-aligned, and a useful
+toehold that signals the direction is welcome without demanding the
+harder changes.
+
+One surprise the spike surfaced worth capturing: the
+`LlvmCodegenBackend(())` seal is **leaky** via `OngoingCodegen.backend`
+field access. After calling `LlvmCodegenBackend::new().codegen_crate(...)`
+and downcasting the returned `Box<dyn Any>` to
+`Box<OngoingCodegen<LlvmCodegenBackend>>`, the concrete
+`LlvmCodegenBackend` is accessible via the struct's `pub backend: B`
+field. `LlvmCodegenBackend: Clone`, so a concrete value can be
+extracted. This enables post-codegen LLVM operations (additional
+CGU codegen, module introspection) even without an upstream PR — but
+does NOT enable `B`-substitution at the start of `codegen_crate`,
+which is what item-level interception would require. Useful for
+debugging and second-pass LLVM work; not a substitute for the primary
+partitioner-override path.
+
+#### Residual plumbing concerns
+
+Two complications remain, neither blocking:
+
 - The facade's current `rustc_driver::Callbacks` integration
   (`install_callbacks` at startup, `after_analysis` for validation)
   doesn't map directly to a backend plugin's lifecycle. The plugin
   would need to install callbacks from within its `init` or
   `codegen_crate` method, which interacts with rustc's Rayon-threaded
-  compilation in non-obvious ways.
+  compilation in non-obvious ways. Mechanical rework, budget factored
+  into the cost estimate.
+- Fragility risk on `OngoingCodegen<LlvmCodegenBackend>` shape — its
+  public-field list has been stable since the `rustc_codegen_ssa`
+  split (#55627 era), but a future rustc refactor could break the
+  downcast path. Low risk, monitored at `join_codegen`.
 
-Implementation cost estimate (revised after §4.1 POC): **4–8 weeks**
-from the current wrapper baseline, broken down approximately as:
+#### Cost estimate
+
+Revised after the spike: **4–8 weeks** from the current wrapper
+baseline, broken down approximately as:
 
 - 1–2 weeks: `optimized_mir` override plumbing (§4.1's rustc-side half)
 - 2–3 weeks: `LangCallbacks` trait job-split and consumer-side adoption
-  (the §4.1 callback-redesign half, surfaced by the POC — this was
-  the line item the earlier 2–4 week estimate elided)
-- 2–3 weeks: plugin integration, including resolving the `ModuleLlvm`
-  `pub(crate)` wall (upstream contribution or type-erasure) and the
-  `rustc_driver::Callbacks` → backend-lifecycle reconciliation
+  (the §4.1 callback-redesign half, surfaced by POC #1)
+- 2–3 weeks: plugin integration — `codegen_crate` / `join_codegen`
+  overrides extending the existing `codegen_wrapper.rs` pattern
+  (~200 LoC), partitioner-override delegating through `DEFAULT_PARTITIONER`
+  (~150 LoC), plus `rustc_driver::Callbacks` → backend-lifecycle
+  reconciliation
+
+Previous estimates included ~100 LoC of `mono_item_linkage_and_visibility`
+copy-paste as fragility-risk line item; the spike showed the
+delegation pattern eliminates it, dropping plugin-partitioner code
+from ~250 LoC to ~150 LoC.
 
 The earlier 2–4 week figure costed only the plugin half (treating the
 query override as a drop-in replacement for `per_instance_mir`
-requiring no facade-side reshaping). The POC's prototype run surfaced
-that the facade's Instance-keyed callback contract doesn't fit a
-DefId-keyed override without the job-split, which is where the extra
-2–3 weeks lives.
+requiring no facade-side reshaping). POC #1 surfaced that the
+facade's Instance-keyed callback contract doesn't fit a DefId-keyed
+override without the job-split, which is where the extra 2–3 weeks
+lives.
 
 **Plugin mode absorbs the separate-crate integration work at
 approximately zero marginal cost.** POC #2 (§4.3) surfaced that a
@@ -694,6 +768,24 @@ none of it has a stable equivalent.
 Budget ~1 person-week per 6-month rustc bump for MIR-construction API
 drift, independent of fork choice. This is the biggest recurring
 cost; everything else is one-time migration.
+
+### 4.6 Spike references
+
+Three investigations inform this Part 4 analysis. All live as branches
+in the erw repo; each has its own `findings.md` + prediction
+pre-registration + scaffolding code, and each stays around indefinitely
+as a reference (no merges planned).
+
+| Branch | Focus | Top-line finding |
+|---|---|---|
+| `poc/optimized-mir-override` | §4.1 — does the `optimized_mir` override approach preserve dep-discovery while surfacing the emission conflict? | Yes on both counts. Also surfaced the `LangCallbacks` trait job-split as a cost line item the design-space doc's earlier estimate elided. |
+| `poc/separate-crate-stubs` | §4.3 — does the separate-crate model eliminate fork patch 5, and at what integration cost? | Mechanical linkage works; toylang-brownfield retrofit costs ~1–2 weeks of backend surgery; greenfield + plugin absorbs it at zero marginal cost. |
+| `spike/modulellvm-wall` | §4.2 — does `rustc_codegen_llvm`'s `pub(crate)` boundary block plugin integration? | Medium: blocks *item-level* interception but a coarser `collect_and_partition_mono_items` override sidesteps the wall entirely. `LlvmCodegenBackend` seal is leaky via `OngoingCodegen.backend` field access. |
+
+Reproducibility anchors are the commit SHAs on each branch; each
+`findings.md` explicitly cites them. If you're evaluating the
+zero-fork path for a new consumer, start with the three `findings.md`
+files — they're the detailed evidence this Part 4 summarizes.
 
 ---
 

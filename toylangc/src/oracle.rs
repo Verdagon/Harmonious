@@ -480,6 +480,14 @@ pub fn find_use_imported_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId>
 /// `mk_args` sites that silently dropped lifetime slots and ICEd rustc
 /// whenever a Rust item had an early-bound lifetime parameter (e.g.,
 /// `serde_json::from_str<'a, T: Deserialize<'a>>`).
+///
+/// Synthetic `impl Trait` params (from `fn foo(x: impl Trait)` desugar)
+/// are handled by the same `Type` arm — rustc exposes them in
+/// `generics_of` with `synthetic: true`, and we consume them from
+/// `resolved_types` identically to named params. Named params first,
+/// synthetic params second in declaration order — matching turbofish.
+/// Don't add a "synthetic-only" branch; that breaks clap and every
+/// `impl Into<T>` / `impl AsRef<T>` / `impl Fn(...)` call site.
 pub fn build_generic_args_for_item<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
