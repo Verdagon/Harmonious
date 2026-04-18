@@ -1,17 +1,27 @@
 //! Query override installation.
 //!
 //! Rustc's compilation is driven by a demand-driven query system. We override
-//! four providers: layout_of (type layout), mir_shims (drop glue),
-//! per_instance_mir (per-instantiation function stubs), and symbol_name
-//! (consumer symbol mapping).
+//! four providers: `layout_of` (type layout), `mir_shims` (drop glue),
+//! `optimized_mir` (synthetic dep-registering bodies for consumer fns), and
+//! `symbol_name` (consumer symbol mapping).
 //!
-//! Consumer functions in __lang_stubs have `unreachable!()` bodies that pass
-//! rustc's normal mir_built and borrowck pipeline. per_instance_mir replaces
-//! them at monomorphization time, and the codegen dispatch skips them.
+//! Consumer functions in `__lang_stubs` have `unreachable!()` bodies that
+//! pass rustc's normal `mir_built` and borrowck pipeline. Our
+//! `optimized_mir` override replaces those bodies during monomorphization
+//! with a synthetic body mentioning each transitive Rust dep via
+//! `ReifyFnPointer` so rustc's collector queues them; the consumer's own
+//! backend provides the real definitions and rustc's codegen is skipped via
+//! `rustc_codegen_ssa::mono_item::CODEGEN_SKIP_HOOK`.
+//!
+//! Stage-3 migration note: before commit, this file installed a custom
+//! `per_instance_mir` query that lived behind a 4-patch rustc fork. That
+//! hook has been retired in favor of the sanctioned `override_queries`
+//! path on `optimized_mir`; see `handoff-optimized-mir-migration.md` and
+//! `docs/reasoning/rustc-fork-design-space.md` §4.1 for context.
 
 pub mod drop_glue;
 pub mod layout;
-pub mod per_instance;
+pub mod optimized_mir;
 pub mod symbol_name;
 
 /// Install query overrides. Called from `LangDriver::config`.
@@ -23,10 +33,11 @@ pub fn lang_override_queries(
         providers.layout_of,
         providers.mir_shims,
         providers.symbol_name,
+        providers.optimized_mir,
     );
 
-    providers.layout_of        = layout::lang_layout_of;
-    providers.mir_shims        = drop_glue::lang_mir_shims;
-    providers.per_instance_mir = per_instance::lang_per_instance_mir;
-    providers.symbol_name      = symbol_name::lang_symbol_name;
+    providers.layout_of     = layout::lang_layout_of;
+    providers.mir_shims     = drop_glue::lang_mir_shims;
+    providers.optimized_mir = optimized_mir::lang_optimized_mir;
+    providers.symbol_name   = symbol_name::lang_symbol_name;
 }

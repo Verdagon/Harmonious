@@ -122,9 +122,12 @@ pub trait LangCallbacks: LangPredicates {
         ty: Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx>;
 
-    /// Called from the `per_instance_mir` query provider for each consumer
-    /// function Instance. Returns the Rust items this consumer function
-    /// transitively depends on, as `(DefId, GenericArgsRef)` pairs.
+    /// Called from the `optimized_mir` query override for each consumer
+    /// function `LocalDefId`. Returns the Rust items this consumer function
+    /// transitively depends on, as `(DefId, GenericArgsRef)` pairs. The
+    /// returned args may contain `ty::TyKind::Param` placeholders; rustc's
+    /// monomorphization collector substitutes them per caller during its
+    /// own walk of the synthesized MIR body.
     ///
     /// Because rustc does not see internal consumer→consumer callees, the
     /// implementation must walk the consumer side transitively to gather
@@ -141,7 +144,6 @@ pub trait LangCallbacks: LangPredicates {
         name: &str,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
-        instance: ty::Instance<'tcx>,
     ) -> Vec<(DefId, GenericArgsRef<'tcx>)>;
 
     /// Called from the `symbol_name` query provider for each concrete
@@ -212,7 +214,6 @@ struct StatefulVtable {
         &str,
         TyCtxt<'tcx>,
         LocalDefId,
-        ty::Instance<'tcx>,
     ) -> Vec<(DefId, GenericArgsRef<'tcx>)>,
 
     notify_concrete_entry_point: for<'tcx> fn(
@@ -283,6 +284,7 @@ static CONFIG: OnceLock<FacadeConfig> = OnceLock::new();
 static DEFAULT_LAYOUT_OF: OnceLock<queries::layout::LayoutOfFn> = OnceLock::new();
 static DEFAULT_MIR_SHIMS: OnceLock<queries::drop_glue::MirShimsFn> = OnceLock::new();
 static DEFAULT_SYMBOL_NAME: OnceLock<queries::symbol_name::SymbolNameFn> = OnceLock::new();
+static DEFAULT_OPTIMIZED_MIR: OnceLock<queries::optimized_mir::OptimizedMirFn> = OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock::new();
@@ -356,12 +358,17 @@ pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> boo
     if is_consumer_fn(&name.to_string()) {
         return true;
     }
-    is_consumer_accessor_structural(tcx, def_id)
+    is_consumer_accessor_safe(tcx, def_id)
 }
 
 /// Accessor-method structural check (cross-crate-safe). Shared between
-/// the codegen-skip hook and the MIR-override filter.
-fn is_consumer_accessor_structural<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+/// the codegen-skip hook, the `optimized_mir` override's consumer filter,
+/// and `queries/symbol_name.rs`. Walks `opt_associated_item` to find the
+/// impl's self type structurally (via `instantiate_identity` — inspection,
+/// not instantiation) and compares its ADT name against
+/// `is_consumer_type`. Safe from any phase — the `def_path_str` trap
+/// (@DPSFDOZ) isn't reached.
+pub(crate) fn is_consumer_accessor_safe<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
     let Some(assoc_item) = tcx.opt_associated_item(def_id) else {
         return false;
     };
@@ -406,14 +413,13 @@ pub(crate) fn call_collect_generic_rust_deps<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    instance: ty::Instance<'tcx>,
 ) -> Vec<(DefId, GenericArgsRef<'tcx>)> {
     let c = CONFIG.get().expect("config not installed");
     let func = c.stateful_vtable.collect_generic_rust_deps;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
     let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, def_id, instance)
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, def_id)
 }
 
 /// Call the consumer's notify_concrete_entry_point. Holds the mutable state
@@ -492,6 +498,10 @@ pub(crate) fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
     *DEFAULT_SYMBOL_NAME.get().expect("default symbol_name not saved")
 }
 
+pub(crate) fn default_optimized_mir() -> queries::optimized_mir::OptimizedMirFn {
+    *DEFAULT_OPTIMIZED_MIR.get().expect("default optimized_mir not saved")
+}
+
 /// Store the compiled .o path after generate_and_compile.
 pub(crate) fn set_lang_obj_path(obj_path: PathBuf) {
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
@@ -548,9 +558,8 @@ fn trampoline_collect_generic_rust_deps<'tcx, C: LangCallbacks + 'static>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-    instance: ty::Instance<'tcx>,
 ) -> Vec<(DefId, GenericArgsRef<'tcx>)> {
-    data.downcast_ref::<C>().unwrap().collect_generic_rust_deps(state, name, tcx, def_id, instance)
+    data.downcast_ref::<C>().unwrap().collect_generic_rust_deps(state, name, tcx, def_id)
 }
 
 fn trampoline_notify_concrete_entry_point<'tcx, C: LangCallbacks + 'static>(
@@ -625,8 +634,10 @@ pub(crate) fn install_query_defaults(
     layout_of: queries::layout::LayoutOfFn,
     mir_shims: queries::drop_glue::MirShimsFn,
     symbol_name: queries::symbol_name::SymbolNameFn,
+    optimized_mir: queries::optimized_mir::OptimizedMirFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
+    let _ = DEFAULT_OPTIMIZED_MIR.set(optimized_mir);
 }

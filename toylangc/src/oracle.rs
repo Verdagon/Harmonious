@@ -71,6 +71,56 @@ use rustc_hir::def::DefKind;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::DefId;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+// Thread-local map from Param name to the Param's index in its owning
+// item's generics. Set by `ActiveParamMap::install` at the start of a
+// deps walk (see `callbacks_impl::collect_generic_rust_deps_inner`) and
+// cleared automatically when the returned guard drops. `try_resolved_to_rustc_ty`
+// consults this map when it encounters `ResolvedType::TypeParam` so the
+// converter can rebuild the rustc `TyKind::Param` at the right index. No
+// map → TypeParam still panics (the fast path for codegen and
+// non-generic walks). Per-worker (rayon) scope: the guard's lifetime
+// bounds the Param-aware region on the firing worker thread; no cross-
+// thread contamination.
+thread_local! {
+    static ACTIVE_PARAM_INDICES: RefCell<Option<HashMap<String, u32>>> = const { RefCell::new(None) };
+}
+
+/// Scope guard that installs a Param-name → Param-index mapping into the
+/// thread-local consulted by `try_resolved_to_rustc_ty`. Drop clears the
+/// mapping. Nested installations are not supported and will panic — the
+/// deps walker is single-shot per `collect_generic_rust_deps` call.
+pub struct ActiveParamMap {
+    _priv: (),
+}
+
+impl ActiveParamMap {
+    pub fn install(map: HashMap<String, u32>) -> Self {
+        ACTIVE_PARAM_INDICES.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            assert!(slot.is_none(), "nested ActiveParamMap install");
+            *slot = Some(map);
+        });
+        Self { _priv: () }
+    }
+}
+
+impl Drop for ActiveParamMap {
+    fn drop(&mut self) {
+        ACTIVE_PARAM_INDICES.with(|cell| {
+            cell.borrow_mut().take();
+        });
+    }
+}
+
+fn lookup_active_param_index(name: &str) -> Option<u32> {
+    ACTIVE_PARAM_INDICES.with(|cell| {
+        cell.borrow().as_ref().and_then(|m| m.get(name).copied())
+    })
+}
+
 /// Walk local HIR definitions to find a struct named `name`.
 /// Also resolves `pub use` re-exports to the original struct DefId.
 pub fn find_local_struct_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
@@ -194,7 +244,23 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
         // reverse maps at `rustc_ty_to_resolved_type` produce the matching variants.
         ResolvedType::Str => Ok(tcx.types.str_),
         ResolvedType::ByteSlice => Ok(ty::Ty::new_slice(tcx, tcx.types.u8)),
-        ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before rustc Ty conversion", name),
+        ResolvedType::TypeParam(name) => {
+            // Under the `optimized_mir` override path, Params flow through the
+            // deps walker. `ActiveParamMap::install` records each Param's
+            // index in the caller's generics; we rebuild the rustc
+            // `TyKind::Param` from (index, name). Outside of a Param-aware
+            // scope (e.g., codegen, non-generic walks) this arm still panics
+            // — which preserves the pre-stage-3 invariant that Params are
+            // substituted before reaching codegen.
+            let Some(index) = lookup_active_param_index(name) else {
+                panic!(
+                    "TypeParam '{}' reached try_resolved_to_rustc_ty outside a \
+                     Param-aware scope (no ActiveParamMap installed)",
+                    name
+                );
+            };
+            Ok(ty::Ty::new_param(tcx, index, rustc_span::Symbol::intern(name)))
+        }
     }
 }
 
@@ -271,6 +337,12 @@ pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> c
             name: "tuple".to_string(),
             type_args: tys.iter().map(|t| rustc_ty_to_resolved_type(tcx, t)).collect(),
         },
+        // Type parameters surface here under the `optimized_mir` override path
+        // (stage-3 migration): rustc hands us a generic consumer body whose
+        // Params are placeholders the collector substitutes per caller. We
+        // represent them as `TypeParam(name)` and round-trip via the
+        // thread-local param_map installed in `collect_generic_rust_deps_inner`.
+        TyKind::Param(p) => ResolvedType::TypeParam(p.name.to_string()),
         _ => panic!("rustc_ty_to_resolved_type: unsupported type {:?}", ty),
     }
 }
@@ -296,7 +368,14 @@ pub fn resolved_type_to_mangled_name(ty: &crate::toylang::typed_ast::ResolvedTyp
             }
         }
         ResolvedType::Ref { inner } => format!("ref_{}", resolved_type_to_mangled_name(inner)),
-        ResolvedType::TypeParam(name) => panic!("resolved_type_to_mangled_name: unresolved TypeParam '{}' during mangling", name),
+        // Under the `optimized_mir` override path, Params flow through the
+        // deps walker inside generic consumer bodies; the cycle-guard seed
+        // for `collect_rust_deps_recursive` mangles the caller's identity
+        // args, which may include Params. Produce a stable, collision-safe
+        // string; the mangling is only used as a dedup key inside the
+        // walker — the produced string is never emitted as a real symbol
+        // (the consumer backend always sees concrete args during codegen).
+        ResolvedType::TypeParam(name) => format!("P_{}", name),
         ResolvedType::Str => "str".to_string(),
         ResolvedType::ByteSlice => "byte_slice".to_string(),
     }

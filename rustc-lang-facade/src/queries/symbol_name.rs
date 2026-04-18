@@ -28,7 +28,7 @@ pub fn lang_symbol_name<'tcx>(
             let name_str = name.to_string();
             let is_fn = crate::is_consumer_fn(&name_str);
             let is_accessor = if !is_fn {
-                super::per_instance::is_consumer_accessor_pub(tcx, def_id)
+                crate::is_consumer_accessor_safe(tcx, def_id)
             } else {
                 false
             };

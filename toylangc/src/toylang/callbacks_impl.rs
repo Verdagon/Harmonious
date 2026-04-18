@@ -81,8 +81,7 @@ impl ToylangCallbacks {
         state: &mut ToylangState,
         name: &str,
         tcx: TyCtxt<'tcx>,
-        _def_id: LocalDefId,
-        instance: ty::Instance<'tcx>,
+        def_id: LocalDefId,
     ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
         state.log.push(CallbackLog::CollectGenericRustDeps { name: name.to_string() });
 
@@ -100,8 +99,30 @@ impl ToylangCallbacks {
             return vec![];
         }
 
-        let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
-        let extern_symbol = compute_fn_symbol(registry_name, tcx, instance);
+        // Build the param-name → Param-index map from the caller's identity
+        // generics. The walker below runs the UNSUBSTITUTED body (Params in
+        // place of concrete types); as the body is type-resolved and deps
+        // are built, oracle helpers consult this map to rebuild rustc
+        // `TyKind::Param` values when they encounter `ResolvedType::TypeParam`.
+        // Dropped at end of this function, clearing the thread-local.
+        let identity_args = ty::GenericArgs::identity_for_item(tcx, def_id.to_def_id());
+        let generics = tcx.generics_of(def_id.to_def_id());
+        let mut param_name_to_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for param in generics.own_params.iter() {
+            if matches!(param.kind, ty::GenericParamDefKind::Type { .. }) {
+                param_name_to_index.insert(param.name.to_string(), param.index);
+            }
+        }
+        let _param_guard = crate::oracle::ActiveParamMap::install(param_name_to_index);
+
+        // `resolve_caller_from_identity_args` is an identity-args substitution:
+        // each type_param `T` maps to `ResolvedType::TypeParam("T")`, so the
+        // body is effectively unchanged. Kept as a single code path so
+        // `collect_rust_deps_recursive`'s signature (which takes an already-
+        // resolved `ToyFunction`) doesn't need to branch.
+        let resolved_caller = resolve_caller_from_identity_args(toy_fn);
+        let identity_instance = ty::Instance::new(def_id.to_def_id(), identity_args);
+        let extern_symbol = compute_fn_symbol(registry_name, tcx, identity_instance);
         // Local cycle guard — prevents infinite recursion on cyclic consumer
         // code. Intentionally NOT shared with `state.walked_entry_points`; see
         // @GCMLZ context and the commit introducing the callback split for the
@@ -358,9 +379,8 @@ impl LangCallbacks for ToylangCallbacks {
         name: &str,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
-        instance: ty::Instance<'tcx>,
     ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
-        self.collect_generic_rust_deps_inner(state(s), name, tcx, def_id, instance)
+        self.collect_generic_rust_deps_inner(state(s), name, tcx, def_id)
     }
 
     fn notify_concrete_entry_point<'tcx>(
@@ -457,6 +477,30 @@ fn resolve_caller_from_instance<'tcx>(
                 subst.insert(param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(tcx, ty));
             }
         }
+    }
+    resolve_caller_from_type_args(caller_fn, &subst)
+}
+
+/// Identity-args variant of `resolve_caller_from_instance`: each type param `T`
+/// substitutes to `ResolvedType::TypeParam("T")` so the returned `ToyFunction`
+/// is structurally unchanged (body retains Param references). The
+/// `type_params: vec![]` canonicalization mirrors the concrete-args path, so
+/// `collect_rust_deps_recursive` and `type_resolve_body` see the same shape
+/// regardless of path — Param resolution at dep sites is handled via the
+/// `oracle::ActiveParamMap` thread-local installed in
+/// `collect_generic_rust_deps_inner`.
+fn resolve_caller_from_identity_args(
+    caller_fn: &crate::toylang::registry::ToyFunction,
+) -> crate::toylang::registry::ToyFunction {
+    if caller_fn.type_params.is_empty() {
+        return caller_fn.clone();
+    }
+    let mut subst = std::collections::HashMap::new();
+    for param_name in caller_fn.type_params.iter() {
+        subst.insert(
+            param_name.clone(),
+            crate::toylang::typed_ast::ResolvedType::TypeParam(param_name.clone()),
+        );
     }
     resolve_caller_from_type_args(caller_fn, &subst)
 }
