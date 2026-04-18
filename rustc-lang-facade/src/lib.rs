@@ -328,6 +328,55 @@ pub fn is_from_lang_stubs_safe(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     })
 }
 
+/// Is this DefId a consumer-owned function whose real implementation
+/// comes from the consumer's backend `.o` rather than from rustc's
+/// codegen?
+///
+/// True iff all three hold:
+/// 1. The DefId lives inside `__lang_stubs::` (cross-crate-safe check).
+/// 2. The item has a simple name (anonymous impl items etc. are excluded).
+/// 3. Either the name matches a consumer function (via `is_consumer_fn`)
+///    or it's an accessor method on a consumer type.
+///
+/// This is the filter the facade uses both (a) to decide whether to
+/// synthesize a dep-discovery body for the item (in the MIR override
+/// that drives rustc's monomorphization collector) and (b) to tell
+/// rustc's codegen to skip emitting a body at the item's symbol.
+/// Items inside `__lang_stubs` that are NOT consumer fns — notably
+/// the Phase-6 `#[inline(never)]` wrappers like `__toylang_option_unwrap`
+/// — fall through to rustc's default codegen; they are real Rust
+/// functions whose symbol must be callable at link time.
+pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+    if !is_from_lang_stubs_safe(tcx, def_id) {
+        return false;
+    }
+    let Some(name) = tcx.opt_item_name(def_id) else {
+        return false;
+    };
+    if is_consumer_fn(&name.to_string()) {
+        return true;
+    }
+    is_consumer_accessor_structural(tcx, def_id)
+}
+
+/// Accessor-method structural check (cross-crate-safe). Shared between
+/// the codegen-skip hook and the MIR-override filter.
+fn is_consumer_accessor_structural<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+    let Some(assoc_item) = tcx.opt_associated_item(def_id) else {
+        return false;
+    };
+    let impl_def_id = assoc_item.container_id(tcx);
+    // instantiate_identity: structural inspection only — we want the impl's
+    // self type with its own params as placeholders so we can read the ADT
+    // name. We are not producing a concrete type here.
+    let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
+    if let ty::TyKind::Adt(adt_def, _) = self_ty.kind() {
+        let struct_name = tcx.item_name(adt_def.did()).to_string();
+        return is_consumer_type(&struct_name);
+    }
+    false
+}
+
 /// Check if a function name belongs to the consumer's language.
 /// Per @GCMLZ, reads from CONFIG (no lock) — safe during generate_and_compile.
 pub(crate) fn is_consumer_fn(name: &str) -> bool {
@@ -559,6 +608,16 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     // already installed (e.g. test re-entry); we ignore.
     let _ = rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK
         .set(facade_visibility_override);
+    // Register the codegen-skip hook: rustc's MonoItemExt::define asks
+    // "should I skip codegen for this Instance?" for every MonoItem::Fn.
+    // We answer "yes" for consumer-owned items (consumer fns + accessor
+    // methods) — their real definitions come from the consumer's own
+    // `.o` at link time. Other items inside `__lang_stubs` (notably the
+    // Phase-6 `#[inline(never)]` unwrap wrappers) are real Rust fns
+    // whose bodies rustc must codegen normally. Structurally parallel
+    // to the visibility-override hook above.
+    let _ = rustc_codegen_ssa::mono_item::CODEGEN_SKIP_HOOK
+        .set(|tcx, instance| is_consumer_codegen_target(tcx, instance.def_id()));
 }
 
 /// Save the original query providers. Phase 2 of globals init.
