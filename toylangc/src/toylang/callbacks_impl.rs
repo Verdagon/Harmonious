@@ -69,13 +69,15 @@ fn state(s: &mut dyn Any) -> &mut ToylangState {
 }
 
 impl ToylangCallbacks {
-    /// Rust-dep discovery for a consumer function Instance. Pure read with
+    /// Rust-dep discovery for a consumer function DefId. Pure read with
     /// respect to `ToylangState` (only `log` is appended); internal-callee
     /// stashing happens in `notify_concrete_entry_point_inner`.
     ///
     /// Per @SMINCZ, the returned `(DefId, GenericArgsRef)` pairs become
-    /// `ReifyFnPointer` casts in `per_instance_mir`'s synthesized body,
-    /// which is what forces rustc's mono collector to emit the Rust symbols.
+    /// `ReifyFnPointer` casts in the `optimized_mir` override's synthesized
+    /// body, which is what forces rustc's mono collector to emit the Rust
+    /// symbols. Args may contain `ty::TyKind::Param` placeholders — rustc's
+    /// collector substitutes per caller during its walk.
     pub fn collect_generic_rust_deps_inner<'tcx>(
         &self,
         state: &mut ToylangState,
@@ -597,8 +599,9 @@ fn resolve_toylang_callee(
 /// mutate `ToylangState`.
 ///
 /// Per @SMINCZ, each returned `(def_id, args)` pair is what ends up as a
-/// `ReifyFnPointer` cast inside `per_instance_mir`'s synthesized body. That's
-/// the mechanism that forces rustc's mono collector to emit the Rust symbol.
+/// `ReifyFnPointer` cast inside the `optimized_mir` override's synthesized
+/// body. That's the mechanism that forces rustc's mono collector to emit the
+/// Rust symbol.
 /// `llvm_gen.rs`'s `tcx.symbol_name` reads are only valid if the matching dep
 /// was registered here first.
 fn collect_rust_deps_recursive<'tcx>(
@@ -682,10 +685,10 @@ fn collect_rust_deps_recursive<'tcx>(
         }
 
         // Phase 6: redirect to wrapper if applicable. The wrapper Instance
-        // (not the inline stdlib method) lands in rust_deps so per_instance_mir
-        // reifies a fn-pointer to it, forcing rustc's mono collector to
-        // codegen the wrapper. Without this, `Option::unwrap` and friends
-        // produce no callable symbol.
+        // (not the inline stdlib method) lands in rust_deps so the
+        // `optimized_mir` override reifies a fn-pointer to it, forcing
+        // rustc's mono collector to codegen the wrapper. Without this,
+        // `Option::unwrap` and friends produce no callable symbol.
         if let Some((wdef, wargs)) = crate::oracle::redirect_to_wrapper(
             tcx, &dep.type_name, &dep.method_name, &dep.type_args,
         ) {

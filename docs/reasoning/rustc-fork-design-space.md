@@ -265,7 +265,22 @@ Each alternative is marked with its evidence level:
   reading, no consumer-side prototype yet
 - **Proposed**: plausible from first principles but unchecked
 
-### 4.1 `override_queries` on `optimized_mir` (prototype-verified)
+### 4.1 `override_queries` on `optimized_mir` (LANDED in stage 3)
+
+**Status update (2026-04-18):** This alternative has been implemented
+and shipped as erw's stage-3 fork reduction. Patches 1, 2, 4 are
+deleted; patch 3 is reshaped as a facade-installed
+`CODEGEN_SKIP_HOOK` (see §4.1.1 below). The trait-level job-split
+described in the original writeup (stage 1, `ed2e692`) was a
+prerequisite and landed separately. Shipping commits:
+`ce437ae` (patch 3 reshape) and `bf770ae` (optimized_mir override
+end-to-end, `per_instance.rs` deleted). All 211 tests pass on the
+shipping form. See
+`docs/historical/handoff-optimized-mir-migration.md` for the full
+migration writeup and `docs/reasoning/dep-discovery-approaches.md`
+for the Approach A vs B comparison. The rest of this section is
+kept as the historical design-space argument that justified the
+migration; treat everything below as pre-landing reasoning.
 
 Instead of adding `per_instance_mir` as a new query (fork patches
 1–4), override `optimized_mir` via
@@ -347,6 +362,17 @@ What this eliminates:
   zero-fork solution**. Zero fork requires pairing with §4.2. The
   plugin path retires patch 3 across all compile sites; any non-plugin
   path leaves a patch-3-equivalent somewhere.
+
+  **What stage-3 actually shipped for patch 3:** reshape, not retire.
+  Following patch 5's precedent, patch 3 is now a
+  `pub static CODEGEN_SKIP_HOOK: OnceLock<fn ptr>` inside
+  `rustc_codegen_ssa::mono_item` that the facade fills at startup with
+  a closure delegating to `is_consumer_codegen_target(tcx,
+  instance.def_id())`. The fork knows nothing about `__lang_stubs` or
+  any other consumer concept — the two remaining patches are
+  structurally symmetric "facade installs a hook" patterns. Net:
+  option 1 from the three-ways-to-resolve list above. Option 3 (plugin
+  pairing) remains the zero-fork target for stage 4.
 
 - **The consumer-callback boundary needs a job-split.** This is a
   facade-side issue the POC surfaced that's not apparent from the
@@ -808,25 +834,44 @@ files — they're the detailed evidence this Part 4 summarizes.
 
 ---
 
-## Part 5: The 5-patch-fork cost accounting
+## Part 5: The 2-patch-fork cost accounting
+
+*(Historical note: prior to stage 3 this section was titled "The
+5-patch-fork cost accounting." The stage-3 migration landed §4.1 and
+shipped a `CODEGEN_SKIP_HOOK` reshape of patch 3, reducing the fork
+from 5 patches to 2. The numbers below reflect the post-stage-3
+shape.)*
 
 For a toylang-style deployment (research project, occasional rustc
 bumps, user installation via `rustup toolchain link`):
 
-- Fork maintenance: ~2-3 days per rustc bump. Patches are small
-  (5 sites, ~50 lines total) and shape-stable across rustc releases.
+- Fork maintenance: ~1-2 days per rustc bump. Patches are small
+  (2 sites: `CODEGEN_SKIP_HOOK` in `rustc_codegen_ssa/src/mono_item.rs`
+  and `VISIBILITY_OVERRIDE_HOOK` in
+  `rustc_monomorphize/src/partitioning.rs`, plus a `pub mod` flip
+  in `rustc_monomorphize/src/lib.rs` required by rustc's
+  `unreachable_pub` lint; ~60 lines total including docstrings).
+  Both hooks are `OnceLock<fn ptr>` statics with stable shapes — they
+  tend to survive nightly rebases without edits.
 - MIR construction churn: ~1 person-week per bump (same as zero-fork).
 
-Total: ~1.5 weeks per bump, fork included.
+Total: ~1-1.5 weeks per bump, fork included. Down from ~1.5 weeks
+pre-stage-3 (the saved time is mostly the eliminated query-plumbing
+patches 1, 2, 4 which were shape-stable but three separate rebase
+sites).
 
 For a zero-fork target (distribution to non-Rust-native users, where
 "install a forked rustc" is user-visible friction):
 
-- Migration: 4-8 weeks engineering (sum of §4.1, §4.2, §4.4 costs)
+- Migration: 2-5 weeks engineering from the current 2-patch baseline
+  (pair §4.2's `CodegenBackend` plugin with the shipping
+  `optimized_mir` override; retires both remaining patches). Down
+  from the pre-stage-3 estimate of 4-8 weeks because §4.1's trait
+  job-split and query-override work have already landed.
 - MIR construction churn: ~1 person-week per bump (same)
 - Fork rebase: 0
 
-Total: 4-8 weeks upfront, ~1 week per bump ongoing.
+Total: 2-5 weeks upfront, ~1 week per bump ongoing.
 
 The math favors zero-fork if the consumer does frequent bumps AND
 user installation friction is a real cost. For toylang the math has

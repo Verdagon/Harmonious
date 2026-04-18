@@ -230,9 +230,10 @@ to get an Instance whose ABI lacks the hidden parameter.
 2. **`resolve_for_fn_ptr` has the same problem**: It automatically wraps
    `#[track_caller]` functions in ReifyShim, producing a different symbol.
 
-3. **per_instance_mir interaction**: If the collector processes a ReifyShim
-   whose underlying def_id is a `__lang_stubs` function, our `per_instance_mir`
-   override would intercept it and return a toylang synthetic body instead of
+3. **optimized_mir interaction**: If the collector processes a ReifyShim
+   whose underlying def_id is a `__lang_stubs` function, our `optimized_mir`
+   override (post stage-3; was `per_instance_mir` before the migration)
+   would intercept it and return a toylang synthetic body instead of
    the shim's wrapper body.
 
 ### No `#[no_track_caller]` attribute exists

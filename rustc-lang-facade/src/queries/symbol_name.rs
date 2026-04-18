@@ -34,7 +34,8 @@ pub fn lang_symbol_name<'tcx>(
             };
 
             if is_fn || is_accessor {
-                // Build callback name (same as per_instance_mir)
+                // Build callback name (must match the one constructed in the
+                // optimized_mir override — consumers key on this string)
                 let callback_name = if is_accessor {
                     if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
                         let impl_def_id = assoc_item.container_id(tcx);

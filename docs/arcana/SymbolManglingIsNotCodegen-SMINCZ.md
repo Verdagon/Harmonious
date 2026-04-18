@@ -9,13 +9,14 @@ if they did has cost two implementers a working linker step.
 
 To force rustc to emit a generic `Instance`, the Instance must appear as a
 `Rvalue::Cast(CastKind::PointerCoercion(ReifyFnPointer))` inside a MIR body
-that rustc's mono collector walks. The facade's `per_instance_mir` query
-provider already does this for every entry in a toylang function's
-`rust_deps` list (see `rustc-lang-facade/src/queries/per_instance.rs:106-173`).
-The mono collector at `rustc_monomorphize/src/collector.rs:709-717` promotes
-ReifyFnPointer targets into `used_items` (authoritative codegen, not
-hint-level), which forces emission. This is the only mechanism in the codebase
-that drives codegen of a generic Instance that toylang references.
+that rustc's mono collector walks. The facade's `optimized_mir` override
+already does this for every entry in a consumer function's `rust_deps` list
+(see `rustc-lang-facade/src/queries/optimized_mir.rs::build_dependency_body`;
+stage-3 migration retired the prior Instance-keyed `per_instance_mir` query,
+which did the same job). The mono collector promotes ReifyFnPointer targets
+into `used_items` (authoritative codegen, not hint-level), which forces
+emission. This is the only mechanism in the codebase that drives codegen of
+a generic Instance that toylang references.
 
 ## Where
 
@@ -27,11 +28,12 @@ that drives codegen of a generic Instance that toylang references.
   returned by
   `toylangc/src/toylang/callbacks_impl.rs::collect_rust_deps_recursive`
   (driven by the `collect_generic_rust_deps` callback), which feeds into
-  `per_instance_mir`'s synthesized MIR body via
-  `rustc-lang-facade/src/queries/per_instance.rs::build_dependency_body`.
-  (Pre-2026-04 this was `collect_toylang_fn_deps_inner`; the callback
-  job-split renamed + specialized the walker but the codegen-driving
-  property is identical.)
+  the `optimized_mir` override's synthesized MIR body via
+  `rustc-lang-facade/src/queries/optimized_mir.rs::build_dependency_body`.
+  Historical: pre-2026-04 this was `collect_toylang_fn_deps_inner` feeding
+  `per_instance_mir`'s body; the callback job-split (stage 1) and the
+  stage-3 query migration both reshaped the plumbing without changing the
+  codegen-driving property.
 - **Anti-pattern that masks the bug:** non-generic items get codegen'd
   unconditionally if they exist in the crate (no mono gate). Per-type
   monomorphic shims like `__toylang_option_unwrap_i32` "work" without
@@ -62,9 +64,10 @@ Workarounds that look attractive but are wrong:
 - `#[used]` — preserves emitted symbols from DCE; doesn't drive mono
   for unemitted ones.
 - Synthetic `static _: &dyn Fn(...) = &wrapper::<T>` — should drive
-  ReifyShim in principle, but ICE'd inside `per_instance_mir` because the
-  hook didn't expect a synthetic static. Even if it didn't ICE, it'd
-  internalize via the same partitioner path.
+  ReifyShim in principle, but ICE'd inside the then-current
+  `per_instance_mir` query (retired in stage 3) because the hook didn't
+  expect a synthetic static. Even if it didn't ICE, it'd internalize via
+  the same partitioner path.
 - `#[no_mangle]` — changes the symbol name, not the codegen decision.
 
 ## Why it exists
@@ -74,12 +77,12 @@ the mono collector walks Rust MIR for ReifyFnPointer / function-call terminators
 and emits whatever it finds. External LLVM IR is invisible to this walk by
 construction — it's a byproduct, not an input.
 
-The fork's `per_instance_mir` query is the bridge: for each toylang function
-that gets compiled, we synthesize a MIR body whose only purpose is to mention
-every Rust dep as a ReifyFnPointer. Rustc thinks these are real calls; the
-mono collector walks them and codegens the deps. The synthesized body itself
-is unreachable (terminator is `Unreachable`), so the references are
-"mention-only" from a runtime perspective but "use" from the collector's
+The facade's `optimized_mir` override is the bridge: for each consumer
+function that gets compiled, we synthesize a MIR body whose only purpose is
+to mention every Rust dep as a ReifyFnPointer. Rustc thinks these are real
+calls; the mono collector walks them and codegens the deps. The synthesized
+body itself is unreachable (terminator is `Unreachable`), so the references
+are "mention-only" from a runtime perspective but "use" from the collector's
 perspective — exactly what the partitioner needs to commit to emission.
 
 The trap is that the codegen-driving mechanism (`rust_deps` registration) is
@@ -91,7 +94,8 @@ should have been — and silently nothing happens if it wasn't.
 
 **Rule:** if the only line that changes when adding a new Rust callee is a
 `tcx.symbol_name` call site, you're in the wrong file. The change must also
-land in the dep-registration path that feeds `per_instance_mir`.
+land in the dep-registration path that feeds the `optimized_mir` override's
+synthesized body.
 
 ## See also
 

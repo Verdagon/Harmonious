@@ -1,7 +1,9 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
 > **Current status:** 129 integration tests + 15 standalone tests + 67 unit tests passing, 0 ignored.
-> Minimal rustc fork with `per_instance_mir` query. Inkwell LLVM backend.
+> Minimal 2-patch rustc fork (codegen-skip + visibility-override hooks); dep
+> discovery runs through a sanctioned `Config::override_queries` override on
+> rustc's existing `optimized_mir` query. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
 > (Mutex) to avoid a deadlock where query providers triggered during
@@ -130,8 +132,31 @@
 >   tail expression — previously a SIGBUS at runtime during teardown
 >   — is now a `TypeResolveError::MainMustReturnVoid` at type-resolve
 >   time (see @MBMRVZ).
+> - Stage-3 fork reduction (2026-04-18): retired the custom
+>   `per_instance_mir` query in favor of a `Config::override_queries`
+>   override on rustc's existing `optimized_mir` query. Rust-dep
+>   discovery now runs once per consumer DefId with Param-bearing
+>   outputs — rustc's mono collector substitutes per caller, same
+>   engine that handles every generic Rust function. Fork drops
+>   patches 1/2/4 (query definition, collector fallback, default
+>   provider); patch 3 (codegen skip) is reshaped into a
+>   facade-installed `CODEGEN_SKIP_HOOK` sibling of the existing
+>   `VISIBILITY_OVERRIDE_HOOK`. Net rustc fork: 5 patches → 2, both
+>   consumer-agnostic `OnceLock<fn ptr>` statics. Consumer-side oracle
+>   gains a thread-local Param-name→index map (`oracle::ActiveParamMap`)
+>   that lets `try_resolved_to_rustc_ty` rebuild rustc `ty::Param`
+>   values when the deps walker hits `ResolvedType::TypeParam`, while
+>   the codegen path's Param-panic invariant stays intact outside that
+>   scope. See `docs/reasoning/dep-discovery-approaches.md` for the
+>   Approach A vs B comparison, `docs/reasoning/rustc-fork-design-space.md`
+>   §4.1/§5 for the fork-cost accounting, and
+>   `docs/historical/handoff-optimized-mir-migration.md` for the
+>   shipping writeup.
 >
-> **Phases done: 1–8.** All planned phases complete.
+> **Phases done: 1–8. Stage 3 fork reduction complete.** All planned
+> phases complete. Remaining fork-reduction work (stage 4, the
+> `CodegenBackend` plugin that retires the last 2 patches) is future
+> architecture — see `future-architecture-investigations.md`.
 
 ## Overview
 
@@ -139,8 +164,11 @@ Two-crate workspace:
 - `rustc-lang-facade` — reusable library for integrating custom languages with rustc
 - `toylangc` — toylang consumer
 
-Forked `nightly-2025-01-15` (rustc 1.86.0-dev) with 4 patches adding `per_instance_mir`.
-Fork at `~/rust` on branch `per-instance-mir`. Linked as toolchain `rustc-fork`.
+Forked `nightly-2025-01-15` (rustc 1.86.0-dev) with 2 consumer-agnostic hooks
+(`CODEGEN_SKIP_HOOK` + `VISIBILITY_OVERRIDE_HOOK`, both `OnceLock<fn ptr>`
+statics the facade fills at startup). Fork at `~/rust` on branch
+`per-instance-mir` (branch name preserved for historical continuity; stage 4
+plugin work may rename). Linked as toolchain `rustc-fork`.
 
 ---
 
@@ -163,10 +191,12 @@ Fork at `~/rust` on branch `per-instance-mir`. Linked as toolchain `rustc-fork`.
 │  5. rustc parses, type-checks, borrow-checks normally            │
 │     (unreachable!() bodies are valid Rust — no overrides needed) │
 │  6. Monomorphization begins (inside codegen_crate)               │
-│     ├─ per_instance_mir fires for each ENTRY-POINT instance      │
-│     │  → deep walk finds ALL transitive Rust deps                │
+│     ├─ optimized_mir override fires once per CONSUMER DefId      │
+│     │  → symbolic walk finds ALL transitive Rust deps            │
+│     │  → Param-bearing (DefId, GenericArgsRef) pairs returned    │
+│     │  → rustc's collector substitutes per caller                │
+│     ├─ symbol_name fires per concrete ENTRY-POINT instance       │
 │     │  → internal toylang callees stashed in ToylangState        │
-│     │  → only Rust deps returned to rustc's collector            │
 │     ├─ layout_of fires for each consumer type instantiation      │
 │     ├─ mir_shims fires for each consumer drop glue instance      │
 │     └─ symbol_name maps entry-point instances to consumer symbols│
@@ -190,8 +220,10 @@ entry-point functions and Rust deps.
 ## Part 2: The Four Query Providers
 
 Only 4 query overrides. Consumer functions in `__lang_stubs` have `unreachable!()`
-bodies that pass rustc's normal pipeline. `per_instance_mir` replaces them at
-monomorphization time.
+bodies that pass rustc's normal pipeline. Our `optimized_mir` override replaces
+them at monomorphization time with a synthetic dep-registering body; rustc's
+codegen for the resulting consumer symbols is skipped via a facade-installed
+`CODEGEN_SKIP_HOOK` (see §10.6.4).
 
 ### 2.1 layout_of
 
@@ -204,51 +236,53 @@ The library computes C-style layout from those.
 Skips types with unresolved type params (`has_param` check) — these are generic
 definitions, not concrete instantiations.
 
-### 2.2 per_instance_mir (rustc fork)
+### 2.2 optimized_mir override
 
-**Key:** `Instance<'tcx>` — fires per concrete function instantiation.
+**Key:** `LocalDefId` — fires once per consumer function. Installed via the
+sanctioned `Config::override_queries` hook.
 
-Four-patch fork of rustc:
-1. Query definition in `rustc_middle/src/queries.rs`
-2. Collector check in `rustc_monomorphize/src/collector.rs` (before `instance_mir`)
-3. Codegen skip in `rustc_codegen_ssa/src/mono_item.rs` (if Some, skip `codegen_instance`)
-4. Default provider in `rustc_mir_transform/src/shim.rs` (returns None)
+Non-consumer DefIds delegate to rustc's saved upstream provider; consumer
+items (filtered by `is_consumer_codegen_target` — `is_from_lang_stubs_safe`
+AND either consumer-fn or consumer-accessor) get a synthesized body whose
+only purpose is to mention each transitive Rust dep via a `ReifyFnPointer`
+cast. The body terminates with `Unreachable` and is never executed — rustc's
+codegen for the item is skipped by `CODEGEN_SKIP_HOOK` (§10.6.4) and the
+consumer's own `.o` supplies the definition at link time.
 
 The provider calls `collect_generic_rust_deps` which:
-1. Substitutes type params with concrete args from the Instance
-2. Type-resolves the body
-3. Walks the typed AST for deps
+1. Installs a Param-name → Param-index map (`oracle::ActiveParamMap`) for the
+   duration of the walk.
+2. Type-resolves the consumer body WITHOUT substituting Params — the body
+   stays generic.
+3. Walks the typed AST for deps.
 4. For toylang callees: recursively walks their bodies using a **local cycle
    guard** (not persistent state) so transitively-reached deps are collected
    on every call.
-5. For Rust deps (extern fns, Rust methods): returns them to rustc.
+5. For Rust deps (extern fns, Rust methods): returns `(DefId, GenericArgsRef)`
+   pairs whose args may contain `ty::TyKind::Param`. Rustc's mono collector
+   substitutes those Params per caller during its own walk of our synthesized
+   body — the same substitution engine it applies to every generic Rust
+   function.
 
 This callback is side-effect-free with respect to consumer codegen state —
 internal-callee stashing is the separate job of `notify_concrete_entry_point`
-(§2.3). Splitting the two jobs removes the old undocumented ordering
-dependency between `per_instance_mir` and `symbol_name` and leaves each hook
-with a single responsibility.
+(§2.3). Splitting the two jobs (stage-1 landing, commit `ed2e692`) removed
+the old undocumented ordering dependency and leaves each hook with a single
+responsibility.
 
-Only Rust deps are returned to rustc. Internal toylang functions never appear in
-rustc's MonoItems. The consumer discovers them independently during codegen.
+Only Rust deps are returned to rustc. Internal toylang functions never appear
+in rustc's MonoItems. The consumer discovers them independently during codegen.
 
-**Design-space note:** this is a new query rather than an override of rustc's
-existing `optimized_mir`, but that choice was pragmatic rather than
-technically necessary. `optimized_mir` is DefId-keyed (not Instance-keyed
-like `per_instance_mir`), but the collector substitutes the Instance's
-type args into the body during its walk — the same substitution machinery
-it applies to every generic Rust function. So the *effect* is per-Instance
-even though the query itself is DefId-keyed. An `override_queries` approach
-on `optimized_mir` would reach the same dep-discovery behavior with fewer
-fork patches; it would not, on its own, eliminate fork patch 3 (codegen
-skip) — that requires either a separate patch equivalent or a paired
-`CodegenBackend` plugin. See `docs/reasoning/rustc-fork-design-space.md`
-Parts 2 and 4.1–4.2 for the honest accounting of why a new query was
-picked, what an `optimized_mir` override would and wouldn't replace, and
-why zero fork requires combining the override with a plugin rather than
-either alone. The deeper question — why the facade must interleave with
-rustc's monomorphization phase at all, rather than running as a pre-pass
-or post-pass — is answered in Part 1 of that document.
+**Why the override works with Params in the output.** The key insight driving
+stage-3's migration from a custom `per_instance_mir` query to this override
+is that dep discovery's OUTPUT must describe per-Instance deps but its
+COMPUTATION can be symbolic and run once per DefId — rustc's collector does
+the per-Instance concretion. `docs/reasoning/dep-discovery-approaches.md`
+spells out this asymmetry in full, including why the same trick does NOT
+apply to internal consumer→consumer codegen (no downstream substitutor
+exists for toylang LLVM IR, so `notify_concrete_entry_point` stays
+Instance-keyed). `docs/reasoning/rustc-fork-design-space.md` §4.1 covers the
+fork-reduction side of the migration (5 patches → 2).
 
 ### 2.3 symbol_name
 
@@ -262,7 +296,8 @@ points is walked + stashed exactly once.
 
 Because `collect_generic_rust_deps` (§2.2) is Rust-deps-only and
 `notify_concrete_entry_point` is symbol + internal-walk, the old ordering
-dependency between `per_instance_mir` and `symbol_name` is gone — each hook now
+dependency between the former `per_instance_mir` query and `symbol_name` is
+gone — each hook now
 does exactly one of the two jobs the former unified `monomorphize_fn` conflated.
 
 Symbol examples:
@@ -311,7 +346,9 @@ locks `MUTABLE_STATE`):
 - `create_state` — constructor for the consumer state box.
 - `monomorphize_type` — produces per-instantiation type-layout data.
 - `collect_generic_rust_deps` — returns the Rust items a consumer function
-  transitively depends on; called from `per_instance_mir`.
+  transitively depends on; called from the `optimized_mir` override at
+  DefId granularity, returns Param-bearing args that rustc's collector
+  substitutes per caller.
 - `notify_concrete_entry_point` — returns the extern symbol for a concrete
   consumer entry-point Instance and drives internal-callee stashing; called
   from `symbol_name`.
@@ -363,8 +400,9 @@ name collisions with user-defined types/functions sharing a name.
 ### 3.3 Why unreachable!() works
 
 Consumer functions have `unreachable!()` bodies. Rustc compiles them normally
-through `mir_built` and `borrowck` — no overrides needed. `per_instance_mir`
-replaces the bodies at monomorphization time. Codegen skips them. The
+through `mir_built` and `borrowck` — no overrides needed. The `optimized_mir`
+override replaces the bodies at monomorphization time with a synthetic
+dep-registering body. `CODEGEN_SKIP_HOOK` (§10.6.4) skips codegen for them. The
 `unreachable!()` code is never emitted in the final binary.
 
 ---
@@ -809,9 +847,9 @@ equivalent from the test's standpoint, since both fire per entry point.
 
 | File | Purpose |
 |------|---------|
-| `lib.rs` | `LangPredicates` + `LangCallbacks: LangPredicates` traits, split globals (`CONFIG`, `MUTABLE_STATE`, `DEFAULT_*` — see @GCMLZ), `PredicateVtable` + `StatefulVtable` + their trampolines, `facade_visibility_override` bridge fn (lock-free, see @GCMLZ), `is_from_lang_stubs` |
+| `lib.rs` | `LangPredicates` + `LangCallbacks: LangPredicates` traits, split globals (`CONFIG`, `MUTABLE_STATE`, `DEFAULT_*` — see @GCMLZ), `PredicateVtable` + `StatefulVtable` + their trampolines, `facade_visibility_override` bridge fn (lock-free, see @GCMLZ), `CODEGEN_SKIP_HOOK` install closure, `is_from_lang_stubs` / `is_from_lang_stubs_safe` / `is_consumer_codegen_target` / `is_consumer_accessor_safe` helpers |
 | `queries/layout.rs` | layout_of override (reads CONFIG/DEFAULT_LAYOUT_OF without lock per @GCMLZ) |
-| `queries/per_instance.rs` | per_instance_mir provider |
+| `queries/optimized_mir.rs` | optimized_mir override: synthesizes Param-bearing dep-registering bodies for consumer DefIds, delegates to saved upstream default for everything else |
 | `queries/symbol_name.rs` | symbol_name override (reads CONFIG/DEFAULT_SYMBOL_NAME without lock per @GCMLZ) |
 | `queries/drop_glue.rs` | Drop glue (mir_shims) override (reads CONFIG/DEFAULT_MIR_SHIMS without lock per @GCMLZ) |
 | `queries/mod.rs` | Query override installation (4 providers) |
@@ -845,7 +883,8 @@ equivalent from the test's standpoint, since both fire per entry point.
 ### Why deep monomorphization walk
 
 Previously, `collect_toylang_fn_deps` reported toylang callees to rustc, causing
-rustc to process internal functions through `per_instance_mir` / `symbol_name`.
+rustc to process internal functions through the (now-retired) `per_instance_mir`
+query / `symbol_name`.
 The deep walk eliminates this: the two walkers (`collect_rust_deps_recursive`
 and `walk_and_stash_internal_callees`, §4.4) cooperatively handle Rust-dep
 discovery and internal-callee stashing without exposing internal callees to
@@ -933,20 +972,26 @@ generic-method-on-generic-trait case that kills the last
 over-approximation workaround — see
 `docs/reasoning/why-interleaved-monomorphization.md`.
 
-### Why per_instance_mir (rustc fork) instead of mir_built
+### Why override `optimized_mir` instead of hooking `mir_built`
 
-`mir_built` fires once per function DEFINITION, not per instantiation. For generic
-functions, rustc calls `mir_built` once for the generic definition and substitutes
-internally. `per_instance_mir` fires per concrete `Instance<'tcx>`.
+`mir_built` fires once per function DEFINITION, not per instantiation. For
+generic functions, rustc calls `mir_built` once for the generic definition
+and substitutes internally. `optimized_mir` ALSO fires once per DefId — but
+rustc's mono collector walks its returned body for each caller Instance,
+substituting Params per caller during the walk (the same substitution engine
+that handles every generic Rust function). That per-caller substitution is
+what makes the DefId-keyed override sufficient for dep discovery.
 
-**But why a new query vs overriding `optimized_mir`?** `optimized_mir` is also
-Instance-keyed and also fires during monomorphization — so the "Instance-keying"
-framing was never the discriminator. The honest answer is that a new query was
-picked for taste reasons: "consumer owns its own query" felt cleaner than
-"consumer intercepts a query rustc's normal MIR pipeline uses too." That
-preference carries a fork-patch cost that was acceptable for toylang but is
-the wrong trade-off for a consumer with a zero-fork target. See
-`docs/reasoning/rustc-fork-design-space.md` Parts 2 and 4.1.
+**Stage-3 migration note:** erw previously shipped a custom Instance-keyed
+`per_instance_mir` query via a 4-patch rustc fork. Stage 3 retired that
+query in favor of the sanctioned `Config::override_queries` path on
+`optimized_mir` — same dep-discovery behavior, three fewer fork patches, no
+custom query plumbing. The insight that made the migration viable is the
+asymmetry between Rust-dep output (Params fine, rustc substitutes) and
+internal-callee output (must be concrete, no downstream substitutor exists
+for toylang LLVM IR). See `docs/reasoning/dep-discovery-approaches.md` for
+the full comparison and `docs/reasoning/rustc-fork-design-space.md` §4.1 for
+the fork-reduction accounting.
 
 ### Why explicit type args instead of inference
 
@@ -1205,10 +1250,10 @@ do NOT cause rustc to emit code for that Instance. The first attempt
 treated these as if they did, and produced clean compiles + broken links.
 
 Codegen is driven by rustc's mono collector walking ReifyFnPointer casts
-inside MIR bodies (`rustc_monomorphize/src/collector.rs:709-717`). The
-facade's `per_instance_mir` synthesizes a MIR body for each toylang
-function whose only purpose is to mention each Rust dep as a
-ReifyFnPointer (`rustc-lang-facade/src/queries/per_instance.rs:106-173`).
+inside MIR bodies (`rustc_monomorphize/src/collector.rs`). The facade's
+`optimized_mir` override synthesizes a MIR body for each consumer DefId
+whose only purpose is to mention each Rust dep as a ReifyFnPointer
+(`rustc-lang-facade/src/queries/optimized_mir.rs::build_dependency_body`).
 Anything pushed into `rust_deps` becomes a ReifyFnPointer; the mono
 collector promotes it to `used_items` and rustc emits the symbol.
 
@@ -1283,7 +1328,7 @@ case. The `__toylang_accessor_*` methods generated by `stub_gen.rs`
 live in impls on consumer types inside `__lang_stubs`, so they're
 already covered by the blanket DefPath check above. Belt and
 suspenders, though: `lang_symbol_name` (`queries/symbol_name.rs`)
-intercepts accessor instances via `is_consumer_accessor_pub` and rewrites
+intercepts accessor instances via `is_consumer_accessor_safe` and rewrites
 their symbols to toylang-mangled names (`__toylang_accessor_<struct>_<field>`)
 before the partitioner ever sees the original rustc-mangled name. By the
 time partitioning runs, accessor callers reference an external-looking
@@ -1296,26 +1341,43 @@ emission.** The immunity claim above is specifically about CGU-partitioner
 behavior: accessors don't enter the internalization candidate set
 because `lang_symbol_name` has already rewritten their symbols by the
 time partitioning runs, and `visibility_override`'s DefPath check backs
-it up. **Under the current `per_instance_mir` architecture this is the
-complete picture, because patch 3 (codegen skip) prevents rustc from
-emitting bodies for consumer items at all.** Under a hypothetical
-`optimized_mir`-override alternative (`docs/reasoning/rustc-fork-design-space.md`
-§4.1), rustc *would* emit trampoline bodies for accessors at the
-rewritten toylang symbols, and those bodies would collide with
-Inkwell's real accessor implementations at link time. The 2026-04-16
-POC on branch `poc/optimized-mir-override` confirmed 19 unique
-`__toylang_accessor_*` collisions across 117 failing tests — same
-emission-conflict shape as consumer entry-point functions.
-If you're reading this §10.6.4 in the context of evaluating fork-reduction
-paths, the accessor immunity does NOT generalize to the
-override-queries-alone design — it survives only because patch 3 keeps
-rustc out of the emission business. See the reasoning doc for the
-full design-space analysis.
+it up. Under the shipping `optimized_mir` override (stage 3), rustc
+*would* synthesize trampoline bodies for accessors at the rewritten
+toylang symbols — the 2026-04-16 POC on branch `poc/optimized-mir-override`
+confirmed 19 unique `__toylang_accessor_*` collisions across 117 failing
+tests when emission wasn't suppressed. The live `CODEGEN_SKIP_HOOK`
+(described below) closes that gap for accessors the same way it does
+for regular consumer fns: `is_consumer_codegen_target` matches on
+accessor DefIds via `is_consumer_accessor_safe`, the hook returns
+`true`, rustc's `MonoItemExt::define` returns without calling
+`codegen_instance`, and the bodies never reach the linker. Treat the
+partitioner immunity and the codegen skip as a matched pair — neither
+alone suffices.
 
-Currently only `MonoItem::Fn` is forwarded to the hook. `MonoItem::Static`
+**Sibling hook: `CODEGEN_SKIP_HOOK`.** Stage 3 (commit `ce437ae`) added
+a second facade-installed `OnceLock<fn ptr>` in the fork, structurally
+parallel to `VISIBILITY_OVERRIDE_HOOK`: `rustc_codegen_ssa::mono_item::CODEGEN_SKIP_HOOK`
+answers "should I skip codegen for this Instance?" for every
+`MonoItem::Fn`. The facade fills it at startup with a closure that
+delegates to `rustc_lang_facade::is_consumer_codegen_target(tcx,
+instance.def_id())`. When the hook returns `true`, rustc's
+`MonoItemExt::define` skips `base::codegen_instance` — the `predefine`
+phase has already emitted an LLVM declaration at the consumer's symbol
+(via the `symbol_name` override), and the consumer's own `.o` provides
+the definition at link time. Before stage 3 this was a direct
+`per_instance_mir(instance).is_some()` check inside `mono_item.rs`;
+reshaping it into a hook eliminated fork patches 1, 2, and 4 (which
+existed only to plumb the `per_instance_mir` query that the old check
+inspected). The two hooks are the complete list of consumer-specific
+machinery in the rustc fork today; both are consumer-agnostic at the
+fork boundary (neither mentions `__lang_stubs` or any other toylang
+concept), and both follow the same idempotent `set` pattern in
+`install_callbacks`.
+
+Currently only `MonoItem::Fn` is forwarded to either hook. `MonoItem::Static`
 and `MonoItem::GlobalAsm` are skipped (toylang doesn't emit either into
-`__lang_stubs`). Widen the hook signature to take `&MonoItem<'tcx>` if a
-future consumer needs them.
+`__lang_stubs`). Widen the hook signatures to take `&MonoItem<'tcx>` if
+a future consumer needs them.
 
 #### 10.6.5 Why this approach beat the alternatives
 
@@ -1345,9 +1407,13 @@ Considered and rejected:
   `generate_stubs()` fires, plus risks `#[no_mangle]` collisions across
   workspace crates.
 - **`#[used]` and synthetic fn-pointer statics.** The first doesn't drive
-  monomorphization; the second ICE'd inside `per_instance_mir` (the hook
-  didn't expect a synthetic static referencing a wrapper). Both attempted
-  in the first prior attempt.
+  monomorphization; the second ICE'd inside the then-current custom
+  `per_instance_mir` query (the hook didn't expect a synthetic static
+  referencing a wrapper). Both attempted in the first prior attempt. The
+  custom query has since been retired (stage-3 migration, see §2.2); the
+  second-attempt ICE is an artifact of the old architecture and wouldn't
+  recur identically under the `optimized_mir` override, though the broader
+  rejection (no monomorphization drive) still holds.
 
 The chosen approach (wrapper functions + partitioner patch) extends the
 existing fork-as-bridge architecture by exactly one mechanism (visibility

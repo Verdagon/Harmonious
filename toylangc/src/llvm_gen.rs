@@ -1811,8 +1811,8 @@ fn parse_struct_type_str<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> Struc
 
 // Per @SMINCZ, this function is read-only — it computes a symbol name but
 // does NOT drive codegen of `def_id` with `args`. The caller must
-// independently register the dep so `per_instance_mir` reifies a
-// ReifyFnPointer to it; otherwise the linker fails on a missing symbol.
+// independently register the dep so the `optimized_mir` override reifies
+// a ReifyFnPointer to it; otherwise the linker fails on a missing symbol.
 fn resolve_rust_symbol<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: rustc_span::def_id::DefId,

@@ -6,9 +6,12 @@ here is *potential* future work — this file exists so the next TL
 can see the investigation landscape at a glance without having to
 re-derive it from branches and reasoning docs.
 
-**Top-line status as of 2026-04-17:** all three investigations complete;
-response drafted but not sent; no decision taken on whether to pursue
-fork reduction for toylang itself.
+**Top-line status as of 2026-04-18:** all three investigations complete;
+response drafted but not sent; **§3.1 (POC #1, `optimized_mir` override)
+landed in shipping as the stage-3 fork reduction** (commits `ce437ae` +
+`bf770ae`, fork now at 2 patches). Remaining investigations (§3.2
+separate-crate, §3.3 plugin) still apply to the stage-4 zero-fork
+target — neither is in flight.
 
 ---
 
@@ -16,8 +19,11 @@ fork reduction for toylang itself.
 
 A reviewer on the Vale project
 (`/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`)
-asked whether `rustc-lang-facade`'s 5-patch rustc fork could be reduced
-or eliminated. The ask was driven by Vale's deployment story: Vale
+asked whether `rustc-lang-facade`'s (then) 5-patch rustc fork could be
+reduced or eliminated. *(Stage 3 since brought the fork down to 2
+patches via §3.1; the rest of this framing reflects the pre-stage-3
+landscape, which is still the starting point for the zero-fork
+question Vale asked about.)* The ask was driven by Vale's deployment story: Vale
 ships a precompiled binary, and "install our forked rustc" is
 user-install friction they want to avoid. Toylang doesn't share that
 distribution concern — the fork is fine for a research project — but
@@ -79,13 +85,26 @@ name Vale's model as a case that requires this mechanism.
 **Commits:** `b425094` → `1ee3800` → `119d287` → `e597fdd`
 **Full findings:** `findings.md` on the branch
 
+**Status: LANDED IN SHIPPING (2026-04-18).** Stage 3 migrated erw
+from the custom `per_instance_mir` query to this override as its
+shipping architecture. Fork patches 1, 2, 4 deleted; patch 3 reshaped
+into a facade-installed `CODEGEN_SKIP_HOOK` structurally parallel to
+the existing `VISIBILITY_OVERRIDE_HOOK`. The trait-level job-split
+described below had landed earlier (commit `ed2e692`) as a
+prerequisite. Shipping commits: `ce437ae` (patch 3 reshape) and
+`bf770ae` (override end-to-end). See
+`docs/historical/handoff-optimized-mir-migration.md` for the shipping
+writeup and `docs/reasoning/dep-discovery-approaches.md` for the
+Approach A vs B comparison. The POC branch itself stays around as
+the pre-landing reproducibility anchor. Net: fork 5 → 2 patches.
+
 **Goal:** replace `per_instance_mir` (fork patches 1, 2, 4) with an
 `override_queries` hook on rustc's existing `optimized_mir` query.
 The consumer returns a generic MIR body for each consumer DefId;
 rustc's collector substitutes per-Instance during its walk, same
 machinery that handles every generic Rust function.
 
-**Verdict: prototype-verified.** Dep discovery works end-to-end —
+**Verdict: prototype-verified, then shipped.** Dep discovery works end-to-end —
 the collector substituted per-caller Params in the synthetic body
 and queued the same Rust deps `per_instance_mir` produces today.
 LLVM IR showed `declare` lines for transitively-reachable Rust items.
@@ -117,14 +136,17 @@ can drive. The redesign split the trait across two queries that
 - `notify_concrete_entry_point(instance)` — called from `symbol_name`,
   Instance-keyed, drives the recursive internal-callee walk.
 
-No new rustc-exposed hook needed. This trait-level reshape **has
-landed** as a standalone refactor (2026-04, all 211 tests pass);
-the zero-fork migration (§3.x) can now assume the facade already
-has the right callback shape.
+No new rustc-exposed hook needed. This trait-level reshape landed
+as a standalone refactor (2026-04, commit `ed2e692`); the stage-3
+shipping migration then dropped the `Instance` parameter from
+`collect_generic_rust_deps` entirely (commit `bf770ae`) — the facade
+now calls the callback once per DefId with identity args, and rustc
+substitutes per caller.
 
-**Cost estimate impact:** bumped the zero-fork estimate from 2-4
-weeks to 4-8 weeks, because the callback-redesign line item wasn't
-in the earlier number.
+**Cost estimate impact:** the 2-3 week trait-job-split line item has
+been absorbed (landed). Remaining estimate for full zero-fork (with
+plugin pairing per §3.3) drops to 2-5 weeks from today's 2-patch
+baseline.
 
 ### 3.2 POC #2 — Separate-crate stub model
 
@@ -236,21 +258,32 @@ grow further), and the mechanism for implementation became concrete.
 ## Part 4: What this means for fork-reduction as a whole
 
 **For Vale** (greenfield, distribution-friction concern): zero-fork is
-viable. 4-8 weeks of engineering. Specific path:
+viable. 2-5 weeks of engineering from today's 2-patch baseline (down
+from the original 4-8 week estimate because §3.1's query override +
+callback job-split have already landed in erw's shipping architecture
+and are reusable by Vale). Specific remaining path:
 
-1. `override_queries` on `optimized_mir` (3.1) — 1-2 weeks plumbing
-2. `LangCallbacks` trait job-split per 3.1's design — 2-3 weeks
-3. `CodegenBackend` plugin with partitioner-override per 3.3's coarser
+1. `CodegenBackend` plugin with partitioner-override per 3.3's coarser
    design + `upstream_monomorphization` override per 3.2's ~5 LoC —
-   2-3 weeks
-4. Separate-crate stubs per 3.2's greenfield pattern — absorbed into
-   step 3 at ~zero marginal cost
+   2-3 weeks. This also retires the reshaped patch 3 (the plugin is
+   the codegen backend and decides what to emit per crate-compile).
+2. Separate-crate stubs per 3.2's greenfield pattern — absorbed into
+   step 1 at ~zero marginal cost. Retires the `VISIBILITY_OVERRIDE_HOOK`
+   patch via `#[linkage = "external"]` in the stub rlib (greenfield
+   consumers keep the feature flag out of user crates by construction).
+3. Adopt the shipping `optimized_mir` override (already in the
+   facade) — zero-cost reuse.
 
-**For toylang** (brownfield, fork-maintenance-cost concern): don't
-pursue. The 4-8 week migration exceeds the fork's ~2-3 days-per-bump
-maintenance cost over any reasonable horizon. The architectural
-investment would be for a capability (zero-fork distribution) toylang
-doesn't need.
+Total: 2-5 weeks to go from erw's current 2-patch baseline to zero
+fork patches for a greenfield consumer like Vale.
+
+**For toylang** (brownfield, fork-maintenance-cost concern): stage 3
+has landed and was worth it (5 → 2 patches, cleaner boundary, no
+custom query plumbing). Further reduction (stage 4, plugin) is
+optional — the remaining 2 patches are small, consumer-agnostic, and
+stable across nightly rebases. Pursue if/when the plugin work is
+separately motivated (e.g., for Vale integration); don't pursue for
+toylang alone.
 
 The reasoning doc (§4.1–4.3, Part 5) has the itemized cost-accounting
 for both positions.
@@ -278,18 +311,26 @@ reviewed by both POC authors and the spike author.
 ### Doc currency
 
 The reasoning doc and architecture guide have been updated to reflect
-all three investigations' findings. Specifically:
+all three investigations' findings plus the stage-3 landing.
+Specifically:
 
 - `docs/reasoning/why-interleaved-monomorphization.md` — the
   seven-case taxonomy anchoring why the architecture exists.
 - `docs/reasoning/rustc-fork-design-space.md` — Parts 2 (query
   choice) / 3 (linkage rejection) / 4.1-4.3 (alternatives catalog)
-  / 4.6 (spike references) / 5 (cost accounting).
-- `docs/architecture/rust-interop-guide.md` §10.6.4 (accessor
-  immunity scope) and §10.6.5 (linkage rejection nuance) updated.
+  / 4.6 (spike references) / 5 (cost accounting, now 2-patch post
+  stage 3).
+- `docs/reasoning/dep-discovery-approaches.md` — the Approach A
+  vs Approach B comparison that names the Params-in-output insight
+  behind the stage-3 migration.
+- `docs/architecture/rust-interop-guide.md` §2.2 (`optimized_mir`
+  override), §10.6.4 (accessor immunity scope + `CODEGEN_SKIP_HOOK`
+  sibling), and §10.6.5 (linkage rejection nuance) updated.
+- `docs/historical/handoff-optimized-mir-migration.md` — the
+  shipping writeup of the stage-3 migration.
 
-All three docs reference the specific POC branches and commit SHAs
-for reproducibility. If future TL work continues the investigation,
+All docs reference the specific POC branches and commit SHAs for
+reproducibility. If future TL work continues the investigation,
 those refs should stay in sync.
 
 ### Branches kept as reference
@@ -374,8 +415,10 @@ If you're picking this investigation up cold:
 7. **If toylang's position changes** (e.g., the distribution-friction
    concern shifts to apply to toylang too), the reasoning doc's
    Part 5 cost accounting tells you what you'd need to commit to
-   for zero-fork. 4-8 weeks, plus ongoing ~1 week per rustc bump
-   for MIR-construction churn (irreducible, same as the fork path).
+   for zero-fork. Post stage-3 baseline: 2-5 weeks remaining
+   (plugin + separate-crate stubs), plus ongoing ~1 week per rustc
+   bump for MIR-construction churn (irreducible, same as the fork
+   path).
 
 The whole investigation is complete and self-contained. If you want
 to leave it alone, everything continues to work as-is (the fork is

@@ -30,8 +30,10 @@ without locking; only callbacks that need `&mut consumer_state` lock
   `is_consumer_type` (CONFIG, no lock) and `default_layout_of` (OnceLock, no
   lock) for non-consumer types
 - `rustc-lang-facade/src/queries/drop_glue.rs` — `lang_mir_shims` same pattern
-- `rustc-lang-facade/src/queries/per_instance.rs` — `lang_per_instance_mir`
-  same pattern
+- `rustc-lang-facade/src/queries/optimized_mir.rs` — `lang_optimized_mir`
+  same pattern (stage-3 replacement for the retired
+  `lang_per_instance_mir` provider; installed via
+  `Config::override_queries` on rustc's existing `optimized_mir` query)
 - `facade_visibility_override` (in `lib.rs`) — bridge fn registered into
   `rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK`. Dispatches
   through `predicate_vtable.visibility_override` and never touches

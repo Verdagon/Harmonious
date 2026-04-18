@@ -80,7 +80,9 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             let field_ident = format_ident!("{}", field.name);
             let field_ty = resolved_type_to_syn(&field.rust_type);
 
-            // unreachable!() body — per_instance_mir handles all accessor instances.
+            // unreachable!() body — the `optimized_mir` override synthesizes
+            // dep-registering bodies for every accessor DefId; rustc's codegen
+            // is skipped via `CODEGEN_SKIP_HOOK`.
             accessor_methods.push(quote! {
                 pub fn #field_ident(&self) -> &#field_ty {
                     unreachable!()
@@ -119,14 +121,17 @@ pub fn generate(registry: &ToylangRegistry) -> String {
 
     // Generate public wrapper functions for ALL toylang functions (with bodies).
     // For non-generic functions with external_symbol, also emit extern "C" declarations.
-    // The wrapper has an unreachable!() body — per_instance_mir/mir_built intercepts it.
+    // The wrapper has an unreachable!() body — the `optimized_mir` override
+    // replaces it with a synthetic dep-registering body at monomorphization time.
     for (_name, toy_fn) in &registry.functions {
         if toy_fn.body.is_none() {
             continue;
         }
 
         // Extern declaration only for concrete (non-generic) functions.
-        // Generic functions go through per_instance_mir (no extern needed).
+        // Generic functions flow through the `optimized_mir` override at
+        // monomorphization time (no extern needed; their symbols come from the
+        // consumer's backend via `CODEGEN_SKIP_HOOK`).
         if toy_fn.type_params.is_empty() {
             let sym = format!("__toylang_impl_{}", _name);
             let fn_ident = format_ident!("{}", sym);

@@ -5,10 +5,10 @@ A framework for embedding custom languages into rustc's compilation pipeline via
 ## Background
 
 Two-crate workspace:
-- **`rustc-lang-facade`** — reusable library that hooks into rustc via 4 query providers (`layout_of`, `per_instance_mir`, `symbol_name`, `mir_shims`)
+- **`rustc-lang-facade`** — reusable library that hooks into rustc via 4 query providers (`layout_of`, `optimized_mir`, `symbol_name`, `mir_shims`)
 - **`toylangc`** — example consumer compiler for "toylang" that uses the facade
 
-Forked `nightly-2025-01-15` (rustc 1.86.0-dev) with `per_instance_mir` query. Toolchain `rustc-fork`.
+Forked `nightly-2025-01-15` (rustc 1.86.0-dev) with 2 consumer-agnostic hooks (codegen-skip + visibility-override), both `OnceLock<fn ptr>` statics the facade fills at startup. Toolchain `rustc-fork`.
 
 Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Internal consumer functions are never exposed to rustc — they are discovered via deep monomorphization walk and compiled separately by an Inkwell LLVM backend. A global mutex serializes all consumer code (single-threaded).
 

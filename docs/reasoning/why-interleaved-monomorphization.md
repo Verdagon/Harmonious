@@ -290,7 +290,9 @@ generic signature. The facade provides this via the generated
 generator emits a signature-only declaration like
 `pub fn wrap<T>(x: T) -> Wrapper<T> { unreachable!() }`. Rustc
 type-checks against the stub declaration; when codegen reaches the
-call site, `per_instance_mir` fires to supply the real body. This
+call site, the facade's `optimized_mir` override fires to supply the
+synthetic dep-registering body (formerly the forked `per_instance_mir`
+query, stage-3 migration). This
 stub-injection mechanism is what allows the Rust-as-top-level cases
 to type-check at all. Pre-pass would still need an equivalent signature
 surfacing step — but the harder problem (enumerating concrete
@@ -692,16 +694,24 @@ methods), layout info (for types), or drop-glue MIR (for destructors)
 
 Today this is implemented via:
 
-- `per_instance_mir` (query, Instance-keyed) — supplies synthetic MIR
-  bodies for consumer function Instances. The body typically contains
-  `ReifyFnPointer` casts of any Rust items the consumer's body calls,
-  which tells the collector to queue those items too.
+- `optimized_mir` (query override, DefId-keyed, post stage-3) —
+  supplies synthetic MIR bodies for consumer function DefIds. The body
+  typically contains `ReifyFnPointer` casts of any Rust items the
+  consumer's body calls — with Param placeholders where the consumer
+  fn is generic. Rustc's collector substitutes those Params per
+  caller during its walk, the same machinery it applies to every
+  generic Rust function. (Pre stage-3 this was a custom Instance-keyed
+  `per_instance_mir` query with pre-substituted bodies; stage-3
+  migrated to Approach B per `docs/reasoning/dep-discovery-approaches.md`.)
 - `layout_of` (query, Ty-keyed) — supplies layout data for consumer
   type instantiations.
 - `mir_shims` (query, InstanceKind::DropGlue-keyed) — supplies drop
   glue for consumer types.
 - `symbol_name` (query, Instance-keyed) — maps consumer Instances to
-  consumer-defined symbol names.
+  consumer-defined symbol names; also the site where the facade
+  drives its internal-callee walk (which, unlike Rust-dep discovery,
+  requires concrete args — no downstream substitutor exists for
+  toylang LLVM IR).
 
 Each of these fires reactively, as rustc's collector encounters
 concrete things it needs information about. The consumer side doesn't
@@ -735,36 +745,39 @@ dependencies listed."
 
 **Case 1b: Rust instantiates toylang generics with Rust-defined types.**
 Rustc's collector walks `main.rs`, sees `wrap::<LocalThing>(t)`,
-queues `wrap<LocalThing>`. Queries `per_instance_mir(wrap<LocalThing>)`
-on the facade. The facade looks up `wrap`'s toylang body with
-`T = LocalThing` substituted, returns a synthetic MIR body listing
-any Rust deps that body needs (for this minimal example, essentially
-none — `wrap` just constructs a struct). Rustc compiles the body
-through toylang's backend. Queries `layout_of(Wrapper<LocalThing>)`
-for stack-frame allocation. Queries `mir_shims` for the drop glue.
-All handled per-Instance.
+queues `wrap<LocalThing>`. Queries `optimized_mir(wrap_def_id)` on
+the facade; the facade returns a generic MIR body with a
+`ReifyFnPointer` cast per Rust dep (for this minimal example,
+essentially none — `wrap` just constructs a struct) and Params in
+place of `T`. The collector substitutes `T = LocalThing` as it walks
+the body under this particular caller, queuing the concrete Rust
+deps for emission. Rustc's codegen for the consumer symbol is skipped
+by `CODEGEN_SKIP_HOOK`; toylang's backend emits the real body
+separately. Queries `layout_of(Wrapper<LocalThing>)` for stack-frame
+allocation. Queries `mir_shims` for the drop glue. All handled
+per-Instance via rustc's substitution machinery.
 
 **Case 3: Rust → toylang → back into Rust.** Rustc walks main, queues
-`clone_it<MyCounter>`. Facade's `per_instance_mir` fires, constructs a
-synthetic body for `clone_it` with `T = MyCounter` substituted. The
-body mentions `<MyCounter as Clone>::clone` as a `ReifyFnPointer`
-cast. Rustc's collector walks the synthetic body, sees the cast,
-queues `<MyCounter as Clone>::clone` — a Rust-defined item (the impl
-block is in `main.rs`). Rustc compiles it normally. The facade never
-has to know about `MyCounter` or its Clone impl beyond "the
-`clone_it<T>` body calls `Clone::clone`, so pass that through as a
-dep."
+`clone_it<MyCounter>`. Facade's `optimized_mir` override fires on
+`clone_it_def_id`, returns a generic synthetic body mentioning
+`<Param(T) as Clone>::clone` as a `ReifyFnPointer` cast. Rustc's
+collector walks it with `T = MyCounter`, substitutes, queues
+`<MyCounter as Clone>::clone` — a Rust-defined item (the impl block
+is in `main.rs`). Rustc compiles it normally. The facade never has to
+know about `MyCounter` or its Clone impl beyond "the `clone_it<T>`
+body calls `Clone::clone`, so pass that through as a dep."
 
 **Case 4: Toylang → Rust → back into toylang.** Toylang emits `main`
 with a call to `duplicate<Widget>` (an extern declaration referencing
 the Rust-emitted symbol). Rustc's collector queues `duplicate<Widget>`
 (a normal Rust generic monomorphization), walks its Rust body,
 substitutes `T = Widget`, sees `x.clone()`, resolves to
-`<Widget as Clone>::clone`. Queries `per_instance_mir` on that
-Instance — the facade recognizes it as a consumer trait impl, returns
-the toylang-defined `clone` body with substituted args. Rustc
-compiles nothing for it (consumer owns the emission); toylang's
-backend emits the real body separately.
+`<Widget as Clone>::clone`. Queries `optimized_mir` on the
+consumer-impl DefId — the facade recognizes it as a consumer trait
+impl, returns the toylang-defined `clone` body with Params intact;
+the collector substitutes `T = Widget` per caller. Rustc's codegen
+for the symbol is skipped by `CODEGEN_SKIP_HOOK`; toylang's backend
+emits the real body separately.
 
 **Case 5 and 6: transitive library structures.** Compose the above.
 Nothing structurally new — the interleaving is already the mechanism
@@ -812,31 +825,42 @@ hook fires per-Instance during monomorphization to supply consumer
 bodies." The specific hook is an implementation detail that can be
 swapped.
 
-Today's toylang implementation uses a forked `per_instance_mir`
-query plus four supporting patches (definition, collector check,
-codegen skip, default provider). The forked query is not
-load-bearing; what's load-bearing is the interleaving behavior
-it produces. The same interleaving can be achieved with:
+**Today's shipping implementation (post stage 3)** uses a
+`rustc_interface::Config::override_queries` override on rustc's
+existing `optimized_mir` query — the sanctioned extension point
+that rust-analyzer, clippy, and miri all use. Paired with two
+small consumer-agnostic fork hooks (`CODEGEN_SKIP_HOOK` in
+`rustc_codegen_ssa` and `VISIBILITY_OVERRIDE_HOOK` in
+`rustc_monomorphize`, both `OnceLock<fn ptr>` statics the facade
+fills at startup). Fork state: 2 patches.
 
-- `rustc_interface::Config::override_queries` on the existing
-  `optimized_mir` query — rustc's standard extension point, no fork.
-- Paired with a `CodegenBackend` plugin for emission control
-  (replaces patch 3's codegen skip).
-- Plus a facade-side callback trait job-split to fit the
-  DefId-keyed-query / Instance-keyed-consumer-callback mismatch.
+*Historical note: before the stage-3 migration (2026-04-18), this
+role was played by a custom `per_instance_mir` query plus four
+supporting fork patches. The forked query was never load-bearing;
+what's load-bearing is the interleaving behavior. The stage-3
+migration swapped the query implementation while preserving the
+interleaving contract. See `docs/reasoning/dep-discovery-approaches.md`
+for the Approach A (retired) vs Approach B (shipping) comparison.*
 
-`docs/reasoning/rustc-fork-design-space.md` §4.1–4.2 analyzes these
-fork-reduction alternatives in detail, including a prototype-verified
-run of the `optimized_mir` override on the `poc/optimized-mir-override`
-branch. The design-space doc takes "interleaving is required" as
-given (from this doc) and asks the follow-up question: *which
-specific rustc mechanism* should implement it. Separating the
-"why" (this doc) from the "how" (that doc) keeps each question
-answerable in isolation: if the current fork patches ever need
-to be replaced — for Vale's distribution story or otherwise — the
-migration path doesn't have to relitigate whether interleaving is
-needed. It is; that's settled here. The only open question at
-migration time is which sanctioned rustc hook to use.
+Further fork reduction is possible but not currently shipping:
+
+- The remaining `CODEGEN_SKIP_HOOK` patch could be retired by
+  pairing with a `CodegenBackend` plugin (see
+  `docs/reasoning/rustc-fork-design-space.md` §4.2).
+- `VISIBILITY_OVERRIDE_HOOK` could be retired via a separate-crate
+  stub model (§4.3) that keeps `#![feature(linkage)]` out of
+  user-visible crates.
+
+`docs/reasoning/rustc-fork-design-space.md` §4.1–4.3 + Part 5
+analyzes these paths and their current cost estimates. The design-
+space doc takes "interleaving is required" as given (from this
+doc) and asks the follow-up question: *which specific rustc
+mechanism* should implement it. Separating the "why" (this doc)
+from the "how" (that doc) keeps each question answerable in
+isolation: if the remaining fork patches ever need to be retired
+— for Vale's distribution story or otherwise — the migration path
+doesn't have to relitigate whether interleaving is needed. It is;
+that's settled here.
 
 ---
 
