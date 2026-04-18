@@ -22,6 +22,7 @@
 pub mod drop_glue;
 pub mod layout;
 pub mod optimized_mir;
+pub mod partition;
 pub mod symbol_name;
 
 /// Install query overrides. Called from `LangDriver::config`.
@@ -34,10 +35,12 @@ pub fn lang_override_queries(
         providers.mir_shims,
         providers.symbol_name,
         providers.optimized_mir,
+        providers.collect_and_partition_mono_items,
     );
 
     providers.layout_of     = layout::lang_layout_of;
     providers.mir_shims     = drop_glue::lang_mir_shims;
     providers.optimized_mir = optimized_mir::lang_optimized_mir;
     providers.symbol_name   = symbol_name::lang_symbol_name;
+    providers.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
 }

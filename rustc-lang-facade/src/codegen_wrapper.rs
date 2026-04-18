@@ -75,6 +75,12 @@ impl CodegenBackend for LangCodegenBackend {
         metadata: rustc_metadata::EncodedMetadata,
         need_metadata_module: bool,
     ) -> Box<dyn Any> {
+        // Clear any stale upstream-CGU stash from a prior compilation (tests
+        // may rerun `codegen_crate` with a fresh `tcx`). The stash will be
+        // repopulated when the partitioner override fires inside
+        // `inner.codegen_crate` below.
+        crate::clear_upstream_cgus();
+
         // Phase 1: inner.codegen_crate runs monomorphization (collect_and_partition_mono_items)
         // then compiles Rust code to LLVM. Our collect_generic_rust_deps /
         // notify_concrete_entry_point / monomorphize_type callbacks fire during

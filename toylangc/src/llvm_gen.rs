@@ -1886,7 +1886,12 @@ pub fn generate_with_tcx<'tcx>(
 
     // Walk MonoItems for accessor methods (still discovered via rustc).
     // Regular toylang functions come from state.toylang_instances instead.
-    let (_, cgus) = tcx.collect_and_partition_mono_items(());
+    // Stage 4a: the facade's partitioner override removes consumer items
+    // from the CGU slice returned by `collect_and_partition_mono_items`, so
+    // we read the UNFILTERED slice from the facade's stash instead. The
+    // stash was populated by the partitioner override earlier in this same
+    // `codegen_crate` call.
+    let cgus = rustc_lang_facade::upstream_cgus(tcx);
     for cgu in cgus.iter() {
         for (&mono_item, _) in cgu.items() {
             let rustc_middle::mir::mono::MonoItem::Fn(instance) = mono_item else { continue };

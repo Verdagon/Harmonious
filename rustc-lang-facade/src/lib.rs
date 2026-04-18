@@ -28,6 +28,10 @@ pub mod file_loader;
 pub mod mir_helpers;
 pub mod queries;
 
+mod cgu_stash;
+pub use cgu_stash::upstream_cgus;
+pub(crate) use cgu_stash::{clear_upstream_cgus, stash_upstream_cgus};
+
 use std::path::PathBuf;
 
 use rustc_hir::def_id::LocalDefId;
@@ -285,6 +289,8 @@ static DEFAULT_LAYOUT_OF: OnceLock<queries::layout::LayoutOfFn> = OnceLock::new(
 static DEFAULT_MIR_SHIMS: OnceLock<queries::drop_glue::MirShimsFn> = OnceLock::new();
 static DEFAULT_SYMBOL_NAME: OnceLock<queries::symbol_name::SymbolNameFn> = OnceLock::new();
 static DEFAULT_OPTIMIZED_MIR: OnceLock<queries::optimized_mir::OptimizedMirFn> = OnceLock::new();
+static DEFAULT_COLLECT_AND_PARTITION: OnceLock<queries::partition::CollectAndPartitionFn> =
+    OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock::new();
@@ -502,6 +508,12 @@ pub(crate) fn default_optimized_mir() -> queries::optimized_mir::OptimizedMirFn 
     *DEFAULT_OPTIMIZED_MIR.get().expect("default optimized_mir not saved")
 }
 
+pub(crate) fn default_collect_and_partition() -> queries::partition::CollectAndPartitionFn {
+    *DEFAULT_COLLECT_AND_PARTITION
+        .get()
+        .expect("default collect_and_partition_mono_items not saved")
+}
+
 /// Store the compiled .o path after generate_and_compile.
 pub(crate) fn set_lang_obj_path(obj_path: PathBuf) {
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
@@ -625,6 +637,11 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     // Phase-6 `#[inline(never)]` unwrap wrappers) are real Rust fns
     // whose bodies rustc must codegen normally. Structurally parallel
     // to the visibility-override hook above.
+    // Vestigial after stage 4a: the partitioner override in
+    // `queries::partition::lang_collect_and_partition_mono_items` removes
+    // consumer items from rustc's CGU slice before codegen dispatch sees
+    // them, so this hook never fires in practice. Kept installed as a
+    // safety net until sub-stage 4b deletes it from both sides.
     let _ = rustc_codegen_ssa::mono_item::CODEGEN_SKIP_HOOK
         .set(|tcx, instance| is_consumer_codegen_target(tcx, instance.def_id()));
 }
@@ -635,9 +652,11 @@ pub(crate) fn install_query_defaults(
     mir_shims: queries::drop_glue::MirShimsFn,
     symbol_name: queries::symbol_name::SymbolNameFn,
     optimized_mir: queries::optimized_mir::OptimizedMirFn,
+    collect_and_partition: queries::partition::CollectAndPartitionFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
     let _ = DEFAULT_OPTIMIZED_MIR.set(optimized_mir);
+    let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
 }
