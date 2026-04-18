@@ -377,7 +377,8 @@ replaces the bodies at monomorphization time. Codegen skips them. The
 
 1. **MonoItems walk** — finds entry-point functions (Rust calls them) and accessor
    methods. Entry-point functions have a rustc `Instance` (needed for extern
-   wrapper ABI queries).
+   wrapper ABI queries). The walk uses `is_from_lang_stubs` as the sole
+   consumer-item filter; DefIds may be local or cross-crate.
 
 2. **`state.toylang_instances`** — internal functions discovered during the deep
    monomorphization walk. These have no rustc `Instance` and only get an internal
@@ -1249,9 +1250,10 @@ through `PredicateVtable` and never touches `MUTABLE_STATE`. See @GCMLZ
 for the trait-family split that enforces this.
 
 **Toylang** (`toylangc/src/toylang/callbacks_impl.rs`) — implements
-`visibility_override` by walking `tcx.def_path(instance.def_id()).data`
-looking for `DefPathData::TypeNs("__lang_stubs")`. Returns
-`Some((External, Default))` for matches, `None` otherwise.
+`visibility_override` via the shared `rustc_lang_facade::is_from_lang_stubs_safe`
+helper, which walks `tcx.def_path(instance.def_id()).data` looking for
+`DefPathData::TypeNs("__lang_stubs")`. Returns `Some((External, Default))`
+for matches, `None` otherwise.
 
 Why `Visibility::Default` is sufficient on its own: the internalization
 candidate set at `partitioning.rs:254` is built only from items that have
@@ -1267,7 +1269,8 @@ in `docs/arcana/DefPathStrIsForDiagnosticsOnly-DPSFDOZ.md` — the existing
 facade `is_from_lang_stubs` uses `def_path_str` and is safe only because
 its callers happen to live inside `generate_and_compile`. The partitioner
 runs outside `generate_and_compile`, so toylang's `visibility_override`
-inlines the safe walk instead of calling `is_from_lang_stubs`.
+calls the companion `is_from_lang_stubs_safe` helper (structural
+`DefPathData` walk) rather than the diagnostic-gated `is_from_lang_stubs`.
 
 The check applies uniformly to generic and non-generic items. Per the
 project invariant "non-generic is the degenerate case of generic," there

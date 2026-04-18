@@ -60,6 +60,16 @@ that runs during normal compilation (query providers, mono collection,
 partitioning, codegen passes, link-time decisions). For matching, use
 `def_path(def_id).data` and inspect the `DefPathData` enum.
 
+## Canonical safe alternative
+
+`rustc_lang_facade::is_from_lang_stubs_safe(tcx, def_id)` is the
+structural-walk counterpart to `is_from_lang_stubs` and is safe from
+any phase (partitioner, pre-`generate_and_compile` hooks, future
+cross-crate paths). Prefer it over re-deriving the inline
+`tcx.def_path(...).data` walk at each call site — the
+`visibility_override` path was the first such caller and is the
+reference implementation.
+
 ## See also
 
 - `docs/arcana/GenerateCompileMutexLock-GCMLZ.md` — covers another implicit

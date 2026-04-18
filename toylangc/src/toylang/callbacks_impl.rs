@@ -125,7 +125,7 @@ impl ToylangCallbacks {
         state: &mut ToylangState,
         name: &str,
         tcx: TyCtxt<'tcx>,
-        _def_id: LocalDefId,
+        _def_id: rustc_span::def_id::DefId,
         instance: ty::Instance<'tcx>,
     ) -> String {
         state.log.push(CallbackLog::NotifyConcreteEntryPoint { name: name.to_string() });
@@ -191,7 +191,6 @@ impl LangPredicates for ToylangCallbacks {
         tcx: TyCtxt<'tcx>,
         instance: ty::Instance<'tcx>,
     ) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
-        use rustc_hir::definitions::DefPathData;
         use rustc_middle::mir::mono::{Linkage, Visibility};
         // Force `(External, Default)` for any item whose DefPath contains
         // `__lang_stubs::`. Without this, the CGU partitioner internalizes
@@ -199,14 +198,9 @@ impl LangPredicates for ToylangCallbacks {
         // because it can't see the references from the externally-linked
         // toylang `.o` file.
         //
-        // Walks `tcx.def_path(...).data` directly. Cannot use
-        // `rustc_lang_facade::is_from_lang_stubs` here — it calls `def_path_str`,
-        // which ICEs in normal (non-diagnostic) compilation contexts, and the
-        // partitioner runs outside `generate_and_compile` (see @DPSFDOZ).
-        let in_lang_stubs = tcx.def_path(instance.def_id()).data.iter().any(|d| {
-            matches!(d.data, DefPathData::TypeNs(name) if name.as_str() == "__lang_stubs")
-        });
-        if in_lang_stubs {
+        // Uses the `_safe` variant because the partitioner runs outside
+        // `generate_and_compile`, where `def_path_str` would ICE (see @DPSFDOZ).
+        if rustc_lang_facade::is_from_lang_stubs_safe(tcx, instance.def_id()) {
             Some((Linkage::External, Visibility::Default))
         } else {
             None
@@ -376,9 +370,7 @@ impl LangCallbacks for ToylangCallbacks {
         tcx: TyCtxt<'tcx>,
         instance: ty::Instance<'tcx>,
     ) -> String {
-        let def_id = instance.def_id().as_local()
-            .expect("notify_concrete_entry_point: consumer instance must have local def_id");
-        self.notify_concrete_entry_point_inner(state(s), name, tcx, def_id, instance)
+        self.notify_concrete_entry_point_inner(state(s), name, tcx, instance.def_id(), instance)
     }
 
     fn generate_and_compile<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)> {

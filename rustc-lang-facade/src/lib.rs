@@ -301,11 +301,31 @@ pub(crate) fn is_consumer_type(name: &str) -> bool {
 /// machinery is permissive). Calling this from a query provider, the
 /// partitioner, or any other normal-compilation hot path will ICE with
 /// `'trimmed_def_paths' called, diagnostics were expected but none were
-/// emitted`. For those contexts, walk `tcx.def_path(def_id).data` directly
-/// and match `DefPathData::TypeNs("__lang_stubs")`.
+/// emitted`. For those contexts, use `is_from_lang_stubs_safe` which walks
+/// `DefPathData` structurally.
 pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     let path = tcx.def_path_str(def_id);
     path.starts_with("__lang_stubs::")
+}
+
+/// Cross-crate-safe variant of `is_from_lang_stubs`. Unlike that helper
+/// (which uses `def_path_str` and is @DPSFDOZ-gated to diagnostic
+/// contexts), this version walks `DefPathData` structurally and is safe
+/// to call from any phase — the partitioner, pre-`generate_and_compile`
+/// hooks, and any future cross-crate paths.
+///
+/// Slightly more expensive than `is_from_lang_stubs` (an iterator walk
+/// vs a string check), but both are dominated by the `tcx.def_path` query
+/// underneath so the difference is imperceptible.
+///
+/// Prefer this over `is_from_lang_stubs` when the call site might run
+/// outside `generate_and_compile`, or for the compile-time guarantee
+/// that @DPSFDOZ cannot bite.
+pub fn is_from_lang_stubs_safe(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    use rustc_hir::definitions::DefPathData;
+    tcx.def_path(def_id).data.iter().any(|d| {
+        matches!(d.data, DefPathData::TypeNs(name) if name.as_str() == "__lang_stubs")
+    })
 }
 
 /// Check if a function name belongs to the consumer's language.

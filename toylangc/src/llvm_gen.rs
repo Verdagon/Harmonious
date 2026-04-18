@@ -1894,7 +1894,6 @@ pub fn generate_with_tcx<'tcx>(
             if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
                 continue;
             }
-            let Some(local_def_id) = def_id.as_local() else { continue };
 
             // Check if it's an accessor method
             if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
@@ -1909,7 +1908,7 @@ pub fn generate_with_tcx<'tcx>(
                         let field_name = tcx.item_name(def_id).to_string();
                         if let Some(field_index) = toy_struct.fields.iter().position(|f| f.name == field_name) {
                             let callback_name = format!("{}.{}", struct_name, field_name);
-                            let extern_symbol = callbacks.notify_concrete_entry_point_inner(state, &callback_name, tcx, local_def_id, instance);
+                            let extern_symbol = callbacks.notify_concrete_entry_point_inner(state, &callback_name, tcx, def_id, instance);
                             if seen_symbols.insert(extern_symbol.clone()) {
                                 let struct_ty = ctx.struct_type_for_instance(toy_struct, instance);
                                 codegen_accessor_inline(&mut ctx, &extern_symbol, struct_ty, field_index);
