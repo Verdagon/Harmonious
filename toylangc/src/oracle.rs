@@ -121,52 +121,94 @@ fn lookup_active_param_index(name: &str) -> Option<u32> {
     })
 }
 
-/// Walk local HIR definitions to find a struct named `name`.
-/// Also resolves `pub use` re-exports to the original struct DefId.
-pub fn find_local_struct_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
-    // First: check local struct definitions
-    for local_def_id in tcx.hir_crate_items(()).definitions() {
-        let def_id = local_def_id.to_def_id();
-        if tcx.def_kind(def_id) == DefKind::Struct {
-            if tcx.item_name(def_id).as_str() == name {
-                return Some(def_id);
-            }
-        }
-    }
-    // Second: check module children for re-exports (pub use)
-    find_reexported_type(tcx, name)
-}
-
-/// Search local module children for a `pub use` re-export matching `name`.
-/// Matches Struct and Enum (e.g., Option, Result are enums, not structs).
-fn find_reexported_type(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
-    use rustc_hir::def::Res;
-    fn is_type_def<Id>(res: &Res<Id>) -> Option<DefId> {
-        match res {
-            Res::Def(DefKind::Struct, id) | Res::Def(DefKind::Enum, id) => Some(*id),
-            _ => None,
-        }
-    }
-    // module_children_local works for local modules
+/// Cross-crate-aware DefId resolver. Searches for an item named `name` whose
+/// `Res::Def` kind passes `kind_filter`. Search order:
+///
+///   1. Children of every local module (including the crate root). Catches
+///      both locally-defined items (`pub struct Foo`) and `pub use`
+///      re-exports — a `pub use` shows up in the parent module's
+///      `module_children_local` exactly like a local definition.
+///   2. Children of the extern `__lang_stubs` rlib's crate root, when present.
+///      Under the FileLoader-single-crate architecture this step is inert
+///      (no `__lang_stubs` extern crate exists). Under the stage-5 two-crate
+///      architecture this finds re-exports and stub items living in the
+///      stub rlib.
+///
+/// The two walks are intentionally symmetric — same matcher, same DefKind
+/// filter — so that the cross-crate path produces semantically identical
+/// DefIds to the local path.
+fn resolve_rust_path(
+    tcx: TyCtxt<'_>,
+    name: &str,
+    kind_filter: fn(DefKind) -> bool,
+) -> Option<DefId> {
+    // Local modules + crate root.
     for local_def_id in tcx.hir_crate_items(()).definitions() {
         if tcx.def_kind(local_def_id.to_def_id()) != DefKind::Mod { continue; }
-        for child in tcx.module_children_local(local_def_id) {
-            if child.ident.as_str() == name {
-                if let Some(def_id) = is_type_def(&child.res) {
-                    return Some(def_id);
-                }
-            }
+        if let Some(def_id) = match_module_child_local(tcx, local_def_id, name, kind_filter) {
+            return Some(def_id);
         }
     }
-    // Also check the crate root
-    for child in tcx.module_children_local(rustc_hir::def_id::CRATE_DEF_ID) {
-        if child.ident.as_str() == name {
-            if let Some(def_id) = is_type_def(&child.res) {
-                return Some(def_id);
-            }
+    if let Some(def_id) = match_module_child_local(
+        tcx, rustc_hir::def_id::CRATE_DEF_ID, name, kind_filter,
+    ) {
+        return Some(def_id);
+    }
+    // Extern __lang_stubs rlib (no-op pre-stage-5).
+    let stubs_cnum = tcx.crates(()).iter().copied().find(|&c| {
+        tcx.crate_name(c).as_str() == "__lang_stubs"
+    })?;
+    match_module_child_extern(tcx, stubs_cnum.as_def_id(), name, kind_filter)
+}
+
+fn match_module_child_local(
+    tcx: TyCtxt<'_>,
+    module: rustc_hir::def_id::LocalDefId,
+    name: &str,
+    kind_filter: fn(DefKind) -> bool,
+) -> Option<DefId> {
+    use rustc_hir::def::Res;
+    for child in tcx.module_children_local(module) {
+        if child.ident.as_str() != name { continue; }
+        if let Res::Def(kind, def_id) = child.res {
+            if kind_filter(kind) { return Some(def_id); }
         }
     }
     None
+}
+
+fn match_module_child_extern(
+    tcx: TyCtxt<'_>,
+    module: DefId,
+    name: &str,
+    kind_filter: fn(DefKind) -> bool,
+) -> Option<DefId> {
+    use rustc_hir::def::Res;
+    for child in tcx.module_children(module) {
+        if child.ident.as_str() != name { continue; }
+        if let Res::Def(kind, def_id) = child.res {
+            if kind_filter(kind) { return Some(def_id); }
+        }
+    }
+    None
+}
+
+fn is_type_kind(kind: DefKind) -> bool {
+    matches!(kind, DefKind::Struct | DefKind::Enum)
+}
+
+fn is_trait_kind(kind: DefKind) -> bool {
+    matches!(kind, DefKind::Trait)
+}
+
+fn is_fn_kind(kind: DefKind) -> bool {
+    matches!(kind, DefKind::Fn)
+}
+
+/// Walk local + extern stub-rlib HIR to find a struct/enum named `name`.
+/// Also resolves `pub use` re-exports to the original struct/enum DefId.
+pub fn find_local_struct_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
+    resolve_rust_path(tcx, name, is_type_kind)
 }
 
 /// Find a named method in a type's inherent impls.
@@ -496,48 +538,12 @@ pub fn find_rust_type_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
 
 /// Find a trait DefId by name among `pub use` re-exports in __lang_stubs.
 pub fn find_use_imported_trait_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
-    use rustc_hir::def::Res;
-    for local_def_id in tcx.hir_crate_items(()).definitions() {
-        if tcx.def_kind(local_def_id.to_def_id()) != DefKind::Mod { continue; }
-        for child in tcx.module_children_local(local_def_id) {
-            if child.ident.as_str() == name {
-                if let Res::Def(DefKind::Trait, target_def_id) = child.res {
-                    return Some(target_def_id);
-                }
-            }
-        }
-    }
-    for child in tcx.module_children_local(rustc_hir::def_id::CRATE_DEF_ID) {
-        if child.ident.as_str() == name {
-            if let Res::Def(DefKind::Trait, target_def_id) = child.res {
-                return Some(target_def_id);
-            }
-        }
-    }
-    None
+    resolve_rust_path(tcx, name, is_trait_kind)
 }
 
 /// Find a use-imported free function by name among `pub use` re-exports in __lang_stubs.
 pub fn find_use_imported_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
-    use rustc_hir::def::Res;
-    for local_def_id in tcx.hir_crate_items(()).definitions() {
-        if tcx.def_kind(local_def_id.to_def_id()) != DefKind::Mod { continue; }
-        for child in tcx.module_children_local(local_def_id) {
-            if child.ident.as_str() == name {
-                if let Res::Def(DefKind::Fn, def_id) = child.res {
-                    return Some(def_id);
-                }
-            }
-        }
-    }
-    for child in tcx.module_children_local(rustc_hir::def_id::CRATE_DEF_ID) {
-        if child.ident.as_str() == name {
-            if let Res::Def(DefKind::Fn, def_id) = child.res {
-                return Some(def_id);
-            }
-        }
-    }
-    None
+    resolve_rust_path(tcx, name, is_fn_kind)
 }
 
 /// @ELASZ — Build a `GenericArgs` for `def_id` by letting rustc drive the
