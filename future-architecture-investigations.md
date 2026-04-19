@@ -6,12 +6,21 @@ here is *potential* future work — this file exists so the next TL
 can see the investigation landscape at a glance without having to
 re-derive it from branches and reasoning docs.
 
-**Top-line status as of 2026-04-18:** all three investigations complete;
-response drafted but not sent; **§3.1 (POC #1, `optimized_mir` override)
-landed in shipping as the stage-3 fork reduction** (commits `ce437ae` +
-`bf770ae`, fork now at 2 patches). Remaining investigations (§3.2
-separate-crate, §3.3 plugin) still apply to the stage-4 zero-fork
-target — neither is in flight.
+**Top-line status as of 2026-04-19:** fork-reduction roadmap fully
+complete; all three investigations have informed the shipped
+architecture. §3.1 (POC #1, `optimized_mir` override) landed as
+stage-3 (commits `ce437ae` + `bf770ae`). §3.3 (plugin /
+`collect_and_partition_mono_items` override) landed as stage-4
+(commits `1d862f4` / `13d8f12` / `51f0c5e` / `d044560`) — the
+pared-down version from the TL's 2026-04-19 Outcome-A investigation,
+which found that the partitioner override alone (no cdylib plugin,
+no separate-crate-stubs migration) is sufficient for zero-fork via
+plugin-set `MonoItemData.linkage`. §3.2 (separate-crate stubs /
+POC #2) was explicitly not pursued — Outcome A made it unnecessary,
+so `FileLoader` + single-crate stubs stays indefinitely. **Fork:
+zero patches. Toylang builds against vanilla `nightly-2025-01-15`.**
+Everything below is retained as the investigation landscape that
+motivated the path.
 
 ---
 

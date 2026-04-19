@@ -489,7 +489,23 @@ weeks for the query override itself; +2-3 weeks for the
 + the plugin integration in §4.2. Most of the MIR construction
 code in `mir_helpers.rs` carries over unchanged.
 
-### 4.2 `-Zcodegen-backend=consumer` plugin + `override_queries` (prototype-characterized)
+### 4.2 `-Zcodegen-backend=consumer` plugin + `override_queries` (LANDED in stage 4)
+
+**Status update (2026-04-19):** Stage 4 shipped zero-fork via a pared-down
+version of this path — `collect_and_partition_mono_items` override alone,
+without the cdylib plugin loading. Commits `1d862f4` / `13d8f12` / `51f0c5e`
+/ `d044560`. Key discovery during Stage 4c: the plugin's existing partitioner
+override can overwrite `MonoItemData.linkage` directly for `__lang_stubs`
+items, and LLVM reads that linkage without re-derivation, so fork patch 5
+(`VISIBILITY_OVERRIDE_HOOK`) becomes redundant — the plugin sets what the
+hook used to force. The FileLoader + single-crate stubs model (§4.3) was
+NOT retired; it stays indefinitely because Outcome A made it unnecessary
+for zero-fork. See `docs/historical/handoff-codegen-backend-plugin.md` for
+the original plan and `HANDOFF-TL.md` §1 for commit pointers. The rest of
+this section is retained as the historical design-space analysis that
+motivated stage 4.
+
+
 
 The `rustc_codegen_cranelift` / `rustc_codegen_gcc` integration model:
 replace rustc's default codegen backend wholesale via
@@ -834,13 +850,25 @@ files — they're the detailed evidence this Part 4 summarizes.
 
 ---
 
-## Part 5: The 2-patch-fork cost accounting
+## Part 5: The zero-fork cost accounting (post stage 4)
 
-*(Historical note: prior to stage 3 this section was titled "The
-5-patch-fork cost accounting." The stage-3 migration landed §4.1 and
-shipped a `CODEGEN_SKIP_HOOK` reshape of patch 3, reducing the fork
-from 5 patches to 2. The numbers below reflect the post-stage-3
-shape.)*
+*(Historical note: this section has been re-titled across the
+roadmap. Pre-stage-3 "5-patch-fork cost accounting"; post-stage-3
+"2-patch-fork cost accounting"; post-stage-4 the current title.
+Stage 4 landed in the commits `1d862f4` → `d044560` on 2026-04-19,
+retiring both remaining fork patches via plugin-set linkage in the
+`collect_and_partition_mono_items` override. No fork patches left
+to account for.)*
+
+**Current shape:** toylang builds against vanilla `nightly-2025-01-15`
+via rustup. Fork maintenance cost is zero. MIR construction churn
+(~1 person-week per 6-month rustc bump) is the remaining
+rustc-internal-API exposure, and that cost is unchanged from the
+fork era — it's `rustc_middle::mir` usage, not fork-specific.
+
+**Historical cost accounting retained below** for readers tracing the
+roadmap's trajectory. Numbers are pre-landing; they motivated the
+path that the stage-4 commits executed.
 
 For a toylang-style deployment (research project, occasional rustc
 bumps, user installation via `rustup toolchain link`):

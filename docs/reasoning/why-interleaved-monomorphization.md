@@ -751,9 +751,10 @@ the facade; the facade returns a generic MIR body with a
 essentially none — `wrap` just constructs a struct) and Params in
 place of `T`. The collector substitutes `T = LocalThing` as it walks
 the body under this particular caller, queuing the concrete Rust
-deps for emission. Rustc's codegen for the consumer symbol is skipped
-by `CODEGEN_SKIP_HOOK`; toylang's backend emits the real body
-separately. Queries `layout_of(Wrapper<LocalThing>)` for stack-frame
+deps for emission. The `collect_and_partition_mono_items` override
+filters the consumer item out of rustc's CGU list so rustc never
+codegens it; toylang's backend emits the real body separately, which
+is linked in via the injected `.o`. Queries `layout_of(Wrapper<LocalThing>)` for stack-frame
 allocation. Queries `mir_shims` for the drop glue. All handled
 per-Instance via rustc's substitution machinery.
 
@@ -775,9 +776,10 @@ substitutes `T = Widget`, sees `x.clone()`, resolves to
 `<Widget as Clone>::clone`. Queries `optimized_mir` on the
 consumer-impl DefId — the facade recognizes it as a consumer trait
 impl, returns the toylang-defined `clone` body with Params intact;
-the collector substitutes `T = Widget` per caller. Rustc's codegen
-for the symbol is skipped by `CODEGEN_SKIP_HOOK`; toylang's backend
-emits the real body separately.
+the collector substitutes `T = Widget` per caller. The
+`collect_and_partition_mono_items` override filters the consumer
+impl out of rustc's CGU list so rustc never codegens it; toylang's
+backend emits the real body separately.
 
 **Case 5 and 6: transitive library structures.** Compose the above.
 Nothing structurally new — the interleaving is already the mechanism
@@ -825,42 +827,47 @@ hook fires per-Instance during monomorphization to supply consumer
 bodies." The specific hook is an implementation detail that can be
 swapped.
 
-**Today's shipping implementation (post stage 3)** uses a
-`rustc_interface::Config::override_queries` override on rustc's
-existing `optimized_mir` query — the sanctioned extension point
-that rust-analyzer, clippy, and miri all use. Paired with two
-small consumer-agnostic fork hooks (`CODEGEN_SKIP_HOOK` in
-`rustc_codegen_ssa` and `VISIBILITY_OVERRIDE_HOOK` in
-`rustc_monomorphize`, both `OnceLock<fn ptr>` statics the facade
-fills at startup). Fork state: 2 patches.
+**Today's shipping implementation (post stage 4)** uses a set of
+`rustc_interface::Config::override_queries` overrides on rustc's
+existing queries — the sanctioned extension point that
+rust-analyzer, clippy, and miri all use. No fork patches: toylang
+builds against vanilla `nightly-2025-01-15` via rustup. The query
+set:
 
-*Historical note: before the stage-3 migration (2026-04-18), this
-role was played by a custom `per_instance_mir` query plus four
-supporting fork patches. The forked query was never load-bearing;
-what's load-bearing is the interleaving behavior. The stage-3
-migration swapped the query implementation while preserving the
-interleaving contract. See `docs/reasoning/dep-discovery-approaches.md`
-for the Approach A (retired) vs Approach B (shipping) comparison.*
+- `optimized_mir` — synthesizes dep-registering bodies for consumer
+  function DefIds (§2.2 of the architecture guide).
+- `collect_and_partition_mono_items` — filters consumer items out
+  of rustc's CGU list so rustc never codegens them, AND forces
+  `(Linkage::External, Visibility::Default)` on surviving
+  `__lang_stubs` items (the Phase-6 `#[inline(never)]` generic
+  wrappers). Takes over what the retired `CODEGEN_SKIP_HOOK` and
+  `VISIBILITY_OVERRIDE_HOOK` fork patches used to do.
+- `symbol_name` — rewrites consumer symbols to toylang-owned
+  `__toylang_impl_*` names.
+- `layout_of` / `mir_shims` / `upstream_monomorphizations_for` —
+  consumer-type layout, drop glue, and upstream-mono routing.
 
-Further fork reduction is possible but not currently shipping:
+*Historical note on the path:* five rustc fork patches shipped
+initially (a custom `per_instance_mir` query plus support plumbing).
+Stage 3 (commits `ce437ae` / `bf770ae` / `da7ad87`, 2026-04-18)
+migrated dep discovery to an `optimized_mir` override and reshaped
+the remaining two patches into facade-installed hooks, reducing
+the fork to 2 patches. Stage 4 (commits `1d862f4` / `13d8f12` /
+`51f0c5e` / `d044560`, 2026-04-19) retired both remaining hooks by
+pulling their behavior into the `collect_and_partition_mono_items`
+override. The forked query was never load-bearing at any point;
+what's load-bearing is the interleaving behavior. Each stage
+swapped the implementation while preserving the interleaving
+contract. See `docs/reasoning/dep-discovery-approaches.md` for the
+Approach A (retired) vs Approach B (shipping) comparison, and
+`docs/reasoning/rustc-fork-design-space.md` §4.1–4.3 for the
+mechanism-level analysis that justified each transition.
 
-- The remaining `CODEGEN_SKIP_HOOK` patch could be retired by
-  pairing with a `CodegenBackend` plugin (see
-  `docs/reasoning/rustc-fork-design-space.md` §4.2).
-- `VISIBILITY_OVERRIDE_HOOK` could be retired via a separate-crate
-  stub model (§4.3) that keeps `#![feature(linkage)]` out of
-  user-visible crates.
-
-`docs/reasoning/rustc-fork-design-space.md` §4.1–4.3 + Part 5
-analyzes these paths and their current cost estimates. The design-
-space doc takes "interleaving is required" as given (from this
-doc) and asks the follow-up question: *which specific rustc
-mechanism* should implement it. Separating the "why" (this doc)
-from the "how" (that doc) keeps each question answerable in
-isolation: if the remaining fork patches ever need to be retired
-— for Vale's distribution story or otherwise — the migration path
-doesn't have to relitigate whether interleaving is needed. It is;
-that's settled here.
+The separating-concerns discipline in this doc vs the design-space
+doc has aged well: this doc answers "why interleaving is required"
+(still true), and the design-space doc answers "which rustc
+mechanism should implement it" (the answer migrated, cleanly,
+without re-litigating whether interleaving is needed).
 
 ---
 

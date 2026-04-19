@@ -1,9 +1,14 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
 > **Current status:** 129 integration tests + 15 standalone tests + 67 unit tests passing, 0 ignored.
-> Minimal 2-patch rustc fork (codegen-skip + visibility-override hooks); dep
-> discovery runs through a sanctioned `Config::override_queries` override on
-> rustc's existing `optimized_mir` query. Inkwell LLVM backend.
+> **Zero rustc fork patches — built against vanilla `nightly-2025-01-15`.**
+> All rustc integration flows through `Config::override_queries`:
+> `optimized_mir` supplies synthetic dep-registering bodies,
+> `collect_and_partition_mono_items` filters consumer items out of rustc's
+> CGU list and forces `(External, Default)` linkage on `__lang_stubs` items
+> directly, `symbol_name` rewrites to toylang-mangled names,
+> `layout_of` / `mir_shims` / `upstream_monomorphizations_for` round out the
+> set. Inkwell LLVM backend.
 > Deep monomorphization walk — internal toylang functions never exposed to rustc.
 > GLOBALS split into immutable `CONFIG` (OnceLock) + mutable `MUTABLE_STATE`
 > (Mutex) to avoid a deadlock where query providers triggered during
@@ -164,11 +169,17 @@ Two-crate workspace:
 - `rustc-lang-facade` — reusable library for integrating custom languages with rustc
 - `toylangc` — toylang consumer
 
-Forked `nightly-2025-01-15` (rustc 1.86.0-dev) with 2 consumer-agnostic hooks
-(`CODEGEN_SKIP_HOOK` + `VISIBILITY_OVERRIDE_HOOK`, both `OnceLock<fn ptr>`
-statics the facade fills at startup). Fork at `~/rust` on branch
-`per-instance-mir` (branch name preserved for historical continuity; stage 4
-plugin work may rename). Linked as toolchain `rustc-fork`.
+Built against vanilla `nightly-2025-01-15` via rustup — zero rustc fork patches.
+Stage-4 landing (commits `1d862f4` / `13d8f12` / `51f0c5e` / `d044560`) retired
+the last two fork hooks (`CODEGEN_SKIP_HOOK` and `VISIBILITY_OVERRIDE_HOOK`)
+by pulling their behavior into plugin-side `collect_and_partition_mono_items`:
+consumer items are filtered out of rustc's CGU list before codegen sees them,
+and surviving `__lang_stubs` items have `(Linkage::External, Visibility::Default)`
+forced directly on their `MonoItemData` (which the LLVM backend reads at
+emission time without re-deriving). Stage-3 had already retired the
+`per_instance_mir` custom query in favor of a sanctioned `optimized_mir`
+override. Historical fork workflow preserved at
+`docs/historical/rebuilding-rustc-fork.md`.
 
 ---
 
