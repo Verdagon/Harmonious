@@ -9,11 +9,12 @@
 //! and rustc's mono collector substitutes per caller during its walk —
 //! exactly the machinery it already applies to every generic Rust function.
 //!
-//! The codegen-skip for the resulting consumer symbols is handled by
-//! `rustc_codegen_ssa::mono_item::CODEGEN_SKIP_HOOK` (patch 3 reshape, see
-//! `lib.rs::install_callbacks` and `rust-interop-guide.md` §10.6.4). Non-
-//! consumer DefIds delegate to the saved upstream default — no behavior
-//! change for ordinary Rust code.
+//! The synthesized body terminates with `Unreachable` and is never executed
+//! — the consumer's own `.o` supplies the real definition at link time, and
+//! the partitioner override (stage 4a, see `queries/partition.rs`) removes
+//! consumer items from rustc's CGU slice so rustc's codegen dispatch never
+//! sees them. Non-consumer DefIds delegate to the saved upstream default
+//! — no behavior change for ordinary Rust code.
 
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, GenericArgs, Instance, Ty, TyCtxt};
@@ -82,8 +83,9 @@ pub fn lang_optimized_mir<'tcx>(
 
 /// Build a MIR body that references Rust dependencies (so the monomorphization
 /// collector discovers them) and terminates with Unreachable (never executed;
-/// rustc's codegen for this item is skipped via `CODEGEN_SKIP_HOOK`, and the
-/// consumer's own `.o` provides the real definition at link time).
+/// the stage-4a partitioner override in `queries::partition` removes consumer
+/// items from rustc's CGU slice before codegen sees them, and the consumer's
+/// own `.o` provides the real definition at link time).
 ///
 /// Moved verbatim from the retired `queries/per_instance.rs`. Accepts
 /// Param-containing sigs safely — `TypingEnv::fully_monomorphized()` is a

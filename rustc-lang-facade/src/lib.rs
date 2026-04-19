@@ -629,21 +629,10 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     // already installed (e.g. test re-entry); we ignore.
     let _ = rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK
         .set(facade_visibility_override);
-    // Register the codegen-skip hook: rustc's MonoItemExt::define asks
-    // "should I skip codegen for this Instance?" for every MonoItem::Fn.
-    // We answer "yes" for consumer-owned items (consumer fns + accessor
-    // methods) — their real definitions come from the consumer's own
-    // `.o` at link time. Other items inside `__lang_stubs` (notably the
-    // Phase-6 `#[inline(never)]` unwrap wrappers) are real Rust fns
-    // whose bodies rustc must codegen normally. Structurally parallel
-    // to the visibility-override hook above.
-    // Vestigial after stage 4a: the partitioner override in
-    // `queries::partition::lang_collect_and_partition_mono_items` removes
-    // consumer items from rustc's CGU slice before codegen dispatch sees
-    // them, so this hook never fires in practice. Kept installed as a
-    // safety net until sub-stage 4b deletes it from both sides.
-    let _ = rustc_codegen_ssa::mono_item::CODEGEN_SKIP_HOOK
-        .set(|tcx, instance| is_consumer_codegen_target(tcx, instance.def_id()));
+    // Stage 4b retired `CODEGEN_SKIP_HOOK`: the partitioner override in
+    // `queries::partition` removes consumer items from rustc's CGU slice
+    // before codegen dispatch ever sees them, so the hook is unreachable.
+    // Fork patch 3 is deleted alongside this commit.
 }
 
 /// Save the original query providers. Phase 2 of globals init.
