@@ -54,7 +54,10 @@ fn run_direct_mode(argv: Vec<String>) {
     let exit_code = rustc_driver::catch_with_exit_code(|| {
         let mut args = argv;
         let registry = extract_registry(&mut args);
-        run_toylang_compile(registry, args);
+        // Direct mode is single-compile (FileLoader-injected stubs); never
+        // downstream-of-stubs. Stage 5c will move integration tests onto the
+        // two-crate path with its own helper.
+        run_toylang_compile(registry, args, false);
         Ok(())
     });
 
@@ -64,8 +67,21 @@ fn run_direct_mode(argv: Vec<String>) {
 /// Wrapper mode: cargo invoked us as RUSTC_WORKSPACE_WRAPPER.
 /// argv = [toylangc, <rustc-path>, <rustc-args...>].
 /// Drop argv[1] (rustc path) so the remaining args are what rustc expects.
-/// If CARGO_PRIMARY_PACKAGE is set, compile through toylang. Otherwise,
-/// pass through to plain rustc (so dependency crates build normally).
+///
+/// Stage 5b: under the two-crate workspace layout, both `__lang_stubs` (the
+/// stub rlib) and the user bin are workspace-primary packages. CARGO_PKG_NAME
+/// distinguishes them:
+///   - `__lang_stubs`: full toylang compile. Consumer `.o` is generated here
+///     and bundled into the rlib via the codegen wrapper. The internal-callee
+///     walk + `generate_and_compile` fire on this side.
+///   - user bin: full toylang compile but with the downstream-of-stubs gating
+///     (see `is_downstream_of_stubs`) — the internal-callee walk is skipped
+///     because callees are already in the rlib's `.o`, and
+///     `generate_and_compile` returns None so no duplicate `.o` is injected.
+///     Facade overrides remain installed so `upstream_monomorphizations_for`
+///     can route generic consumer wrappers (e.g. `__toylang_option_unwrap<T>`)
+///     to local user-bin codegen.
+///   - non-primary deps: plain rustc, as before.
 fn run_wrapper_mode(mut argv: Vec<String>) {
     // argv = [toylangc, <rustc-path>, <args>...]
     // Drop argv[1] so argv = [toylangc, <args>...] which rustc_driver expects
@@ -89,14 +105,28 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
         // it first to orchestrate cargo; wrapper mode re-parses it here to
         // locate the .toylang source, using the manifest as a single source of
         // truth instead of an env var side-channel.
-        // The generated Cargo project lives at <user-dir>/.toylang-build/,
-        // so the user's manifest is one directory up from CARGO_MANIFEST_DIR.
+        //
+        // Two-crate layout: the user bin is at `<user-dir>/.toylang-build/user_bin/`
+        // and the stub rlib is at `<user-dir>/.toylang-build/lang_stubs_crate/`,
+        // so `toylang.toml` is two directories up from CARGO_MANIFEST_DIR. Walk
+        // up looking for it; if not found this isn't a toylang-authored package
+        // (e.g., an auxiliary crate cargo happens to have set primary on) — pass
+        // through to plain rustc rather than panicking on manifest parse.
         let cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
             .unwrap_or_else(|_| panic!("wrapper mode: CARGO_MANIFEST_DIR not set"));
         let manifest_path = Path::new(&cargo_manifest_dir)
-            .parent()
-            .unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR has no parent: {}", cargo_manifest_dir))
-            .join("toylang.toml");
+            .ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.join("toylang.toml"))
+            .find(|p| p.exists());
+        let manifest_path = match manifest_path {
+            Some(p) => p,
+            None => {
+                run_plain_rustc(&argv);
+                return Ok(());
+            }
+        };
 
         let manifest = manifest::parse(&manifest_path)
             .unwrap_or_else(|e| panic!("wrapper mode: {}", e));
@@ -110,7 +140,12 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
         let registry = crate::toylang::parser::parse(&src)
             .unwrap_or_else(|e| panic!("parse error in {}: {:?}", source_path.display(), e));
 
-        run_toylang_compile(registry, argv.clone());
+        // Detect downstream-of-stubs (user bin) vs the rlib compile by crate
+        // name. The stub rlib is fixed-named `__lang_stubs`; everything else
+        // is downstream.
+        let pkg_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+        let is_downstream = pkg_name != "__lang_stubs";
+        run_toylang_compile(registry, argv.clone(), is_downstream);
         Ok(())
     });
 
@@ -118,7 +153,20 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
 }
 
 /// Shared toylang compilation path used by both direct and wrapper modes.
-fn run_toylang_compile(registry: ToylangRegistry, mut args: Vec<String>) {
+///
+/// `is_downstream_of_stubs` is true for the user-bin compile in stage-5
+/// two-crate wrapper mode. In that mode the stub rlib has already produced
+/// the consumer `.o` (linked into the rlib) and walked all internal callees;
+/// the user-bin compile only needs facade overrides installed so cross-crate
+/// queries (`upstream_monomorphizations_for`, `symbol_name`-via-metadata,
+/// etc.) route correctly. Allocating LLVM paths in this mode would lead to
+/// duplicate consumer codegen and a colliding `.o`; pass `None` instead so
+/// `generate_and_compile` short-circuits.
+fn run_toylang_compile(
+    registry: ToylangRegistry,
+    mut args: Vec<String>,
+    is_downstream_of_stubs: bool,
+) {
     let unique_id = std::process::id();
     let ll_path = std::env::temp_dir().join(format!("toylang_output_{}.ll", unique_id));
     let obj_path = std::env::temp_dir().join(format!("toylang_output_{}.o", unique_id));
@@ -129,9 +177,16 @@ fn run_toylang_compile(registry: ToylangRegistry, mut args: Vec<String>) {
         args.push("codegen-units=16".to_string());
     }
 
+    let llvm_paths = if has_functions && !is_downstream_of_stubs {
+        Some((ll_path, obj_path))
+    } else {
+        None
+    };
+
     let toylang_callbacks = toylang::callbacks_impl::ToylangCallbacks {
         registry: Arc::new(registry),
-        llvm_paths: if has_functions { Some((ll_path, obj_path)) } else { None },
+        llvm_paths,
+        is_downstream_of_stubs,
     };
 
     rustc_lang_facade::driver::run_compiler(toylang_callbacks, &args);

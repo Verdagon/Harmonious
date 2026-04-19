@@ -283,7 +283,8 @@ pub(crate) fn is_consumer_type(name: &str) -> bool {
     (c.predicate_vtable.is_consumer_type)(&*c.callbacks, name)
 }
 
-/// Check if a DefId is from the __lang_stubs module (the consumer's injected stubs).
+/// Check if a DefId is from the consumer's `__lang_stubs` (injected module
+/// or — under stage-5 two-crate — the rlib crate of that name).
 ///
 /// Per @DPSFDOZ, this uses `def_path_str` and is therefore safe ONLY from
 /// callers that run inside `generate_and_compile` (where rustc's diagnostic
@@ -293,24 +294,48 @@ pub(crate) fn is_consumer_type(name: &str) -> bool {
 /// emitted`. For those contexts, use `is_from_lang_stubs_safe` which walks
 /// `DefPathData` structurally.
 pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    // Stage 5b two-crate fast path: the DefId lives in a crate named
+    // `__lang_stubs`. Handles both the rlib's own compile (items local to
+    // LOCAL_CRATE, which IS `__lang_stubs`) and the user-bin compile
+    // (items in an extern crate of that name). `def_path_str` trims the
+    // crate prefix for local items at the crate root, so the string check
+    // below can't cover this case — we take the crate name directly.
+    if tcx.crate_name(def_id.krate).as_str() == "__lang_stubs" {
+        return true;
+    }
+    // Single-crate FileLoader (direct mode, and wrapper mode pre-stage-5b):
+    // items are nested in `mod __lang_stubs {}` inside the user crate. The
+    // textual path includes the module name; check for it. Stage 5d retires
+    // this branch when FileLoader is deleted.
     let path = tcx.def_path_str(def_id);
-    path.starts_with("__lang_stubs::")
+    path.starts_with("__lang_stubs::") || path.contains("::__lang_stubs::")
 }
 
 /// Cross-crate-safe variant of `is_from_lang_stubs`. Unlike that helper
 /// (which uses `def_path_str` and is @DPSFDOZ-gated to diagnostic
-/// contexts), this version walks `DefPathData` structurally and is safe
-/// to call from any phase — the partitioner, pre-`generate_and_compile`
-/// hooks, and any future cross-crate paths.
+/// contexts), this version inspects the crate name + walks `DefPathData`
+/// structurally and is safe to call from any phase — the partitioner,
+/// pre-`generate_and_compile` hooks, and any future cross-crate paths.
 ///
-/// Slightly more expensive than `is_from_lang_stubs` (an iterator walk
-/// vs a string check), but both are dominated by the `tcx.def_path` query
-/// underneath so the difference is imperceptible.
+/// Slightly more expensive than `is_from_lang_stubs` (a small iterator walk
+/// after a constant-time crate-name check vs a string check), but both are
+/// dominated by the `tcx.def_path` query underneath so the difference is
+/// imperceptible.
 ///
 /// Prefer this over `is_from_lang_stubs` when the call site might run
 /// outside `generate_and_compile`, or for the compile-time guarantee
 /// that @DPSFDOZ cannot bite.
 pub fn is_from_lang_stubs_safe(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    // Stage 5b two-crate: the stub items live in their own rlib whose crate
+    // name is `__lang_stubs`. This handles both (a) the rlib's own compile
+    // (items are local to LOCAL_CRATE, whose name is `__lang_stubs`) and
+    // (b) the user-bin compile (items are in an extern crate of that name).
+    if tcx.crate_name(def_id.krate).as_str() == "__lang_stubs" {
+        return true;
+    }
+    // Single-crate FileLoader: items live in a `mod __lang_stubs {}` inside
+    // some other (user) crate. Walk the def-path data looking for the
+    // module name. Stage 5d retires this branch when FileLoader is deleted.
     use rustc_hir::definitions::DefPathData;
     tcx.def_path(def_id).data.iter().any(|d| {
         matches!(d.data, DefPathData::TypeNs(name) if name.as_str() == "__lang_stubs")

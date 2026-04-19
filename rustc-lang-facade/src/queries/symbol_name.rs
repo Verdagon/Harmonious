@@ -56,12 +56,18 @@ pub fn lang_symbol_name<'tcx>(
                     name_str.clone()
                 };
 
-                if def_id.as_local().is_some() {
-                    let symbol = crate::call_notify_concrete_entry_point(
-                        &callback_name, tcx, instance,
-                    );
-                    return ty::SymbolName::new(tcx, &symbol);
-                }
+                // Stage 5b: rewrite consumer symbols regardless of local/extern.
+                // In the rlib compile consumer fns are local. In the user-bin
+                // compile they're extern (in the `__lang_stubs` rlib). Rustc
+                // re-queries `symbol_name` locally for cross-crate references
+                // rather than reading from metadata, so the user-bin compile
+                // sees these DefIds here too and must rewrite so its call sites
+                // target the consumer-chosen symbol (`__toylang_impl_*`) that
+                // the rlib's `.o` defines.
+                let symbol = crate::call_notify_concrete_entry_point(
+                    &callback_name, tcx, instance,
+                );
+                return ty::SymbolName::new(tcx, &symbol);
             }
         }
     }

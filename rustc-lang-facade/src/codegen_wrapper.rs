@@ -79,7 +79,17 @@ impl CodegenBackend for LangCodegenBackend {
         // may rerun `codegen_crate` with a fresh `tcx`). The stash will be
         // repopulated when the partitioner override fires inside
         // `inner.codegen_crate` below.
-        crate::clear_upstream_cgus();
+        // Note: the stash is cleared in `LangDriver::config` (once per compile
+        // session) rather than here. The partitioner override may fire before
+        // this function — notably under stage 5b two-crate, rustc queries
+        // `collect_and_partition_mono_items` during rlib metadata setup, which
+        // runs before `LangCodegenBackend::codegen_crate`. Clearing here would
+        // wipe that pre-codegen stash, and the subsequent `inner.codegen_crate`
+        // call would reuse the query's cached result without re-firing the
+        // override — leaving the consumer's `generate_and_compile` with an
+        // empty stash. Clearing once at `config()` time is both sufficient
+        // (prevents stale pointers from prior TyCtxts across direct-mode
+        // test runs) and correct (no mid-session wipe).
 
         // Phase 1: inner.codegen_crate runs monomorphization (collect_and_partition_mono_items)
         // then compiles Rust code to LLVM. Our collect_generic_rust_deps /

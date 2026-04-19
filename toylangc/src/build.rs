@@ -37,16 +37,31 @@ pub fn build_project(manifest_path: &Path) -> i32 {
             return 1;
         }
     }
-    if let Err(e) = fs::create_dir_all(build_dir.join("src")) {
-        eprintln!("toylangc: cannot create {}: {}", build_dir.display(), e);
+
+    // Stage 5b: two-crate workspace layout. The stub rlib lives in
+    // `.toylang-build/lang_stubs_crate/` as its own package, the user bin
+    // lives in `.toylang-build/user_bin/`, and `.toylang-build/Cargo.toml`
+    // is the workspace root tying them together. User bin's Cargo.toml
+    // path-depends on the stub rlib via `__lang_stubs = { path = "..." }`.
+    let stubs_dir = build_dir.join("lang_stubs_crate");
+    let user_dir = build_dir.join("user_bin");
+    if let Err(e) = fs::create_dir_all(user_dir.join("src")) {
+        eprintln!("toylangc: cannot create {}: {}", user_dir.display(), e);
         return 1;
     }
-
-    if let Err(e) = write_cargo_toml(&build_dir, &manifest) {
+    if let Err(e) = write_workspace_toml(&build_dir) {
         eprintln!("toylangc: {}", e);
         return 1;
     }
-    if let Err(e) = write_main_shim(&build_dir, &manifest) {
+    if let Err(e) = write_stub_crate(&stubs_dir, &source_path, &manifest) {
+        eprintln!("toylangc: {}", e);
+        return 1;
+    }
+    if let Err(e) = write_user_bin_cargo_toml(&user_dir, &manifest) {
+        eprintln!("toylangc: {}", e);
+        return 1;
+    }
+    if let Err(e) = write_main_shim(&user_dir, &manifest) {
         eprintln!("toylangc: {}", e);
         return 1;
     }
@@ -58,34 +73,88 @@ pub fn build_project(manifest_path: &Path) -> i32 {
     run_cargo_build(&build_dir)
 }
 
-fn write_cargo_toml(build_dir: &Path, manifest: &Manifest) -> Result<(), String> {
+/// Workspace manifest tying the user bin and stub rlib together. Setting a
+/// workspace root here prevents cargo from walking up into the user's actual
+/// project (where `toylang.toml` lives) looking for a workspace.
+fn write_workspace_toml(build_dir: &Path) -> Result<(), String> {
+    let s = "[workspace]\n\
+             members = [\"lang_stubs_crate\", \"user_bin\"]\n\
+             resolver = \"2\"\n";
+    fs::write(build_dir.join("Cargo.toml"), s)
+        .map_err(|e| format!("cannot write workspace Cargo.toml: {}", e))
+}
+
+/// User-bin Cargo.toml. Depends on `__lang_stubs` by path. Re-lists user
+/// rust_dependencies so they're directly resolvable in the bin too — the
+/// bin shim is trivial today (`fn main() { __toylang_main(); }`) and only
+/// needs `__lang_stubs`, but listing the deps keeps cargo's dep graph
+/// honest and tolerates future bin-side changes.
+fn write_user_bin_cargo_toml(user_dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    let name = sanitize_name(&manifest.project.name);
     let mut s = String::new();
     s.push_str("[package]\n");
-    s.push_str(&format!("name = \"{}\"\n", sanitize_name(&manifest.project.name)));
+    s.push_str(&format!("name = \"{}\"\n", name));
     s.push_str("version = \"0.0.0\"\n");
     s.push_str(&format!("edition = \"{}\"\n", manifest.project.edition));
-    s.push_str("\n");
-    s.push_str("[[bin]]\n");
-    s.push_str(&format!("name = \"{}\"\n", sanitize_name(&manifest.project.name)));
+    s.push_str("\n[[bin]]\n");
+    s.push_str(&format!("name = \"{}\"\n", name));
     s.push_str("path = \"src/main.rs\"\n");
-    s.push_str("\n");
+    s.push_str("\n[dependencies]\n");
+    s.push_str("__lang_stubs = { path = \"../lang_stubs_crate\" }\n");
+    fs::write(user_dir.join("Cargo.toml"), s)
+        .map_err(|e| format!("cannot write user_bin/Cargo.toml: {}", e))
+}
 
+/// Write the stub rlib package: its `src/lib.rs` is the same content
+/// `stub_gen` used to feed FileLoader, and its `Cargo.toml` mirrors the
+/// user's rust_dependencies so the rlib's `pub use uuid::Uuid;` etc.
+/// resolve directly against crates.io rather than transitively via the
+/// user bin.
+fn write_stub_crate(
+    stubs_dir: &Path,
+    source_path: &Path,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    fs::create_dir_all(stubs_dir.join("src"))
+        .map_err(|e| format!("cannot create {}: {}", stubs_dir.display(), e))?;
+
+    // Parse the toylang source so we can feed stub_gen. Duplicates the parse
+    // that wrapper mode will do later, which is fine — the stub generator is
+    // deterministic and cheap.
+    let src = fs::read_to_string(source_path).map_err(|e| {
+        format!(
+            "cannot read toylang source {}: {}",
+            source_path.display(),
+            e
+        )
+    })?;
+    let registry = crate::toylang::parser::parse(&src).map_err(|e| {
+        format!("parse error in {}: {:?}", source_path.display(), e)
+    })?;
+    let stubs = crate::stub_gen::generate(&registry);
+
+    fs::write(stubs_dir.join("src/lib.rs"), stubs)
+        .map_err(|e| format!("cannot write lang_stubs_crate/src/lib.rs: {}", e))?;
+
+    let mut cargo = String::new();
+    cargo.push_str("[package]\n");
+    cargo.push_str("name = \"__lang_stubs\"\n");
+    cargo.push_str("version = \"0.0.0\"\n");
+    cargo.push_str(&format!("edition = \"{}\"\n", manifest.project.edition));
+    cargo.push_str("\n[lib]\n");
+    cargo.push_str("path = \"src/lib.rs\"\n");
+    cargo.push_str("crate-type = [\"rlib\"]\n");
+    cargo.push_str("\n");
     if !manifest.rust_dependencies.is_empty() {
-        s.push_str("[dependencies]\n");
+        cargo.push_str("[dependencies]\n");
         for (name, spec) in &manifest.rust_dependencies {
-            s.push_str(&format!("{} = {}\n", name, render_dep(spec)));
+            cargo.push_str(&format!("{} = {}\n", name, render_dep(spec)));
         }
     }
+    fs::write(stubs_dir.join("Cargo.toml"), cargo)
+        .map_err(|e| format!("cannot write lang_stubs_crate/Cargo.toml: {}", e))?;
 
-    // Mark the generated project as its own workspace root. Otherwise, if
-    // the user's project sits inside another cargo workspace (common for
-    // our own tests at toylangc/tests/standalone/*), cargo walks up, finds
-    // the parent [workspace] table, and errors with "current package
-    // believes it's in a workspace when it's not."
-    s.push_str("\n[workspace]\n");
-
-    fs::write(build_dir.join("Cargo.toml"), s)
-        .map_err(|e| format!("cannot write Cargo.toml: {}", e))
+    Ok(())
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -114,7 +183,7 @@ fn render_dep(spec: &DepSpec) -> String {
     }
 }
 
-fn write_main_shim(build_dir: &Path, manifest: &Manifest) -> Result<(), String> {
+fn write_main_shim(user_dir: &Path, manifest: &Manifest) -> Result<(), String> {
     let mut s = String::new();
     for feat in &manifest.project.features {
         s.push_str(&format!("#![feature({})]\n", feat));
@@ -122,15 +191,13 @@ fn write_main_shim(build_dir: &Path, manifest: &Manifest) -> Result<(), String> 
     if !manifest.project.features.is_empty() {
         s.push_str("\n");
     }
-    // `mod __lang_stubs;` must come before `use __lang_stubs::*;`.
-    // The facade's LangFileLoader intercepts `__lang_stubs.rs` by filename,
-    // serving virtual stubs instead of reading from disk.
-    s.push_str("mod __lang_stubs;\n");
+    // Two-crate layout: stubs live in a separate rlib; `__lang_stubs` is an
+    // extern crate. Edition 2018+ makes `use` resolve transparently.
     s.push_str("use __lang_stubs::*;\n");
     s.push_str("\n");
     s.push_str("fn main() { __toylang_main(); }\n");
 
-    fs::write(build_dir.join("src/main.rs"), s)
+    fs::write(user_dir.join("src/main.rs"), s)
         .map_err(|e| format!("cannot write src/main.rs: {}", e))
 }
 

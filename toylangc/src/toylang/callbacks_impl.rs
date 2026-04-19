@@ -61,6 +61,17 @@ pub struct ToylangCallbacks {
     pub registry: Arc<ToylangRegistry>,
     /// (ll_path, obj_path) for LLVM compilation. None if no external codegen.
     pub llvm_paths: Option<(PathBuf, PathBuf)>,
+    /// Stage 5b: true when this callbacks instance is the downstream user-bin
+    /// compile in the two-crate wrapper mode. The stub rlib's compile has
+    /// already walked the consumer side and produced `.o`; here we install
+    /// facade overrides so cross-crate queries route correctly, but skip the
+    /// internal-callee walk in `notify_concrete_entry_point_inner` (callees
+    /// are already in the rlib's `.o`) and skip `after_rust_analysis`
+    /// validation (already validated upstream). `llvm_paths` is also forced
+    /// to None upstream of construction so `generate_and_compile` short-
+    /// circuits without producing a colliding `.o`. False in direct mode and
+    /// in the rlib's own compile.
+    pub is_downstream_of_stubs: bool,
 }
 
 /// Downcast `&mut dyn Any` to `&mut ToylangState`.
@@ -176,7 +187,14 @@ impl ToylangCallbacks {
             return extern_symbol;
         }
 
-        if state.walked_entry_points.insert(extern_symbol.clone()) {
+        // Stage 5b: in the downstream (user-bin) compile, the upstream stub
+        // rlib has already walked internal callees and produced the consumer
+        // `.o`. Re-walking here would duplicate work and (worse) re-stash
+        // instances into a `toylang_instances` queue that this compile has no
+        // `generate_and_compile` to drain — leaving stale state. Skip.
+        if !self.is_downstream_of_stubs
+            && state.walked_entry_points.insert(extern_symbol.clone())
+        {
             let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
             state.toylang_instances.push(ToylangInstance {
                 extern_symbol: extern_symbol.clone(),
@@ -222,6 +240,19 @@ impl LangCallbacks for ToylangCallbacks {
 
     fn after_rust_analysis<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) {
         state(s).log.push(CallbackLog::AfterRustAnalysis);
+
+        // Stage 5b: validation already ran in the upstream stub-rlib compile,
+        // where every consumer item + every Rust type is local. The downstream
+        // user-bin compile sees those same items via the extern `__lang_stubs`
+        // rlib's `module_children`; re-running the checks here would either
+        // be redundant (type-resolution helpers from 5a route cross-crate
+        // already) or fail (the local-definition walks in `find_extern_fn_def_id`
+        // and friends only see the bin's `fn main()` shim). Bail to preserve
+        // the rlib-compile's validation as the single source of truth.
+        if self.is_downstream_of_stubs {
+            return;
+        }
+
         let mut errors: Vec<String> = Vec::new();
 
         // Check 1: Every toylang struct is visible to rustc
@@ -867,6 +898,14 @@ fn walk_typed_expr_for_deps(
 
 /// Convert a type string to a rustc Ty.
 /// Find a function's DefId in __lang_stubs by name.
+///
+/// Uses the cross-crate-safe `is_from_lang_stubs_safe` so the check works
+/// uniformly under both architectures: in the FileLoader-single-crate
+/// (direct mode) path the items live in `mod __lang_stubs {}` inside the
+/// user crate; in the stage-5 two-crate (wrapper mode) path the items are
+/// at the root of the `__lang_stubs` rlib's local crate. The unsafe
+/// `is_from_lang_stubs` variant relies on `def_path_str` which trims the
+/// crate prefix for local items and would miss the rlib case.
 fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id::DefId> {
     use rustc_hir::def::DefKind;
     for local_def_id in tcx.hir_crate_items(()).definitions() {
@@ -877,7 +916,7 @@ fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id
         if tcx.item_name(def_id).as_str() != name {
             continue;
         }
-        if rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+        if rustc_lang_facade::is_from_lang_stubs_safe(tcx, def_id) {
             return Some(def_id);
         }
     }
