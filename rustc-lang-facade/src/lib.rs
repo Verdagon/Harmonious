@@ -291,6 +291,8 @@ static DEFAULT_SYMBOL_NAME: OnceLock<queries::symbol_name::SymbolNameFn> = OnceL
 static DEFAULT_OPTIMIZED_MIR: OnceLock<queries::optimized_mir::OptimizedMirFn> = OnceLock::new();
 static DEFAULT_COLLECT_AND_PARTITION: OnceLock<queries::partition::CollectAndPartitionFn> =
     OnceLock::new();
+static DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR:
+    OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsForFn> = OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock::new();
@@ -514,6 +516,14 @@ pub(crate) fn default_collect_and_partition() -> queries::partition::CollectAndP
         .expect("default collect_and_partition_mono_items not saved")
 }
 
+pub(crate) fn default_upstream_monomorphizations_for()
+    -> queries::upstream_monomorphization::UpstreamMonomorphizationsForFn
+{
+    *DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR
+        .get()
+        .expect("default upstream_monomorphizations_for not saved")
+}
+
 /// Store the compiled .o path after generate_and_compile.
 pub(crate) fn set_lang_obj_path(obj_path: PathBuf) {
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
@@ -642,10 +652,13 @@ pub(crate) fn install_query_defaults(
     symbol_name: queries::symbol_name::SymbolNameFn,
     optimized_mir: queries::optimized_mir::OptimizedMirFn,
     collect_and_partition: queries::partition::CollectAndPartitionFn,
+    upstream_monomorphizations_for:
+        queries::upstream_monomorphization::UpstreamMonomorphizationsForFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
     let _ = DEFAULT_OPTIMIZED_MIR.set(optimized_mir);
     let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
+    let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR.set(upstream_monomorphizations_for);
 }
