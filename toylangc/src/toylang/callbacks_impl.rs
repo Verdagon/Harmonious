@@ -209,26 +209,10 @@ impl LangPredicates for ToylangCallbacks {
         crate::stub_gen::generate(&self.registry)
     }
 
-    fn visibility_override<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        instance: ty::Instance<'tcx>,
-    ) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
-        use rustc_middle::mir::mono::{Linkage, Visibility};
-        // Force `(External, Default)` for any item whose DefPath contains
-        // `__lang_stubs::`. Without this, the CGU partitioner internalizes
-        // generic `#[inline(never)]` wrappers (e.g. `__toylang_option_unwrap<T>`)
-        // because it can't see the references from the externally-linked
-        // toylang `.o` file.
-        //
-        // Uses the `_safe` variant because the partitioner runs outside
-        // `generate_and_compile`, where `def_path_str` would ICE (see @DPSFDOZ).
-        if rustc_lang_facade::is_from_lang_stubs_safe(tcx, instance.def_id()) {
-            Some((Linkage::External, Visibility::Default))
-        } else {
-            None
-        }
-    }
+    // Stage 4c retired the `visibility_override` trait method: the
+    // facade's partitioner override now forces `(External, Default)` on
+    // `__lang_stubs` items directly in the CGU slice. No consumer-side
+    // predicate needed.
 }
 
 impl LangCallbacks for ToylangCallbacks {

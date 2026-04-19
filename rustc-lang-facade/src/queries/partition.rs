@@ -23,7 +23,7 @@
 //! retires the hook once 4a's filter is proven exhaustive.
 
 use rustc_hir::def_id::DefIdSet;
-use rustc_middle::mir::mono::CodegenUnit;
+use rustc_middle::mir::mono::{CodegenUnit, Linkage, MonoItemData, Visibility};
 use rustc_middle::ty::TyCtxt;
 
 pub type CollectAndPartitionFn = for<'tcx> fn(
@@ -44,7 +44,18 @@ pub fn lang_collect_and_partition_mono_items<'tcx>(
     // collector-discovered Instances of accessor methods and consumer fns.
     crate::stash_upstream_cgus(upstream_cgus);
 
-    // Reconstruct each CGU with consumer items removed.
+    // Reconstruct each CGU with consumer items removed. For items that
+    // survive the filter but still live inside `__lang_stubs` (namely the
+    // Phase-6 `#[inline(never)]` generic wrappers like
+    // `__toylang_option_unwrap<T>` / `__toylang_result_unwrap<T, E>` —
+    // real Rust functions whose bodies rustc must codegen), force
+    // `(Linkage::External, Visibility::Default)`. That's what retires
+    // fork patch 5 (`VISIBILITY_OVERRIDE_HOOK`): the hook used to apply
+    // this linkage via `mono_item_linkage_and_visibility`; now the plugin
+    // applies it directly in the CGU slice the LLVM backend reads. The
+    // linkage stored in `MonoItemData` is what rustc_codegen_llvm reads
+    // at emission time — it is never re-derived, so the override
+    // survives to the final `.o`.
     let mut filtered_cgus: Vec<CodegenUnit<'tcx>> = Vec::with_capacity(upstream_cgus.len());
     for cgu in upstream_cgus.iter() {
         let mut new_cgu = CodegenUnit::new(cgu.name());
@@ -53,7 +64,16 @@ pub fn lang_collect_and_partition_mono_items<'tcx>(
             if crate::is_consumer_codegen_target(tcx, def_id) {
                 continue;
             }
-            new_cgu.items_mut().insert(mono_item, data);
+            let final_data = if crate::is_from_lang_stubs_safe(tcx, def_id) {
+                MonoItemData {
+                    linkage: Linkage::External,
+                    visibility: Visibility::Default,
+                    ..data
+                }
+            } else {
+                data
+            };
+            new_cgu.items_mut().insert(mono_item, final_data);
         }
         if cgu.is_primary() {
             new_cgu.make_primary();

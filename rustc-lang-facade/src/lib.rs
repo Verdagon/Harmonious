@@ -88,24 +88,9 @@ pub trait LangPredicates: Send + Sync {
     /// Generate the Rust source code to inject via FileLoader.
     fn generate_stubs(&self) -> String;
 
-    /// Optionally override an item's linkage and visibility during CGU
-    /// partitioning. Returning `None` defers to rustc's normal logic;
-    /// returning `Some((linkage, vis))` short-circuits `mono_item_visibility`
-    /// and prevents internalization.
-    ///
-    /// Used to keep symbols in the consumer's stub module visible to the
-    /// externally-linked consumer .o file (rustc's CGU partitioner cannot
-    /// see those references and would otherwise internalize the symbols).
-    ///
-    /// Default impl returns `None` — consumers that don't need this hook
-    /// can ignore it.
-    fn visibility_override<'tcx>(
-        &self,
-        _tcx: TyCtxt<'tcx>,
-        _instance: ty::Instance<'tcx>,
-    ) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
-        None
-    }
+    // Stage 4c retired `visibility_override`: the partitioner override in
+    // `queries::partition` now forces `(External, Default)` on
+    // `__lang_stubs` items directly. No trait method needed.
 }
 
 /// Stateful callbacks: each takes `&mut dyn Any state` (downcast to your
@@ -192,12 +177,6 @@ use std::sync::OnceLock;
 struct PredicateVtable {
     is_consumer_type: fn(&(dyn Any + Send + Sync), &str) -> bool,
     is_consumer_fn: fn(&(dyn Any + Send + Sync), &str) -> bool,
-
-    visibility_override: for<'tcx> fn(
-        &(dyn Any + Send + Sync),
-        TyCtxt<'tcx>,
-        ty::Instance<'tcx>,
-    ) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)>,
 }
 
 /// Vtable for the stateful (`LangCallbacks`) callback family. Helpers
@@ -469,29 +448,6 @@ pub(crate) fn call_generate_and_compile<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
-/// Bridge function registered into rustc_monomorphize's
-/// `VISIBILITY_OVERRIDE_HOOK` static at startup. The partitioner calls
-/// this as a plain `fn` pointer; it forwards through `predicate_vtable`
-/// to the consumer's `visibility_override` impl.
-///
-/// Lock-free: dispatches a `LangPredicates` callback which by definition
-/// has no `&mut state` to lock. This is what makes adding partitioner-time
-/// hooks safe — the trait family enforces it structurally, no prose
-/// invariant required. See @GCMLZ for the broader locking story this
-/// pattern resolves.
-///
-/// Returns `None` if config isn't installed yet (very early init), so
-/// the partitioner falls through to its default logic harmlessly.
-fn facade_visibility_override<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    instance: ty::Instance<'tcx>,
-) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
-    let c = CONFIG.get()?;
-    let func = c.predicate_vtable.visibility_override;
-    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
-    (func)(unsafe { &*callbacks_ptr }, tcx, instance)
-}
-
 /// Read saved default query providers. Per @GCMLZ, no locking — stored in
 /// OnceLock so they're safe to call during generate_and_compile.
 pub(crate) fn default_layout_of() -> queries::layout::LayoutOfFn {
@@ -556,14 +512,6 @@ fn trampoline_is_consumer_fn<C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().is_consumer_fn(name)
 }
 
-fn trampoline_visibility_override<'tcx, C: LangCallbacks + 'static>(
-    data: &(dyn Any + Send + Sync),
-    tcx: TyCtxt<'tcx>,
-    instance: ty::Instance<'tcx>,
-) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
-    data.downcast_ref::<C>().unwrap().visibility_override(tcx, instance)
-}
-
 fn trampoline_monomorphize_type<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     state: &mut (dyn Any + Send + Sync),
@@ -620,7 +568,6 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         predicate_vtable: PredicateVtable {
             is_consumer_type: trampoline_is_consumer_type::<C>,
             is_consumer_fn: trampoline_is_consumer_fn::<C>,
-            visibility_override: trampoline_visibility_override::<C>,
         },
         stateful_vtable: StatefulVtable {
             monomorphize_type: trampoline_monomorphize_type::<C>,
@@ -634,11 +581,13 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         consumer_state,
         lang_obj_path: None,
     }));
-    // Register the partitioner visibility-override hook so the rustc fork
-    // can call back into the consumer. Idempotent — `set` returns Err if
-    // already installed (e.g. test re-entry); we ignore.
-    let _ = rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK
-        .set(facade_visibility_override);
+    // Stage 4c retired `VISIBILITY_OVERRIDE_HOOK`: the partitioner override
+    // in `queries::partition` now forces `(External, Default)` directly on
+    // `__lang_stubs` items' `MonoItemData`. rustc_codegen_llvm reads the
+    // linkage straight from the CGU struct at emission time and never
+    // re-derives it, so the plugin-applied override survives to the final
+    // `.o` — no fork hook needed.
+    //
     // Stage 4b retired `CODEGEN_SKIP_HOOK`: the partitioner override in
     // `queries::partition` removes consumer items from rustc's CGU slice
     // before codegen dispatch ever sees them, so the hook is unreachable.
