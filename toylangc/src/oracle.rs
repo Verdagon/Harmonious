@@ -345,7 +345,7 @@ pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> c
         TyKind::Adt(adt_def, args) => {
             let name = tcx.item_name(adt_def.did()).to_string();
             let type_args: Vec<ResolvedType> = args.iter()
-                .filter_map(|a| match a.unpack() {
+                .filter_map(|a| match a.kind() {
                     ty::GenericArgKind::Type(t) => Some(rustc_ty_to_resolved_type(tcx, t)),
                     _ => None,
                 })

@@ -96,8 +96,8 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             builder: context.create_builder(),
             tcx,
             registry,
-            pointer_bits: dl.pointer_size.bits(),
-            pointer_align: dl.pointer_align.abi.bytes(),
+            pointer_bits: dl.pointer_size().bits(),
+            pointer_align: dl.pointer_align().abi.bytes(),
             vars: HashMap::new(),
             rust_symbols: Vec::new(),
             declared_fns: HashMap::new(),
@@ -1180,7 +1180,7 @@ fn lower_typed_expr<'ctx>(
                     .collect();
                 // @ELASZ
                 let args_ref = crate::oracle::build_generic_args_for_item(ctx.tcx, def_id, &ty_arg_refs);
-                let instance = ty::Instance::new(def_id, args_ref);
+                let instance = ty::Instance::new_raw(def_id, args_ref);
                 let symbol = resolve_rust_symbol(ctx.tcx, def_id, args_ref);
 
                 // Query Rust ABI for params and return convention

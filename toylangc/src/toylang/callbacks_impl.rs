@@ -135,7 +135,7 @@ impl ToylangCallbacks {
         // `collect_rust_deps_recursive`'s signature (which takes an already-
         // resolved `ToyFunction`) doesn't need to branch.
         let resolved_caller = resolve_caller_from_identity_args(toy_fn);
-        let identity_instance = ty::Instance::new(def_id.to_def_id(), identity_args);
+        let identity_instance = ty::Instance::new_raw(def_id.to_def_id(), identity_args);
         let extern_symbol = compute_fn_symbol(registry_name, tcx, identity_instance);
         // Local cycle guard — prevents infinite recursion on cyclic consumer
         // code. Intentionally NOT shared with `state.walked_entry_points`; see
@@ -175,7 +175,7 @@ impl ToylangCallbacks {
         if let Some((struct_name, field_name)) = name.split_once('.') {
             let mut sym = format!("__toylang_accessor_{}_{}", struct_name, field_name);
             for arg in instance.args.iter() {
-                if let ty::GenericArgKind::Type(ty) = arg.unpack() {
+                if let ty::GenericArgKind::Type(ty) = arg.kind() {
                     let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
                     sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
                 }
@@ -310,7 +310,7 @@ fn walk_ty_for_layout_log<'tcx>(
         // Recurse into generic args so consumer types nested in
         // `Vec<ToyPoint>` etc. get their log entries too.
         for arg in args.iter() {
-            if let ty::GenericArgKind::Type(inner) = arg.unpack() {
+            if let ty::GenericArgKind::Type(inner) = arg.kind() {
                 walk_ty_for_layout_log(tcx, inner, seen);
             }
         }
@@ -645,7 +645,7 @@ fn resolve_caller_from_instance<'tcx>(
     let mut subst = std::collections::HashMap::new();
     for (i, param_name) in caller_fn.type_params.iter().enumerate() {
         if let Some(arg) = instance.args.get(i) {
-            if let ty::GenericArgKind::Type(ty) = arg.unpack() {
+            if let ty::GenericArgKind::Type(ty) = arg.kind() {
                 subst.insert(param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(tcx, ty));
             }
         }
@@ -1105,7 +1105,7 @@ fn collect_rust_type_names(ty: &crate::toylang::typed_ast::ResolvedType) -> Vec<
 pub fn compute_fn_symbol<'tcx>(name: &str, tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> String {
     let mut sym = format!("__toylang_impl_{}", name);
     for arg in instance.args.iter() {
-        if let ty::GenericArgKind::Type(ty) = arg.unpack() {
+        if let ty::GenericArgKind::Type(ty) = arg.kind() {
             let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
             sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
         }

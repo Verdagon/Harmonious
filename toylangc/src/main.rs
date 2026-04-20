@@ -84,7 +84,7 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
 
         if !is_primary {
             run_plain_rustc(&argv);
-            return Ok(());
+            return;
         }
 
         // Per @MRRIWMZ, this is read site 2 of toylang.toml. Build mode parses
@@ -110,7 +110,7 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
             Some(p) => p,
             None => {
                 run_plain_rustc(&argv);
-                return Ok(());
+                return;
             }
         };
 
@@ -138,7 +138,6 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
         let pkg_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
         let is_downstream = !pkg_name.starts_with("lang_stubs_");
         run_toylang_compile(registry, argv.clone(), is_downstream);
-        Ok(())
     });
 
     std::process::exit(exit_code);
@@ -191,7 +190,7 @@ impl rustc_driver::Callbacks for NoopCallbacks {}
 /// Used for dependency crates in wrapper mode.
 fn run_plain_rustc(args: &[String]) {
     let mut cb = NoopCallbacks;
-    rustc_driver::RunCompiler::new(args, &mut cb).run();
+    rustc_driver::run_compiler(args, &mut cb);
 }
 
 fn find_sysroot_tool(tool_name: &str) -> PathBuf {
