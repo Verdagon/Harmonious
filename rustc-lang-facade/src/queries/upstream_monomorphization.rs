@@ -42,7 +42,7 @@ pub fn lang_upstream_monomorphizations_for<'tcx>(
     // generic wrappers (Phase-6 unwraps + any future cross-crate generic
     // stubs) must be emitted in whatever crate currently needs them, not
     // routed to a nonexistent upstream instantiation.
-    if crate::is_from_lang_stubs_safe(tcx, def_id) {
+    if crate::is_from_lang_stubs(tcx, def_id) {
         return None;
     }
     let default = crate::default_upstream_monomorphizations_for();

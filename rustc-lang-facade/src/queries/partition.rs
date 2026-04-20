@@ -64,7 +64,7 @@ pub fn lang_collect_and_partition_mono_items<'tcx>(
             if crate::is_consumer_codegen_target(tcx, def_id) {
                 continue;
             }
-            let final_data = if crate::is_from_lang_stubs_safe(tcx, def_id) {
+            let final_data = if crate::is_from_lang_stubs(tcx, def_id) {
                 MonoItemData {
                     linkage: Linkage::External,
                     visibility: Visibility::Default,

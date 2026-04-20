@@ -178,7 +178,7 @@ fn write_stub_crate(
     // package name unique per project (suffix with the user's project name)
     // while keeping the rust-level crate name fixed at `__lang_stubs` via
     // `[lib].name`. The fixed crate name matters: the facade's
-    // `is_from_lang_stubs_safe` predicate checks `tcx.crate_name(...) ==
+    // `is_from_lang_stubs` predicate checks `tcx.crate_name(...) ==
     // "__lang_stubs"`, and the user bin's `use __lang_stubs::*;` resolves
     // by crate name. Hash differs per package → separate rlibs in the
     // shared cache; tests don't cross-contaminate.

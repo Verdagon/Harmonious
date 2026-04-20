@@ -896,16 +896,19 @@ fn walk_typed_expr_for_deps(
     }
 }
 
-/// Convert a type string to a rustc Ty.
 /// Find a function's DefId in __lang_stubs by name.
 ///
-/// Uses the cross-crate-safe `is_from_lang_stubs_safe` so the check works
-/// uniformly under both architectures: in the FileLoader-single-crate
-/// (direct mode) path the items live in `mod __lang_stubs {}` inside the
-/// user crate; in the stage-5 two-crate (wrapper mode) path the items are
-/// at the root of the `__lang_stubs` rlib's local crate. The unsafe
-/// `is_from_lang_stubs` variant relies on `def_path_str` which trims the
-/// crate prefix for local items and would miss the rlib case.
+/// Walks the local crate's items and filters by `is_from_lang_stubs`.
+/// Under the post-5c.4 two-crate architecture, in the stub rlib's
+/// compile the items are at LOCAL_CRATE's root (whose name is
+/// `__lang_stubs`); in the user-bin compile the items aren't local to
+/// scan here (use the facade's extern-crate walker for that). Pre-5c.4
+/// this function had to handle a FileLoader path where items lived
+/// nested in `mod __lang_stubs {}` inside the user crate; that path
+/// was retired along with direct mode, and the former name-dispatch
+/// comment documenting the difference between safe/unsafe variants of
+/// the predicate is moot now that `is_from_lang_stubs_safe` has
+/// collapsed into `is_from_lang_stubs`.
 fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id::DefId> {
     use rustc_hir::def::DefKind;
     for local_def_id in tcx.hir_crate_items(()).definitions() {
@@ -916,7 +919,7 @@ fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id
         if tcx.item_name(def_id).as_str() != name {
             continue;
         }
-        if rustc_lang_facade::is_from_lang_stubs_safe(tcx, def_id) {
+        if rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
             return Some(def_id);
         }
     }

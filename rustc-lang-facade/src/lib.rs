@@ -292,22 +292,13 @@ pub(crate) fn is_consumer_type(name: &str) -> bool {
 /// (items local to LOCAL_CRATE, which IS `__lang_stubs`) and the user-
 /// bin compile (items in an extern crate of that name) are handled by
 /// the same `tcx.crate_name` check. Stage 5c.4 retired the FileLoader-
-/// injected `mod __lang_stubs {}` fallback along with direct mode.
-///
-/// `is_from_lang_stubs_safe` is a thin alias retained for historical
-/// call sites — the safe/unsafe distinction mattered under the former
-/// string-based fallback which called `def_path_str` (@DPSFDOZ-gated);
-/// the crate-name check has no such restriction.
+/// injected `mod __lang_stubs {}` fallback along with direct mode;
+/// the post-5c.4 followup consolidated the former `is_from_lang_stubs_safe`
+/// alias into this single name (the safe/unsafe distinction mattered
+/// only under the former string-based `def_path_str` fallback, which
+/// was @DPSFDOZ-gated; the crate-name check has no such restriction).
 pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     tcx.crate_name(def_id.krate).as_str() == "__lang_stubs"
-}
-
-/// Alias for `is_from_lang_stubs` — same implementation. Kept as a
-/// separate symbol so existing call sites (partitioner, cross-crate
-/// query providers, oracle resolver) don't need a mechanical rename
-/// pass. Future clean-up may consolidate to the single name.
-pub fn is_from_lang_stubs_safe(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    is_from_lang_stubs(tcx, def_id)
 }
 
 /// Is this DefId a consumer-owned function whose real implementation
@@ -329,7 +320,7 @@ pub fn is_from_lang_stubs_safe(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 /// — fall through to rustc's default codegen; they are real Rust
 /// functions whose symbol must be callable at link time.
 pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
-    if !is_from_lang_stubs_safe(tcx, def_id) {
+    if !is_from_lang_stubs(tcx, def_id) {
         return false;
     }
     let Some(name) = tcx.opt_item_name(def_id) else {
