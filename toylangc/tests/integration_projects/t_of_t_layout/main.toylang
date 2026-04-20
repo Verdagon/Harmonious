@@ -1,0 +1,20 @@
+fn println_i32(x: i32)
+
+struct ToyInner {
+    x: i32,
+}
+
+struct ToyOuter {
+    inner: ToyInner,
+    extra: i32,
+}
+
+fn probe() -> i32 {
+    let inner = ToyInner { x: 1 };
+    let outer = ToyOuter { inner: inner, extra: 2 };
+    outer.extra
+}
+
+fn main() {
+    println_i32(probe());
+}

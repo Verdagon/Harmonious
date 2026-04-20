@@ -56,15 +56,28 @@ pub fn lang_layout_of<'tcx>(
         // Only intercept fully monomorphized types (no unresolved type params).
         let has_params = args.iter().any(|a| a.has_param());
         if !has_params && crate::is_consumer_type(&name) && crate::is_from_lang_stubs(tcx, adt_def.did()) {
-            eprintln!("[toylang] layout_of intercepted for: {:?}", ty);
-
             // Ask the consumer to monomorphize this type — returns concrete field types.
             // For non-generic types, this just returns the field types directly.
             // For generic types like Pair<i32, i32>, the consumer substitutes
             // type params with concrete args and returns [tcx.types.i32, tcx.types.i32].
             let result = crate::call_monomorphize_type(&name, tcx, ty);
 
-            return Ok(build_layout(tcx, ty, &result.field_types, query.typing_env));
+            let layout = build_layout(tcx, ty, &result.field_types, query.typing_env);
+
+            // Stage 5c: log includes size + align so integration-test harnesses
+            // (`run_integration_project` reading the build output) can assert
+            // on layout values without a Rust-side size_of probe. Previously
+            // emitted `layout_of intercepted for: <ty>` only; now the log
+            // line is machine-parseable as `key=value` pairs. Migration of
+            // the 6 layout probe tests depends on this format.
+            eprintln!(
+                "[toylang] layout_of intercepted for: {:?} size={} align={}",
+                ty,
+                layout.layout.size().bytes(),
+                layout.layout.align().abi.bytes(),
+            );
+
+            return Ok(layout);
         }
     }
 

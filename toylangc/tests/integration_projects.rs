@@ -224,6 +224,83 @@ fn run_integration_project_check_callbacks(
     }
 }
 
+/// Build a project, capture toylangc's stderr, and assert that it
+/// contains every non-empty line of `expected_build_stderr.txt`. Used by
+/// layout-probe tests that assert on `layout_of intercepted for: <ty>
+/// size=N align=M` emissions — the facade's `lang_layout_of` override
+/// logs each interception with size + align, and that log is the only
+/// wrapper-mode surface where the ABI decision is observable (direct
+/// mode asserted on `std::mem::size_of::<ConsumerType>()` from a Rust
+/// `fn main`, which has no wrapper-mode equivalent).
+///
+/// Runs the produced binary after building — a side-effect-free smoke
+/// test that the layout probe also codegens cleanly. Binary stdout is
+/// not checked (layout probes don't assert on runtime output, just on
+/// the build-time layout log).
+fn run_integration_project_check_build_stderr(name: &str) {
+    let project = projects_dir().join(name);
+    assert!(
+        project.is_dir(),
+        "integration project not found: {}",
+        project.display(),
+    );
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let cargo_target = shared_cargo_target_dir();
+
+    let build_out = Command::new(toylangc_bin())
+        .current_dir(&project)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("CARGO_INCREMENTAL", "0")
+        .args(["build"])
+        .output()
+        .expect("failed to spawn toylangc");
+    assert!(
+        build_out.status.success(),
+        "{} toylangc build failed:\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    // Smoke-run the binary if one got produced. Confirms the layout
+    // probe's toylang source compiles + links to a working executable;
+    // doesn't assert on stdout.
+    let bin = cargo_target.join("debug").join(name);
+    if bin.exists() {
+        let run = Command::new(&bin)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .output()
+            .unwrap_or_else(|e| panic!("{}: failed to spawn binary: {}", name, e));
+        assert!(
+            run.status.success(),
+            "{} binary exited non-zero:\nstdout: {}\nstderr: {}",
+            name,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&build_out.stderr).to_string();
+    let expected = std::fs::read_to_string(project.join("expected_build_stderr.txt"))
+        .unwrap_or_else(|e| panic!("{}: cannot read expected_build_stderr.txt: {}", name, e));
+    for line in expected.lines() {
+        if line.is_empty() { continue; }
+        assert!(
+            stderr.contains(line),
+            "{}: expected '{}' in build stderr, got:\n{}",
+            name, line, stderr,
+        );
+    }
+}
+
 /// Build a project that is expected to FAIL compilation. Asserts toylangc
 /// exits non-zero and the combined stdout+stderr contains every line of
 /// `expected_error.txt` (substring, same line-wise contains semantics as
@@ -523,97 +600,29 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 #[test] fn test_roguelike() { run_integration_project("roguelike"); }
 
 // ============================================================================
-// Parked tests — unmigrated, with reasons
+// Parked tests — unmigrated, with reasons. 2 remaining as of 5c.4.
 // ============================================================================
 //
-// Every test below is still present in `integration_tests.rs` (direct mode)
-// and passes there. They do not migrate cleanly to wrapper-mode + projects
-// for the documented reasons. Stage 5c.3 and 5c.4 address the unblockable
-// ones (error-harness helper, ENV_LOG-callback replacement, Vec<consumer
-// type> debuginfo fix).
+// All prior parked categories (Vec<consumer-type> debuginfo ICE, ENV_LOG
+// callback-trace tests, error-assertion tests, layout probes) resolved
+// and migrated; see the bottom of this file for their #[test] entries.
 //
-// CATEGORY: Vec<consumer-type> debuginfo ICE (same cause as the
-// inline-TODO'd test_toylang_main_with_vec below; tracked as risks.md
-// §B6's debuginfo sibling issue). Every test listed here constructs
-// `Vec<Point, Global>` or similar with a toylang-defined struct as the
-// element type, and the stub rlib compile panics in
-// `build_struct_type_di_node` during debuginfo generation for the
-// opaque struct's generic instantiation inside Vec.
+// 1. test_extern_fn_call (integration_tests.rs:1949) — pre-existing bool
+//    extern-arg return-type leak in toylang codegen. LLVM IR verifier
+//    rejects toylang's emitted `define i8 @... ret void` mismatch. Hash-
+//    order-dependent: identical source under a different project name
+//    doesn't reproduce. Architecturally independent of stage 5; parked
+//    for a dedicated codegen fix. See handoff §B7 + risks.md §3 B7.
 //
-// Fix is architectural: either emit `pub struct Point;` (unit struct)
-// instead of `pub struct Point(());` (tuple struct with unit field)
-// from stub_gen so the source-level field count matches our
-// layout_of(0-field), OR teach the layout_of override to always agree
-// with the source-level field count (slightly more invasive because
-// the override synthesizes layouts for generic instantiations that
-// don't exist in source). Defer to stage 5c.4 or a dedicated follow-up.
-//
-//   test_vec_point                       (line  249)
-//   test_r_t_r_vec_of_ship               (line  530)
-//   test_t_r_t_construct                 (line  571)
-//   test_r_r_t_vec_of_vec                (line  649)
-//   test_deep_t_r_t_r                    (line  808)
-//   test_vec_of_structs_len              (line 1396)
-//   test_toylang_main_with_vec           (line 1695) — see also v2 below
-//   test_toylang_main_with_vec_v2        (line 1656)
-//   test_vec_method_lookup_is_exact      (line 1798)
-//   test_vec_push_fn_call_result         (line 1852)
-//
-// CATEGORY: Rust-specific layout probes. These tests assert on
-// `std::mem::size_of::<ConsumerType>()` / `std::mem::align_of` from
-// the Rust side. Wrapper mode runs a toylang binary; there's no
-// Rust-side entry point to query layout. Migrating would require a
-// layout-introspection helper exposed via test_helpers that takes a
-// concrete type and returns its size — which means the set of types
-// has to be baked into test_helpers, defeating the point. These
-// tests are really facade-correctness probes; candidate for
-// promotion to a rustc-lang-facade unit test rather than an
-// integration project. Park.
-//
-//   test_point_layout                    (line  288)
-//   test_t_of_r_layout                   (line  442)
-//   test_t_of_t_layout                   (line  501)
-//   test_tg_of_vec_layout                (line  723)
-//   test_tg_of_toypoint_layout           (line  779)
-//   test_point_drop                      (line  313) — uses runtime.o
-//                                        link-args + std::ptr::drop_in_place
-//
-// CATEGORY: ENV_LOG callback-trace tests. These use
-// `compile_and_run_with_env` to set `TOYLANG_CALLBACK_LOG=1` and
-// assert on the callback sequence the facade recorded for the
-// compile. The log is a facade-internal observation that doesn't
-// surface through `toylangc build` output. 5c.3 or 5c.4 either
-// needs to add a `--log-callbacks=<path>` flag or these tests need
-// to become facade-level unit tests. Park.
-//
-//   test_internal_toylang_fn_not_monomorphized_by_rustc (line 2692)
-//   test_deep_chain_only_entry_point_monomorphized      (line 2741)
-//   test_diamond_call_pattern                           (line 2791)
-//   test_generic_deep_walk                              (line 2847)
-//   test_two_entry_points_shared_internal               (line 2892)
-//
-// CATEGORY: Error-assertion tests. These expect `toylangc` to exit
-// non-zero with a structured error. 5c.3 will add a
-// `run_integration_project_expects_error(name, pattern)` harness
-// helper that captures stderr and substring-matches. Park until
-// that lands.
-//
-//   test_lexer_rejects_unknown_chars                           (line 1891)
-//   test_rust_free_fn_undefined_gives_error                    (line 3115)
-//   test_main_non_void_tail_rejected                           (line 3149)
-//   test_trait_self_not_imported_gives_error                   (line 3189)
-//   test_static_call_undefined_type_gives_structured_error     (line 3886)
-//   test_trait_call_unknown_trait_name_gives_structured_error  (line 3934)
-//   test_trait_call_unknown_method_name_gives_structured_error (line 3985)
-//
-// CATEGORY: Codegen bugs (pre-existing, exposed only under two-crate).
-// See handoff §B7 + risks.md §3 B7.
-//
-//   test_extern_fn_call                  (line 1949) — bool extern-arg
-//                                        return-type leak
-//
-// Previously-TODO'd inline text about the Vec<Point> ICE retained below
-// for git-log searchability; superseded by the category block above.
+// 2. test_point_drop (integration_tests.rs:313) — Rust main calls
+//    `std::ptr::drop_in_place(&mut p as *mut Point)` and links against a
+//    pre-built `runtime.o` providing `__toylang_drop_Point`. Wrapper
+//    mode's user_bin is a generated `fn main() { __toylang_main(); }`
+//    shim — no Rust-side entry point for drop_in_place. Would require
+//    either (a) toylang.toml support for `[build] link-args = [...]` +
+//    an override hook for the user_bin template, or (b) promotion to
+//    a unit test against the facade's drop-glue path. Defer until
+//    either direction is worth pursuing.
 //
 // Vec<consumer-type> migrations — unblocked by the stub_gen unit-struct
 // change (pub struct Foo; instead of pub struct Foo(());). See the
@@ -715,3 +724,19 @@ fn test_two_entry_points_shared_internal() {
         &["entry_a", "entry_b", "internal_helper"],
     );
 }
+
+// ============================================================================
+// Stage 5c.4 — layout probe tests. Each triggers `layout_of` for a
+// consumer type via a toylang fn that constructs one, then asserts that
+// the facade's `[toylang] layout_of intercepted for: <ty> size=N
+// align=M` log appears in toylangc's build stderr. Replaces direct
+// mode's `assert_eq!(std::mem::size_of::<Point>(), 8)` from Rust main,
+// which has no wrapper-mode equivalent (user_bin's main.rs is a
+// generated `__toylang_main()` shim, not arbitrary Rust).
+// ============================================================================
+
+#[test] fn test_point_layout() { run_integration_project_check_build_stderr("point_layout"); }
+#[test] fn test_t_of_t_layout() { run_integration_project_check_build_stderr("t_of_t_layout"); }
+#[test] fn test_t_of_r_layout() { run_integration_project_check_build_stderr("t_of_r_layout"); }
+#[test] fn test_tg_of_vec_layout() { run_integration_project_check_build_stderr("tg_of_vec_layout"); }
+#[test] fn test_tg_of_toypoint_layout() { run_integration_project_check_build_stderr("tg_of_toypoint_layout"); }

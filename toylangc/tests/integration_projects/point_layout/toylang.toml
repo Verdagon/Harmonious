@@ -1,0 +1,6 @@
+[project]
+name = "point_layout"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

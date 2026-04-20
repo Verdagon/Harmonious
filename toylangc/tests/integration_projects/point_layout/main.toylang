@@ -1,0 +1,15 @@
+fn println_i32(x: i32)
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn probe() -> i32 {
+    let p = Point { x: 1, y: 2 };
+    p.x
+}
+
+fn main() {
+    println_i32(probe());
+}

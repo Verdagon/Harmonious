@@ -1,0 +1,18 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct ToyShip {
+    wings: Vec<i32, Global>,
+}
+
+fn probe() -> usize {
+    let v = Vec::new<i32, Global>();
+    let s = ToyShip { wings: v };
+    s.wings.len()
+}
+
+fn main() {
+    println_usize(probe());
+}

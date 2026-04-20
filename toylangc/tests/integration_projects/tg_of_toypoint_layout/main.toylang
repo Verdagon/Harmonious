@@ -1,0 +1,32 @@
+// Layout probe for ToyWrapper<ToyPoint>. Constructing the wrapper
+// inline in `probe()` (`let w = ToyWrapper<ToyPoint> { inner: p };`)
+// doesn't trigger layout_of for the wrapper type — rustc inlines the
+// stack storage + field access without ever asking for the whole
+// struct's layout. Routing through `make_wrapper` forces the ABI
+// decision by requiring rustc to materialize a ToyWrapper<ToyPoint>
+// as a function return value, which in turn queries layout_of.
+
+fn println_i32(x: i32)
+
+struct ToyPoint {
+    x: i32,
+    y: i32,
+}
+
+struct ToyWrapper<T> {
+    inner: T,
+}
+
+fn make_wrapper(p: ToyPoint) -> ToyWrapper<ToyPoint> {
+    ToyWrapper<ToyPoint> { inner: p }
+}
+
+fn probe() -> i32 {
+    let p = ToyPoint { x: 1, y: 2 };
+    let w = make_wrapper(p);
+    w.inner.x
+}
+
+fn main() {
+    println_i32(probe());
+}

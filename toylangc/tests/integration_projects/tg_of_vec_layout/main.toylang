@@ -1,0 +1,27 @@
+// Layout probe for ToyWrapper<Vec<i32, Global>>. See
+// tg_of_toypoint_layout for the rationale — inline `let w =
+// ToyWrapper<...> { inner: v };` doesn't query the wrapper's layout;
+// make_wrapper's return type does.
+
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct ToyWrapper<T> {
+    inner: T,
+}
+
+fn make_wrapper(v: Vec<i32, Global>) -> ToyWrapper<Vec<i32, Global>> {
+    ToyWrapper<Vec<i32, Global>> { inner: v }
+}
+
+fn probe() -> usize {
+    let v = Vec::new<i32, Global>();
+    let w = make_wrapper(v);
+    w.inner.len()
+}
+
+fn main() {
+    println_usize(probe());
+}
