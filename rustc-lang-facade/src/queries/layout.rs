@@ -23,7 +23,7 @@
 #![allow(unused)]
 
 use rustc_abi::{
-    AbiAndPrefAlign, Align, BackendRepr, FieldIdx, FieldsShape, LayoutData, Size, VariantIdx,
+    AbiAlign, Align, BackendRepr, FieldIdx, FieldsShape, LayoutData, Size, VariantIdx,
     Variants,
 };
 use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
@@ -119,7 +119,7 @@ fn build_layout<'tcx>(
     let total_size = align_up(offset, max_align);
 
     let align = Align::from_bytes(max_align).unwrap();
-    let abi_align = AbiAndPrefAlign::new(align);
+    let abi_align = AbiAlign::new(align);
 
     // Report 0 fields to rustc — the struct is fully opaque. Rustc only needs
     // the total size and alignment for ABI decisions with BackendRepr::Memory.
@@ -128,16 +128,17 @@ fn build_layout<'tcx>(
     let layout_data = LayoutData {
         fields: FieldsShape::Arbitrary {
             offsets: IndexVec::new(),
-            memory_index: IndexVec::new(),
+            in_memory_order: IndexVec::new(),
         },
         variants: Variants::Single { index: VariantIdx::from_u32(0) },
         backend_repr: BackendRepr::Memory { sized: true },
         largest_niche: None,
+        uninhabited: false,
         align: abi_align,
         size: Size::from_bytes(total_size),
         max_repr_align: None,
         unadjusted_abi_align: align,
-        randomization_seed: 0,
+        randomization_seed: rustc_hashes::Hash64::ZERO,
     };
 
     TyAndLayout {

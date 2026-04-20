@@ -15,6 +15,7 @@ extern crate rustc_codegen_llvm;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
+extern crate rustc_hashes;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_interface;
