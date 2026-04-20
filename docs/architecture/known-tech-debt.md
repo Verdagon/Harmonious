@@ -112,6 +112,68 @@ risks.md §B6 RESOLVED note for the historical framing.
 
 ---
 
+## 30. `layout_of` log-emission cache-skip under shared target dir
+
+### Problem
+
+Layout-probe integration tests (`t_of_r_layout`, `t_of_t_layout`, and
+the siblings that assert on the `[toylang] layout_of intercepted for:
+… size=N align=M` stderr line from `rustc-lang-facade/src/queries/layout.rs`)
+can spuriously fail when:
+
+1. The suite is run piecemeal (e.g. `cargo test --test integration_projects`
+   followed by `cargo test -p toylangc`) against the shared
+   `CARGO_TARGET_DIR` at `toylangc/target/integration-projects-cache/`, and
+2. The earlier run warmed rustc's per-item incremental cache for the
+   same project's layout queries.
+
+On the second run the `lang_layout_of` override never fires (cache hit
+at the query-provider layer), so the `eprintln!` that the layout-probe
+tests assert on is never emitted, and the test fails with "expected
+`…size=8 align=4` in build stderr."
+
+Wiping `toylangc/target/integration-projects-cache/` and each per-project
+`.toylang-build/` dir restores 210/210. The failure is deterministic given
+the warm-cache precondition, not flaky.
+
+### Why it's distinct from B6
+
+Same *class* of problem as risks.md §B6 (query-provider side-effect
+fragility under rustc's incremental cache), different *site*. B6 was
+about `state.toylang_instances` population — the fix moved that to an
+up-front deterministic walk in `generate_and_compile` (`populate_toylang_instances_from_cgus`).
+The `layout_of` log emission is still a side-effect of the query
+provider firing; it wasn't moved because no test depended on its
+cache-deterministic emission until layout probes were added.
+
+Diagnosed 2026-04-22 during the nightly-2025-01-15 → nightly-2026-01-20
+bump's verification pass. Pre-existing; not a bump regression (reproduces
+on the old pin too).
+
+### Fix
+
+Two viable approaches, both bounded:
+
+1. **Move layout logging to the `generate_and_compile` walk.** Iterate
+   `state.toylang_instances` + the registry's consumer types once up
+   front, call `call_monomorphize_type` for each concrete consumer type
+   (it's stateless + cheap), and emit the log line from there. Parallel
+   to B6's architectural fix. The layout-probe tests would assert on
+   the deterministic emission instead of the query-provider one.
+2. **Have the test harness wipe the shared cache between test binaries.**
+   Cheaper but only shifts the fragility — other future tests that depend
+   on query-side-effect stderr emission would hit the same wall.
+
+Option 1 is the real fix. Option 2 is a workaround if layout-probe
+tests need to stay green in the interim.
+
+Non-blocking; the user-facing `toylangc build` flow doesn't hit this
+(users don't share `CARGO_TARGET_DIR` across unrelated compilations the
+way the test harness does). Flagged for whoever next touches the
+layout-probe or integration-test harness.
+
+---
+
 ## Resolved Items (sessions 1–8)
 
 | # | Item | Session | Resolution |
