@@ -1,3 +1,15 @@
+<!--
+Record of the Vale response sent 2026-04-20.
+
+This is the rewritten post-landing version (not the original mid-
+roadmap draft that lived here through stages 1–5). Kept at repo
+root as the canonical record of what went out. If Vale replies,
+use this as the starting point for the follow-up rather than re-
+deriving from reasoning docs.
+
+See HANDOFF-TL.md §3a for context.
+-->
+
 Hey,
 
 Good writeup. Spent a couple hours digging through the actual code + every historical doc + the fork patches to answer your questions honestly. The short version is: **most of your alternatives are more viable than the architecture guide's framing suggests, because several weren't explicitly considered when the current design was picked.** Long version below, with the six questions answered in order.

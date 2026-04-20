@@ -301,21 +301,19 @@ for both positions.
 
 ## Part 5: Current status — what's outstanding
 
-### The Vale response
+### The Vale response — sent
 
-Draft at `response-reducing-rustc-fork.md` at the repo root.
-**~168 lines. Not sent. Updated with all three investigations'
-findings.**
+Sent 2026-04-20. The mid-roadmap draft that lived here through
+stages 1–5 was rewritten as a post-landing status report before
+sending — reframing "we're considering X" into "here's what we
+shipped, including stage 5 making the architecture a natural fit
+for Vale's greenfield case." Record-of-sent at
+`response-reducing-rustc-fork.md` (repo root).
 
-Decision required from whoever picks up this investigation:
-- Send as-is
-- Tighten or rewrite
-- Hold while Vale's timeline clarifies
-
-Sending requires: knowing the Vale contact (see `/Volumes/V/ValeRustInterop/`
-for the original inquiry document) and deciding whether it's the right
-time in their own architecture planning cycle. The draft has been
-reviewed by both POC authors and the spike author.
+Original Vale inquiry at `/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`.
+No reply yet. If Vale engages further, the sent response is the
+starting point; customize the follow-up to Vale's current posture
+rather than re-deriving from the reasoning docs.
 
 ### Doc currency
 
@@ -405,10 +403,10 @@ If you're picking this investigation up cold:
    branches** if you need specific evidence cited in the reasoning
    doc. You don't need to read them for top-level understanding.
 
-4. **Look at `response-reducing-rustc-fork.md`** to see what's been
-   drafted to Vale. That's the "outbound" form of the investigation.
-   If you're deciding whether to send / rewrite / hold, this is the
-   artifact under review.
+4. **Look at `response-reducing-rustc-fork.md`** to see what was
+   sent to Vale on 2026-04-20. That's the "outbound" form of the
+   investigation — the rewritten post-landing status report, not
+   the original mid-roadmap draft.
 
 5. **Don't re-run any of the three investigations.** They're
    prototype-verified or prototype-characterized as noted; unless
@@ -416,10 +414,10 @@ If you're picking this investigation up cold:
    the rustc-fork toolchain version), re-running would just reproduce
    known results.
 
-6. **If Vale engages further**, the response draft is your starting
-   point, not the reasoning doc. The reasoning doc is the substrate;
-   the response is the conversation. Customize the response to
-   whatever Vale's current posture is.
+6. **If Vale engages further**, the sent response (see item 4) is
+   your starting point, not the reasoning doc. The reasoning doc is
+   the substrate; the sent response is the conversation. Customize
+   the follow-up to whatever Vale's current posture is.
 
 7. **If toylang's position changes** (e.g., the distribution-friction
    concern shifts to apply to toylang too), the reasoning doc's

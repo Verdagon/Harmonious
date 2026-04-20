@@ -31,9 +31,9 @@ maintenance-mode handoff, not a mid-project one.
 - **Active work:** none. No junior handoffs in flight. No unresolved
   architectural risks. No mid-stage refactors.
 
-- **Open threads** (all non-urgent, see §3): a Vale response draft
-  at repo root, optional upstream PR opportunity, minor tech-debt
-  items.
+- **Open threads** (all non-urgent, see §3): optional upstream PR
+  opportunity, minor tech-debt items. (The Vale response was sent
+  2026-04-20; no reply yet — logged in §3a for the record.)
 
 - **The rustc fork working tree at `~/rust` is empty** (no diff
   against upstream). Its branch name `per-instance-mir` is vestigial.
@@ -78,34 +78,23 @@ Key shipping commits:
 
 All non-urgent; none block normal maintenance.
 
-### 3a. The Vale response
+### 3a. The Vale response — sent
 
-Draft at `response-reducing-rustc-fork.md` (repo root, ~168 lines).
+Sent 2026-04-20 (rewrite-and-send path from the earlier three-way
+decision). The rewritten version reframes the content as a post-
+landing status report: "here's what we ended up shipping, including
+stage 5 making the architecture a natural fit for a greenfield
+consumer like Vale," rather than the mid-roadmap "we're considering
+X" framing the original draft carried.
 
-Original Vale inquiry:
+Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
+Original Vale inquiry at
 `/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`.
-The draft was authored mid-roadmap when stages 1/2/3 had shipped
-but stages 4/5 were still future work. **It's now fully outdated**
-in the sense that every POC finding it cites is shipping
-architecture, every "we're considering..." is now "we shipped...".
 
-**Decision:**
-
-- **Send as-is:** content's factually correct except for tense and
-  framing. Minimal effort but slightly confusing for the recipient
-  (reads as "we're considering X" when X is years-old shipping
-  architecture).
-- **Rewrite as a post-landing status report:** reframe as "here's
-  what we ended up shipping, including stage 5 making the
-  architecture a natural fit for a greenfield consumer like Vale."
-  Accurate and current; ~1 day of reworking.
-- **Hold:** content isn't time-sensitive; Vale has not followed up.
-  Can be sent any time, or never.
-
-**My recommendation: rewrite and send.** The project is in a good
-natural closing posture — zero fork, Vale-fork-ready architecture,
-all stages shipped. A post-landing writeup is the clean handshake
-moment. But the judgment is the next TL's.
+No reply yet (logged for whoever picks this up). If Vale engages
+further, the sent response is your starting point — customize the
+follow-up to whatever Vale's current posture is rather than re-
+arguing from the reasoning docs.
 
 ### 3b. Upstream PR contribution (optional)
 
@@ -202,8 +191,8 @@ mid-project would be.
 12. **`docs/historical/phase-history.md`** — per-phase writeups
     (phases 1–8 + fork-reduction stages 1–5 + post-stage-5
     cleanup). Historical reference.
-13. **`response-reducing-rustc-fork.md`** — outbound Vale draft
-    (see §3a).
+13. **`response-reducing-rustc-fork.md`** — record of the Vale
+    response sent 2026-04-20 (see §3a).
 14. **`docs/historical/handoff-*.md`** — archived junior handoffs
     from each stage. Reference if you need to see how past work
     was scoped + executed.
@@ -294,7 +283,7 @@ erw/
 ├── README.md                                   # public-facing (minimal)
 ├── HANDOFF-TL.md                               # this doc
 ├── future-architecture-investigations.md       # Vale/POC summary
-├── response-reducing-rustc-fork.md             # outbound Vale draft (unsent)
+├── response-reducing-rustc-fork.md             # Vale response (sent 2026-04-20)
 ├── Cargo.toml                                  # workspace
 ├── docs/
 │   ├── meta.md                                 # doc strategy
@@ -389,8 +378,8 @@ part of the output without re-running.
       knows what the canaries are for the Category A/B risks.
 - [ ] Outgoing TL has walked through §3 (open threads) + §6
       (in-head knowledge) in a sync (if any).
-- [ ] If the Vale response is sent, sent before handoff. If held,
-      new maintainer knows the current posture.
+- [x] Vale response sent 2026-04-20 (see §3a). New maintainer
+      knows to use it as the starting point if Vale replies.
 - [ ] Full test suite runs green on the new maintainer's machine
       (`cargo +nightly-2026-01-20 test -p toylangc` → 210/210).
 - [ ] New maintainer knows about the three preserved POC/spike
