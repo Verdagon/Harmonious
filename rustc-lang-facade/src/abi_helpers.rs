@@ -12,8 +12,7 @@
 //! See `docs/historical/problem-abi-coercion.md` for the investigation that led to
 //! this approach — small struct returns were silently zeroing fields before this fix.
 
-use rustc_abi::Size;
-use rustc_target::callconv::{Reg, RegKind};
+use rustc_abi::{Reg, RegKind, Size};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_target::callconv::{CastTarget, PassMode};
