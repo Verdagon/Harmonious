@@ -32,21 +32,24 @@
 //! matching here; partitioner-time is one of the non-diagnostic contexts
 //! where `def_path_str` ICEs.
 
-use rustc_hir::def_id::DefIdSet;
-use rustc_middle::mir::mono::{CodegenUnit, Linkage, MonoItemData, Visibility};
+use rustc_hir::attrs::Linkage;
+use rustc_middle::mir::mono::{CodegenUnit, MonoItemData, MonoItemPartitions, Visibility};
 use rustc_middle::ty::TyCtxt;
 
 pub type CollectAndPartitionFn = for<'tcx> fn(
     TyCtxt<'tcx>,
     (),
-) -> (&'tcx DefIdSet, &'tcx [CodegenUnit<'tcx>]);
+) -> MonoItemPartitions<'tcx>;
 
 pub fn lang_collect_and_partition_mono_items<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: (),
-) -> (&'tcx DefIdSet, &'tcx [CodegenUnit<'tcx>]) {
+) -> MonoItemPartitions<'tcx> {
     let upstream = crate::default_collect_and_partition();
-    let (reachable, upstream_cgus) = upstream(tcx, key);
+    let MonoItemPartitions {
+        codegen_units: upstream_cgus,
+        all_mono_items: reachable,
+    } = upstream(tcx, key);
 
     // Stash the unfiltered upstream slice for the consumer's own MonoItems
     // walk in `generate_with_tcx`. Without this, the consumer couldn't find
@@ -95,5 +98,8 @@ pub fn lang_collect_and_partition_mono_items<'tcx>(
         filtered_cgus.push(new_cgu);
     }
 
-    (reachable, tcx.arena.alloc_from_iter(filtered_cgus))
+    MonoItemPartitions {
+        codegen_units: tcx.arena.alloc_from_iter(filtered_cgus),
+        all_mono_items: reachable,
+    }
 }
