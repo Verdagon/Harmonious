@@ -1,0 +1,9 @@
+use std::io::stdout
+use std::io::Stdout
+
+fn println_i32(x: i32)
+
+fn main() {
+    let out = stdout();
+    println_i32(42i32)
+}

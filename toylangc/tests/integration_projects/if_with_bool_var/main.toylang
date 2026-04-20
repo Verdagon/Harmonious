@@ -1,0 +1,10 @@
+fn println_i32(x: i32)
+
+fn check(flag: bool) -> i32 {
+    if flag { 42 } else { 0 }
+}
+
+fn main() {
+    println_i32(check(true));
+    println_i32(check(false));
+}

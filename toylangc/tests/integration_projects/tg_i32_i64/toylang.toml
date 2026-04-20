@@ -1,0 +1,6 @@
+[project]
+name = "tg_i32_i64"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

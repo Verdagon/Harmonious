@@ -1,0 +1,6 @@
+fn check_str(data: &str) -> i32
+fn println_i32(x: i32)
+
+fn main() {
+    println_i32(check_str("hello"));
+}

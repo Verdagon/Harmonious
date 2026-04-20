@@ -1,0 +1,14 @@
+use std::io::stdout
+use std::io::Stdout
+use std::io::Write
+use std::result::Result
+use std::io::Error
+
+fn println_i32(x: i32)
+
+fn main() {
+    let out = stdout();
+    let r = Write::write_all(&out, b"hello
+");
+    println_i32(42i32)
+}

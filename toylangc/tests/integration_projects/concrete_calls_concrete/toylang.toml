@@ -1,0 +1,6 @@
+[project]
+name = "concrete_calls_concrete"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

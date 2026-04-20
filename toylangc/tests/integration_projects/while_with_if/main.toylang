@@ -1,0 +1,15 @@
+fn println_i32(x: i32)
+
+fn count_big(n: i32) -> i32 {
+    let i = 0;
+    let count = 0;
+    while i < n {
+        let count = count + if i > 2 { 1 } else { 0 };
+        let i = i + 1;
+    }
+    count
+}
+
+fn main() {
+    println_i32(count_big(5));
+}

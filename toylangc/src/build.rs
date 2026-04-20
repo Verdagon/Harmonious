@@ -152,7 +152,22 @@ fn write_stub_crate(
     })?;
     let stubs = crate::stub_gen::generate(&registry);
 
-    fs::write(stubs_dir.join("src/lib.rs"), stubs)
+    // `features` in toylang.toml propagates to BOTH the user bin and the
+    // stub rlib: the user bin needs them for its `#![feature(...)]` at the
+    // main.rs level; the stub rlib needs them because `pub use` re-exports
+    // (e.g. `pub use std::alloc::Global;` under `allocator_api`) fail to
+    // compile against stable-only surface without the attribute at the
+    // crate root where the `use` lives.
+    let mut stubs_with_features = String::new();
+    for feat in &manifest.project.features {
+        stubs_with_features.push_str(&format!("#![feature({})]\n", feat));
+    }
+    if !manifest.project.features.is_empty() {
+        stubs_with_features.push('\n');
+    }
+    stubs_with_features.push_str(&stubs);
+
+    fs::write(stubs_dir.join("src/lib.rs"), stubs_with_features)
         .map_err(|e| format!("cannot write lang_stubs_crate/src/lib.rs: {}", e))?;
 
     // Cargo identifies a package by `(name, version, source)`. If we set

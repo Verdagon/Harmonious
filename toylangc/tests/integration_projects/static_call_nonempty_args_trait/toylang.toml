@@ -1,0 +1,7 @@
+[project]
+name = "static_call_nonempty_args_trait"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

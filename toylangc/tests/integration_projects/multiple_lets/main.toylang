@@ -1,0 +1,16 @@
+fn println_i32(x: i32)
+
+struct Counter {
+    value: i32,
+}
+
+fn multi_let() -> Counter {
+    let a = 42;
+    let b = Counter { value: a };
+    b
+}
+
+fn main() {
+    let c = multi_let();
+    println_i32(c.value);
+}

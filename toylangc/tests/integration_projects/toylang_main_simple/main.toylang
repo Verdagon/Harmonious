@@ -1,0 +1,10 @@
+fn println_i32(x: i32)
+
+fn toylang_main() -> i32 {
+    42
+}
+
+fn main() {
+    let code = toylang_main();
+    println_i32(code);
+}

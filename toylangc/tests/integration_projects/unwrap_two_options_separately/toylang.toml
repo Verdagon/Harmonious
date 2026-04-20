@@ -1,0 +1,6 @@
+[project]
+name = "unwrap_two_options_separately"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

@@ -1,0 +1,6 @@
+[project]
+name = "tg_of_toypoint"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

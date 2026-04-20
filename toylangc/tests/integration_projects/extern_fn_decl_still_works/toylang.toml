@@ -1,0 +1,6 @@
+[project]
+name = "extern_fn_decl_still_works"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

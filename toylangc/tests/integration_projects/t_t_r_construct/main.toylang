@@ -1,0 +1,23 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct ToyEngine {
+    parts: Vec<i32, Global>,
+}
+
+struct ToyShip {
+    engine: ToyEngine,
+}
+
+fn make_ship() -> ToyShip {
+    let v = Vec::new<i32, Global>();
+    v.push(100);
+    ToyShip { engine: ToyEngine { parts: v } }
+}
+
+fn main() {
+    let ship = make_ship();
+    println_usize(ship.engine.parts.len());
+}

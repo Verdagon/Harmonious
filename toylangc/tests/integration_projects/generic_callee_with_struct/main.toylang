@@ -1,0 +1,25 @@
+fn println_i32(x: i32)
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn identity<T>(x: T) -> T {
+    x
+}
+
+fn identity_point(p: Point) -> Point {
+    identity<Point>(p)
+}
+
+fn make_point() -> Point {
+    Point { x: 10, y: 20 }
+}
+
+fn main() {
+    let p = make_point();
+    let p2 = identity_point(p);
+    println_i32(p2.x);
+    println_i32(p2.y);
+}

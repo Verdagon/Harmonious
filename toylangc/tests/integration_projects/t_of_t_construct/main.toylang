@@ -1,0 +1,18 @@
+fn println_i32(x: i32)
+
+struct ToyInner {
+    x: i32,
+}
+
+struct ToyOuter {
+    inner: ToyInner,
+}
+
+fn make_outer() -> ToyOuter {
+    ToyOuter { inner: ToyInner { x: 42 } }
+}
+
+fn main() {
+    let o = make_outer();
+    println_i32(o.inner.x);
+}

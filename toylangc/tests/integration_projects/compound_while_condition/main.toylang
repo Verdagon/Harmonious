@@ -1,0 +1,17 @@
+fn println_i32(x: i32)
+
+fn search(n: i32) -> i32 {
+    let i = 0;
+    let found = false;
+    while i < n && found == false {
+        if i == 5 {
+            found = true;
+        }
+        i = i + 1;
+    }
+    i
+}
+
+fn main() {
+    println_i32(search(10));
+}

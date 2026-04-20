@@ -1,0 +1,16 @@
+fn println_i32(x: i32)
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn make_point() -> Point {
+    Point { x: 10, y: 20 }
+}
+
+fn main() {
+    let p = make_point();
+    println_i32(p.x);
+    println_i32(p.y);
+}

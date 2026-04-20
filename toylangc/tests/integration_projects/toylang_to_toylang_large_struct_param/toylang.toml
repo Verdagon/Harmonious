@@ -1,0 +1,6 @@
+[project]
+name = "toylang_to_toylang_large_struct_param"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

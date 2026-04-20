@@ -1,0 +1,16 @@
+fn println_i64(x: i64)
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn make_pair() -> Pair<i64, i64> {
+    Pair<i64, i64> { first: 100i64, second: 200i64 }
+}
+
+fn main() {
+    let p = make_pair();
+    println_i64(p.first);
+    println_i64(p.second);
+}

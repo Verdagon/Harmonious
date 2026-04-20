@@ -1,0 +1,6 @@
+[project]
+name = "rust_fn_returning_option_u8"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

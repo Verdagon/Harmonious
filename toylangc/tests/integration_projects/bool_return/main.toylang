@@ -1,0 +1,14 @@
+fn println_bool(x: bool)
+
+fn always_true() -> bool {
+    true
+}
+
+fn always_false() -> bool {
+    false
+}
+
+fn main() {
+    println_bool(always_true());
+    println_bool(always_false());
+}

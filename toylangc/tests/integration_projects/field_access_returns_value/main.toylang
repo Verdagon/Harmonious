@@ -1,0 +1,21 @@
+fn println_i32(x: i32)
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn get_x() -> i32 {
+    let p = Point { x: 10, y: 20 };
+    p.x
+}
+
+fn get_y() -> i32 {
+    let p = Point { x: 10, y: 20 };
+    p.y
+}
+
+fn main() {
+    println_i32(get_x());
+    println_i32(get_y());
+}

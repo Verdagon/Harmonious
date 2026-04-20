@@ -1,0 +1,17 @@
+fn println_bool(x: bool)
+fn println_i32(x: i32)
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn make_pair() -> Pair<bool, i32> {
+    Pair<bool, i32> { first: true, second: 99 }
+}
+
+fn main() {
+    let p = make_pair();
+    println_bool(p.first);
+    println_i32(p.second);
+}

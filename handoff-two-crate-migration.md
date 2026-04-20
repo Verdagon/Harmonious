@@ -5,10 +5,39 @@
 **Estimated effort:** 3–5 weeks for a junior, including ramp time.
 **Risk level:** medium. Scope is well-bounded (four clearly-separated sub-phases); the tricky architectural piece — cross-crate type resolution in `oracle.rs` — was landed in 5a. No toolchain rebuild required; erw is already zero-fork.
 
-**Landing status (2026-04-19):**
-- **Sub-stage 5a landed** (cross-crate oracle). Commit `99b10df`-ish — see git log.
-- **Sub-stage 5b landed** (wrapper-mode two-crate). Commit `b6a2bf6`. 211/211 green.
-- **Sub-stage 5c pivoted mid-attempt.** An earlier 5c attempt (in-process `rustc_driver::RunCompiler` twice per test) surfaced a real architectural question — which compile owns consumer codegen when tests use body-less toylang fns backed by bin-local Rust fixtures. TL call: the fixture pattern is test-only and violates "tests should act like production users," so the right move is to migrate tests to the production pattern rather than architect around the test-only one. **5c now scoped as F-wide**: migrate all 129 integration tests to standalone-style projects, retire direct mode and FileLoader entirely. Details in §4.3 and §5 below (rewritten for F-wide; previous in-process `rustc_driver` approach is superseded and intentionally not preserved inline — see git history of this doc if you need the old plan).
+**Landing status (2026-04-20 updated):**
+
+- **Sub-stage 5a landed** (cross-crate oracle, 5 walkers → 1 helper). Commit `6bda10c`.
+- **Sub-stage 5b landed** (wrapper-mode two-crate). Commit `b6a2bf6`.
+- **Sub-stage 5c.1 landed** (cargo orchestration + `test_helpers` crate + 3 canary projects). Commits `91cad25` + `05fed63`.
+- **Sub-stage 5c.2 largely complete.** 93 of 129 tests migrated to `integration_projects/<name>/` across 5 batches (+ features propagation to stub rlib, + test_helpers expansion for Option/Result/str/bytes/roguelike fixtures). **36 tests remain unmigrated across 4 categories, all parked inline in `integration_projects.rs` with reasons.** See "Parked tests" block inside that file for the per-category list. Runtime ~16s for 100 integration_projects tests, comfortably inside the 5–15 min budget.
+- **Sub-stages 5c.3, 5c.4 outstanding.** Pattern + harness + most tests in place; remaining work is category-shaped (error-harness helper + Vec<consumer-type> debuginfo fix + ENV_LOG replacement) rather than per-test mechanical.
+
+**Current state:** 311/311 green (67 unit + 100 integration_projects + 129 integration legacy + 15 standalone).
+
+**Parked tests (documented in `toylangc/tests/integration_projects.rs` "Parked tests" block):**
+
+| Category | Count | Blocker | Fix owner |
+|----------|------:|---------|-----------|
+| `Vec<consumer-type>` debuginfo ICE | 10 | `pub struct Point(())` source-field count mismatches `layout_of(0-field)`. rustc's `build_struct_type_di_node` panics indexing FieldsShape. Fix: emit unit struct instead of tuple struct in stub_gen, OR align layout_of with source field count. | Stage 5c.4 or dedicated commit |
+| Rust-specific layout probes | 6 | Use `std::mem::size_of::<ConsumerType>()` from Rust main. No Rust-side entry point in wrapper mode. Candidate for promotion to rustc-lang-facade unit tests. | Stage 5c.4 |
+| ENV_LOG callback-trace tests | 5 | Use `compile_and_run_with_env` to set `TOYLANG_CALLBACK_LOG=1` and assert on facade-internal callback sequence. Need `--log-callbacks=<path>` flag or promotion to facade unit tests. | Stage 5c.3 or 5c.4 |
+| Error-assertion tests | 7 | Expect `toylangc` non-zero exit + structured error. Need `run_integration_project_expects_error(name, pattern)` harness helper. | Stage 5c.3 |
+| Codegen latent bug (bool extern-arg return-type leak) | 1 | Pre-existing, hash-order-dependent. `test_extern_fn_call`. | Dedicated fix commit |
+| Not migrated (yet) | 7 | All listed in the parked block with line refs; each falls into one of the above. | Same owners |
+
+**Two architectural items parked** (TL-tracked, see `docs/architecture/risks.md` Category B addenda):
+1. `.o` emission as side-effect of rustc query firing, hidden by rustc incremental cache. Stopgap: `CARGO_INCREMENTAL=0` in test harness (scoped, not shipping). Architectural fix options (registry-driven codegen invocation, or `build.rs` + cargo-tracked `.o` paths) deferred. See commit `91cad25` for the diagnosis.
+2. Bool extern-arg return-type leak in toylang codegen. Pre-existing latent bug, hash-order-dependent (`extern_fn_call` project reproduces). See commit `a2f06ea`.
+
+**5c.2 patterns worth preserving** (established during this session's migration work, see `toylangc/tests/integration_projects/test_helpers/src/lib.rs`):
+
+- Primitive-typed extern helpers (`println_i32`, `println_bool`, etc.): `#[no_mangle] pub extern "C" fn`. Straight C ABI.
+- Fat-pointer extern helpers (`check_bytes(&[u8])`, `check_str(&str)`): `#[no_mangle] pub extern "C" fn` + `#[allow(improper_ctypes_definitions)]`. rustc warns but the ABI happens to line up with toylang's emitted call.
+- `Option<T>` / `Result<T, E>` extern helpers (`make_some_i32`, `make_ok_i32`, `get_byte`): same pattern as fat-pointer — `#[no_mangle] pub extern "C" fn` with `#[allow(improper_ctypes_definitions)]`.
+- `features = [...]` in `toylang.toml` now propagates to the stub rlib's `src/lib.rs` as well as the user bin's `src/main.rs`. Both crates need the `#![feature(...)]` at crate root when `pub use std::alloc::Global;` or similar appears in the stub rlib. See `build.rs::write_stub_crate`.
+
+Next junior picks up at **5c.3** (error-harness helper + error-test migration) or **5c.4** (Vec<consumer-type> debuginfo fix + layout-test promotion + direct-mode + FileLoader retirement + doc pass). Both are independent of the remaining 5c.2 residue — the parked tests don't block either.
 
 ---
 

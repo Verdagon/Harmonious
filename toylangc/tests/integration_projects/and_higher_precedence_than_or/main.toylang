@@ -1,0 +1,11 @@
+fn println_bool(x: bool)
+
+fn check(a: bool, b: bool, c: bool) -> bool {
+    a || b && c
+}
+
+fn main() {
+    println_bool(check(true, false, false));
+    println_bool(check(false, true, true));
+    println_bool(check(false, true, false));
+}

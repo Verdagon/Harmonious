@@ -1,0 +1,15 @@
+fn println_int(x: i32)
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn get_x(p: Point) -> i32 {
+    p.x
+}
+
+fn main() {
+    let p = Point { x: 42, y: 99 };
+    println_int(get_x(p));
+}

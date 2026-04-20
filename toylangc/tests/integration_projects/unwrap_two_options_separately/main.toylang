@@ -1,0 +1,12 @@
+use std::option::Option
+
+fn make_some_i32(x: i32) -> Option<i32>
+fn println_i32(x: i32)
+
+fn main() {
+    let a = make_some_i32(10i32);
+    let b = make_some_i32(32i32);
+    let av = a.unwrap();
+    let bv = b.unwrap();
+    println_i32(av + bv)
+}

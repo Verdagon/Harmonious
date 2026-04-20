@@ -1,0 +1,12 @@
+use std::alloc::Global
+use std::vec::Vec
+use std::clone::Clone
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(1);
+    Clone::clone(&v);
+    println_usize(v.len())
+}

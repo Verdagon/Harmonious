@@ -1,0 +1,7 @@
+[project]
+name = "trait_static_call_inherent_still_works"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

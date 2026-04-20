@@ -1,0 +1,6 @@
+[project]
+name = "compound_while_condition"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

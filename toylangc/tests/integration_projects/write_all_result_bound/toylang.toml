@@ -1,0 +1,6 @@
+[project]
+name = "write_all_result_bound"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

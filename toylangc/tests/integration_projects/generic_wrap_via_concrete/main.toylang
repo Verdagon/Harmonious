@@ -1,0 +1,18 @@
+fn println_i32(x: i32)
+
+struct Wrapper<T> {
+    inner: T,
+}
+
+fn wrap<T>(x: T) -> Wrapper<T> {
+    Wrapper<T> { inner: x }
+}
+
+fn wrap_i32(x: i32) -> Wrapper<i32> {
+    wrap<i32>(x)
+}
+
+fn main() {
+    let w = wrap_i32(42);
+    println_i32(w.inner);
+}

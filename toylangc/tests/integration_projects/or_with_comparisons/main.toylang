@@ -1,0 +1,11 @@
+fn println_bool(x: bool)
+
+fn out_of_range(x: i32) -> bool {
+    x < 0 || x > 10
+}
+
+fn main() {
+    println_bool(out_of_range(-5));
+    println_bool(out_of_range(15));
+    println_bool(out_of_range(5));
+}

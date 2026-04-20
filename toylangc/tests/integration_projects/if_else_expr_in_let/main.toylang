@@ -1,0 +1,11 @@
+fn println_i32(x: i32)
+
+fn max(a: i32, b: i32) -> i32 {
+    let result = if a > b { a } else { b };
+    result
+}
+
+fn main() {
+    println_i32(max(3, 5));
+    println_i32(max(7, 2));
+}

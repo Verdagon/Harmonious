@@ -1,0 +1,9 @@
+use std::option::Option
+
+fn get_byte() -> Option<u8>
+fn println_i32(x: i32)
+
+fn main() {
+    let b = get_byte();
+    println_i32(42i32)
+}

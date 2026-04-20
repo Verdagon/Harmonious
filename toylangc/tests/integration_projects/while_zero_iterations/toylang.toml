@@ -1,0 +1,6 @@
+[project]
+name = "while_zero_iterations"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

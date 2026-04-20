@@ -1,0 +1,25 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_i32(x: i32)
+fn println_usize(x: usize)
+
+struct ToyGenMixed<T> {
+    a: T,
+    b: Vec<T, Global>,
+    c: i32,
+}
+
+fn make_mixed() -> ToyGenMixed<i32> {
+    let v = Vec::new<i32, Global>();
+    v.push(10);
+    v.push(20);
+    ToyGenMixed<i32> { a: 42, b: v, c: 99 }
+}
+
+fn main() {
+    let m = make_mixed();
+    println_i32(m.a);
+    println_usize(m.b.len());
+    println_i32(m.c);
+}

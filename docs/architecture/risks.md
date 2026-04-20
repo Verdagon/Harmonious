@@ -187,6 +187,39 @@ Three responses in order of preference:
 
 **Long-term solution.** None needed today. Monitor `CodegenUnit<'tcx>`'s semantic shape per bump.
 
+### B6. Consumer `.o` emission is a side-effect of rustc query firing (incremental-cache interaction)
+
+**What.** Toylang's consumer `.o` is produced as a side effect of facade callbacks that fire during rustc's query execution — specifically `notify_concrete_entry_point` (driven by `symbol_name`) populates `state.toylang_instances`, which `generate_with_tcx` consumes to emit the `.o`. Under rustc's incremental cache with a shared `CARGO_TARGET_DIR` and unchanged per-project sources, the query provider cache-hits; the side-effecting walk doesn't fire; `state.toylang_instances` stays empty; the emitted `.o` contains only items discovered via the direct CGU walk (accessors). The rlib gets rebuilt bundling an incomplete `.o`; downstream link fails with `__toylang_impl_main undefined` or similar.
+
+**Probability:** **fires reliably** under rustc's incremental cache + shared target dir + unchanged sources. Does NOT bite the typical `toylangc build` wrapper-mode user flow (users edit `main.toylang` between builds, which invalidates the cache correctly and triggers query re-fire). The failure mode is specific to test harnesses with shared target dirs across many unchanged-source test projects.
+
+**Canaries.** Symbols like `__toylang_impl_main` go undefined on a second build with unchanged source. Diagnosed by inspecting the rlib's archive (`ar -t <rlib>`) after repeated builds — the archive bundles an undersized `.o` that's missing most expected consumer symbols.
+
+**Mitigation (shipping wrapper mode).** The preconditions don't fire under typical user flow. Monitor; no active concern.
+
+**Mitigation (test harness).** Stage-5c.1 landed `CARGO_INCREMENTAL=0` scoped to the integration-test harness. Package-level cache (`test_helpers`, crates.io deps) still benefits from sharing; only rustc's per-crate fingerprint is forfeit. Per-test marginal cost stays ~0.3–0.4s warm — comfortable inside the runtime budget.
+
+**Architectural fix (deferred).** Two options:
+
+1. **Drive consumer codegen from the registry directly** rather than relying on `notify_concrete_entry_point`'s side effects. Removes the "query must fire for codegen to be correct" dependency; `state.toylang_instances` gets built deterministically each compile. More invasive; cleanest architecturally.
+2. **Route the `.o` through cargo-tracked paths via a `build.rs` in the stub rlib** that invokes `toylangc` as a subprocess and emits `cargo::rustc-link-arg=` + `cargo::rerun-if-changed=` directives. Cargo treats the `.o` as a tracked build artifact; cache invalidation becomes cargo's responsibility. Scoped fix; requires `toylangc` to be invokable as a subprocess from build scripts.
+
+**References.** Diagnosis in commit `91cad25`. Harness stopgap in the same commit's `integration_projects.rs`.
+
+### B7. Bool extern-arg return-type leak in toylang codegen
+
+**What.** Pre-existing latent bug in toylang's codegen path for functions containing extern "C" calls returning void. Toylang emits `define i8 @__toylang_internal_do_print()` with a `ret void` terminator — an LLVM type mismatch (declared return type vs terminator shape don't agree). Hash-order-dependent: the project name `extern_fn_call` reproduces the bug; identical toylang source under a different project name (`probe_extern_void`) does not. Traced to how bool return types leak through `__toylang_internal_*` wrapper generation when the wrapped extern returns void.
+
+**Probability:** fires on any toylang program that wraps a void-returning extern "C" Rust fn in a context where the internal ABI derivation picks up a stale bool. Stage-5c migration exposed it via 1 of 57 extern-fixture tests.
+
+**Canaries.** LLVM IR verifier errors at build time: "function return type does not match ret terminator" or similar. Internal fn signature shows `i8` return but body has `ret void`.
+
+**Mitigation.** None applied. The affected test is parked in `integration_projects.rs` with an inline TODO; blocks 1 of 57 migrated tests but doesn't block stage 5c overall.
+
+**Reaction if investigated.** Trace through `llvm_gen.rs::codegen_internal_function` — specifically the return-type derivation for internal-ABI wrappers around extern-C-void calls. Likely a bad default in the ABI-coerced return mapping. Probably a few hours' fix once the exact code path is isolated. Non-architectural; a straightforward codegen-correctness bug fix.
+
+**References.** Diagnosis in commit `a2f06ea`. Test inline-documented in `toylangc/tests/integration_projects.rs`.
+
 ---
 
 ## 4. Category C: Operational invariants
@@ -298,6 +331,8 @@ If neither workaround is viable, accept the small fork and treat it as maintaine
 | MIR construction drift | B3 | 100% / each bump | ~1 week / bump | `mir_helpers.rs` compile errors |
 | ABI helpers drift | B4 | 15–25% / 5yr | 1–2 weeks repair | ABI-shape tests fail |
 | CGU lifetime erasure | B5 | 15–20% / 5yr | 1–2 weeks redesign | partition.rs lifetime errors |
+| `.o` emission side-effect / incremental cache | B6 | Fires reliably under specific conditions | Test harness: harness-scoped stopgap ✓ / Shipping: doesn't trigger typical flows | Undefined `__toylang_impl_main` on second build |
+| Bool extern-arg return leak | B7 | Fires on narrow code shape | 1 of 57 tests parked; non-blocking | LLVM verifier: "return type does not match ret" |
 | `@DPSFDOZ` violation | C1 | Regression-risk | Self-inflicted | `trimmed_def_paths` ICE |
 | `@GCMLZ` violation | C2 | Regression-risk | Self-inflicted | Test hangs (0% CPU) |
 | Partitioner invariant violation | C3 | Regression-risk | Self-inflicted | Unexpected missing items |

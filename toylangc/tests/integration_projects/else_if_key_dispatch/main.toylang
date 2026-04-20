@@ -1,0 +1,20 @@
+fn println_i32(x: i32)
+
+fn handle_key(key: i32) -> i32 {
+    let result = 0;
+    if key == 1 {
+        result = 10;
+    } else if key == 2 {
+        result = 20;
+    } else if key == 3 {
+        result = 30;
+    }
+    result
+}
+
+fn main() {
+    println_i32(handle_key(1));
+    println_i32(handle_key(2));
+    println_i32(handle_key(3));
+    println_i32(handle_key(99));
+}

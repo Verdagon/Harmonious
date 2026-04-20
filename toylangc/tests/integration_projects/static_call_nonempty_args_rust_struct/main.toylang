@@ -1,0 +1,9 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+fn main() {
+    let v = Vec::with_capacity<i32, Global>(5usize);
+    println_usize(v.capacity())
+}

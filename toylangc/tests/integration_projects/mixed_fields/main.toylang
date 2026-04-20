@@ -1,0 +1,30 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_i32(x: i32)
+fn println_usize(x: usize)
+
+struct ToyPoint {
+    x: i32,
+    y: i32,
+}
+
+struct ToyMixed {
+    a: i32,
+    b: Vec<i32, Global>,
+    c: ToyPoint,
+}
+
+fn make_mixed() -> ToyMixed {
+    let v = Vec::new<i32, Global>();
+    v.push(10);
+    ToyMixed { a: 1, b: v, c: ToyPoint { x: 2, y: 3 } }
+}
+
+fn main() {
+    let m = make_mixed();
+    println_i32(m.a);
+    println_usize(m.b.len());
+    println_i32(m.c.x);
+    println_i32(m.c.y);
+}

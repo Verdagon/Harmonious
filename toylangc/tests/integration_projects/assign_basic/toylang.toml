@@ -1,0 +1,6 @@
+[project]
+name = "assign_basic"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

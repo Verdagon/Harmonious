@@ -1,0 +1,6 @@
+[project]
+name = "and_with_comparisons"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

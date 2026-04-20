@@ -1,0 +1,6 @@
+[project]
+name = "field_access_returns_value"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

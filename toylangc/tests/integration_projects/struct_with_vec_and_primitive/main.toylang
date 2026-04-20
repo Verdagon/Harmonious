@@ -1,0 +1,23 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_i32(x: i32)
+fn println_usize(x: usize)
+
+struct Data {
+    count: i32,
+    items: Vec<i32, Global>,
+}
+
+fn make_data() -> Data {
+    let v = Vec::new<i32, Global>();
+    v.push(10);
+    v.push(20);
+    Data { count: 2, items: v }
+}
+
+fn main() {
+    let d = make_data();
+    println_i32(d.count);
+    println_usize(d.items.len());
+}

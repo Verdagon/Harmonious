@@ -1,0 +1,6 @@
+[project]
+name = "assign_in_while"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

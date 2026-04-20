@@ -1,0 +1,7 @@
+fn println_bool(x: bool)
+
+fn check() -> bool { 5 > 3 }
+
+fn main() {
+    println_bool(check());
+}

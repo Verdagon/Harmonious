@@ -1,0 +1,6 @@
+[project]
+name = "var_in_struct_field"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

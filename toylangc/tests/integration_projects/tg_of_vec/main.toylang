@@ -1,0 +1,19 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct ToyWrapper<T> {
+    inner: T,
+}
+
+fn wrap_vec() -> ToyWrapper<Vec<i32, Global>> {
+    let v = Vec::new<i32, Global>();
+    v.push(42);
+    ToyWrapper<Vec<i32, Global>> { inner: v }
+}
+
+fn main() {
+    let w = wrap_vec();
+    println_usize(w.inner.len());
+}

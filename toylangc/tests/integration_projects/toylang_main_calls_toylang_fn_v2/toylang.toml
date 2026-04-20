@@ -1,0 +1,6 @@
+[project]
+name = "toylang_main_calls_toylang_fn_v2"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

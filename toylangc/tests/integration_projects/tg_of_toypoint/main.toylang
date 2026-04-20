@@ -1,0 +1,20 @@
+fn println_i32(x: i32)
+
+struct ToyPoint {
+    x: i32,
+    y: i32,
+}
+
+struct ToyWrapper<T> {
+    inner: T,
+}
+
+fn wrap_point() -> ToyWrapper<ToyPoint> {
+    ToyWrapper<ToyPoint> { inner: ToyPoint { x: 5, y: 6 } }
+}
+
+fn main() {
+    let w = wrap_point();
+    println_i32(w.inner.x);
+    println_i32(w.inner.y);
+}

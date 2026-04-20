@@ -1,0 +1,12 @@
+use std::alloc::Global
+use std::vec::Vec
+use std::option::Option
+
+fn println_i32(x: i32)
+
+fn main() {
+    let v = Vec::new<i32, Global>();
+    v.push(99);
+    let popped = v.pop();
+    println_i32(42i32)
+}

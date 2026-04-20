@@ -1,0 +1,17 @@
+fn println_int(x: i32)
+
+struct Quad {
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+}
+
+fn sum_quad(q: Quad) -> i32 {
+    q.a + q.b + q.c + q.d
+}
+
+fn main() {
+    let q = Quad { a: 10, b: 20, c: 30, d: 40 };
+    println_int(sum_quad(q));
+}

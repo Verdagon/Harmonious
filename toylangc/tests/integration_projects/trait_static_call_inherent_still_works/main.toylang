@@ -1,0 +1,14 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+fn get_len() -> usize {
+    let v = Vec::new<i32, Global>();
+    v.push(42);
+    v.len()
+}
+
+fn main() {
+    println_usize(get_len());
+}

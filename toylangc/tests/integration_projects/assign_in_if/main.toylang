@@ -1,0 +1,14 @@
+fn println_i32(x: i32)
+
+fn pick(x: i32) -> i32 {
+    let result = 0;
+    if x > 0 {
+        result = 1;
+    }
+    result
+}
+
+fn main() {
+    println_i32(pick(5));
+    println_i32(pick(-1));
+}

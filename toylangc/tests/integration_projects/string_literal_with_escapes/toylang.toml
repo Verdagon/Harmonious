@@ -1,0 +1,6 @@
+[project]
+name = "string_literal_with_escapes"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

@@ -1,0 +1,13 @@
+fn println_i32(x: i32)
+
+fn noop() -> i32 {
+    let i = 10;
+    while i < 5 {
+        let i = i + 1;
+    }
+    i
+}
+
+fn main() {
+    println_i32(noop());
+}

@@ -1,0 +1,15 @@
+fn println_i32(x: i32)
+
+fn sum_to(n: i32) -> i32 {
+    let i = 0;
+    let sum = 0;
+    while i < n {
+        let i = i + 1;
+        let sum = sum + i;
+    }
+    sum
+}
+
+fn main() {
+    println_i32(sum_to(10));
+}
