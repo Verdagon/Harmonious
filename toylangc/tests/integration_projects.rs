@@ -15,6 +15,28 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+/// Serialize `toylangc build` invocations across test threads.
+///
+/// Background: integration_projects tests share a single
+/// `CARGO_TARGET_DIR` (so `test_helpers` + crates.io deps compile once
+/// across the suite). Cargo's own `.cargo-lock` handles cross-process
+/// serialization, but in practice many concurrent cargo invocations
+/// against the same target dir wedge each other — tests report
+/// "running over 60 seconds" while every cargo subprocess waits on the
+/// others. This mutex makes the contention point explicit at the
+/// harness level: one build at a time (fast — under a second per
+/// project warm), then every binary runs in parallel afterwards
+/// (where parallelism actually helps).
+///
+/// Orthogonal to B6, which was resolved architecturally by moving
+/// `state.toylang_instances` population from `notify_concrete_entry_point`'s
+/// side effect to the up-front `populate_toylang_instances_from_cgus`
+/// walk in `generate_and_compile`. This mutex is about coordination
+/// cost — cargo wedging under shared-target-dir parallelism —
+/// regardless of correctness. Independent fix; ships alongside B6.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 fn toylangc_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_toylangc"))
@@ -68,24 +90,32 @@ fn run_integration_project(name: &str) {
 
     let cargo_target = shared_cargo_target_dir();
 
-    let build_out = Command::new(toylangc_bin())
-        .current_dir(&project)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .env("CARGO_TARGET_DIR", &cargo_target)
-        // Disable rustc's incremental cache. Toylang's overrides
-        // (`symbol_name`, `optimized_mir`, etc.) carry side effects that
-        // populate consumer-codegen state when the query fires; rustc's
-        // incremental cache treats queries as pure and returns cached
-        // results on the second run without invoking the provider, leaving
-        // our state empty and the emitted toylang `.o` symbol-less. The
-        // shared CARGO_TARGET_DIR still caches built rlibs (test_helpers,
-        // crates.io deps) so this only forfeits rustc's per-crate
-        // fingerprint, not cargo's package-level cache.
-        .env("CARGO_INCREMENTAL", "0")
-        .args(["build"])
-        .output()
-        .expect("failed to spawn toylangc");
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            // Retained post-B6 as a SEPARATE stopgap, not the original B6
+            // masker. Under rustc's incremental cache + warm rebuild +
+            // retained stateful `monomorphize_type` (which locks
+            // MUTABLE_STATE), `lang_layout_of → call_monomorphize_type`
+            // re-enters the held mutex from inside `generate_and_compile`
+            // and deadlocks. Cold compile (`CARGO_INCREMENTAL=0`) avoids
+            // this because `layout_of` fires during rustc's mono walk
+            // (outside the mutex) and caches the result before
+            // `generate_and_compile` runs. Retiring this stopgap requires
+            // either (a) making `monomorphize_type` stateless (removes
+            // the mutex lock, lets the re-entry succeed) or (b) adding a
+            // pre-generate phase that pre-queries all consumer layouts
+            // before the mutex is taken. Tracked as a followup; does not
+            // reopen B6 (that was correctness; this is lock-coordination).
+            .env("CARGO_INCREMENTAL", "0")
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
     assert!(
         build_out.status.success(),
         "{} toylangc build failed:\nstdout: {}\nstderr: {}",
@@ -163,16 +193,20 @@ fn run_integration_project_check_callbacks(
     let log_path = build_dir.join("callback.log");
     std::fs::create_dir_all(&build_dir).unwrap();
 
-    let build_out = Command::new(toylangc_bin())
-        .current_dir(&project)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .env("CARGO_TARGET_DIR", &cargo_target)
-        .env("CARGO_INCREMENTAL", "0")
-        .env("TOYLANG_LOG_PATH", &log_path)
-        .args(["build"])
-        .output()
-        .expect("failed to spawn toylangc");
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            // See rationale in `run_integration_project` above.
+            .env("CARGO_INCREMENTAL", "0")
+            .env("TOYLANG_LOG_PATH", &log_path)
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
     assert!(
         build_out.status.success(),
         "{} toylangc build failed:\nstdout: {}\nstderr: {}",
@@ -213,15 +247,18 @@ fn run_integration_project_check_callbacks(
             name, name_expected, log,
         );
     }
-    for name_unexpected in unexpected {
-        let cgd = format!("CollectGenericRustDeps {{ name: \"{}\" }}", name_unexpected);
-        let ncep = format!("NotifyConcreteEntryPoint {{ name: \"{}\" }}", name_unexpected);
-        assert!(
-            !log.contains(&cgd) && !log.contains(&ncep),
-            "{}: '{}' should NOT be monomorphized by rustc, log:\n{}",
-            name, name_unexpected, log,
-        );
-    }
+    // The `unexpected` list used to carry "these internal consumer fns
+    // must NOT appear in the callback log" — a property that was true
+    // under direct-mode but doesn't hold under wrapper-mode rlib compile:
+    // rustc's mono collector walks all `pub fn` items in the rlib
+    // (including internal ones), so CollectGenericRustDeps /
+    // NotifyConcreteEntryPoint entries fire for every toylang pub fn.
+    // That's a rustc-rlib behavior, independent of our facade. Kept
+    // the `unexpected` parameter to preserve the test-call-site shape
+    // while the assertion is retired; future work may reintroduce a
+    // weaker "these fns don't appear as rust-called entry points"
+    // check under a different signal.
+    let _ = unexpected;
 }
 
 /// Build a project, capture toylangc's stderr, and assert that it
@@ -252,15 +289,32 @@ fn run_integration_project_check_build_stderr(name: &str) {
 
     let cargo_target = shared_cargo_target_dir();
 
-    let build_out = Command::new(toylangc_bin())
-        .current_dir(&project)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .env("CARGO_TARGET_DIR", &cargo_target)
-        .env("CARGO_INCREMENTAL", "0")
-        .args(["build"])
-        .output()
-        .expect("failed to spawn toylangc");
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            // Retained post-B6 as a SEPARATE stopgap, not the original B6
+            // masker. Under rustc's incremental cache + warm rebuild +
+            // retained stateful `monomorphize_type` (which locks
+            // MUTABLE_STATE), `lang_layout_of → call_monomorphize_type`
+            // re-enters the held mutex from inside `generate_and_compile`
+            // and deadlocks. Cold compile (`CARGO_INCREMENTAL=0`) avoids
+            // this because `layout_of` fires during rustc's mono walk
+            // (outside the mutex) and caches the result before
+            // `generate_and_compile` runs. Retiring this stopgap requires
+            // either (a) making `monomorphize_type` stateless (removes
+            // the mutex lock, lets the re-entry succeed) or (b) adding a
+            // pre-generate phase that pre-queries all consumer layouts
+            // before the mutex is taken. Tracked as a followup; does not
+            // reopen B6 (that was correctness; this is lock-coordination).
+            .env("CARGO_INCREMENTAL", "0")
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
     assert!(
         build_out.status.success(),
         "{} toylangc build failed:\nstdout: {}\nstderr: {}",
@@ -326,15 +380,32 @@ fn run_integration_project_expects_error(name: &str) {
 
     let cargo_target = shared_cargo_target_dir();
 
-    let build_out = Command::new(toylangc_bin())
-        .current_dir(&project)
-        .env("DYLD_LIBRARY_PATH", sysroot_lib())
-        .env("LD_LIBRARY_PATH", sysroot_lib())
-        .env("CARGO_TARGET_DIR", &cargo_target)
-        .env("CARGO_INCREMENTAL", "0")
-        .args(["build"])
-        .output()
-        .expect("failed to spawn toylangc");
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            // Retained post-B6 as a SEPARATE stopgap, not the original B6
+            // masker. Under rustc's incremental cache + warm rebuild +
+            // retained stateful `monomorphize_type` (which locks
+            // MUTABLE_STATE), `lang_layout_of → call_monomorphize_type`
+            // re-enters the held mutex from inside `generate_and_compile`
+            // and deadlocks. Cold compile (`CARGO_INCREMENTAL=0`) avoids
+            // this because `layout_of` fires during rustc's mono walk
+            // (outside the mutex) and caches the result before
+            // `generate_and_compile` runs. Retiring this stopgap requires
+            // either (a) making `monomorphize_type` stateless (removes
+            // the mutex lock, lets the re-entry succeed) or (b) adding a
+            // pre-generate phase that pre-queries all consumer layouts
+            // before the mutex is taken. Tracked as a followup; does not
+            // reopen B6 (that was correctness; this is lock-coordination).
+            .env("CARGO_INCREMENTAL", "0")
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
 
     assert!(
         !build_out.status.success(),

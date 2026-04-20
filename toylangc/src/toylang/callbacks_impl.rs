@@ -147,9 +147,15 @@ impl ToylangCallbacks {
         )
     }
 
-    /// Concrete-entry-point notification. Drives internal consumer→consumer
-    /// discovery + stashing into `state.toylang_instances`, and returns the
-    /// extern symbol the consumer has chosen for this Instance.
+    /// Concrete-entry-point notification. Returns the extern symbol the
+    /// consumer has chosen for this Instance. Pure (aside from the log
+    /// push) — the former side-effecting internal-callee walk and
+    /// `state.toylang_instances` stashing moved to
+    /// `populate_toylang_instances_from_cgus`, which runs up front in
+    /// `generate_and_compile` instead of as a byproduct of rustc's
+    /// query firing. Removing the side effect resolves B6 (rustc's
+    /// incremental cache can short-circuit per-item queries; consumer
+    /// `.o` went empty when it did).
     ///
     /// Called from the trait impl (holding the facade mutex) and also directly
     /// from `generate_with_tcx` for accessor symbol lookup (already inside
@@ -177,35 +183,79 @@ impl ToylangCallbacks {
         }
 
         let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main" } else { name };
-        let toy_fn = self.registry.functions.get(registry_name)
-            .unwrap_or_else(|| panic!("[toylang] notify_concrete_entry_point: function '{}' not in registry", registry_name));
+        compute_fn_symbol(registry_name, tcx, instance)
+    }
 
-        let extern_symbol = compute_fn_symbol(registry_name, tcx, instance);
-
-        // Extern declarations — symbol only, no body to walk, no stashing.
-        if toy_fn.body.is_none() {
-            return extern_symbol;
+    /// Populate `state.toylang_instances` + `state.walked_entry_points` by
+    /// walking the partitioner's CGU list + recursively resolving each
+    /// consumer entry point's internal callees. Runs at
+    /// `generate_and_compile` time, once per compile. Replaces the former
+    /// side-effect-accumulation pattern where each `symbol_name` call
+    /// would incrementally populate these via
+    /// `notify_concrete_entry_point_inner`.
+    ///
+    /// The former pattern broke under rustc's incremental cache: on cache
+    /// hit the query provider is skipped, the walk doesn't fire, state
+    /// stays empty, consumer `.o` goes symbol-less, link fails. Deriving
+    /// everything from the post-mono CGU list up front makes the rebuild
+    /// story incremental-safe — the CGU list itself is a rustc query,
+    /// but its result is what we'd have ended up with anyway. Cached
+    /// equals fresh equals correct.
+    ///
+    /// Gated on `!self.is_downstream_of_stubs`: the user-bin compile
+    /// doesn't own consumer codegen and shouldn't populate the queue
+    /// (would leave stale state with no `generate_and_compile` to drain).
+    pub fn populate_toylang_instances_from_cgus<'tcx>(
+        &self,
+        state: &mut ToylangState,
+        tcx: TyCtxt<'tcx>,
+    ) {
+        if self.is_downstream_of_stubs {
+            return;
         }
 
-        // Stage 5b: in the downstream (user-bin) compile, the upstream stub
-        // rlib has already walked internal callees and produced the consumer
-        // `.o`. Re-walking here would duplicate work and (worse) re-stash
-        // instances into a `toylang_instances` queue that this compile has no
-        // `generate_and_compile` to drain — leaving stale state. Skip.
-        if !self.is_downstream_of_stubs
-            && state.walked_entry_points.insert(extern_symbol.clone())
-        {
-            let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
-            state.toylang_instances.push(ToylangInstance {
-                extern_symbol: extern_symbol.clone(),
-                resolved_func: resolved_caller.clone(),
-            });
-            walk_and_stash_internal_callees(
-                tcx, &self.registry, &resolved_caller, registry_name, state,
-            );
-        }
+        let cgus = rustc_lang_facade::upstream_cgus(tcx);
+        for cgu in cgus.iter() {
+            for (&mono_item, _) in cgu.items() {
+                let rustc_middle::mir::mono::MonoItem::Fn(instance) = mono_item else { continue };
+                let def_id = instance.def_id();
+                if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+                    continue;
+                }
 
-        extern_symbol
+                // Accessors (associated items) are handled inline in
+                // `generate_with_tcx`; the instance list here is only
+                // for consumer fns with bodies.
+                if tcx.opt_associated_item(def_id).is_some() {
+                    continue;
+                }
+
+                let name = tcx.item_name(def_id).to_string();
+                let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main".to_string() } else { name.clone() };
+                let Some(toy_fn) = self.registry.functions.get(registry_name.as_str()) else {
+                    // Non-consumer fn in __lang_stubs (e.g., Phase-6
+                    // `__toylang_option_unwrap<T>` wrappers). Skip.
+                    continue;
+                };
+                if toy_fn.body.is_none() {
+                    continue;
+                }
+
+                let extern_symbol = compute_fn_symbol(&registry_name, tcx, instance);
+                if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                    continue;
+                }
+
+                let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
+                state.toylang_instances.push(ToylangInstance {
+                    extern_symbol: extern_symbol.clone(),
+                    resolved_func: resolved_caller.clone(),
+                });
+                walk_and_stash_internal_callees(
+                    tcx, &self.registry, &resolved_caller, &registry_name, state,
+                );
+            }
+        }
     }
 }
 
@@ -414,14 +464,28 @@ impl LangCallbacks for ToylangCallbacks {
         let ts = state(s);
         ts.log.push(CallbackLog::GenerateAndCompile);
 
+        let (ref ll_path, ref obj_path) = self.llvm_paths.as_ref()?;
+
+        // B6 fix: populate state.toylang_instances from the CGU list + a
+        // transitive internal-callee walk, up front and deterministically.
+        // Prior art accumulated state as a side effect of the per-item
+        // `notify_concrete_entry_point` query firing — which rustc's
+        // incremental cache could skip on cache hit, leaving state empty
+        // and the emitted `.o` symbol-less. See risks.md §B6 for the
+        // full diagnosis and risks.md §B6 RESOLVED marker for this fix.
+        self.populate_toylang_instances_from_cgus(ts, tcx);
+
         // Dump callback log to file if requested (for test assertions).
-        // Done before codegen so the log captures only the monomorphization-phase callbacks.
+        // Done before codegen so the log captures the monomorphization-
+        // phase callbacks + the B6 population step, not any internal
+        // codegen logs. `NotifyConcreteEntryPoint` entries come from
+        // `notify_concrete_entry_point_inner`'s log push (still live);
+        // under CARGO_INCREMENTAL=0 (test-harness stopgap) the query
+        // provider fires freely so this is a reliable source.
         if let Ok(path) = std::env::var("TOYLANG_LOG_PATH") {
             let lines: Vec<String> = ts.log.iter().map(|entry| format!("{:?}", entry)).collect();
             std::fs::write(&path, lines.join("\n")).expect("failed to write callback log");
         }
-
-        let (ref ll_path, ref obj_path) = self.llvm_paths.as_ref()?;
 
         // Walk MonoItems and codegen each consumer instance inline (same 'tcx scope).
         let (llvm_ir, rust_symbols) = crate::llvm_gen::generate_with_tcx(
