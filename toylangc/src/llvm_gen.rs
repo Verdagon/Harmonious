@@ -123,7 +123,19 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             ResolvedType::F64 => self.context.f64_type().into(),
             ResolvedType::Bool => self.context.bool_type().into(),
             ResolvedType::Usize => self.usize_type().into(),
-            ResolvedType::Void => self.context.i8_type().into(), // shouldn't be needed
+            // Void has no `BasicTypeEnum` representation — callers must
+            // branch on `Void` themselves and produce `None` / `void_type()`
+            // on the LLVM side before reaching here. The former silent
+            // fallback to `i8` silently materialized as `declare i8
+            // @fn() { ret void }` when a forward-declaration site forgot
+            // to guard Void (B7 bool bug, fixed at the two `internal_sret
+            // || == Void` call sites in this file). Panicking here turns
+            // future equivalent bugs into a loud crash rather than an
+            // LLVM IR verifier error 200 stack frames deep.
+            ResolvedType::Void => panic!(
+                "resolved_to_inkwell called on Void — the caller must guard \
+                 against void types before mapping to a BasicTypeEnum"
+            ),
             ResolvedType::Struct { field_types, .. } => {
                 let fields: Vec<BasicTypeEnum<'ctx>> = field_types.iter()
                     .map(|ft| self.resolved_to_inkwell(ft))
@@ -1294,8 +1306,23 @@ fn lower_typed_expr<'ctx>(
                 param_types.push(ctx.resolved_to_inkwell(&a.ty).into());
             }
 
-            // Internal ABI return type: void for sret, direct for primitives
-            let internal_ret_type: Option<BasicTypeEnum<'ctx>> = if callee_sret {
+            // Internal ABI return type: void for sret AND for void-returning
+            // fns; direct for primitives. Mirrors the predicate used in
+            // `codegen_internal_function` when emitting the callee's
+            // definition (line ~731) — the forward declaration built here
+            // MUST produce the same signature or the forward-declared type
+            // shadows the definition's type via `ctx.module.get_function`'s
+            // existing-decl lookup, leaving us with `declare i8 @fn()` but
+            // `ret void` in the body (LLVM IR verifier rejects).
+            //
+            // Stale pre-fix behavior: `resolved_to_inkwell(Void)` falls
+            // through to `i8` (commented "shouldn't be needed") so void
+            // fns forward-declared without this guard got `i8` returns
+            // and llc caught the mismatch only for certain toylang
+            // programs (hash-order-dependent — HashMap iteration over
+            // the call-site set affected whether the call-site decl or
+            // the defn decl landed first in LLVM's symbol table).
+            let internal_ret_type: Option<BasicTypeEnum<'ctx>> = if callee_sret || expr.ty == ResolvedType::Void {
                 None
             } else {
                 Some(ctx.resolved_to_inkwell(&expr.ty))

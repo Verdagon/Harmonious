@@ -206,19 +206,17 @@ Three responses in order of preference:
 
 **References.** Diagnosis in commit `91cad25`. Harness stopgap in the same commit's `integration_projects.rs`.
 
-### B7. Bool extern-arg return-type leak in toylang codegen
+### B7. Bool extern-arg return-type leak in toylang codegen — RESOLVED
 
-**What.** Pre-existing latent bug in toylang's codegen path for functions containing extern "C" calls returning void. Toylang emits `define i8 @__toylang_internal_do_print()` with a `ret void` terminator — an LLVM type mismatch (declared return type vs terminator shape don't agree). Hash-order-dependent: the project name `extern_fn_call` reproduces the bug; identical toylang source under a different project name (`probe_extern_void`) does not. Traced to how bool return types leak through `__toylang_internal_*` wrapper generation when the wrapped extern returns void.
+**Status:** Resolved in the post-stage-5 codegen fix (commit at TL-specified followup; see `llvm_gen.rs::lower_typed_expr`'s FnCall arm). The parked `test_extern_fn_call` integration project is re-enabled and green.
 
-**Probability:** fires on any toylang program that wraps a void-returning extern "C" Rust fn in a context where the internal ABI derivation picks up a stale bool. Stage-5c migration exposed it via 1 of 57 extern-fixture tests.
+**What (historical).** Pre-existing latent bug in toylang's codegen path for functions containing extern "C" calls returning void. Toylang emitted `define i8 @__toylang_internal_do_print()` with a `ret void` terminator — LLVM IR verifier rejected. Hash-order-dependent: the project name `extern_fn_call` reproduced the bug; identical toylang source under a different project name (`probe_extern_void`) did not.
 
-**Canaries.** LLVM IR verifier errors at build time: "function return type does not match ret terminator" or similar. Internal fn signature shows `i8` return but body has `ret void`.
+**Root cause (diagnosed during fix).** `lower_typed_expr`'s FnCall arm forward-declared toylang internal fns at the call site using `resolved_to_inkwell(&expr.ty)` without guarding against `ResolvedType::Void`. `resolved_to_inkwell(Void)` fell through to `i8` as a silent fallback ("shouldn't be needed" per the source comment). So a call site emitted `declare i8 @fn()`, which was then shadowed by the later `define void @fn()` from `codegen_internal_function` via `ctx.module.get_function`'s existing-decl lookup (line 743 reuses existing declarations). HashMap iteration order over callsite discovery decided which site landed first in LLVM's symbol table, hence the project-name sensitivity. `codegen_internal_function` itself had the correct guard (`if internal_sret || ret_resolved == ResolvedType::Void { None } else { ... }`); the call-site decl was missing the same predicate.
 
-**Mitigation.** None applied. The affected test is parked in `integration_projects.rs` with an inline TODO; blocks 1 of 57 migrated tests but doesn't block stage 5c overall.
+**Fix.** Add `|| expr.ty == ResolvedType::Void` to the call-site's return-type branch in `lower_typed_expr`'s FnCall arm, matching the pattern in `codegen_internal_function`. Defensively: change `resolved_to_inkwell`'s Void arm from a silent i8 fallback to a loud panic — future equivalent bugs surface as a bad caller rather than as an LLVM IR verifier error 200 stack frames deep.
 
-**Reaction if investigated.** Trace through `llvm_gen.rs::codegen_internal_function` — specifically the return-type derivation for internal-ABI wrappers around extern-C-void calls. Likely a bad default in the ABI-coerced return mapping. Probably a few hours' fix once the exact code path is isolated. Non-architectural; a straightforward codegen-correctness bug fix.
-
-**References.** Diagnosis in commit `a2f06ea`. Test inline-documented in `toylangc/tests/integration_projects.rs`.
+**References.** Original diagnosis in commit `a2f06ea`. Root-cause isolation + fix in the B7 followup commit; re-enabled `integration_projects/extern_fn_call/` with the same toylang source that originally reproduced the bug.
 
 ---
 

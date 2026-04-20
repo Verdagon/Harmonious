@@ -376,26 +376,19 @@ fn test_pair_construct() {
     run_integration_project("pair_construct");
 }
 
-// TODO(stage5c-followup): test_extern_fn_call hits a toylang codegen bug
-// that surfaces only under the stage-5c wrapper-mode path. The toylang
-// fn `do_print()` (containing both `println_int(42)` and `println_bool(true)`
-// extern "C" calls) gets emitted with declared return `i8` but body
-// `ret void`. Mismatch fails llc.
-//
-// Confirmed independent of stage 5c.2's pattern via probe: toylang source
-// IS the same as a `probe_extern_void` project, but project name
-// `extern_fn_call` reproduces the bug while `probe_extern_void` does not.
-// HashMap iteration order over the toylang registry — different project
-// names hash to different orderings, exposing/hiding the bug. Pre-existing
-// codegen latent bug; the FileLoader (direct-mode) path masked it. Affects
-// 1 of 57 extern-fixture tests; no other migrated tests exercise the
-// `bool extern "C" arg + sibling extern "C" call` shape. Park here; flag
-// to TL for separate ticket.
-//
-// #[test]
-// fn test_extern_fn_call() {
-//     run_integration_project("extern_fn_call");
-// }
+// B7 unblocked this test. Bug root cause: `lower_typed_expr`'s FnCall
+// arm forward-declared toylang internal fns at the call site without
+// guarding against void-returning callees — `resolved_to_inkwell(Void)`
+// fell through to i8, so a call site emitted `declare i8 @fn()` that
+// shadowed the later `define void @fn()` from `codegen_internal_function`
+// via `ctx.module.get_function`'s existing-decl lookup. Hash-order
+// decided which was seen first. Fixed by mirroring the
+// `internal_sret || ret == Void → None` guard across both sites.
+// risks.md §B7 marked RESOLVED.
+#[test]
+fn test_extern_fn_call() {
+    run_integration_project("extern_fn_call");
+}
 
 // ============================================================================
 // Stage 5c.2 — extern-fixture migrations (in progress)
@@ -600,29 +593,24 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 #[test] fn test_roguelike() { run_integration_project("roguelike"); }
 
 // ============================================================================
-// Parked tests — unmigrated, with reasons. 2 remaining as of 5c.4.
+// Parked tests — unmigrated, with reasons. 1 remaining (previously 2).
 // ============================================================================
 //
 // All prior parked categories (Vec<consumer-type> debuginfo ICE, ENV_LOG
-// callback-trace tests, error-assertion tests, layout probes) resolved
-// and migrated; see the bottom of this file for their #[test] entries.
+// callback-trace tests, error-assertion tests, layout probes, and the
+// bool extern-arg return-type leak) resolved and migrated; see the
+// bottom of this file for their #[test] entries.
 //
-// 1. test_extern_fn_call (integration_tests.rs:1949) — pre-existing bool
-//    extern-arg return-type leak in toylang codegen. LLVM IR verifier
-//    rejects toylang's emitted `define i8 @... ret void` mismatch. Hash-
-//    order-dependent: identical source under a different project name
-//    doesn't reproduce. Architecturally independent of stage 5; parked
-//    for a dedicated codegen fix. See handoff §B7 + risks.md §3 B7.
-//
-// 2. test_point_drop (integration_tests.rs:313) — Rust main calls
-//    `std::ptr::drop_in_place(&mut p as *mut Point)` and links against a
-//    pre-built `runtime.o` providing `__toylang_drop_Point`. Wrapper
-//    mode's user_bin is a generated `fn main() { __toylang_main(); }`
-//    shim — no Rust-side entry point for drop_in_place. Would require
-//    either (a) toylang.toml support for `[build] link-args = [...]` +
-//    an override hook for the user_bin template, or (b) promotion to
-//    a unit test against the facade's drop-glue path. Defer until
-//    either direction is worth pursuing.
+// 1. test_point_drop (deleted along with integration_tests.rs in 5c.4)
+//    — Rust main called `std::ptr::drop_in_place(&mut p as *mut Point)`
+//    and linked against a pre-built `runtime.o` providing
+//    `__toylang_drop_Point`. Wrapper mode's user_bin is a generated
+//    `fn main() { __toylang_main(); }` shim — no Rust-side entry point
+//    for drop_in_place. Would require either (a) toylang.toml support
+//    for `[build] link-args = [...]` + an override hook for the
+//    user_bin template, or (b) promotion to a unit test against the
+//    facade's drop-glue path. Defer until either direction is worth
+//    pursuing.
 //
 // Vec<consumer-type> migrations — unblocked by the stub_gen unit-struct
 // change (pub struct Foo; instead of pub struct Foo(());). See the

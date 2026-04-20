@@ -1,0 +1,11 @@
+fn println_int(x: i32)
+fn println_bool(x: bool)
+
+fn do_print() {
+    println_int(42);
+    println_bool(true);
+}
+
+fn main() {
+    do_print();
+}
