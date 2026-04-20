@@ -53,11 +53,11 @@ pub fn build_project(manifest_path: &Path) -> i32 {
         eprintln!("toylangc: {}", e);
         return 1;
     }
-    if let Err(e) = write_stub_crate(&stubs_dir, &source_path, &manifest) {
+    if let Err(e) = write_stub_crate(&stubs_dir, &source_path, &project_dir, &manifest) {
         eprintln!("toylangc: {}", e);
         return 1;
     }
-    if let Err(e) = write_user_bin_cargo_toml(&user_dir, &manifest) {
+    if let Err(e) = write_user_bin_cargo_toml(&user_dir, &project_dir, &manifest) {
         eprintln!("toylangc: {}", e);
         return 1;
     }
@@ -84,12 +84,19 @@ fn write_workspace_toml(build_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot write workspace Cargo.toml: {}", e))
 }
 
-/// User-bin Cargo.toml. Depends on `__lang_stubs` by path. Re-lists user
-/// rust_dependencies so they're directly resolvable in the bin too — the
-/// bin shim is trivial today (`fn main() { __toylang_main(); }`) and only
-/// needs `__lang_stubs`, but listing the deps keeps cargo's dep graph
-/// honest and tolerates future bin-side changes.
-fn write_user_bin_cargo_toml(user_dir: &Path, manifest: &Manifest) -> Result<(), String> {
+/// User-bin Cargo.toml. Depends on `__lang_stubs` by path AND re-lists
+/// every user rust_dependencies entry directly. The re-listing matters
+/// because toylang's emitted `.o` (bundled into the rlib via the codegen
+/// wrapper) calls into rust_dependencies symbols at the OBJECT-FILE level
+/// — cargo's transitive-dep linking only follows Rust metadata references,
+/// which the rlib's `extern "C" { pub fn foo(...); }` decls don't create.
+/// Without the bin-side dep, the linker sees the toylang `.o`'s undefined
+/// `_foo` symbol and has nothing to satisfy it.
+fn write_user_bin_cargo_toml(
+    user_dir: &Path,
+    project_dir: &Path,
+    manifest: &Manifest,
+) -> Result<(), String> {
     let name = sanitize_name(&manifest.project.name);
     let mut s = String::new();
     s.push_str("[package]\n");
@@ -100,7 +107,18 @@ fn write_user_bin_cargo_toml(user_dir: &Path, manifest: &Manifest) -> Result<(),
     s.push_str(&format!("name = \"{}\"\n", name));
     s.push_str("path = \"src/main.rs\"\n");
     s.push_str("\n[dependencies]\n");
-    s.push_str("__lang_stubs = { path = \"../lang_stubs_crate\" }\n");
+    // Cargo aliasing: the bin imports the per-project-unique stub package
+    // (`lang_stubs_<project>`) under the fixed Rust name `__lang_stubs`.
+    // See the matching package-name comment in `write_stub_crate` for why
+    // the dedup-busting unique package name is necessary under shared
+    // CARGO_TARGET_DIR.
+    s.push_str(&format!(
+        "__lang_stubs = {{ package = \"lang_stubs_{}\", path = \"../lang_stubs_crate\" }}\n",
+        name,
+    ));
+    for (dep_name, spec) in &manifest.rust_dependencies {
+        s.push_str(&format!("{} = {}\n", dep_name, render_dep(spec, project_dir)));
+    }
     fs::write(user_dir.join("Cargo.toml"), s)
         .map_err(|e| format!("cannot write user_bin/Cargo.toml: {}", e))
 }
@@ -113,6 +131,7 @@ fn write_user_bin_cargo_toml(user_dir: &Path, manifest: &Manifest) -> Result<(),
 fn write_stub_crate(
     stubs_dir: &Path,
     source_path: &Path,
+    project_dir: &Path,
     manifest: &Manifest,
 ) -> Result<(), String> {
     fs::create_dir_all(stubs_dir.join("src"))
@@ -136,19 +155,33 @@ fn write_stub_crate(
     fs::write(stubs_dir.join("src/lib.rs"), stubs)
         .map_err(|e| format!("cannot write lang_stubs_crate/src/lib.rs: {}", e))?;
 
+    // Cargo identifies a package by `(name, version, source)`. If we set
+    // the package name to `__lang_stubs` for every project, two projects
+    // sharing a CARGO_TARGET_DIR would dedupe to the same rlib — meaning
+    // every project links against whichever stub rlib happened to be built
+    // first (with the wrong toylang `.o` injected into it). Make the cargo
+    // package name unique per project (suffix with the user's project name)
+    // while keeping the rust-level crate name fixed at `__lang_stubs` via
+    // `[lib].name`. The fixed crate name matters: the facade's
+    // `is_from_lang_stubs_safe` predicate checks `tcx.crate_name(...) ==
+    // "__lang_stubs"`, and the user bin's `use __lang_stubs::*;` resolves
+    // by crate name. Hash differs per package → separate rlibs in the
+    // shared cache; tests don't cross-contaminate.
+    let pkg_name = sanitize_name(&manifest.project.name);
     let mut cargo = String::new();
     cargo.push_str("[package]\n");
-    cargo.push_str("name = \"__lang_stubs\"\n");
+    cargo.push_str(&format!("name = \"lang_stubs_{}\"\n", pkg_name));
     cargo.push_str("version = \"0.0.0\"\n");
     cargo.push_str(&format!("edition = \"{}\"\n", manifest.project.edition));
     cargo.push_str("\n[lib]\n");
+    cargo.push_str("name = \"__lang_stubs\"\n");
     cargo.push_str("path = \"src/lib.rs\"\n");
     cargo.push_str("crate-type = [\"rlib\"]\n");
     cargo.push_str("\n");
     if !manifest.rust_dependencies.is_empty() {
         cargo.push_str("[dependencies]\n");
         for (name, spec) in &manifest.rust_dependencies {
-            cargo.push_str(&format!("{} = {}\n", name, render_dep(spec)));
+            cargo.push_str(&format!("{} = {}\n", name, render_dep(spec, project_dir)));
         }
     }
     fs::write(stubs_dir.join("Cargo.toml"), cargo)
@@ -161,9 +194,31 @@ fn sanitize_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
-fn render_dep(spec: &DepSpec) -> String {
+fn render_dep(spec: &DepSpec, project_dir: &Path) -> String {
     match spec {
         DepSpec::Version(v) => format!("\"{}\"", v),
+        DepSpec::Path { path } => {
+            // Resolve relative to the toylang.toml's directory, then emit as
+            // an absolute path. The generated stub rlib's Cargo.toml lives
+            // at `<project>/.toylang-build/lang_stubs_crate/Cargo.toml`,
+            // two directories below `<project>`, so a literal pass-through
+            // would require the user to count those `..`s. Resolving here
+            // keeps the toylang.toml relative to the user's source tree.
+            // Absolute paths also let multiple integration projects share
+            // the same `test_helpers` cargo cache entry — cargo dedupes by
+            // resolved path.
+            let resolved = if std::path::Path::new(path).is_absolute() {
+                std::path::PathBuf::from(path)
+            } else {
+                project_dir.join(path)
+            };
+            // canonicalize() resolves `..` segments; if the path doesn't yet
+            // exist we still want the `../foo` form normalized so cargo's
+            // dedup works. Fall back to the raw join for missing paths and
+            // let cargo surface the error.
+            let final_path = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+            format!("{{ path = {:?} }}", final_path.display().to_string())
+        }
         DepSpec::Detailed {
             version,
             features,
@@ -194,6 +249,17 @@ fn write_main_shim(user_dir: &Path, manifest: &Manifest) -> Result<(), String> {
     // Two-crate layout: stubs live in a separate rlib; `__lang_stubs` is an
     // extern crate. Edition 2018+ makes `use` resolve transparently.
     s.push_str("use __lang_stubs::*;\n");
+    // Force-link every user rust_dependency. The bin source is trivial
+    // (`fn main() { __toylang_main(); }`) and doesn't reference any of
+    // these deps in Rust source — but toylang's emitted `.o` (bundled into
+    // the rlib) DOES call into them at the symbol level. Cargo's transitive-
+    // dep link logic only follows Rust metadata references; without an
+    // `extern crate <name> as _;` here cargo's linker would drop the dep
+    // and the bin's link would fail with "_<sym> undefined" for any toylang
+    // call into a Rust dep helper crate.
+    for name in manifest.rust_dependencies.keys() {
+        s.push_str(&format!("extern crate {} as _;\n", name));
+    }
     s.push_str("\n");
     s.push_str("fn main() { __toylang_main(); }\n");
 

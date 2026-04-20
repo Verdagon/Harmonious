@@ -1,0 +1,13 @@
+[package]
+name = "test_helpers"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+# Self-contained workspace — keeps cargo from walking up into the outer
+# `erw` workspace and treating this crate as a member there. The integration
+# test harness sets a shared CARGO_TARGET_DIR so all 129 toylang projects
+# compile + cache test_helpers exactly once across the suite.
+[workspace]

@@ -1,0 +1,16 @@
+fn println_int(x: i32)
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn make_pair() -> Pair<i32, i32> {
+    Pair<i32, i32> { first: 10, second: 20 }
+}
+
+fn main() {
+    let p = make_pair();
+    println_int(p.first);
+    println_int(p.second);
+}

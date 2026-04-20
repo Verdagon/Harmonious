@@ -1,0 +1,6 @@
+[project]
+name = "pair_construct"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

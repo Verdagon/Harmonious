@@ -125,6 +125,35 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // replaces it with a synthetic dep-registering body at monomorphization time.
     for (_name, toy_fn) in &registry.functions {
         if toy_fn.body.is_none() {
+            // Stage 5c: body-less toylang fns are extern Rust fn declarations
+            // (e.g. `fn println_int(x: i32);` in toylang source). Emit them
+            // as `extern "C"` declarations in the stub rlib so:
+            //   1. `find_extern_fn_def_id` resolves them to a local DefId
+            //      during the rlib compile's consumer codegen.
+            //   2. Toylang's emitted `.o` calls them via the unmangled symbol.
+            //   3. A user-provided `#[no_mangle] pub extern "C" fn <name>` in
+            //      a sibling crate (e.g. integration tests' `test_helpers`)
+            //      satisfies the symbol at final link time.
+            //
+            // Only emit decls for fns whose signature is C-ABI-compatible.
+            // For body-less toylang fns whose signatures use Option/Result
+            // return types (a small handful of integration test fixtures),
+            // a sret-style wrapper is needed instead — flagged for the
+            // 5c.2 migration; for now just emit them as `extern "C"` and
+            // accept rustc's `improper_ctypes` warning.
+            let extern_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
+                let pname = format_ident!("{}", p.name);
+                let pty = resolved_type_to_syn(&p.ty);
+                quote! { #pname: #pty }
+            }).collect();
+            let ret: syn::Type = match &toy_fn.return_ty {
+                Some(ty) => resolved_type_to_syn(ty),
+                None => parse_quote!(()),
+            };
+            let fn_ident = format_ident!("{}", _name);
+            extern_fns.push(quote! {
+                pub fn #fn_ident(#(#extern_params),*) -> #ret;
+            });
             continue;
         }
 

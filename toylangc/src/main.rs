@@ -140,11 +140,17 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
         let registry = crate::toylang::parser::parse(&src)
             .unwrap_or_else(|e| panic!("parse error in {}: {:?}", source_path.display(), e));
 
-        // Detect downstream-of-stubs (user bin) vs the rlib compile by crate
-        // name. The stub rlib is fixed-named `__lang_stubs`; everything else
-        // is downstream.
+        // Detect downstream-of-stubs (user bin) vs the rlib compile.
+        //
+        // The stub rlib's cargo package is named `lang_stubs_<project>`
+        // (per-project unique to bust cargo's cross-project dedup under a
+        // shared CARGO_TARGET_DIR — see `build::write_stub_crate`'s package-
+        // name comment). The rust-level crate name is fixed at `__lang_stubs`
+        // via `[lib].name`. CARGO_PKG_NAME reports the cargo PACKAGE name,
+        // not the lib name, so we match on the `lang_stubs_` prefix rather
+        // than the literal `__lang_stubs`.
         let pkg_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-        let is_downstream = pkg_name != "__lang_stubs";
+        let is_downstream = !pkg_name.starts_with("lang_stubs_");
         run_toylang_compile(registry, argv.clone(), is_downstream);
         Ok(())
     });

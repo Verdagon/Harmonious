@@ -27,6 +27,14 @@ fn default_edition() -> String {
 #[serde(untagged)]
 pub enum DepSpec {
     Version(String),
+    /// Path dep — `{ path = "../foo" }`. The path is interpreted relative
+    /// to the toylang.toml file's directory; build.rs resolves it to an
+    /// absolute path before writing it into the generated stub rlib's
+    /// Cargo.toml. Stage 5c integration tests use this to pull in the
+    /// shared `test_helpers` crate.
+    Path {
+        path: String,
+    },
     Detailed {
         version: String,
         #[serde(default)]

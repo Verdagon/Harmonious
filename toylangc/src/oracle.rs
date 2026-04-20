@@ -512,8 +512,25 @@ pub fn rust_method_return_type<'tcx>(
 }
 
 /// Find an extern (non-toylang) function by name among local definitions.
-/// Excludes functions in __lang_stubs (those are toylang wrappers).
+///
+/// Two acceptable shapes:
+///   - A local Rust `pub fn <name> { … }` outside `__lang_stubs`. Used by
+///     the FileLoader-single-crate (direct mode) path: the user's `.rs`
+///     fixture defines `pub fn println_int` etc. at the user crate root.
+///   - A foreign declaration `extern "C" { pub fn <name>(…); }` inside
+///     `__lang_stubs`. Used by the stage-5 two-crate path: stub_gen emits
+///     these for body-less toylang fns; an external cargo dep (e.g. the
+///     integration tests' `test_helpers`) provides the matching
+///     `#[no_mangle] pub extern "C" fn <name>` at final link time.
+///
+/// Both shapes return a usable `DefId` for `tcx.fn_sig` / `symbol_name` /
+/// `coerced_*_for_instance` queries; toylang's codegen treats them the
+/// same. Where both might match the same name (consumer fn shadowing
+/// extern decl), the local-defined fn wins by iteration order — historically
+/// the only case anyone hit and the `!is_from_lang_stubs` filter that
+/// stood here pre-stage-5c preserves that bias.
 pub fn find_extern_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
+    let mut foreign_match: Option<DefId> = None;
     for local_def_id in tcx.hir_crate_items(()).definitions() {
         let def_id = local_def_id.to_def_id();
         if tcx.def_kind(def_id) != DefKind::Fn { continue; }
@@ -521,8 +538,13 @@ pub fn find_extern_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
         if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
             return Some(def_id);
         }
+        // Stub-rlib foreign decl. Remember; only return if no non-stub
+        // match shows up in the rest of the iteration.
+        if tcx.is_foreign_item(def_id) {
+            foreign_match = Some(def_id);
+        }
     }
-    None
+    foreign_match
 }
 
 pub fn find_rust_type_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {

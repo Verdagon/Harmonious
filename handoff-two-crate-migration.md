@@ -2,8 +2,13 @@
 
 **Task owner:** a junior engineer joining the erw project. **Previous exposure to stages 1–4 not assumed.** The first few sections of this doc give you the context you need; beyond that we go into specifics.
 **Branch:** work on `main` directly.
-**Estimated effort:** 3–4 weeks for a junior, including ramp time.
-**Risk level:** medium. The scope is well-bounded (three clearly-separated pieces); the tricky architectural piece — cross-crate type resolution in `oracle.rs` — has been scoped, sketched, and tested in prior exploratory work. No toolchain rebuild required; erw is already zero-fork.
+**Estimated effort:** 3–5 weeks for a junior, including ramp time.
+**Risk level:** medium. Scope is well-bounded (four clearly-separated sub-phases); the tricky architectural piece — cross-crate type resolution in `oracle.rs` — was landed in 5a. No toolchain rebuild required; erw is already zero-fork.
+
+**Landing status (2026-04-19):**
+- **Sub-stage 5a landed** (cross-crate oracle). Commit `99b10df`-ish — see git log.
+- **Sub-stage 5b landed** (wrapper-mode two-crate). Commit `b6a2bf6`. 211/211 green.
+- **Sub-stage 5c pivoted mid-attempt.** An earlier 5c attempt (in-process `rustc_driver::RunCompiler` twice per test) surfaced a real architectural question — which compile owns consumer codegen when tests use body-less toylang fns backed by bin-local Rust fixtures. TL call: the fixture pattern is test-only and violates "tests should act like production users," so the right move is to migrate tests to the production pattern rather than architect around the test-only one. **5c now scoped as F-wide**: migrate all 129 integration tests to standalone-style projects, retire direct mode and FileLoader entirely. Details in §4.3 and §5 below (rewritten for F-wide; previous in-process `rustc_driver` approach is superseded and intentionally not preserved inline — see git history of this doc if you need the old plan).
 
 ---
 
@@ -207,50 +212,60 @@ POC #2's `build.rs` on branch `poc/separate-crate-stubs` has the cargo orchestra
 
 **Crucially:** the plugin's `RUSTC_WORKSPACE_WRAPPER` fires for BOTH crate compiles under two-crate. The plugin needs to behave correctly in both. For the stub rlib compile, `collect_generic_rust_deps` / `notify_concrete_entry_point` fire on consumer items (they're local); for the user bin compile, `upstream_monomorphizations_for` routes generic wrappers back to the bin compile's local codegen. The facade's `callbacks_impl.rs::notify_concrete_entry_point_inner` will be called in BOTH compiles for the same consumer entry-point Instance — under the stub rlib compile it should do the internal-callee walk; under the user bin compile it should skip the walk (already done). Gate the walk behind an `is_downstream_of_stubs` predicate (follow the `after_rust_analysis` precedent).
 
-### 4.3 Direct-mode in-process two-crate (sub-stage 5c)
+### 4.3 Migrate integration tests to standalone-style (sub-stage 5c, F-wide)
 
-Each integration test allocates a tempdir, writes stub rlib source + user bin source, and invokes `rustc_driver::RunCompiler` TWICE per test:
+Each of the 129 integration tests becomes a self-contained toylang project that runs via `toylangc build` — the same path the 15 existing standalone tests use. This makes test invocations match real toylang-user workflow: toylang source + `toylang.toml` + real Rust crate deps, compiled via cargo, binary run with output captured.
 
-```rust
-fn compile_toylang_direct_two_crate(toylang_source: &str) -> CompileResult {
-    let tmp = tempfile::tempdir()?;
+Layout per test:
 
-    // Generate stub rlib + user bin sources via facade's helpers.
-    let (stub_content, user_main_content) =
-        facade::generate_two_crate_sources(toylang_source);
-
-    std::fs::create_dir(tmp.path().join("lang_stubs"))?;
-    std::fs::write(tmp.path().join("lang_stubs/lib.rs"), stub_content)?;
-    std::fs::write(tmp.path().join("main.rs"), user_main_content)?;
-
-    // Phase 1: compile stub rlib via rustc_driver.
-    let stub_rlib_path = tmp.path().join("liblang_stubs.rlib");
-    let rlib_args = compose_rustc_args_for_rlib(tmp.path(), &stub_rlib_path);
-    rustc_driver::RunCompiler::new(&rlib_args, &mut facade_callbacks()).run();
-
-    // Phase 2: compile user bin with --extern lang_stubs=<rlib>.
-    let bin_path = tmp.path().join("test_bin");
-    let bin_args = compose_rustc_args_for_bin(tmp.path(), &stub_rlib_path, &bin_path);
-    rustc_driver::RunCompiler::new(&bin_args, &mut facade_callbacks()).run();
-
-    // Execute and capture output.
-    run_and_capture(&bin_path)
-}
+```
+toylangc/tests/integration_projects/<test_name>/
+├── main.toylang
+├── toylang.toml             # [project] + [rust-dependencies]
+└── expected_output.txt      # or inline assertion in the harness
 ```
 
-No cargo spawn — just two in-process `rustc_driver` invocations. Expect ~2× the per-test compilation cost vs today, so the integration-test suite goes from ~30s to ~2–3 min. Acceptable per TL direction.
+Tests that currently declare body-less `fn println_int(x: i32);` in toylang source + provide a matching `pub fn println_int` in an inline Rust fixture get migrated to depend on a shared `test_helpers` crate:
 
-**Add `tempfile` as a dev-dependency** in `toylangc/Cargo.toml`. Integration tests live in `toylangc/tests/`, so dev-dep scope suffices.
+```
+toylangc/tests/test_helpers/
+├── Cargo.toml
+└── src/lib.rs               # pub fn println_int, pub fn read_int, etc.
+```
 
-**Facade helper:** add `generate_two_crate_sources(toylang_source) -> (stub_content, user_main_content)` in the facade, wrapping the existing `stub_gen` + wrapper-source-generation logic. Both direct mode and wrapper mode use it.
+Test's `toylang.toml`:
 
-### 4.4 Retire FileLoader + §6.10 probe + doc pass (sub-stage 5d)
+```toml
+[project]
+name = "my_test"
 
-- Delete `rustc-lang-facade/src/file_loader.rs`.
-- Remove the `FileLoader` installation from `rustc-lang-facade/src/driver.rs`.
-- Delete any `generate_stubs` / wrapper-source helpers that were FileLoader-specific. Retain whatever's still used by `generate_two_crate_sources`.
-- Run the §6.10 `#[linkage]` probe (if not already done during 5b).
-- Doc pass.
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }
+```
+
+**Error-asserting tests** (parser / type-resolver error tests) today use `assert_matches!(result, Err(TypeResolveError::FooBar { ... }))`. Under wrapper mode, errors surface as `toylangc build` stderr — the harness captures that and matches against expected substring or regex. A new helper like `run_integration_test_expects_error(name, error_pattern)` sits alongside the existing `run_standalone_test` in the test runner. **Granularity regression is accepted:** moving from structural-match to string-match loses some precision, but production users see error strings, not error enum variants — tests now match what users would see.
+
+**Cargo orchestration (runtime-critical).** Without care, each of 129 tests gets its own `.toylang-build/target/`, and cargo rebuilds `test_helpers` (and any shared artifacts) fresh for every test. That's naive-path runtime of 30–60 minutes. The target runtime is 5–15 minutes, achieved by sharing state aggressively:
+
+- **Single shared `CARGO_TARGET_DIR`.** The test harness exports `CARGO_TARGET_DIR=<shared path>` (e.g., `$CARGO_MANIFEST_DIR/tests/integration_target/` or a deterministic `/tmp/` path) before invoking `toylangc build`. All 129 test invocations write to the same cargo target directory. `test_helpers` compiles once across the suite; subsequent tests hit the cache. Cargo's own target-dir locking (`.cargo-lock`) handles concurrent-build coordination cleanly — expect some serialization during the compile phase, none during test-run phase.
+- **`test_helpers` as a stable reusable artifact.** All test `toylang.toml` files declare it via the same relative path: `{ path = "../../test_helpers" }` (or an absolute path via cargo's `[patch]` if the relative is awkward under the build-dir layout). Shared path = shared cache entry under shared target dir.
+- **Parallel test execution.** `cargo test` parallelizes by default to CPU core count. The shared target dir is safe under concurrent cargo invocations — cargo serializes compilation but runs multiple separate tests' binaries in parallel afterward. 8–16 cores typically give 3–5× speedup over sequential.
+- **Avoid crates.io deps in integration-test projects.** Unlike standalone tests (which test real crates.io interop), integration tests should depend only on `test_helpers` and stdlib. No `uuid` / `reqwest` / etc. in integration test tomls — those are what make standalone tests minutes per test. Keep integration tests pure toylang + in-workspace helpers.
+
+With these in place: realistic full-suite runtime 5–15 min, ~5 min warm cache after the first run. Validate this during 5c.1 — if the canary tests run cold at 5+ seconds each, investigate orchestration before committing to 129 migrations.
+
+**Retirement fallout:**
+
+- Direct mode (`toylangc --toylang-input <path>`) has no remaining callers after migration. Retire entirely (delete from `toylangc/src/main.rs`).
+- `FileLoader` has no callers after direct mode retires (wrapper mode doesn't use it under two-crate). Retire entirely (delete `rustc-lang-facade/src/file_loader.rs`).
+- `generate_stubs` trait callback and FileLoader-specific helpers follow.
+- The facade's callback trait may reshape — retain whatever's used by wrapper-mode stub source generation, delete FileLoader-specific pieces.
+
+### 4.4 §6.10 probe: is `#[linkage = "external"]` still needed?
+
+Stage 4's partitioner override sets `(External, Default)` linkage directly on `__lang_stubs` items. Under two-crate, the stub rlib's `src/lib.rs` can ALSO carry `#[linkage = "external"]` (under `#![feature(linkage)]` at crate root) — belt-and-suspenders. These are different mechanisms: the partitioner override is post-partition mutation; `#[linkage]` is a source-attribute fast-path that runs before internalization.
+
+Probe during 5c: emit the stub rlib WITHOUT `#[linkage = "external"]` AND WITHOUT `#![feature(linkage)]`. Run the suite. If 211/211, the attribute/feature are redundant — drop them, retire one more nightly feature. If tests fail, keep them and document what pattern was load-bearing.
 
 ---
 
@@ -275,31 +290,54 @@ Four sub-stages, each a clean commit point. Pause between any two if you need a 
 6. **Run the full suite.** Standalone tests (`toylangc/tests/standalone_tests.rs`) all pass via the new wrapper-mode path. Integration tests still pass via the old FileLoader path (unchanged in this sub-stage).
 7. **Commit 5b.** Wrapper mode on two-crate; direct mode still uses FileLoader.
 
-### Sub-stage 5c — direct-mode in-process two-crate (~1–1.5 weeks)
+### Sub-stage 5c — migrate integration tests to standalone-style (F-wide, ~3 weeks total across 4 phases)
 
-1. **Add `tempfile` as a dev-dependency** in `toylangc/Cargo.toml`.
-2. **Write a shared test helper** `toylangc/tests/common/mod.rs` (create if it doesn't exist) implementing `compile_toylang_direct_two_crate` per §4.3. Handles tempdir, source writing, two rustc_driver invocations, cleanup-on-drop.
-3. **Add facade helper** `generate_two_crate_sources(toylang_source) -> (stub_content, user_main_content)`. Wraps existing `stub_gen` + wrapper-source logic. Keep the old FileLoader-driven helpers alive for now — retire in 5d.
-4. **Migrate integration tests in one pass.** Most are a mechanical find-replace: `compile_toylang_direct(source)` → `compile_toylang_direct_two_crate(source)`. A handful of tests may have FileLoader-specific assertions; adapt to two-crate reality.
-5. **Runtime expectations.** Post-migration suite takes ~2–3 min (vs today's ~30s). Acceptable per TL direction. If you see 10+ min, something's wrong — probably cargo is spawning somewhere it shouldn't, or tempdir cleanup is non-linear. Check the rustc-driver arg composition.
-6. **Grep for remaining `FileLoader` references in code** (outside the file being retired in 5d). Document any remaining call sites in the commit message.
-7. **Commit 5c.** Direct mode on two-crate; FileLoader still present but unused by any caller.
+Split into 4 internal phases, each a clean commit point.
 
-### Sub-stage 5d — retire FileLoader, §6.10 probe, docs (~3–5 days)
+#### 5c.1 — `test_helpers` crate + cargo orchestration + canary migration (~5–7 days)
 
-1. **Run the §6.10 `#[linkage]` probe if not already done.** Try emitting the stub rlib's `src/lib.rs` WITHOUT `#[linkage = "external"]` and WITHOUT `#![feature(linkage)]`. Run the full suite. If 211/211, the attribute/feature are redundant under plugin-set-linkage — drop them. If tests fail with link errors, keep them.
-2. **Delete `rustc-lang-facade/src/file_loader.rs`.**
-3. **Remove the FileLoader installation in `rustc-lang-facade/src/driver.rs`**.
-4. **Delete FileLoader-specific helpers** that are no longer called by `generate_two_crate_sources`. Keep helpers still in use.
-5. **Run the full suite** one more time. 211/211 expected.
+1. **Create `test_helpers` workspace member** at `toylangc/tests/test_helpers/` (or equivalent). Cargo.toml declares it as a library crate. `src/lib.rs` exposes the functions current inline fixtures provide — `println_int`, `read_int`, etc. Grep `toylangc/tests/integration_tests.rs` for `pub fn ` inside test fixtures to find the full set.
+2. **Set up shared cargo target dir.** The test harness (`tests/integration_tests.rs`'s helper, parallel to `run_standalone_test`) exports `CARGO_TARGET_DIR=<shared path>` before invoking `toylangc build`. Pick a path that's deterministic, per-session, and outside the repo (e.g., `/tmp/erw-integration-target/` or env-var-pointed). Verify `test_helpers` compiles once across multiple test invocations by inspecting `<target>/debug/deps/libtest_helpers-*.rlib` existence between runs.
+3. **Pick 3–5 canary tests** that currently use extern-fn fixtures. Migrate each to `toylangc/tests/integration_projects/<test_name>/{main.toylang, toylang.toml, expected_output.txt}`. The `toylang.toml` for each declares `[rust-dependencies] test_helpers = { path = "../../test_helpers" }` (adjust relative path to match the actual directory depth).
+4. **Write the harness helper** `run_integration_test(name, expected)` in `tests/integration_tests.rs`, mirroring `run_standalone_test` in `tests/standalone_tests.rs`. Calls `toylangc build` on the project directory (with `CARGO_TARGET_DIR` env set), runs the produced binary, asserts stdout contains `expected`.
+5. **Validate runtime.** Run the 3–5 canaries. Warm-cache per-test time should be ~3–8s. If individual tests take 30+ seconds each, the shared target dir isn't being picked up — check the env-var export path in the harness, and verify `test_helpers`'s rlib is genuinely reused (not recompiled) between test invocations via `ls -la <target>/debug/deps/libtest_helpers*` mtime checks.
+6. **Commit 5c.1.** `test_helpers` exists, harness helper + shared target dir orchestration added, canary tests migrated, orchestration validated. Other 124+ tests still use the inline-fixture direct-mode path.
+
+#### 5c.2 — migrate extern-fixture tests (~1 week)
+
+1. **~57 tests currently use the body-less-fn-plus-Rust-fixture pattern.** Each migrates mechanically:
+   - Extract toylang source → `main.toylang`.
+   - Extract Rust fixture body → either moves into `test_helpers/src/lib.rs` (if the fn name is shared across tests) or becomes a test-specific tiny Rust helper crate (if the body is test-specific).
+   - Extract expected stdout → `expected_output.txt`.
+   - Replace inline test body with `run_integration_test("<test_name>", "<expected>");`.
+2. **Run full suite after each batch.** Migrate in batches of 5–10 tests, not all 57 at once — easier to bisect if something regresses.
+3. **Commit 5c.2.** 57 extern-fixture tests migrated. ~72 remaining tests still use direct mode + inline source strings.
+
+#### 5c.3 — migrate remaining tests (~1 week)
+
+1. **~72 remaining integration tests** — mostly parser and type-resolver error tests plus a few codegen tests that don't use fixtures.
+2. **Add error-assertion harness variant** `run_integration_test_expects_error(name, error_pattern)` that captures `toylangc build` stderr and matches against `error_pattern` (substring or regex — pick substring unless a test genuinely needs regex).
+3. **Migrate each test.** Most are mechanical. Watch for:
+   - Tests exercising specific facade callbacks or internal state that don't surface through `toylangc build` output. **Flag and escalate per-test** — may need rewriting, deletion, or preservation as a unit test on a different harness.
+   - Error-assertion granularity loss — today's `Err(TypeResolveError::FooBar { .. })` becomes `stderr.contains("foo bar")`. Accept the regression; production users see strings too.
+4. **Run full suite after each batch.**
+5. **Commit 5c.3.** All 129 integration tests migrated. Direct mode code in `toylangc/src/main.rs` + `FileLoader` still present as dead code (nobody calls them).
+
+#### 5c.4 — retire direct mode, retire FileLoader, §6.10 probe, doc pass (~3–5 days)
+
+1. **Delete direct-mode handling** from `toylangc/src/main.rs` (`--toylang-input` argv parsing and the direct-mode dispatch).
+2. **Delete `rustc-lang-facade/src/file_loader.rs`** and its installation in `driver.rs`.
+3. **Delete FileLoader-specific trait callbacks** — specifically `generate_stubs` if/when it's no longer called outside wrapper-mode stub-source generation. Reshape the trait to match what's actually used now.
+4. **Run the §6.10 `#[linkage]` probe.** Try emitting the stub rlib without `#[linkage = "external"]` and without `#![feature(linkage)]`. If 211/211 still passes, drop both and retire one more nightly feature.
+5. **Run the full suite** one more time. 211/211 expected. Expected suite runtime: 5–15 min with cargo orchestration in place (was ~30s pre-migration; TL-confirmed acceptable).
 6. **Doc pass:**
-   - `docs/architecture/rust-interop-guide.md` — front-matter status line: mention stage-5 (two-crate architecture). §2.5 partitioner-override description may need a brief mention that stub-rlib items also carry `#[linkage]` belt-and-suspenders (or, per §6.10, don't). §3 Opaque Stubs discussion of `FileLoader` becomes historical — describe the two-crate shape instead.
-   - `docs/architecture/risks.md` §3 B2 — update to reflect that Outcome A is now supplemented by the `#[linkage]` source-attribute fast-path (belt-and-suspenders). If §6.10 probe succeeded, note that the attribute was redundant but the source-attribute path was NOT; these are different mechanisms.
-   - `docs/architecture/known-tech-debt.md` — if it mentions FileLoader, update.
-   - `HANDOFF-TL.md` — §1 summary: note stage-5 landing. §2: FileLoader is gone.
-   - `docs/historical/phase-history.md` — add a Stage 5 entry.
+   - `docs/architecture/rust-interop-guide.md` — front-matter status: stage-5 complete, two-crate architecture, FileLoader retired, direct mode retired. §3 Opaque Stubs: describe the two-crate shape rather than FileLoader injection. §2.5 partitioner override: belt-and-suspenders with `#[linkage]` if the probe said keep it; otherwise note that partitioner override is the sole mechanism.
+   - `docs/architecture/risks.md` §3 B2: reflect the `#[linkage]` source-attribute fast-path supplement if it survived the probe.
+   - `docs/architecture/known-tech-debt.md`: update any FileLoader/direct-mode refs.
+   - `HANDOFF-TL.md` §1/§2: note stage-5 landing; both direct mode and FileLoader gone.
+   - `docs/historical/phase-history.md`: add Stage 5 entry.
    - Move `handoff-two-crate-migration.md` (this doc) to `docs/historical/`.
-7. **Commit 5d.** Stage 5 complete.
+7. **Commit 5c.4.** Stage 5 complete.
 
 ---
 
@@ -343,9 +381,16 @@ The stub rlib compile runs entirely inside `generate_and_compile` (the consumer'
 
 Under two-crate, the facade's `MUTABLE_STATE` is a per-process mutex. Both compiles share the same process (when running tests in-process, or when the toylangc wrapper handles both via cargo). If some new code path introduces a lock acquire outside `generate_and_compile`, deadlock returns. Audit any new synchronization you add. Read `@GCMLZ` arcana.
 
-### 6.8 The 129 direct-mode tests are where 5c's risk lives
+### 6.8 Test-runtime orchestration is load-bearing
 
-Most will migrate mechanically. A handful have FileLoader-specific assertions or specific path expectations. Expect to spend ~2–3 days on the mechanical migration and ~1–2 days on edge cases. Don't move to 5d until all 129 pass.
+Naive F-wide migration hits 30–60 min full-suite runtime because each of 129 tests runs its own isolated cargo build. The target is 5–15 min, achieved via the cargo orchestration in §4.3:
+
+- Shared `CARGO_TARGET_DIR` (env var exported by the harness).
+- `test_helpers` as a workspace-path dep shared across all test tomls.
+- No crates.io deps inside integration-test projects (keep them pure — `test_helpers` + stdlib only).
+- Rely on cargo's default parallel test execution.
+
+**Validate orchestration empirically at 5c.1 canary stage.** If individual canary tests take 30+ seconds cold, something's off — `CARGO_TARGET_DIR` isn't being honored, or `test_helpers` is re-resolving per test. Fix before scaling to 129 migrations. An orchestration bug multiplied across 129 tests is where "30–60 min suite" materializes.
 
 ### 6.9 Don't destabilize stage 4 for stage 5
 
@@ -374,7 +419,7 @@ After each sub-stage: 211/211 passing, 0 failed, 0 ignored.
 
 ### Runtime check after 5c
 
-Post-5c, the integration-test suite runs ~2–3 min (vs today's ~30s). If 10+ min, something's spawning cargo or doing non-linear work. Check the `rustc_driver` arg composition and tempdir-cleanup path.
+Post-5c, the integration-test suite runs 5–15 min with cargo orchestration in place (shared `CARGO_TARGET_DIR`, `test_helpers` as a shared workspace dep, parallel test execution). Warm-cache subsequent runs closer to 5 min. If sustained runtime is 30+ min, orchestration isn't working — `test_helpers` is recompiling per test, or `CARGO_TARGET_DIR` isn't being honored. Debug via `ls -la <shared_target>/debug/deps/libtest_helpers*` between runs (rlib mtime should only change on first compile after source changes, not per test invocation).
 
 ### Required greps after 5d
 
@@ -424,7 +469,7 @@ At every stage the tree is green before the next commit. Don't skip the full tes
 
 - **The cross-crate oracle rewrite hits an unexpected rustc internal.** `tcx.module_children` on an extern crate might have quirks; if a DefId comes back that's different from what `module_children_local` would have produced for the same-shape item, something's subtle. Don't spin; escalate.
 - **Phase 6 unwrap tests fail after 5b.** Means `upstream_monomorphizations_for` isn't routing generic wrappers correctly. This is the canary. Grep for the override's body in `queries/upstream_monomorphizations.rs` and trace.
-- **Direct-mode test runtime explodes past 5 min.** Something is spawning cargo or doing redundant work. Check rustc-driver arg composition.
+- **Integration-test suite runtime explodes past 30 min.** Cargo orchestration isn't sharing state correctly. Check `CARGO_TARGET_DIR` export in the harness, and verify `test_helpers`'s rlib is cached (not rebuilt per test) via `ls -la <target>/debug/deps/libtest_helpers*` mtime inspection.
 - **`#[linkage]` probe (§6.10) produces surprising results** — e.g., tests fail with `#[linkage]` removed but pass without it AND without `#![feature(linkage)]`. That's internally inconsistent; probably means some interaction I didn't anticipate. Escalate.
 - **Any test fails unexpectedly after a behavior-preserving change** (5a specifically). The migration is supposed to be invisible under single-crate; any failure means something subtle drifted. Investigate, don't paper over.
 
