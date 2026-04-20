@@ -1,1 +1,2 @@
 *.txt
+!tests/integration_projects/**/*.txt
