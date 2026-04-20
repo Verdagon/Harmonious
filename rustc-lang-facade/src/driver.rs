@@ -49,7 +49,7 @@ pub fn run_compiler<C: LangCallbacks + 'static>(
     // Always install the codegen backend wrapper. If generate_and_compile
     // returns None at runtime, no .o gets injected — no harm done.
     let mut driver = LangDriver;
-    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
+    rustc_driver::run_compiler(rustc_args, &mut driver);
 }
 
 struct LangDriver;
@@ -68,7 +68,7 @@ impl rustc_driver::Callbacks for LangDriver {
         crate::clear_upstream_cgus();
 
         config.override_queries = Some(crate::queries::lang_override_queries);
-        config.make_codegen_backend = Some(Box::new(|_opts| {
+        config.make_codegen_backend = Some(Box::new(|_opts, _target| {
             crate::codegen_wrapper::LangCodegenBackend::new()
         }));
     }

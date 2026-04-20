@@ -57,6 +57,10 @@ impl LangCodegenBackend {
 }
 
 impl CodegenBackend for LangCodegenBackend {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
     fn locale_resource(&self) -> &'static str {
         self.inner.locale_resource()
     }
@@ -72,8 +76,6 @@ impl CodegenBackend for LangCodegenBackend {
     fn codegen_crate<'tcx>(
         &self,
         tcx: rustc_middle::ty::TyCtxt<'tcx>,
-        metadata: rustc_metadata::EncodedMetadata,
-        need_metadata_module: bool,
     ) -> Box<dyn Any> {
         // Clear any stale upstream-CGU stash from a prior compilation (tests
         // may rerun `codegen_crate` with a fresh `tcx`). The stash will be
@@ -96,7 +98,7 @@ impl CodegenBackend for LangCodegenBackend {
         // notify_concrete_entry_point / monomorphize_type callbacks fire during
         // this phase. Query providers (symbol_name, layout_of, etc.) also fire
         // here — their results get cached in rustc's query system.
-        let result = self.inner.codegen_crate(tcx, metadata, need_metadata_module);
+        let result = self.inner.codegen_crate(tcx);
 
         // Phase 2: generate_and_compile. Per @GCMLZ, this locks MUTABLE_STATE for the
         // entire duration. Query providers triggered during codegen read only from
@@ -132,6 +134,7 @@ impl CodegenBackend for LangCodegenBackend {
                 bytecode: None,
                 assembly: None,
                 llvm_ir: None,
+                links_from_incr_cache: Vec::new(),
             });
         }
 
@@ -142,8 +145,9 @@ impl CodegenBackend for LangCodegenBackend {
         &self,
         sess: &Session,
         codegen_results: CodegenResults,
+        metadata: rustc_metadata::EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
-        self.inner.link(sess, codegen_results, outputs);
+        self.inner.link(sess, codegen_results, metadata, outputs);
     }
 }
