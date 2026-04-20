@@ -172,6 +172,7 @@ On balance: B is strictly better for a project planning to reduce its rustc fork
 ## See also
 
 - `docs/reasoning/why-interleaved-monomorphization.md` — the foundational argument for why dep discovery must happen during monomorphization at all. Both approaches in this document satisfy that constraint.
+- `docs/reasoning/why-outer-params-suffice.md` — deepens Approach B's correctness claim: the Param-bearing args it returns are always expressible over the outer fn's generic scope, regardless of call-tree depth or intermediate substitution complexity. Addresses the natural worry that B's symbolic output might blow up in some unbounded way.
 - `docs/reasoning/rustc-fork-design-space.md` §4.1 — the stage-3 migration from A to B, treated as a fork-reduction opportunity. Has the cost-accounting that made B the winner.
 - `docs/architecture/rust-interop-guide.md` §2.2 — the shipping `optimized_mir` override architecture (Approach B).
 - Stage-1 handoff (callback split) in `docs/historical/` — the precursor refactor that split the unified callback into the `collect_generic_rust_deps` + `notify_concrete_entry_point` pair, enabling the stage-3 migration.

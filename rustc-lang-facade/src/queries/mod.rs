@@ -1,20 +1,22 @@
 //! Query override installation.
 //!
 //! Rustc's compilation is driven by a demand-driven query system. We override
-//! five providers: `layout_of` (type layout), `mir_shims` (drop glue),
+//! six providers: `layout_of` (type layout), `mir_shims` (drop glue),
 //! `optimized_mir` (synthetic dep-registering bodies for consumer fns),
-//! `symbol_name` (consumer symbol mapping), and `collect_and_partition_mono_items`
-//! (CGU filtering, stage 4a).
+//! `symbol_name` (consumer symbol mapping), `collect_and_partition_mono_items`
+//! (CGU filtering, stage 4a), and `upstream_monomorphizations_for` (force
+//! local mono for consumer items under the two-crate architecture).
 //!
 //! Consumer functions in `__lang_stubs` have `unreachable!()` bodies that
 //! pass rustc's normal `mir_built` and borrowck pipeline. Our
 //! `optimized_mir` override replaces those bodies during monomorphization
 //! with a synthetic body mentioning each transitive Rust dep via
-//! `ReifyFnPointer` so rustc's collector queues them; the consumer's own
-//! backend provides the real definitions. The partitioner override in
-//! `partition` removes consumer items from rustc's CGU slice before codegen
-//! dispatch sees them — stage 4a's replacement for the retired
-//! `CODEGEN_SKIP_HOOK` fork patch.
+//! `ReifyFnPointer` so rustc's collector queues them (see `@SMINCZ` for
+//! why this is the only mechanism that forces codegen of a generic
+//! Instance); the consumer's own backend provides the real definitions.
+//! The partitioner override in `partition` removes consumer items from
+//! rustc's CGU slice before codegen dispatch sees them — stage 4a's
+//! replacement for the retired `CODEGEN_SKIP_HOOK` fork patch.
 
 pub mod drop_glue;
 pub mod layout;

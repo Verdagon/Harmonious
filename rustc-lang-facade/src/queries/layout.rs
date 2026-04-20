@@ -39,10 +39,16 @@ pub type LayoutOfFn = for<'tcx> fn(
 /// The layout_of override. Intercepts consumer-defined types, falls through
 /// to rustc's default for everything else.
 ///
-/// Per @GCMLZ, may fire during generate_and_compile. For non-consumer types,
-/// only reads CONFIG and DEFAULT_LAYOUT_OF (no lock). For consumer types,
-/// calls call_monomorphize_type (locks MUTABLE_STATE), but those are always
-/// cached from inner.codegen_crate.
+/// Per @GCMLZ, may fire during generate_and_compile. Lock-free on both paths:
+/// non-consumer types fall through to `default_layout_of` (OnceLock read);
+/// consumer types call `call_monomorphize_type`, which is stateless by
+/// contract and dispatches without locking `MUTABLE_STATE`. The stateless
+/// signature was adopted in the B6 architectural fix (see
+/// `docs/architecture/risks.md` §B6) precisely to avoid the re-entrant
+/// deadlock that would otherwise fire when rustc's incremental cache skips
+/// `layout_of` during mono collection and then re-fires it inside
+/// `generate_and_compile` via `fn_abi_of_instance` — i.e., inside the
+/// outer mutex the trampoline holds.
 pub fn lang_layout_of<'tcx>(
     tcx: TyCtxt<'tcx>,
     query: PseudoCanonicalInput<'tcx, Ty<'tcx>>,

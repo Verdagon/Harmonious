@@ -209,7 +209,17 @@ Vale-fork-readiness work. Migrates both compile modes from FileLoader-injected s
 - **5c.3** (`1ae7fd4`): stub_gen unit-struct fix (`pub struct Foo;` instead of `pub struct Foo(());` — aligns source field count with `layout_of(0-field)`, silences a `build_struct_type_di_node` "index out of bounds" ICE that fires when opaque consumer types appear inside `Vec<Foo, Global>` debuginfo). Two new harness helpers: `run_integration_project_expects_error` (substring match against toylangc stderr) and `run_integration_project_check_callbacks` (reads `TOYLANG_LOG_PATH` output). +22 test migrations.
 - **5c.4** (`b3e276d` + stage-5 landing commit): layout probe tests via `run_integration_project_check_build_stderr` harness; `lang_layout_of` log augmented with `size=N align=M`. Stage-5 landing: retire `FileLoader` + `file_loader.rs` + `generate_stubs` trait method, retire direct mode (`--toylang-input` argv handling + `run_direct_mode` + `extract_registry`). Delete `toylangc/tests/integration_tests.rs` (all 129 direct-mode tests — 127 have integration_projects counterparts; 2 accepted coverage loss: pre-existing bool codegen bug + Rust-side `drop_in_place`+runtime.o test with no wrapper-mode equivalent). `is_from_lang_stubs` / `is_from_lang_stubs_safe` collapse to a single `tcx.crate_name == "__lang_stubs"` check. §6.10 `#[linkage]` probe vacuously satisfied: the attribute was never emitted by stub_gen; partitioner-set-linkage has been the sole mechanism all along.
 
-Final test count: 209 (67 unit + 127 integration_projects + 15 standalone). Two-crate architecture complete; FileLoader retired; direct mode retired; zero-fork preserved.
+Final test count at stage-5 landing: 209 (67 unit + 127 integration_projects + 15 standalone). Two-crate architecture complete; FileLoader retired; direct mode retired; zero-fork preserved.
+
+### Post-stage-5 cleanup (B6 + B7 + alias consolidation)
+
+Three followup items identified in `risks.md` Category B plus the `is_from_lang_stubs_safe` alias carried forward from stage 5c.4, all landed immediately after the stage-5 landing:
+
+- **B7** (`7bac631`): bool extern-arg return-type leak in toylang codegen. Fix lives at the internal call-site forward-decl derivation: when an extern "C" fn returns void, the internal-ABI wrapper must also declare void rather than defaulting to `i8`. `test_extern_fn_call` re-enabled → 210 tests.
+- **Alias cleanup** (`74fe3a2`): `is_from_lang_stubs_safe` deleted; 4 call sites renamed to `is_from_lang_stubs` directly.
+- **B6 architectural fix** (`3cfb983` + `2eea9b8`): registry-driven consumer codegen. `notify_concrete_entry_point_inner` made side-effect-free; a new `populate_toylang_instances_from_cgus` in `generate_and_compile` builds `state.toylang_instances` deterministically from the CGU list + registry each compile. Also made `monomorphize_type` stateless to kill a re-entrant deadlock under incremental-on warm, and moved layout-log emission into the populate step so layout-probe stderr tests are incremental-safe. `CARGO_INCREMENTAL=0` stopgap retired from the test harness.
+
+Post-cleanup state: 210/210 cold **and** warm, no harness stopgaps, `risks.md` Category B empty of active items. The five callback-trace tests' `unexpected` parameter became a no-op under wrapper-mode semantics (rustc's mono collector walks every `pub fn` in an rlib regardless of reachability, so the original "internal fn should NOT be monomorphized by rustc" invariant no longer holds as stated). Documented as tech-debt #29 for future retirement or reformulation; non-blocking.
 
 ---
 

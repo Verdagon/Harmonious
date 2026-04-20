@@ -1,19 +1,21 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 209 tests passing (67 unit + 127 integration_projects + 15
-> standalone), 0 failed, 0 ignored. **Zero rustc fork patches — built
-> against vanilla `nightly-2025-01-15`.** All rustc integration flows
-> through `Config::override_queries` and a `CodegenBackend` wrapper — no
-> fork, no FileLoader, no hook statics. Two-crate architecture: the stub
-> rlib is a real on-disk cargo package; toylang code lives in a separate
-> user-bin crate that path-depends on it.
+> **Current status:** 210 tests passing (67 unit + 128 integration_projects + 15
+> standalone), 0 failed, 0 ignored, cold **and** warm. **Zero rustc fork
+> patches — built against vanilla `nightly-2025-01-15`.** All rustc
+> integration flows through `Config::override_queries` and a
+> `CodegenBackend` wrapper — no fork, no FileLoader, no hook statics,
+> no `CARGO_INCREMENTAL=0` harness stopgap. Two-crate architecture:
+> the stub rlib is a real on-disk cargo package; toylang code lives
+> in a separate user-bin crate that path-depends on it.
 >
 > All 8 implementation phases complete. Fork-reduction + architectural-
-> readiness roadmap fully shipped (stages 1–5: `ed2e692`, `b345162`,
-> `ce437ae`/`bf770ae`/`da7ad87`, `1d862f4`/`13d8f12`/`51f0c5e`/`d044560`/
-> `c25aa4b`, `6bda10c`/`b6a2bf6`/`91cad25`/`05fed63`/`a2f06ea`/`6d65831`/
-> `1ae7fd4`/`b3e276d` + the stage-5c.4 landing that retired direct mode +
-> FileLoader).
+> readiness roadmap fully shipped (stages 1–5). Post-stage-5 cleanup
+> resolved both Category-B risks in `risks.md` — registry-driven
+> consumer codegen replaced the rustc-incremental-cache-fragile
+> side-effect model (B6, `3cfb983` + `2eea9b8`), and the bool
+> extern-arg return-type leak in toylang codegen is fixed (B7,
+> `7bac631`).
 >
 > **Per-phase history:** `docs/historical/phase-history.md`.
 > **Architectural decisions** (why each choice): `docs/reasoning/architecture-decisions.md`.
@@ -103,7 +105,7 @@ Skips types with unresolved type params (`has_param` check) — these are generi
 
 **Key:** `LocalDefId` — fires once per consumer function. Installed via `Config::override_queries`.
 
-Non-consumer DefIds delegate to rustc's saved upstream provider; consumer items (filtered by `is_consumer_codegen_target` — `is_from_lang_stubs_safe` AND either consumer-fn or consumer-accessor) get a synthesized body whose only purpose is to mention each transitive Rust dep via a `ReifyFnPointer` cast. The body terminates with `Unreachable`. Rustc codegen never sees these bodies because the partitioner override (§2.5) filters consumer items out of the CGU list before codegen starts; the consumer's own `.o` supplies the definitions at link time.
+Non-consumer DefIds delegate to rustc's saved upstream provider; consumer items (filtered by `is_consumer_codegen_target` — `is_from_lang_stubs` AND either consumer-fn or consumer-accessor) get a synthesized body whose only purpose is to mention each transitive Rust dep via a `ReifyFnPointer` cast. The body terminates with `Unreachable`. Rustc codegen never sees these bodies because the partitioner override (§2.5) filters consumer items out of the CGU list before codegen starts; the consumer's own `.o` supplies the definitions at link time.
 
 The provider calls `collect_generic_rust_deps` which:
 
@@ -206,7 +208,7 @@ pub fn wrap<T>(x: T) -> Wrapper<T> { unreachable!() }
 
 ### 3.2 Module-qualified matching
 
-Query overrides use `is_from_lang_stubs(tcx, def_id)` (diagnostic-gated — safe inside `generate_and_compile`) or `is_from_lang_stubs_safe(tcx, def_id)` (structural `DefPathData` walk — safe anywhere). Both check that the DefId's path contains `__lang_stubs::`. The `_safe` variant is used in the partitioner override and other paths that may run outside `generate_and_compile`; see `@DPSFDOZ`.
+Query overrides use `is_from_lang_stubs(tcx, def_id)` — a single helper that checks `tcx.crate_name(def_id.krate).as_str() == "__lang_stubs"` (stage 5c.4 collapsed the previous `is_from_lang_stubs` / `is_from_lang_stubs_safe` pair into this one check, since under the two-crate architecture the stub crate is always its own compilation unit with a well-known name). Safe from any phase; see `@DPSFDOZ` for the historical context on why the earlier split between diagnostic-only and structural variants existed.
 
 ### 3.3 Why unreachable!() works
 
@@ -428,7 +430,7 @@ Tests can set `TOYLANG_LOG_PATH` env var to dump the log to a file, then assert 
 
 | File | Purpose |
 |------|---------|
-| `lib.rs` | `LangPredicates` + `LangCallbacks: LangPredicates` traits, split globals (`CONFIG`, `MUTABLE_STATE`, `DEFAULT_*` — see `@GCMLZ`), vtables + trampolines, `is_from_lang_stubs` / `is_from_lang_stubs_safe` / `is_consumer_codegen_target` / `is_consumer_accessor_safe` helpers |
+| `lib.rs` | `LangPredicates` + `LangCallbacks: LangPredicates` traits, split globals (`CONFIG`, `MUTABLE_STATE`, `DEFAULT_*` — see `@GCMLZ`), vtables + trampolines, `is_from_lang_stubs` / `is_consumer_codegen_target` / `is_consumer_accessor_safe` helpers |
 | `queries/layout.rs` | `layout_of` override |
 | `queries/optimized_mir.rs` | `optimized_mir` override: synthesizes Param-bearing dep-registering bodies for consumer DefIds, delegates to saved upstream default for everything else |
 | `queries/symbol_name.rs` | `symbol_name` override |

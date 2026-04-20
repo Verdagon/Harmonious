@@ -229,7 +229,7 @@ These are rules you follow to keep the architecture working. Failures here are s
 
 **Rule.** `tcx.def_path_str` is diagnostic-only; it ICEs during normal compilation outside diagnostic contexts. See `docs/arcana/DefPathStrIsForDiagnosticsOnly-DPSFDOZ.md`.
 
-**What to do instead.** Use `is_from_lang_stubs_safe` (walks `tcx.def_path(def_id).data` structurally) — added in stage 2, the canonical cross-phase-safe version.
+**What to do instead.** Use `is_from_lang_stubs` (checks `tcx.crate_name(def_id.krate) == "__lang_stubs"`) — the canonical cross-phase-safe helper. (Historical note: stages 2–5c used a separate `is_from_lang_stubs_safe` that walked `tcx.def_path(def_id).data` structurally; stage 5c.4 collapsed both into the current crate-name check since under two-crate the stub rlib is always its own compilation unit.)
 
 **How this gets violated in practice.** Someone adds a new query provider or partitioner hook, writes an inline `tcx.def_path_str(def_id).starts_with("__lang_stubs::")` check because it's shorter than the DefPathData walk, and it silently works in tests that happen to run inside `generate_and_compile` but ICEs in some other integration path. The arcana doc calls this out; the helper exists to make the safe form trivially reusable.
 
@@ -330,8 +330,8 @@ If neither workaround is viable, accept the small fork and treat it as maintaine
 | MIR construction drift | B3 | 100% / each bump | ~1 week / bump | `mir_helpers.rs` compile errors |
 | ABI helpers drift | B4 | 15–25% / 5yr | 1–2 weeks repair | ABI-shape tests fail |
 | CGU lifetime erasure | B5 | 15–20% / 5yr | 1–2 weeks redesign | partition.rs lifetime errors |
-| `.o` emission side-effect / incremental cache | B6 | Fires reliably under specific conditions | Test harness: harness-scoped stopgap ✓ / Shipping: doesn't trigger typical flows | Undefined `__toylang_impl_main` on second build |
-| Bool extern-arg return leak | B7 | Fires on narrow code shape | 1 of 57 tests parked; non-blocking | LLVM verifier: "return type does not match ret" |
+| `.o` emission side-effect / incremental cache | B6 | **RESOLVED** | Registry-driven codegen (`3cfb983` + `2eea9b8`) removed the side-effect dependency; stateless `monomorphize_type` killed the re-entrant deadlock. `CARGO_INCREMENTAL=0` stopgap retired. | n/a |
+| Bool extern-arg return leak | B7 | **RESOLVED** | Bool void-return guard at internal call-site forward decl (`7bac631`). `test_extern_fn_call` re-enabled. | n/a |
 | `@DPSFDOZ` violation | C1 | Regression-risk | Self-inflicted | `trimmed_def_paths` ICE |
 | `@GCMLZ` violation | C2 | Regression-risk | Self-inflicted | Test hangs (0% CPU) |
 | Partitioner invariant violation | C3 | Regression-risk | Self-inflicted | Unexpected missing items |

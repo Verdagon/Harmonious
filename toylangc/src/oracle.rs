@@ -128,11 +128,12 @@ fn lookup_active_param_index(name: &str) -> Option<u32> {
 ///      both locally-defined items (`pub struct Foo`) and `pub use`
 ///      re-exports — a `pub use` shows up in the parent module's
 ///      `module_children_local` exactly like a local definition.
-///   2. Children of the extern `__lang_stubs` rlib's crate root, when present.
-///      Under the FileLoader-single-crate architecture this step is inert
-///      (no `__lang_stubs` extern crate exists). Under the stage-5 two-crate
-///      architecture this finds re-exports and stub items living in the
-///      stub rlib.
+///   2. Children of the extern `__lang_stubs` rlib's crate root. Under the
+///      two-crate architecture (stage 5b) the stub rlib is always an extern
+///      crate from the user bin's perspective, so this walk finds its
+///      re-exports and stub items. (Pre-5c.4 FileLoader-single-crate
+///      setups had no extern `__lang_stubs`, making this step inert; that
+///      path is retired.)
 ///
 /// The two walks are intentionally symmetric — same matcher, same DefKind
 /// filter — so that the cross-crate path produces semantically identical
@@ -154,7 +155,9 @@ fn resolve_rust_path(
     ) {
         return Some(def_id);
     }
-    // Extern __lang_stubs rlib (no-op pre-stage-5).
+    // Extern __lang_stubs rlib. Under the two-crate architecture this is
+    // the user-bin side lookup path that resolves re-exports carried by
+    // the stub rlib (e.g. `pub use std::io::Stdout;`).
     let stubs_cnum = tcx.crates(()).iter().copied().find(|&c| {
         tcx.crate_name(c).as_str() == "__lang_stubs"
     })?;
@@ -513,22 +516,27 @@ pub fn rust_method_return_type<'tcx>(
 
 /// Find an extern (non-toylang) function by name among local definitions.
 ///
-/// Two acceptable shapes:
-///   - A local Rust `pub fn <name> { … }` outside `__lang_stubs`. Used by
-///     the FileLoader-single-crate (direct mode) path: the user's `.rs`
-///     fixture defines `pub fn println_int` etc. at the user crate root.
+/// Under the current two-crate architecture the primary shape is:
 ///   - A foreign declaration `extern "C" { pub fn <name>(…); }` inside
-///     `__lang_stubs`. Used by the stage-5 two-crate path: stub_gen emits
-///     these for body-less toylang fns; an external cargo dep (e.g. the
-///     integration tests' `test_helpers`) provides the matching
-///     `#[no_mangle] pub extern "C" fn <name>` at final link time.
+///     `__lang_stubs`. `stub_gen` emits these for body-less toylang fns;
+///     an external cargo dep (e.g. the integration tests' `test_helpers`)
+///     provides the matching `#[no_mangle] pub extern "C" fn <name>` at
+///     final link time.
+///
+/// A vestigial second shape — a local Rust `pub fn <name> { … }` outside
+/// `__lang_stubs` — is also accepted. It was exercised by the retired
+/// FileLoader-single-crate (direct mode) path (stage 5c.4) where the
+/// user's `.rs` fixture defined `pub fn println_int` etc. at the user
+/// crate root. The branch is preserved because it's harmless under the
+/// current architecture (the user-bin's HIR contains only the tiny
+/// `fn main() { __toylang_main(); }` shim, so no name collision is
+/// possible) and because removing it would be a no-op refactor.
 ///
 /// Both shapes return a usable `DefId` for `tcx.fn_sig` / `symbol_name` /
 /// `coerced_*_for_instance` queries; toylang's codegen treats them the
 /// same. Where both might match the same name (consumer fn shadowing
-/// extern decl), the local-defined fn wins by iteration order — historically
-/// the only case anyone hit and the `!is_from_lang_stubs` filter that
-/// stood here pre-stage-5c preserves that bias.
+/// extern decl), the local-defined fn wins by iteration order — the
+/// `!is_from_lang_stubs` filter below preserves that historical bias.
 pub fn find_extern_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
     let mut foreign_match: Option<DefId> = None;
     for local_def_id in tcx.hir_crate_items(()).definitions() {

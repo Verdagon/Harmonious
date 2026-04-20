@@ -87,6 +87,13 @@ pub fn lang_optimized_mir<'tcx>(
 /// items from rustc's CGU slice before codegen sees them, and the consumer's
 /// own `.o` provides the real definition at link time).
 ///
+/// This is the designated "fix site" per @SMINCZ — the only mechanism in the
+/// codebase that forces rustc's mono collector to codegen a generic Rust
+/// `Instance` the consumer references. `tcx.symbol_name` / `Instance::expect_resolve`
+/// calls elsewhere are pure reads and do not drive codegen on their own; the
+/// `ReifyFnPointer` casts synthesized here are what put dep Instances into the
+/// collector's `used_items` queue.
+///
 /// Moved verbatim from the retired `queries/per_instance.rs`. Accepts
 /// Param-containing sigs safely — `TypingEnv::fully_monomorphized()` is a
 /// typing-MODE declaration (`PostAnalysis` + `Reveal::All`), not an input
@@ -163,7 +170,10 @@ fn build_dependency_body<'tcx>(
 
     // Single block: dependency statements + Unreachable terminator. The body
     // is never executed — the consumer's .o provides the real implementation
-    // and rustc's codegen is skipped by `CODEGEN_SKIP_HOOK`.
+    // and rustc's codegen never sees these items because the stage-4a
+    // partitioner override in `queries::partition` filters them out of the
+    // CGU slice before codegen dispatch. (The earlier `CODEGEN_SKIP_HOOK`
+    // fork patch was retired in stage 4a.)
     blocks.push(BasicBlockData {
         statements: stmts,
         terminator: Some(Terminator {

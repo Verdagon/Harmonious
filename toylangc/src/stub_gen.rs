@@ -104,8 +104,10 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             let field_ty = resolved_type_to_syn(&field.rust_type);
 
             // unreachable!() body — the `optimized_mir` override synthesizes
-            // dep-registering bodies for every accessor DefId; rustc's codegen
-            // is skipped via `CODEGEN_SKIP_HOOK`.
+            // dep-registering bodies for every accessor DefId; the partitioner
+            // override filters these accessor items out of the CGU slice so
+            // rustc's LLVM backend never emits code for them. (Stage 4a/4b
+            // retired `CODEGEN_SKIP_HOOK` in favor of this CGU-level filter.)
             accessor_methods.push(quote! {
                 pub fn #field_ident(&self) -> &#field_ty {
                     unreachable!()
@@ -182,8 +184,9 @@ pub fn generate(registry: &ToylangRegistry) -> String {
 
         // Extern declaration only for concrete (non-generic) functions.
         // Generic functions flow through the `optimized_mir` override at
-        // monomorphization time (no extern needed; their symbols come from the
-        // consumer's backend via `CODEGEN_SKIP_HOOK`).
+        // monomorphization time (no extern needed; their symbols come from
+        // the consumer's backend — the partitioner override filters them
+        // out of rustc's CGU slice, replacing the retired `CODEGEN_SKIP_HOOK`).
         if toy_fn.type_params.is_empty() {
             let sym = format!("__toylang_impl_{}", _name);
             let fn_ident = format_ident!("{}", sym);
@@ -258,7 +261,12 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // uses ptr::read to consume the value before calling the inline method.
     // #[inline(never)] is mandatory — without it rustc could inline the wrapper
     // itself, putting us back at "no callable symbol." External linkage is
-    // forced by the rustc-fork patch in partitioning.rs (Phase 6 step 1).
+    // forced by the facade's partitioner override, which mutates
+    // `MonoItemData` to `(Linkage::External, Visibility::Default)` on items
+    // surviving the consumer filter in `__lang_stubs`. Stage 4c retired the
+    // prior `VISIBILITY_OVERRIDE_HOOK` rustc-fork patch in favor of this
+    // post-partition mutation (see @DPSFDOZ-related partition.rs docs and
+    // risks.md §B2 for the Outcome A assumption stack).
     items.push(parse_quote! {
         #[inline(never)]
         pub unsafe fn __toylang_option_unwrap<T>(o: *mut core::option::Option<T>) -> T {

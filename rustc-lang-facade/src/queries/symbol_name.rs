@@ -8,8 +8,21 @@
 //!
 //! Per @GCMLZ, this provider may fire during generate_and_compile. For
 //! non-consumer items, it only reads CONFIG and DEFAULT_SYMBOL_NAME (no lock).
-//! For consumer items, it calls call_monomorphize_fn (locks MUTABLE_STATE),
-//! but those are always cached from inner.codegen_crate.
+//! For consumer items, it calls `call_notify_concrete_entry_point`, which
+//! locks `MUTABLE_STATE`. Before the B6 fix this was the side-effect that
+//! populated `state.toylang_instances`; post-B6 the populate step moved to
+//! an up-front CGU walk in `generate_and_compile` and
+//! `notify_concrete_entry_point_inner` is pure (aside from the log push).
+//! See `docs/architecture/risks.md` §B6 and `@GCMLZ` for the full story,
+//! including the `_inner` bypass used during codegen to avoid re-locking.
+//!
+//! @SMINCZ — computing a symbol name here does NOT force rustc to codegen
+//! the `Instance`. It is a pure read. Codegen for consumer-referenced Rust
+//! generics is driven exclusively by the `ReifyFnPointer` casts synthesized
+//! in the `optimized_mir` override's `build_dependency_body`. A reader who
+//! sees this file as "the place where the consumer's symbol enters LLVM IR"
+//! and assumes it also drives codegen is in the trap the @SMINCZ arcana
+//! documents.
 
 use rustc_middle::ty::{self, Instance, TyCtxt};
 

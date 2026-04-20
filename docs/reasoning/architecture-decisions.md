@@ -54,6 +54,8 @@ Short form: rustc's monomorphization collector is the only entity that walks bot
 
 **Stage-3 migration note:** erw previously shipped a custom Instance-keyed `per_instance_mir` query via a 4-patch rustc fork. Stage 3 retired that query in favor of the sanctioned `Config::override_queries` path on `optimized_mir` — same dep-discovery behavior, three fewer fork patches, no custom query plumbing. The insight that made the migration viable is the asymmetry between Rust-dep output (Params fine, rustc substitutes) and internal-callee output (must be concrete, no downstream substitutor exists for toylang LLVM IR). See `docs/reasoning/dep-discovery-approaches.md` for the full comparison and `docs/reasoning/rustc-fork-design-space.md` §4.1 for the fork-reduction accounting.
 
+**Why the Param-bearing output is bounded:** the natural follow-up worry about Approach B is whether the returned `(DefId, GenericArgsRef)` pairs can grow unboundedly complex in deep call trees with intricate substitution chains. They can't — source-level scoping guarantees every dep-arg expression is closed over {outer_fn_params ∪ concrete_rust_types}, and this property survives inference + lowering for any conventional type system. `docs/reasoning/why-outer-params-suffice.md` walks the structural argument and enumerates the apparent breakers (closures, `impl Trait`, inferred args) showing each lowers away before dep discovery runs.
+
 ## Why explicit type args instead of inference
 
 Type inference was attempted but caused cascading problems (backward propagation, fragile heuristics for Vec element types). Explicit type args eliminated ~150 lines of inference machinery.
@@ -70,5 +72,6 @@ Consumer functions have `unreachable!()` bodies — valid Rust that passes all c
 - `docs/reasoning/why-interleaved-monomorphization.md` — the foundational seven-case taxonomy for "why the facade exists at all."
 - `docs/reasoning/rustc-fork-design-space.md` — fork-reduction design space, the road to stage-4's zero-fork landing.
 - `docs/reasoning/dep-discovery-approaches.md` — Approach A vs B comparison; the asymmetry insight behind stage 3.
+- `docs/reasoning/why-outer-params-suffice.md` — why Approach B's Param-bearing dep args are always expressible over the outer fn's generic scope; refutes the "unbounded symbolic complexity" worry.
 - `docs/reasoning/trait-call-investigation.md` — trait method dispatch investigation.
 - `docs/arcana/` — cross-cutting invariants these decisions produced (`@GCMLZ`, `@ACRTFDZ`, etc.).

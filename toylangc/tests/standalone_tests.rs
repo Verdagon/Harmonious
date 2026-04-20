@@ -6,8 +6,12 @@ fn toylangc_bin() -> PathBuf {
 }
 
 fn sysroot_lib() -> String {
+    // Zero-fork: standalone tests run against the same vanilla
+    // `nightly-2025-01-15` rustup toolchain as the rest of the suite.
+    // The historical `rustc-fork` toolchain (HANDOFF-TL.md §3d) is
+    // vestigial and no longer referenced here.
     let out = Command::new("rustup")
-        .args(["run", "rustc-fork", "rustc", "--print=sysroot"])
+        .args(["run", "nightly-2025-01-15", "rustc", "--print=sysroot"])
         .output()
         .expect("failed to run rustup");
     let sysroot = String::from_utf8(out.stdout).unwrap();

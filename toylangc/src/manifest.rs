@@ -1,3 +1,14 @@
+//! `toylang.toml` parser.
+//!
+//! Per @MRRIWMZ, this file is parsed twice per build: once by `toylangc
+//! build` orchestrating cargo (via `build::build_project`), and once by
+//! the wrapper-mode child process cargo spawns for the primary crate
+//! (via `main::run_wrapper_mode`). Both sites call `parse` below so any
+//! schema change takes effect on both automatically. Schema changes that
+//! affect the path-resolution semantics (e.g., `[project].source`'s
+//! relative-vs-absolute interpretation) must keep both call sites in
+//! sync — the arcana documents the side-channel invariant.
+
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;

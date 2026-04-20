@@ -1,8 +1,12 @@
 //! rustc-lang-facade: a library for integrating custom languages with rustc.
 //!
 //! Consumers implement the `LangCallbacks` trait and call `run_compiler()`.
-//! The library handles query overrides, stub injection, codegen backend
-//! wrapping, and the rustc driver lifecycle.
+//! The library handles query overrides, `CodegenBackend` wrapping, and the
+//! rustc driver lifecycle. Stub-crate generation is the consumer's
+//! responsibility — under the two-crate architecture (stage 5b/5c.4) the
+//! `__lang_stubs` rlib is produced on disk by the consumer's build step
+//! and compiled by cargo as ordinary Rust, so the facade has no stub-
+//! injection surface.
 
 #![feature(rustc_private)]
 
@@ -47,9 +51,12 @@ pub struct MonomorphizeTypeResult<'tcx> {
 
 /// The main interface between the library and a consumer language.
 ///
-/// The library identifies consumer items automatically by tracking which DefIds
-/// came from the stub file (injected via generate_stubs). The consumer does not
-/// need to provide is_lang_type / is_lang_fn methods.
+/// The library identifies consumer items by the crate they live in — every
+/// stub item is in the `__lang_stubs` rlib — and by the `is_consumer_type`
+/// / `is_consumer_fn` predicates the consumer supplies on `LangPredicates`.
+/// Under the two-crate architecture (stage 5b/5c.4) `__lang_stubs` is a
+/// real on-disk rlib produced by the consumer's build step; the prior
+/// `generate_stubs` FileLoader-injected shape is retired.
 ///
 /// Must be Send + Sync because rustc query providers run on Rayon worker threads.
 use std::any::Any;
@@ -329,13 +336,14 @@ pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 ///    or it's an accessor method on a consumer type.
 ///
 /// This is the filter the facade uses both (a) to decide whether to
-/// synthesize a dep-discovery body for the item (in the MIR override
-/// that drives rustc's monomorphization collector) and (b) to tell
-/// rustc's codegen to skip emitting a body at the item's symbol.
-/// Items inside `__lang_stubs` that are NOT consumer fns — notably
-/// the Phase-6 `#[inline(never)]` wrappers like `__toylang_option_unwrap`
-/// — fall through to rustc's default codegen; they are real Rust
-/// functions whose symbol must be callable at link time.
+/// synthesize a dep-discovery body for the item in the `optimized_mir`
+/// override (which drives rustc's monomorphization collector) and (b)
+/// to remove the item from the CGU slice in the partitioner override
+/// so rustc's codegen backend never sees it. Items inside
+/// `__lang_stubs` that are NOT consumer fns — notably the Phase-6
+/// `#[inline(never)]` wrappers like `__toylang_option_unwrap` — fall
+/// through to rustc's default codegen; they are real Rust functions
+/// whose symbol must be callable at link time.
 pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
     if !is_from_lang_stubs(tcx, def_id) {
         return false;
@@ -350,12 +358,12 @@ pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> boo
 }
 
 /// Accessor-method structural check (cross-crate-safe). Shared between
-/// the codegen-skip hook, the `optimized_mir` override's consumer filter,
-/// and `queries/symbol_name.rs`. Walks `opt_associated_item` to find the
-/// impl's self type structurally (via `instantiate_identity` — inspection,
-/// not instantiation) and compares its ADT name against
-/// `is_consumer_type`. Safe from any phase — the `def_path_str` trap
-/// (@DPSFDOZ) isn't reached.
+/// the partitioner-override consumer filter, the `optimized_mir`
+/// override's consumer filter, and `queries/symbol_name.rs`. Walks
+/// `opt_associated_item` to find the impl's self type structurally
+/// (via `instantiate_identity` — inspection, not instantiation) and
+/// compares its ADT name against `is_consumer_type`. Safe from any
+/// phase — the `def_path_str` trap (@DPSFDOZ) isn't reached.
 pub(crate) fn is_consumer_accessor_safe<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
     let Some(assoc_item) = tcx.opt_associated_item(def_id) else {
         return false;

@@ -119,9 +119,8 @@ impl CodegenBackend for LangCodegenBackend {
     >) {
         let (mut results, work_products) = self.inner.join_codegen(ongoing_codegen, sess, outputs);
 
-        // Inject Toylang's compiled object as an additional module.
-        // Fat LTO will merge this with the Rust modules.
-        // Add Toylang's compiled object as an additional module.
+        // Inject the consumer's compiled object as an additional module so
+        // rustc's linker picks it up alongside the Rust-compiled ones.
         let obj_path = crate::get_lang_obj_path();
         if let Some(ref obj_path) = obj_path {
             eprintln!("[toylang] injecting module: {}", obj_path.display());

@@ -69,8 +69,9 @@ pub struct ToylangCallbacks {
     /// are already in the rlib's `.o`) and skip `after_rust_analysis`
     /// validation (already validated upstream). `llvm_paths` is also forced
     /// to None upstream of construction so `generate_and_compile` short-
-    /// circuits without producing a colliding `.o`. False in direct mode and
-    /// in the rlib's own compile.
+    /// circuits without producing a colliding `.o`. False in the rlib's own
+    /// compile. (Direct mode, once the third case, was retired in 5c.4 —
+    /// every toylang compile now flows through wrapper mode.)
     pub is_downstream_of_stubs: bool,
 }
 
@@ -566,8 +567,12 @@ impl LangCallbacks for ToylangCallbacks {
         // phase callbacks + the B6 population step, not any internal
         // codegen logs. `NotifyConcreteEntryPoint` entries come from
         // `notify_concrete_entry_point_inner`'s log push (still live);
-        // under CARGO_INCREMENTAL=0 (test-harness stopgap) the query
-        // provider fires freely so this is a reliable source.
+        // under incremental cache these entries may be cache-skipped at
+        // the query-provider layer, which is fine — the B6 populate step
+        // above is the load-bearing source of truth for consumer-codegen
+        // inputs and runs deterministically every compile regardless of
+        // cache state. (The former `CARGO_INCREMENTAL=0` test-harness
+        // stopgap was retired by the B6 architectural fix.)
         if let Ok(path) = std::env::var("TOYLANG_LOG_PATH") {
             let lines: Vec<String> = ts.log.iter().map(|entry| format!("{:?}", entry)).collect();
             std::fs::write(&path, lines.join("\n")).expect("failed to write callback log");
@@ -1049,16 +1054,16 @@ fn walk_typed_expr_for_deps(
 /// Find a function's DefId in __lang_stubs by name.
 ///
 /// Walks the local crate's items and filters by `is_from_lang_stubs`.
-/// Under the post-5c.4 two-crate architecture, in the stub rlib's
-/// compile the items are at LOCAL_CRATE's root (whose name is
-/// `__lang_stubs`); in the user-bin compile the items aren't local to
-/// scan here (use the facade's extern-crate walker for that). Pre-5c.4
-/// this function had to handle a FileLoader path where items lived
-/// nested in `mod __lang_stubs {}` inside the user crate; that path
-/// was retired along with direct mode, and the former name-dispatch
-/// comment documenting the difference between safe/unsafe variants of
-/// the predicate is moot now that `is_from_lang_stubs_safe` has
-/// collapsed into `is_from_lang_stubs`.
+/// Under the two-crate architecture (stage 5b onwards) this only
+/// resolves during the stub rlib's own compile — where the items are
+/// at LOCAL_CRATE's root and LOCAL_CRATE is `__lang_stubs`. In the
+/// user-bin compile the stub items aren't local, so this walker
+/// returns `None` and callers fall back to cross-crate resolution via
+/// the facade's extern-crate walker. `is_from_lang_stubs`'s simple
+/// crate-name check is safe from any phase; see `@DPSFDOZ` for why
+/// the former structural-walk `is_from_lang_stubs_safe` helper was
+/// unnecessary once the two-crate shape made the stub rlib always its
+/// own compilation unit.
 fn find_stub_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<rustc_span::def_id::DefId> {
     use rustc_hir::def::DefKind;
     for local_def_id in tcx.hir_crate_items(()).definitions() {

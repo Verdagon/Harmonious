@@ -62,13 +62,20 @@ partitioning, codegen passes, link-time decisions). For matching, use
 
 ## Canonical safe alternative
 
-`rustc_lang_facade::is_from_lang_stubs_safe(tcx, def_id)` is the
-structural-walk counterpart to `is_from_lang_stubs` and is safe from
-any phase (partitioner, pre-`generate_and_compile` hooks, future
-cross-crate paths). Prefer it over re-deriving the inline
-`tcx.def_path(...).data` walk at each call site — the
-`visibility_override` path was the first such caller and is the
-reference implementation.
+`rustc_lang_facade::is_from_lang_stubs(tcx, def_id)` — checks
+`tcx.crate_name(def_id.krate).as_str() == "__lang_stubs"`. Safe from
+any phase (partitioner, pre-`generate_and_compile` hooks, cross-crate
+paths). Under the two-crate architecture landed in stage 5b, the stub
+crate is always its own compilation unit with a well-known name, so
+the crate-name check is both trivial and correct.
+
+*Historical note:* stages 2 through 5c shipped a separate
+`is_from_lang_stubs_safe` helper that walked `tcx.def_path(...).data`
+structurally to avoid the `def_path_str` hazard. Stage 5c.4 collapsed
+both into the current crate-name check since the two-crate shape
+makes the structural walk unnecessary. The `visibility_override` path
+that first motivated the safe variant no longer exists either (stage
+4c retired `VISIBILITY_OVERRIDE_HOOK` via plugin-set linkage).
 
 ## See also
 

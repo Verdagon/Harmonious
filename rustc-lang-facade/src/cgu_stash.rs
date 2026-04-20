@@ -16,10 +16,18 @@
 //! taking a live `TyCtxt<'tcx>` and reconstituting the slice as
 //! `&'tcx [CodegenUnit<'tcx>]` — the caller is responsible for matching `'tcx`.
 //!
-//! The facade's `codegen_wrapper::LangCodegenBackend::codegen_crate` clears
-//! the stash on entry so a new compilation starts fresh. The stash pointer
-//! itself lives in `tcx.arena`, which survives for the lifetime of the
-//! `TyCtxt` it came from; reads within that `TyCtxt` are sound.
+//! `LangDriver::config` clears the stash at the start of every compile
+//! session so a new compilation starts fresh. Clearing cannot be deferred
+//! to `LangCodegenBackend::codegen_crate`: under the stage 5b two-crate
+//! architecture the partitioner override fires during rlib metadata setup
+//! (before `codegen_crate` runs) and clearing there would wipe a valid
+//! pre-codegen stash. The stash pointer itself lives in `tcx.arena`, which
+//! survives for the lifetime of the `TyCtxt` it came from; reads within
+//! that `TyCtxt` are sound.
+//!
+//! See `docs/architecture/risks.md` §B5 for the long-term risk profile of
+//! the lifetime-erased stash (category B: bounded-cost redesign if rustc's
+//! `CodegenUnit<'tcx>` arena semantics shift).
 
 use rustc_middle::mir::mono::CodegenUnit;
 use rustc_middle::ty::TyCtxt;
@@ -51,8 +59,10 @@ pub(crate) fn stash_upstream_cgus<'tcx>(cgus: &'tcx [CodegenUnit<'tcx>]) {
     });
 }
 
-/// Clear the stash. Called at the start of every `LangCodegenBackend::codegen_crate`
-/// so a new compilation doesn't see a stale pointer from a prior one.
+/// Clear the stash. Called from `LangDriver::config` at the start of every
+/// compile session so a new compilation doesn't see a stale pointer from
+/// a prior one. See module-level docs for why clearing lives in `config`
+/// rather than `codegen_crate`.
 pub(crate) fn clear_upstream_cgus() {
     if let Some(slot) = STASH.get() {
         let mut g = slot.lock().unwrap();

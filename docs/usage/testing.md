@@ -13,7 +13,7 @@ No forked toolchain needed. The historical fork-rebuild workflow — useful only
 ## Run the test suite
 
 ```bash
-# Full suite (67 unit + 127 integration_projects + 15 standalone = 209; 0 failed, 0 ignored)
+# Full suite (67 unit + 128 integration_projects + 15 standalone = 210; 0 failed, 0 ignored)
 cargo +nightly-2025-01-15 test -p toylangc
 
 # Just integration projects (toylangc build each project under

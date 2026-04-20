@@ -17,10 +17,20 @@
 //! from reachable would alter behavior for those downstream callers. The
 //! filter applies only to CGU placement.
 //!
-//! Stage 4 intent: once this override is shipping and consumer items never
-//! reach rustc's codegen dispatch, the existing `CODEGEN_SKIP_HOOK` becomes
-//! vestigial — it fires only if the filter missed something. Sub-stage 4b
-//! retires the hook once 4a's filter is proven exhaustive.
+//! Stage 4a's CGU filter replaced the `CODEGEN_SKIP_HOOK` fork patch (stage
+//! 4b retired the hook once the filter was proven exhaustive — both stages
+//! now shipped). The `(Linkage::External, Visibility::Default)` mutation
+//! below replaced the `VISIBILITY_OVERRIDE_HOOK` fork patch (stage 4c).
+//! Together these two post-partition mutations are the load-bearing piece
+//! of the Outcome A assumption — see `docs/architecture/risks.md` §B2 for
+//! the timing assumptions (internalization runs inside upstream's default
+//! partitioner, and the LLVM backend reads `data.linkage` from the returned
+//! CGU slice without re-derivation) and what breaks if they shift.
+//!
+//! `is_from_lang_stubs` (crate-name check) is the canonical cross-phase-safe
+//! predicate — see `@DPSFDOZ`. Do not introduce `def_path_str`-based
+//! matching here; partitioner-time is one of the non-diagnostic contexts
+//! where `def_path_str` ICEs.
 
 use rustc_hir::def_id::DefIdSet;
 use rustc_middle::mir::mono::{CodegenUnit, Linkage, MonoItemData, Visibility};
