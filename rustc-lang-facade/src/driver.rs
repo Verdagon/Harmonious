@@ -2,14 +2,18 @@
 //!
 //! This module owns the full compilation lifecycle: it takes the consumer's
 //! `LangCallbacks` implementation, sets up the rustc session with all the
-//! necessary hooks (FileLoader, query overrides, CodegenBackend wrapper),
-//! and runs the compilation.
+//! necessary hooks (query overrides + CodegenBackend wrapper), and runs the
+//! compilation.
 //!
 //! The consumer never interacts with rustc directly — they implement the
 //! `LangCallbacks` trait and call `run_compiler`. Everything else is handled
 //! here and in the query/codegen modules.
-
-#![allow(unused)]
+//!
+//! Stage 5c.4 retired `FileLoader` stub injection. Under the current two-
+//! crate architecture the stub rlib is a real on-disk crate compiled by
+//! cargo; there's nothing to intercept. The `generate_stubs` callback is
+//! retired along with it — wrapper mode's `build::write_stub_crate`
+//! generates the stub rlib's `src/lib.rs` directly via `stub_gen::generate`.
 
 use rustc_driver::Compilation;
 use rustc_interface::Config;
@@ -19,7 +23,7 @@ use crate::LangCallbacks;
 
 /// Entry point for consumers. Takes a concrete `LangCallbacks` implementation
 /// and rustc command-line arguments. Handles the full driver lifecycle:
-/// stub injection, query overrides, codegen backend wrapping.
+/// query overrides + codegen backend wrapping.
 ///
 /// This function is generic over `C: LangCallbacks` — it monomorphizes the
 /// vtable trampolines for the concrete consumer type at compile time. Internally
@@ -41,23 +45,14 @@ pub fn run_compiler<C: LangCallbacks + 'static>(
     callbacks: C,
     rustc_args: &[String],
 ) {
-    let stubs = callbacks.generate_stubs();
     crate::install_callbacks(callbacks);
     // Always install the codegen backend wrapper. If generate_and_compile
     // returns None at runtime, no .o gets injected — no harm done.
-    let mut driver = LangDriver::new(stubs);
+    let mut driver = LangDriver;
     rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
 }
 
-struct LangDriver {
-    stubs: String,
-}
-
-impl LangDriver {
-    fn new(stubs: String) -> Self {
-        Self { stubs }
-    }
-}
+struct LangDriver;
 
 impl rustc_driver::Callbacks for LangDriver {
     fn config(&mut self, config: &mut Config) {
@@ -72,9 +67,6 @@ impl rustc_driver::Callbacks for LangDriver {
         // `codegen_wrapper.rs` for the full reasoning.
         crate::clear_upstream_cgus();
 
-        config.file_loader = Some(Box::new(
-            crate::file_loader::LangFileLoader::new(self.stubs.clone())
-        ));
         config.override_queries = Some(crate::queries::lang_override_queries);
         config.make_codegen_backend = Some(Box::new(|_opts| {
             crate::codegen_wrapper::LangCodegenBackend::new()

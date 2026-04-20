@@ -4,7 +4,7 @@
 
 This document catalogs the specific ways erw's architecture could degrade or fail over time, and what to do when each one fires. It's the companion to the architectural optimism in `rust-interop-guide.md` — that doc describes what works today; this one describes where the edges are.
 
-The framing throughout: erw embeds a custom language into rustc's compilation pipeline via sanctioned extension points (`Config::override_queries`, `FileLoader`, `CodegenBackend` wrapping). Zero rustc fork patches as of stage 4 (commits `ed2e692` → `c25aa4b`). The architecture is built on decade-old rustc infrastructure, but rustc internals are explicitly-unstable-but-shape-stable — individual APIs drift, the overall integration model persists.
+The framing throughout: erw embeds a custom language into rustc's compilation pipeline via sanctioned extension points (`Config::override_queries`, `CodegenBackend` wrapping) plus a real on-disk two-crate cargo workspace (stub rlib + user bin) that rustc compiles as ordinary Rust. Zero rustc fork patches as of stage 4 (commits `ed2e692` → `c25aa4b`); stage 5c.4 retired `FileLoader` and the direct-mode `--toylang-input` path, so the stub rlib is now always a real on-disk crate. The architecture is built on decade-old rustc infrastructure, but rustc internals are explicitly-unstable-but-shape-stable — individual APIs drift, the overall integration model persists.
 
 ---
 
@@ -35,7 +35,7 @@ These are the "whole architecture stops working" scenarios. Each is unlikely and
 - RFC proposing removal or hard-gating.
 - Public communication from the compiler team signaling sunset.
 
-**Mitigation.** Monitor the compiler-team roadmap and `rustc_public` trajectory. If `rustc_public` stabilizes enough to replace significant portions of our rustc-internal surface, the migration becomes a proactive option. Today `rustc_public` covers ~40-50% of our read-side surface — the other half (query providers, MIR construction, `CodegenBackend` integration, `FileLoader`, partitioner hooks) has no stable equivalent on any current roadmap.
+**Mitigation.** Monitor the compiler-team roadmap and `rustc_public` trajectory. If `rustc_public` stabilizes enough to replace significant portions of our rustc-internal surface, the migration becomes a proactive option. Today `rustc_public` covers ~40-50% of our read-side surface — the other half (query providers, MIR construction, `CodegenBackend` integration, partitioner hooks) has no stable equivalent on any current roadmap.
 
 **Reaction if it fires.** Two possible paths:
 - **Fork rustc** — the pre-stage-4 model. The three POC/spike worktrees + `docs/historical/rebuilding-rustc-fork.md` preserve the full fork-rebuild workflow. This is a multi-week retreat but viable; erw shipped with a 5-patch fork for most of its history.
@@ -274,7 +274,7 @@ Your risk correlates with this cohort. If rustc ever threatens any single one of
 
 ### `rustc_public` trajectory
 
-The stable-MIR effort (now `rustc_public`) covers ~40–50% of our read-side rustc surface. If it eventually stabilizes, that portion of erw becomes stable-Rust-compatible. The load-bearing pieces (query providers, MIR construction, `CodegenBackend`, `FileLoader`, partitioner hooks) have no equivalent on the stabilization roadmap, but even partial migration would reduce drift surface meaningfully. See `docs/reasoning/rustc-fork-design-space.md` §4.4 for the current coverage breakdown.
+The stable-MIR effort (now `rustc_public`) covers ~40–50% of our read-side rustc surface. If it eventually stabilizes, that portion of erw becomes stable-Rust-compatible. The load-bearing pieces (query providers, MIR construction, `CodegenBackend`, partitioner hooks) have no equivalent on the stabilization roadmap, but even partial migration would reduce drift surface meaningfully. See `docs/reasoning/rustc-fork-design-space.md` §4.4 for the current coverage breakdown.
 
 ### Nightly-pin strategy
 

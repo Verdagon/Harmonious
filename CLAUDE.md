@@ -29,6 +29,6 @@ Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Int
 ## Building & testing
 
 ```bash
-cargo +nightly-2025-01-15 test          # run all tests (67 unit + 129 integration + 15 standalone = 211)
+cargo +nightly-2025-01-15 test          # run all tests (67 unit + 127 integration_projects + 15 standalone = 209)
 cargo +nightly-2025-01-15 test --test integration_tests test_name  # run one test
 ```

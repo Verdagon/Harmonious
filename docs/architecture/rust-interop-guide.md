@@ -1,14 +1,19 @@
 # Rust Interop via rustc Query Provider: Architecture Guide
 
-> **Current status:** 211 tests passing (67 unit + 129 integration + 15
+> **Current status:** 209 tests passing (67 unit + 127 integration_projects + 15
 > standalone), 0 failed, 0 ignored. **Zero rustc fork patches — built
 > against vanilla `nightly-2025-01-15`.** All rustc integration flows
-> through `Config::override_queries`, `FileLoader`, and a `CodegenBackend`
-> wrapper — no fork, no hook statics.
+> through `Config::override_queries` and a `CodegenBackend` wrapper — no
+> fork, no FileLoader, no hook statics. Two-crate architecture: the stub
+> rlib is a real on-disk cargo package; toylang code lives in a separate
+> user-bin crate that path-depends on it.
 >
-> All 8 implementation phases complete. Fork-reduction roadmap fully
-> shipped (stages 1–4: `ed2e692`, `b345162`, `ce437ae`/`bf770ae`/`da7ad87`,
-> `1d862f4`/`13d8f12`/`51f0c5e`/`d044560`/`c25aa4b`).
+> All 8 implementation phases complete. Fork-reduction + architectural-
+> readiness roadmap fully shipped (stages 1–5: `ed2e692`, `b345162`,
+> `ce437ae`/`bf770ae`/`da7ad87`, `1d862f4`/`13d8f12`/`51f0c5e`/`d044560`/
+> `c25aa4b`, `6bda10c`/`b6a2bf6`/`91cad25`/`05fed63`/`a2f06ea`/`6d65831`/
+> `1ae7fd4`/`b3e276d` + the stage-5c.4 landing that retired direct mode +
+> FileLoader).
 >
 > **Per-phase history:** `docs/historical/phase-history.md`.
 > **Architectural decisions** (why each choice): `docs/reasoning/architecture-decisions.md`.
@@ -25,7 +30,7 @@ Two-crate workspace:
 Built against vanilla `nightly-2025-01-15` via rustup — zero rustc fork patches. All rustc integration flows through sanctioned extension points:
 
 - **`Config::override_queries`** installs six query overrides (`optimized_mir`, `symbol_name`, `layout_of`, `mir_shims`, `collect_and_partition_mono_items`, `upstream_monomorphizations_for`).
-- **`FileLoader`** injects `__lang_stubs.rs` as a virtual source file.
+- **Stub rlib as a real cargo package** (stage 5b/5c): `toylangc build` emits a two-member workspace at `<project>/.toylang-build/` with `lang_stubs_crate/` (rlib, stub struct defs + `pub use` re-exports + extern accessor decls) and `user_bin/` (bin, `fn main() { __toylang_main(); }` shim path-depending on the stub rlib). Stage 5c.4 retired the earlier FileLoader-based stub injection.
 - **`CodegenBackend` wrapper** (`codegen_wrapper.rs`) sits between cargo's driver and `LlvmCodegenBackend`, injects the consumer's `.o` at `join_codegen`.
 
 Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Internal consumer functions are never exposed to rustc — they are discovered via deep monomorphization walk and compiled separately by an Inkwell LLVM backend. A global mutex serializes all consumer code (single-threaded).
@@ -48,8 +53,10 @@ Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Int
 ┌──────────────────────────────────────────────────────────────────┐
 │  rustc session (consumer embedded as query providers)            │
 │                                                                  │
-│  4. FileLoader injects __lang_stubs.rs (opaque structs,          │
-│     accessor methods, wrapper functions — all unreachable!())    │
+│  4. Stub rlib (`lang_stubs_crate/src/lib.rs`) contains opaque    │
+│     unit structs, accessor impls, wrapper fns — all `unreachable!()`.│
+│     Written by `toylangc build`'s `write_stub_crate` before cargo    │
+│     dispatches compilation.                                      │
 │  5. rustc parses, type-checks, borrow-checks normally            │
 │     (unreachable!() bodies are valid Rust — no overrides needed) │
 │  6. Monomorphization begins (inside codegen_crate)               │
@@ -432,18 +439,17 @@ Tests can set `TOYLANG_LOG_PATH` env var to dump the log to a file, then assert 
 | `abi_helpers.rs` | ABI coercion helpers: `CoercedReturn`, `CoercedParam` (incl. `Pair` variant for ScalarPair, see `@ACRTFDZ`); hidden `#[track_caller]` param (see `@TCHAPZ`) |
 | `mir_helpers.rs` | Drop glue MIR builder |
 | `codegen_wrapper.rs` | CodegenBackend wrapper, .o injection at `join_codegen` |
-| `driver.rs` | `run_compiler` entry point |
-| `file_loader.rs` | Stub injection via rustc's `FileLoader` trait |
+| `driver.rs` | `run_compiler` entry point (installs query overrides + codegen wrapper) |
 
 ### Consumer (`toylangc/src/`)
 
 | File | Purpose |
 |------|---------|
 | `llvm_gen.rs` | Inkwell LLVM backend: instance discovery, two-pass codegen, Rust method resolution, FnCall use-import path with ABI return coercion (`@ACRTFDZ`) |
-| `stub_gen.rs` | Generates `__lang_stubs.rs` content |
+| `stub_gen.rs` | Generates `__lang_stubs.rs` content (written to `lang_stubs_crate/src/lib.rs` by `build::write_stub_crate`; consumed by cargo as an ordinary Rust source file) |
 | `oracle.rs` | TyCtxt query helpers, type conversion, symbol mangling, `ActiveParamMap` thread-local |
-| `main.rs` | CLI entry point — three-mode dispatch (build / wrapper / direct) |
-| `build.rs` | `toylangc build` — generates `.toylang-build/` Cargo project, spawns cargo (see `@MRRIWMZ`) |
+| `main.rs` | CLI entry point — two-mode dispatch (build / wrapper). Direct mode retired in 5c.4. |
+| `build.rs` | `toylangc build` — generates `.toylang-build/` two-member workspace (stub rlib + user bin), spawns cargo with the self-executable as `RUSTC_WORKSPACE_WRAPPER` (see `@MRRIWMZ`) |
 | `manifest.rs` | `toylang.toml` parser |
 | `toylang/ast.rs` | Untyped AST |
 | `toylang/typed_ast.rs` | `ResolvedType` enum, `TypedBlock`, `TypedStmt` |

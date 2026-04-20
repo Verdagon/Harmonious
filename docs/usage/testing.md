@@ -13,20 +13,21 @@ No forked toolchain needed. The historical fork-rebuild workflow — useful only
 ## Run the test suite
 
 ```bash
-# Full suite (67 unit + 129 integration + 15 standalone = 211; 0 failed, 0 ignored)
+# Full suite (67 unit + 127 integration_projects + 15 standalone = 209; 0 failed, 0 ignored)
 cargo +nightly-2025-01-15 test -p toylangc
 
-# Just integration tests
-cargo +nightly-2025-01-15 test -p toylangc --test integration_tests
+# Just integration projects (toylangc build each project under
+# toylangc/tests/integration_projects/<name>/, run binary, check stdout)
+cargo +nightly-2025-01-15 test -p toylangc --test integration_projects
 
 # Just unit tests (embedded in the toylangc binary)
 cargo +nightly-2025-01-15 test -p toylangc --bin toylangc
 
-# Just standalone tests
+# Just standalone tests (larger projects that depend on real crates.io crates)
 cargo +nightly-2025-01-15 test -p toylangc --test standalone_tests
 
 # Run a specific test
-cargo +nightly-2025-01-15 test -p toylangc --test integration_tests test_name
+cargo +nightly-2025-01-15 test -p toylangc --test integration_projects test_name
 ```
 
 ## Check for warnings

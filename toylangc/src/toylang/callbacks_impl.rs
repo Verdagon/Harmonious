@@ -223,14 +223,14 @@ impl LangPredicates for ToylangCallbacks {
         self.registry.functions.get(name).map_or(false, |f| f.body.is_some())
     }
 
-    fn generate_stubs(&self) -> String {
-        crate::stub_gen::generate(&self.registry)
-    }
-
     // Stage 4c retired the `visibility_override` trait method: the
     // facade's partitioner override now forces `(External, Default)` on
     // `__lang_stubs` items directly in the CGU slice. No consumer-side
     // predicate needed.
+    //
+    // Stage 5c.4 retired the `generate_stubs` trait method: wrapper mode's
+    // `build::write_stub_crate` calls `stub_gen::generate` directly when
+    // writing the stub rlib's `src/lib.rs`. No facade-level callback.
 }
 
 impl LangCallbacks for ToylangCallbacks {

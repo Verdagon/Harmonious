@@ -170,9 +170,9 @@ Net 596 → 334 lines (-44%). The helper enforces the project-dir-name = `[proje
 
 ---
 
-## Fork-reduction stages (1–4)
+## Fork-reduction stages (1–4) + architecture-readiness stage 5
 
-After Phase 8, the fork-reduction roadmap. Five stages planned, four shipped (stage 5 absorbed into 4c via Outcome A). Net: 5-patch fork → 0 patches.
+After Phase 8, the fork-reduction roadmap. Five stages planned, four shipped stages 1–4 reduced the fork from 5 patches to 0. Stage 5 originally scoped alongside 4 was deferred; it shipped later as the two-crate architecture migration (see below the stage-4 section).
 
 ### Stage 1 — `LangCallbacks` job-split (commit `ed2e692`)
 
@@ -196,7 +196,20 @@ Four sub-commits:
 - **4c** (`d044560`): **Outcome A landing.** Plugin's partitioner override mutates `MonoItemData.linkage` directly — LLVM reads `data.linkage` without re-derivation, so `(Linkage::External, Visibility::Default)` on `__lang_stubs` items survives to emission. `VISIBILITY_OVERRIDE_HOOK` retired (facade + fork). Fork at 0 patches.
 - **4d** (`c25aa4b`): toolchain switch (vanilla `nightly-2025-01-15`) + full doc pass + handoff move to historical.
 
-The original stage-4 roadmap scoped separate-crate stubs + `FileLoader` retirement as part of the work. A TL investigation mid-stage-4 (see `docs/historical/handoff-codegen-backend-plugin.md` §6.9) established that Outcome A reaches zero-fork without the separate-crate migration. Stage 5 collapsed into stage 4c; `FileLoader` preserved as-is indefinitely.
+The original stage-4 roadmap scoped separate-crate stubs + `FileLoader` retirement as part of the work. A TL investigation mid-stage-4 (see `docs/historical/handoff-codegen-backend-plugin.md` §6.9) established that Outcome A reaches zero-fork without the separate-crate migration. Stage 5 was deferred and eventually shipped as a separate roadmap (see below); `FileLoader` preserved through stages 5a/5b as the single-crate stub-injection mechanism.
+
+### Stage 5 — Two-crate architecture (stubs become a real rlib)
+
+Vale-fork-readiness work. Migrates both compile modes from FileLoader-injected stubs to a two-crate architecture (stubs in their own rlib; user code in a separate crate that depends on it). Preserves zero-fork; the work is about what the integration *shape* looks like for someone else to build on, not about what rustc requires.
+
+- **5a** (`6bda10c`): cross-crate oracle. Unified the eight `find_*` name-resolution helpers in `toylangc/src/oracle.rs` behind a single `resolve_rust_path(tcx, path, kind_filter)` walker that tries the local crate root first, then falls back to walking the extern `__lang_stubs` rlib's `module_children`. Behavior-preserving under single-crate FileLoader (five of the helpers collapse to one-liner adapters); becomes load-bearing under 5b's two-crate shape.
+- **5b** (`b6a2bf6`): wrapper-mode two-crate. `toylangc build` emits a two-member Cargo workspace at `<project>/.toylang-build/` with `lang_stubs_crate/` (rlib, contains stub struct defs + `pub use` re-exports + extern decls; src from `stub_gen::generate`) and `user_bin/` (bin, path-depends on the stub rlib, `fn main() { __toylang_main(); }` shim). `CARGO_PRIMARY_PACKAGE` + `CARGO_PKG_NAME` distinguish the two compiles at the wrapper; `is_downstream_of_stubs` gates the user-bin compile from running the codegen side of `generate_and_compile`. `upstream_monomorphizations_for` (scaffolded in 4c as ~40 LoC) becomes load-bearing for the first time, routing generic consumer wrappers (`__toylang_option_unwrap<T>`) locally in the user-bin compile.
+- **5c.1** (`91cad25` + `05fed63`): integration-test orchestration. Cargo `[[package]]` unique-per-project naming in `write_stub_crate` (cargo dedupes by `(name, version, source)`, so every project needs a distinct package name under a shared `CARGO_TARGET_DIR`). Shared `CARGO_TARGET_DIR` lets `test_helpers` + crates.io deps compile once across the suite. `CARGO_INCREMENTAL=0` scoped to the test harness (risks.md §B6: rustc's incremental cache can short-circuit side-effecting query providers). 3 canary projects landed.
+- **5c.2** (`a2f06ea` + `6d65831`): 93-test migration + `test_helpers` expansion. Established the ABI conventions for test_helpers (primitives via `#[no_mangle] pub extern "C"`, fat pointers + `Option`/`Result` via the same plus `#[allow(improper_ctypes_definitions)]`). `build.rs` propagates `features = [...]` from `toylang.toml` to the stub rlib's `src/lib.rs` as well as the user bin's `src/main.rs`.
+- **5c.3** (`1ae7fd4`): stub_gen unit-struct fix (`pub struct Foo;` instead of `pub struct Foo(());` — aligns source field count with `layout_of(0-field)`, silences a `build_struct_type_di_node` "index out of bounds" ICE that fires when opaque consumer types appear inside `Vec<Foo, Global>` debuginfo). Two new harness helpers: `run_integration_project_expects_error` (substring match against toylangc stderr) and `run_integration_project_check_callbacks` (reads `TOYLANG_LOG_PATH` output). +22 test migrations.
+- **5c.4** (`b3e276d` + stage-5 landing commit): layout probe tests via `run_integration_project_check_build_stderr` harness; `lang_layout_of` log augmented with `size=N align=M`. Stage-5 landing: retire `FileLoader` + `file_loader.rs` + `generate_stubs` trait method, retire direct mode (`--toylang-input` argv handling + `run_direct_mode` + `extract_registry`). Delete `toylangc/tests/integration_tests.rs` (all 129 direct-mode tests — 127 have integration_projects counterparts; 2 accepted coverage loss: pre-existing bool codegen bug + Rust-side `drop_in_place`+runtime.o test with no wrapper-mode equivalent). `is_from_lang_stubs` / `is_from_lang_stubs_safe` collapse to a single `tcx.crate_name == "__lang_stubs"` check. §6.10 `#[linkage]` probe vacuously satisfied: the attribute was never emitted by stub_gen; partitioner-set-linkage has been the sole mechanism all along.
+
+Final test count: 209 (67 unit + 127 integration_projects + 15 standalone). Two-crate architecture complete; FileLoader retired; direct mode retired; zero-fork preserved.
 
 ---
 

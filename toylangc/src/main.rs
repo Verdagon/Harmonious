@@ -16,7 +16,7 @@ use crate::toylang::registry::ToylangRegistry;
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
 
-    // Mode 1: `toylangc build [manifest.toml]` — orchestrates cargo
+    // Mode 1: `toylangc build [manifest.toml]` — orchestrates cargo.
     if argv.get(1).map(|s| s.as_str()) == Some("build") {
         let manifest_path = argv
             .get(2)
@@ -26,8 +26,11 @@ fn main() {
     }
 
     // Mode 2: wrapper mode (invoked by cargo as RUSTC_WORKSPACE_WRAPPER).
-    // Cargo invokes as: toylangc <rustc-path> <rustc-args...>
-    // Detect by checking if argv[1] is a path whose basename is "rustc".
+    // Cargo invokes as: toylangc <rustc-path> <rustc-args...>, detected by
+    // argv[1] being a path whose basename is "rustc". The two-crate
+    // architecture (stage 5b) drives every toylang compile through this
+    // mode; stage 5c.4 retired the former `--toylang-input`-based direct
+    // mode along with FileLoader.
     let is_wrapper = argv.get(1).map_or(false, |s| {
         Path::new(s)
             .file_stem()
@@ -39,29 +42,12 @@ fn main() {
         return;
     }
 
-    // Mode 3: direct mode (existing behavior — --toylang-input in args)
-    run_direct_mode(argv);
-}
-
-/// Direct mode: toylangc invoked with `--toylang-input <path>` and normal
-/// rustc args. Used by integration tests. Unchanged existing behavior.
-fn run_direct_mode(argv: Vec<String>) {
-    rustc_driver::install_ice_hook(
-        "https://github.com/your-org/toylang/issues",
-        |_| {},
+    eprintln!(
+        "toylangc: expected `toylangc build [manifest.toml]` or invocation as \
+         RUSTC_WORKSPACE_WRAPPER (argv[1] a path to rustc). Got argv = {:?}",
+        argv,
     );
-
-    let exit_code = rustc_driver::catch_with_exit_code(|| {
-        let mut args = argv;
-        let registry = extract_registry(&mut args);
-        // Direct mode is single-compile (FileLoader-injected stubs); never
-        // downstream-of-stubs. Stage 5c will move integration tests onto the
-        // two-crate path with its own helper.
-        run_toylang_compile(registry, args, false);
-        Ok(())
-    });
-
-    std::process::exit(exit_code);
+    std::process::exit(2);
 }
 
 /// Wrapper mode: cargo invoked us as RUSTC_WORKSPACE_WRAPPER.
@@ -158,7 +144,7 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
     std::process::exit(exit_code);
 }
 
-/// Shared toylang compilation path used by both direct and wrapper modes.
+/// Toylang compilation path invoked from wrapper mode.
 ///
 /// `is_downstream_of_stubs` is true for the user-bin compile in stage-5
 /// two-crate wrapper mode. In that mode the stub rlib has already produced
@@ -206,20 +192,6 @@ impl rustc_driver::Callbacks for NoopCallbacks {}
 fn run_plain_rustc(args: &[String]) {
     let mut cb = NoopCallbacks;
     rustc_driver::RunCompiler::new(args, &mut cb).run();
-}
-
-fn extract_registry(args: &mut Vec<String>) -> ToylangRegistry {
-    if let Some(pos) = args.iter().position(|a| a == "--toylang-input") {
-        if pos + 1 < args.len() {
-            let path = args[pos + 1].clone();
-            args.drain(pos..=pos + 1);
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("toylang: cannot read {}: {}", path, e));
-            return crate::toylang::parser::parse(&src)
-                .unwrap_or_else(|e| panic!("toylang: parse error in {}: {:?}", path, e));
-        }
-    }
-    panic!("toylang: missing --toylang-input argument")
 }
 
 fn find_sysroot_tool(tool_name: &str) -> PathBuf {

@@ -15,24 +15,24 @@ doc in the repo.
   framework by compiling toylang programs that call into real
   crates.io Rust crates.
 - **Current state:** all 8 implementation phases complete + fork-
-  reduction roadmap **fully shipped, zero fork patches.** 211 tests
-  passing (67 unit + 129 integration + 15 standalone), 0 failed,
-  0 ignored, against vanilla `nightly-2025-01-15` installed via
-  rustup. Stages 1–4 committed: `ed2e692` (callback job-split),
-  `b345162` (cross-crate backend cleanup), `ce437ae` / `bf770ae` /
-  `da7ad87` (Stage 3 — `optimized_mir` override, 5 patches → 2),
-  `1d862f4` (Stage 4a — partitioner override filters consumer items
-  from CGUs), `13d8f12` (Stage 4b — `CODEGEN_SKIP_HOOK` retired,
-  1 patch remaining), `51f0c5e` (Stage 4c step 1 —
-  `upstream_monomorphizations_for` override scaffolding), `d044560`
-  (Stage 4c — `VISIBILITY_OVERRIDE_HOOK` retired via plugin-set
-  linkage, 0 patches), plus Stage 4d for toolchain switch + doc
-  pass.
-- **Active work:** none. Fork-reduction roadmap complete.
-  `FileLoader`-injected stub model is preserved as-is (retirement
-  was not pursued — Outcome A from the 2026-04-19 TL investigation
-  showed zero-fork was reachable without it, so single-crate
-  `FileLoader` stays indefinitely for simplicity).
+  reduction roadmap **fully shipped, zero fork patches** + stage-5
+  two-crate architecture migration **fully shipped, FileLoader +
+  direct mode retired.** 209 tests passing (67 unit + 127
+  integration_projects + 15 standalone), 0 failed, 0 ignored,
+  against vanilla `nightly-2025-01-15` installed via rustup. Stages
+  1–4 committed: `ed2e692`, `b345162`, `ce437ae`/`bf770ae`/`da7ad87`,
+  `1d862f4`, `13d8f12`, `51f0c5e`, `d044560`, `c25aa4b`. Stage 5
+  committed: `6bda10c` (5a cross-crate oracle), `b6a2bf6` (5b
+  wrapper-mode two-crate), `91cad25`/`05fed63` (5c.1 integration-test
+  orchestration), `a2f06ea`/`6d65831` (5c.2 93-test migration +
+  test_helpers expansion), `1ae7fd4` (5c.3 stub_gen unit-struct fix
+  + error/callback harnesses), `b3e276d` (5c.4 layout probes) + the
+  stage-5 landing commit (FileLoader + direct-mode retirement).
+- **Active work:** none. Stages 1–4 (fork reduction) and stage 5
+  (two-crate architecture) both complete. Erw now compiles toylang
+  projects via a real on-disk two-crate cargo workspace (stub rlib
+  + user bin) with vanilla nightly rustc; no stub injection, no
+  FileLoader, no direct-mode CLI.
 - **Open outbound:** a response draft to the Vale team
   (`response-reducing-rustc-fork.md`, repo root, ~168 lines). Not
   sent; its content is partially superseded by stages 1/2/3 having
@@ -43,14 +43,15 @@ doc in the repo.
 
 ## 2. What's in flight
 
-- **No active junior handoffs.** Stages 1–4 all landed cleanly;
-  their handoff docs are in `docs/historical/`
-  (`handoff-codegen-backend-plugin.md` among them). The
-  `FileLoader` retirement / separate-crate-stubs migration was
-  scoped and then explicitly dropped during Stage 4c — the TL's
-  investigation found that plugin-set linkage in the partitioner
-  override retires `VISIBILITY_OVERRIDE_HOOK` without needing any
-  of it. `FileLoader` stays indefinitely.
+- **No active junior handoffs.** Stages 1–4 (fork reduction) and
+  stage 5 (two-crate architecture) all landed cleanly; their
+  handoff docs live in `docs/historical/`
+  (`handoff-codegen-backend-plugin.md` for stage 4,
+  `handoff-two-crate-migration.md` for stage 5). The FileLoader
+  retirement originally scoped under stage 4 was deferred because
+  plugin-set linkage in the partitioner override reached zero-fork
+  without it; it ultimately landed under stage 5c.4 alongside the
+  direct-mode retirement.
 - **Three POC/spike branches** (`poc/optimized-mir-override`,
   `poc/separate-crate-stubs`, `spike/modulellvm-wall`) remain at
   `/Users/verdagon/erw-poc-*` and `/Users/verdagon/erw-spike-*`.
@@ -400,8 +401,9 @@ the `collect_and_partition_mono_items` override). Toylang now
 builds against vanilla `nightly-2025-01-15` via rustup — zero
 fork patches. The `~/rust` forked working tree is empty and
 deletable; the `rustc-fork` rustup link is vestigial and safe to
-uninstall. `FileLoader`-injected single-crate stubs stay in
-place indefinitely (the 2026-04-19 Outcome-A investigation
-showed it wasn't load-bearing for zero-fork). Handoff is "the
-roadmap is complete — here's what's done and how it's all
+uninstall. Stage 5 (two-crate architecture + FileLoader retirement
++ direct-mode retirement) also shipped, completing the Vale-fork-
+readiness story: a greenfield consumer like Vale can reuse erw's
+shape as-is without any stub-injection trickery. Handoff is "the
+roadmaps are complete — here's what's done and how it's all
 wired."

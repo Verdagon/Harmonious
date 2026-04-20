@@ -192,9 +192,9 @@ the type and tells you where it came from — add the import and rerun.
   special-case).
 - `docs/arcana/UnsizedTypesAppearInsideRef-UTAIRZ.md` — why string
   literals produce `&str` (used in the rule-3 worked example).
-- `toylangc/tests/integration_tests.rs::test_stdout_write_all`,
-  `test_write_all_result_bound` — canonical working patterns for
-  I/O in toylang.
+- `toylangc/tests/integration_projects/stdout_write_all/main.toylang`,
+  `toylangc/tests/integration_projects/write_all_result_bound/main.toylang`
+  — canonical working patterns for I/O in toylang.
 - `toylangc/tests/standalone/uuid_test/main.toylang` — canonical
   zero-generics standalone project.
 - `toylangc/tests/standalone/clap_test/main.toylang` — canonical

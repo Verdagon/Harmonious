@@ -24,7 +24,6 @@ extern crate rustc_target;
 pub mod abi_helpers;
 pub mod codegen_wrapper;
 pub mod driver;
-pub mod file_loader;
 pub mod mir_helpers;
 pub mod queries;
 
@@ -85,12 +84,15 @@ pub trait LangPredicates: Send + Sync {
     /// Check if a function name belongs to the consumer's language.
     fn is_consumer_fn(&self, name: &str) -> bool;
 
-    /// Generate the Rust source code to inject via FileLoader.
-    fn generate_stubs(&self) -> String;
-
     // Stage 4c retired `visibility_override`: the partitioner override in
     // `queries::partition` now forces `(External, Default)` on
     // `__lang_stubs` items directly. No trait method needed.
+    //
+    // Stage 5c.4 retired `generate_stubs`: under the two-crate architecture
+    // the stub rlib's `src/lib.rs` is written by the consumer's build-mode
+    // path (e.g. `toylangc build`'s `write_stub_crate`), not injected into
+    // rustc at compile time. The facade no longer needs to know how to
+    // generate stubs.
 }
 
 /// Stateful callbacks: each takes `&mut dyn Any state` (downcast to your
@@ -283,63 +285,29 @@ pub(crate) fn is_consumer_type(name: &str) -> bool {
     (c.predicate_vtable.is_consumer_type)(&*c.callbacks, name)
 }
 
-/// Check if a DefId is from the consumer's `__lang_stubs` (injected module
-/// or — under stage-5 two-crate — the rlib crate of that name).
+/// Check if a DefId is from the consumer's `__lang_stubs` rlib.
 ///
-/// Per @DPSFDOZ, this uses `def_path_str` and is therefore safe ONLY from
-/// callers that run inside `generate_and_compile` (where rustc's diagnostic
-/// machinery is permissive). Calling this from a query provider, the
-/// partitioner, or any other normal-compilation hot path will ICE with
-/// `'trimmed_def_paths' called, diagnostics were expected but none were
-/// emitted`. For those contexts, use `is_from_lang_stubs_safe` which walks
-/// `DefPathData` structurally.
+/// Under the current two-crate architecture the stub items live in their
+/// own rlib crate named `__lang_stubs`. Both the rlib's own compile
+/// (items local to LOCAL_CRATE, which IS `__lang_stubs`) and the user-
+/// bin compile (items in an extern crate of that name) are handled by
+/// the same `tcx.crate_name` check. Stage 5c.4 retired the FileLoader-
+/// injected `mod __lang_stubs {}` fallback along with direct mode.
+///
+/// `is_from_lang_stubs_safe` is a thin alias retained for historical
+/// call sites — the safe/unsafe distinction mattered under the former
+/// string-based fallback which called `def_path_str` (@DPSFDOZ-gated);
+/// the crate-name check has no such restriction.
 pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    // Stage 5b two-crate fast path: the DefId lives in a crate named
-    // `__lang_stubs`. Handles both the rlib's own compile (items local to
-    // LOCAL_CRATE, which IS `__lang_stubs`) and the user-bin compile
-    // (items in an extern crate of that name). `def_path_str` trims the
-    // crate prefix for local items at the crate root, so the string check
-    // below can't cover this case — we take the crate name directly.
-    if tcx.crate_name(def_id.krate).as_str() == "__lang_stubs" {
-        return true;
-    }
-    // Single-crate FileLoader (direct mode, and wrapper mode pre-stage-5b):
-    // items are nested in `mod __lang_stubs {}` inside the user crate. The
-    // textual path includes the module name; check for it. Stage 5d retires
-    // this branch when FileLoader is deleted.
-    let path = tcx.def_path_str(def_id);
-    path.starts_with("__lang_stubs::") || path.contains("::__lang_stubs::")
+    tcx.crate_name(def_id.krate).as_str() == "__lang_stubs"
 }
 
-/// Cross-crate-safe variant of `is_from_lang_stubs`. Unlike that helper
-/// (which uses `def_path_str` and is @DPSFDOZ-gated to diagnostic
-/// contexts), this version inspects the crate name + walks `DefPathData`
-/// structurally and is safe to call from any phase — the partitioner,
-/// pre-`generate_and_compile` hooks, and any future cross-crate paths.
-///
-/// Slightly more expensive than `is_from_lang_stubs` (a small iterator walk
-/// after a constant-time crate-name check vs a string check), but both are
-/// dominated by the `tcx.def_path` query underneath so the difference is
-/// imperceptible.
-///
-/// Prefer this over `is_from_lang_stubs` when the call site might run
-/// outside `generate_and_compile`, or for the compile-time guarantee
-/// that @DPSFDOZ cannot bite.
+/// Alias for `is_from_lang_stubs` — same implementation. Kept as a
+/// separate symbol so existing call sites (partitioner, cross-crate
+/// query providers, oracle resolver) don't need a mechanical rename
+/// pass. Future clean-up may consolidate to the single name.
 pub fn is_from_lang_stubs_safe(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    // Stage 5b two-crate: the stub items live in their own rlib whose crate
-    // name is `__lang_stubs`. This handles both (a) the rlib's own compile
-    // (items are local to LOCAL_CRATE, whose name is `__lang_stubs`) and
-    // (b) the user-bin compile (items are in an extern crate of that name).
-    if tcx.crate_name(def_id.krate).as_str() == "__lang_stubs" {
-        return true;
-    }
-    // Single-crate FileLoader: items live in a `mod __lang_stubs {}` inside
-    // some other (user) crate. Walk the def-path data looking for the
-    // module name. Stage 5d retires this branch when FileLoader is deleted.
-    use rustc_hir::definitions::DefPathData;
-    tcx.def_path(def_id).data.iter().any(|d| {
-        matches!(d.data, DefPathData::TypeNs(name) if name.as_str() == "__lang_stubs")
-    })
+    is_from_lang_stubs(tcx, def_id)
 }
 
 /// Is this DefId a consumer-owned function whose real implementation
