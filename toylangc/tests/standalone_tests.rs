@@ -1,17 +1,23 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+// Duplicated here from `toylangc/src/main.rs`'s `TOYLANG_NIGHTLY` — integration
+// tests cannot import from a `[[bin]]`-only crate, so the pin is carried
+// independently. See HANDOFF-nightly-bump.md §3.2 and the `TOYLANG_NIGHTLY`
+// doc comment in main.rs for the bump-site inventory.
+const TOYLANG_NIGHTLY: &str = "nightly-2026-01-20";
+
 fn toylangc_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_toylangc"))
 }
 
 fn sysroot_lib() -> String {
-    // Zero-fork: standalone tests run against the same vanilla
-    // `nightly-2025-01-15` rustup toolchain as the rest of the suite.
+    // Zero-fork: standalone tests run against the same vanilla rustup
+    // toolchain as the rest of the suite (see `TOYLANG_NIGHTLY` above).
     // The historical `rustc-fork` toolchain (HANDOFF-TL.md §3d) is
     // vestigial and no longer referenced here.
     let out = Command::new("rustup")
-        .args(["run", "nightly-2025-01-15", "rustc", "--print=sysroot"])
+        .args(["run", TOYLANG_NIGHTLY, "rustc", "--print=sysroot"])
         .output()
         .expect("failed to run rustup");
     let sysroot = String::from_utf8(out.stdout).unwrap();

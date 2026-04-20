@@ -17,6 +17,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
+// Duplicated here from `toylangc/src/main.rs`'s `TOYLANG_NIGHTLY` — integration
+// tests cannot import from a `[[bin]]`-only crate, so the pin is carried
+// independently. See HANDOFF-nightly-bump.md §3.2 and the `TOYLANG_NIGHTLY`
+// doc comment in main.rs for the bump-site inventory.
+const TOYLANG_NIGHTLY: &str = "nightly-2026-01-20";
+
 /// Serialize `toylangc build` invocations across test threads.
 ///
 /// Background: integration_projects tests share a single
@@ -46,7 +52,7 @@ fn toylangc_bin() -> PathBuf {
 
 fn sysroot_lib() -> String {
     let out = Command::new("rustup")
-        .args(["run", "nightly-2025-01-15", "rustc", "--print=sysroot"])
+        .args(["run", TOYLANG_NIGHTLY, "rustc", "--print=sysroot"])
         .output()
         .expect("failed to run rustup");
     let sysroot = String::from_utf8(out.stdout).unwrap();

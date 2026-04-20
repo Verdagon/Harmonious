@@ -285,14 +285,14 @@ fn write_main_shim(user_dir: &Path, manifest: &Manifest) -> Result<(), String> {
 fn write_toolchain(build_dir: &Path) -> Result<(), String> {
     fs::write(
         build_dir.join("rust-toolchain.toml"),
-        "[toolchain]\nchannel = \"nightly-2025-01-15\"\n",
+        format!("[toolchain]\nchannel = \"{}\"\n", crate::TOYLANG_NIGHTLY),
     )
     .map_err(|e| format!("cannot write rust-toolchain.toml: {}", e))
 }
 
 fn sysroot_lib() -> Option<PathBuf> {
     let out = Command::new("rustc")
-        .arg("+nightly-2025-01-15")
+        .arg(format!("+{}", crate::TOYLANG_NIGHTLY))
         .arg("--print")
         .arg("sysroot")
         .output()
@@ -314,7 +314,7 @@ fn run_cargo_build(build_dir: &Path) -> i32 {
     };
 
     let mut cmd = Command::new("cargo");
-    cmd.arg("+nightly-2025-01-15")
+    cmd.arg(format!("+{}", crate::TOYLANG_NIGHTLY))
         .arg("build")
         .current_dir(build_dir)
         .env("RUSTC_WORKSPACE_WRAPPER", &self_exe);

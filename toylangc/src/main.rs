@@ -13,6 +13,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use crate::toylang::registry::ToylangRegistry;
 
+/// The pinned nightly rustc toolchain toylangc was built against. Referenced
+/// in code sites that spawn rustc or cargo via rustup's `+<pin>` selector,
+/// and written into the generated stub crate's `rust-toolchain.toml`. The
+/// pin is duplicated in `rust-toolchain.toml` at the repo root (the canonical
+/// anchor for `cargo`/`rustc` without a `+pin`) and independently in
+/// `tests/integration_projects.rs` and `tests/standalone_tests.rs` because
+/// the toylangc crate has no lib target, so integration tests cannot
+/// `use toylangc::TOYLANG_NIGHTLY`. When bumping the pin, update all four
+/// sites — see `HANDOFF-nightly-bump.md` §3.2.
+pub const TOYLANG_NIGHTLY: &str = "nightly-2026-01-20";
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
 
@@ -194,8 +205,9 @@ fn run_plain_rustc(args: &[String]) {
 }
 
 fn find_sysroot_tool(tool_name: &str) -> PathBuf {
+    let plus_pin = format!("+{}", TOYLANG_NIGHTLY);
     let sysroot = std::process::Command::new("rustc")
-        .arg("+nightly-2025-01-15")
+        .arg(&plus_pin)
         .arg("--print")
         .arg("sysroot")
         .output()
@@ -204,7 +216,7 @@ fn find_sysroot_tool(tool_name: &str) -> PathBuf {
     let sysroot = sysroot.trim();
 
     let host = std::process::Command::new("rustc")
-        .arg("+nightly-2025-01-15")
+        .arg(&plus_pin)
         .arg("-vV")
         .output()
         .expect("failed to run rustc -vV");
