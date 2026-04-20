@@ -105,9 +105,23 @@ pub trait LangCallbacks: LangPredicates {
     fn create_state(&self) -> Box<dyn Any + Send + Sync>;
 
     /// Monomorphize a consumer type for concrete type args.
+    ///
+    /// Stateless: no `&mut dyn Any state` param. Called from
+    /// `lang_layout_of`, which can re-enter during
+    /// `generate_and_compile` (whose trampoline holds MUTABLE_STATE).
+    /// Under rustc incremental cache + warm rebuild, `layout_of` queries
+    /// that fired cold during the mono walk get skipped on cache hit and
+    /// fire later when `codegen_extern_wrapper` calls
+    /// `coerced_return_type_for_instance → fn_abi_of_instance → layout_of`
+    /// — now inside the outer mutex. A stateful callback would re-lock
+    /// MUTABLE_STATE from `call_monomorphize_type` and deadlock. The
+    /// stateless signature lets the facade dispatcher skip the lock.
+    ///
+    /// Correspondingly, no per-call logging can happen here; the former
+    /// `CallbackLog::MonomorphizeType` entry is retired (unused by any
+    /// test or diagnostic).
     fn monomorphize_type<'tcx>(
         &self,
-        state: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         ty: Ty<'tcx>,
@@ -185,9 +199,12 @@ struct PredicateVtable {
 /// dispatching through this vtable lock `MUTABLE_STATE` for the duration of
 /// the call.
 struct StatefulVtable {
+    // `monomorphize_type` takes no state (unlike the other entries in
+    // this vtable). Dispatch via `call_monomorphize_type` skips the
+    // mutex — see trait method's doc comment for the re-entrancy
+    // rationale.
     monomorphize_type: for<'tcx> fn(
         &(dyn Any + Send + Sync),
-        &mut (dyn Any + Send + Sync),
         &str,
         TyCtxt<'tcx>,
         Ty<'tcx>,
@@ -362,8 +379,17 @@ pub(crate) fn is_consumer_fn(name: &str) -> bool {
     (c.predicate_vtable.is_consumer_fn)(&*c.callbacks, name)
 }
 
-/// Call the consumer's monomorphize_type. Holds the mutable state mutex for the entire call.
-pub(crate) fn call_monomorphize_type<'tcx>(
+/// Call the consumer's monomorphize_type. Lock-free — reads only from
+/// CONFIG (immutable `OnceLock`). Safe to call during
+/// `generate_and_compile` (whose trampoline holds MUTABLE_STATE) without
+/// risking re-entrant deadlock. The callback itself is stateless by
+/// contract (see trait docs).
+///
+/// `pub` so consumers can invoke it from their generate-phase code to
+/// log layout values directly (useful for tests that need a cache-
+/// independent log source — `lang_layout_of`'s eprintln fires via
+/// the query provider, which incremental can skip on cache hit).
+pub fn call_monomorphize_type<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
@@ -371,11 +397,8 @@ pub(crate) fn call_monomorphize_type<'tcx>(
     let c = CONFIG.get().expect("config not installed");
     let func = c.stateful_vtable.monomorphize_type;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
-    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
     // Safety: callbacks is immutable (from CONFIG, no lock needed).
-    // state is mutable (from MUTABLE_STATE, lock held for the entire call).
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, ty)
+    (func)(unsafe { &*callbacks_ptr }, name, tcx, ty)
 }
 
 /// Call the consumer's collect_generic_rust_deps. Holds the mutable state mutex
@@ -498,12 +521,11 @@ fn trampoline_is_consumer_fn<C: LangCallbacks + 'static>(
 
 fn trampoline_monomorphize_type<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
-    state: &mut (dyn Any + Send + Sync),
     name: &str,
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> MonomorphizeTypeResult<'tcx> {
-    data.downcast_ref::<C>().unwrap().monomorphize_type(state, name, tcx, ty)
+    data.downcast_ref::<C>().unwrap().monomorphize_type(name, tcx, ty)
 }
 
 fn trampoline_collect_generic_rust_deps<'tcx, C: LangCallbacks + 'static>(

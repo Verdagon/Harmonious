@@ -254,9 +254,93 @@ impl ToylangCallbacks {
                 walk_and_stash_internal_callees(
                     tcx, &self.registry, &resolved_caller, &registry_name, state,
                 );
+
+                // Emit `[toylang] layout_of intercepted for: <ty>
+                // size=N align=M` for each consumer type in this
+                // Instance's signature. `lang_layout_of`'s eprintln
+                // fires from the query provider, which incremental
+                // cache skips on hit; emitting here (during populate,
+                // always runs) makes the layout log incremental-safe
+                // for tests that assert on the stderr — e.g.
+                // `test_point_layout`. Lock-free now that
+                // `monomorphize_type` is stateless.
+                emit_layout_log_for_instance(tcx, instance);
             }
         }
     }
+}
+
+/// For each consumer ADT type reachable from the Instance's signature,
+/// emit the `[toylang] layout_of intercepted for: <ty> size=N
+/// align=M` log line. Safe inside `generate_and_compile` (MUTABLE_STATE
+/// held) because `call_monomorphize_type` is lock-free.
+fn emit_layout_log_for_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) {
+    let fn_sig = tcx.fn_sig(instance.def_id()).instantiate(tcx, instance.args);
+    let sig = fn_sig.skip_binder();
+    let mut seen: HashSet<String> = HashSet::new();
+    for ty in sig.inputs().iter().copied().chain(std::iter::once(sig.output())) {
+        walk_ty_for_layout_log(tcx, ty, &mut seen);
+    }
+}
+
+fn walk_ty_for_layout_log<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    seen: &mut HashSet<String>,
+) {
+    use rustc_middle::ty::TypeVisitableExt;
+    if let ty::TyKind::Adt(adt_def, args) = ty.kind() {
+        let name = tcx.item_name(adt_def.did()).to_string();
+        let has_params = args.iter().any(|a| a.has_param());
+        if !has_params
+            && rustc_lang_facade::is_from_lang_stubs(tcx, adt_def.did())
+        {
+            if seen.insert(format!("{:?}", ty)) {
+                let result = rustc_lang_facade::call_monomorphize_type(
+                    &name, tcx, ty,
+                );
+                let (size, align) = compute_layout_size_align(tcx, &result.field_types);
+                eprintln!(
+                    "[toylang] layout_of intercepted for: {:?} size={} align={}",
+                    ty, size, align,
+                );
+            }
+        }
+        // Recurse into generic args so consumer types nested in
+        // `Vec<ToyPoint>` etc. get their log entries too.
+        for arg in args.iter() {
+            if let ty::GenericArgKind::Type(inner) = arg.unpack() {
+                walk_ty_for_layout_log(tcx, inner, seen);
+            }
+        }
+    }
+}
+
+/// Compute `(size, align)` for a consumer type given its resolved
+/// field types. Mirrors `rustc-lang-facade::queries::layout::
+/// build_layout`'s arithmetic; we just need the numbers, not a full
+/// `TyAndLayout`.
+fn compute_layout_size_align<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    field_types: &[Ty<'tcx>],
+) -> (u64, u64) {
+    let mut offset = 0u64;
+    let mut max_align = 1u64;
+    for &field_ty in field_types {
+        let layout = tcx.layout_of(
+            rustc_middle::ty::PseudoCanonicalInput {
+                value: field_ty,
+                typing_env: rustc_middle::ty::TypingEnv::fully_monomorphized(),
+            },
+        ).expect("layout of field type");
+        let fsz = layout.size.bytes();
+        let falign = layout.align.abi.bytes();
+        max_align = max_align.max(falign);
+        offset = (offset + falign - 1) & !(falign - 1);
+        offset += fsz;
+    }
+    let size = (offset + max_align - 1) & !(max_align - 1);
+    (size, max_align)
 }
 
 impl LangPredicates for ToylangCallbacks {
@@ -407,12 +491,14 @@ impl LangCallbacks for ToylangCallbacks {
 
     fn monomorphize_type<'tcx>(
         &self,
-        s: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         ty: Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx> {
-        state(s).log.push(CallbackLog::MonomorphizeType { name: name.to_string() });
+        // Stateless: facade's `call_monomorphize_type` skips the mutex
+        // so `lang_layout_of` can re-enter during `generate_and_compile`
+        // without deadlocking. Former `CallbackLog::MonomorphizeType`
+        // log push retired — wasn't consumed by any test.
         let toy_struct = self.registry.structs.get(name)
             .unwrap_or_else(|| panic!("[toylang] monomorphize_type: struct '{}' not in registry", name));
 

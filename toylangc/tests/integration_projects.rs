@@ -30,12 +30,14 @@ use std::sync::Mutex;
 /// project warm), then every binary runs in parallel afterwards
 /// (where parallelism actually helps).
 ///
-/// Orthogonal to B6, which was resolved architecturally by moving
+/// Orthogonal to B6, which was resolved architecturally by (a) moving
 /// `state.toylang_instances` population from `notify_concrete_entry_point`'s
 /// side effect to the up-front `populate_toylang_instances_from_cgus`
-/// walk in `generate_and_compile`. This mutex is about coordination
-/// cost — cargo wedging under shared-target-dir parallelism —
-/// regardless of correctness. Independent fix; ships alongside B6.
+/// walk in `generate_and_compile`, and (b) making `monomorphize_type`
+/// stateless so `lang_layout_of` can re-enter during generate without
+/// deadlocking. The `CARGO_INCREMENTAL=0` stopgap that was in place
+/// from 5c.1 through the intermediate B6 commit is now retired; cold
+/// and warm compiles both produce correct consumer `.o` output.
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 fn toylangc_bin() -> PathBuf {
@@ -97,21 +99,6 @@ fn run_integration_project(name: &str) {
             .env("DYLD_LIBRARY_PATH", sysroot_lib())
             .env("LD_LIBRARY_PATH", sysroot_lib())
             .env("CARGO_TARGET_DIR", &cargo_target)
-            // Retained post-B6 as a SEPARATE stopgap, not the original B6
-            // masker. Under rustc's incremental cache + warm rebuild +
-            // retained stateful `monomorphize_type` (which locks
-            // MUTABLE_STATE), `lang_layout_of → call_monomorphize_type`
-            // re-enters the held mutex from inside `generate_and_compile`
-            // and deadlocks. Cold compile (`CARGO_INCREMENTAL=0`) avoids
-            // this because `layout_of` fires during rustc's mono walk
-            // (outside the mutex) and caches the result before
-            // `generate_and_compile` runs. Retiring this stopgap requires
-            // either (a) making `monomorphize_type` stateless (removes
-            // the mutex lock, lets the re-entry succeed) or (b) adding a
-            // pre-generate phase that pre-queries all consumer layouts
-            // before the mutex is taken. Tracked as a followup; does not
-            // reopen B6 (that was correctness; this is lock-coordination).
-            .env("CARGO_INCREMENTAL", "0")
             .args(["build"])
             .output()
             .expect("failed to spawn toylangc")
@@ -200,8 +187,6 @@ fn run_integration_project_check_callbacks(
             .env("DYLD_LIBRARY_PATH", sysroot_lib())
             .env("LD_LIBRARY_PATH", sysroot_lib())
             .env("CARGO_TARGET_DIR", &cargo_target)
-            // See rationale in `run_integration_project` above.
-            .env("CARGO_INCREMENTAL", "0")
             .env("TOYLANG_LOG_PATH", &log_path)
             .args(["build"])
             .output()
@@ -296,21 +281,6 @@ fn run_integration_project_check_build_stderr(name: &str) {
             .env("DYLD_LIBRARY_PATH", sysroot_lib())
             .env("LD_LIBRARY_PATH", sysroot_lib())
             .env("CARGO_TARGET_DIR", &cargo_target)
-            // Retained post-B6 as a SEPARATE stopgap, not the original B6
-            // masker. Under rustc's incremental cache + warm rebuild +
-            // retained stateful `monomorphize_type` (which locks
-            // MUTABLE_STATE), `lang_layout_of → call_monomorphize_type`
-            // re-enters the held mutex from inside `generate_and_compile`
-            // and deadlocks. Cold compile (`CARGO_INCREMENTAL=0`) avoids
-            // this because `layout_of` fires during rustc's mono walk
-            // (outside the mutex) and caches the result before
-            // `generate_and_compile` runs. Retiring this stopgap requires
-            // either (a) making `monomorphize_type` stateless (removes
-            // the mutex lock, lets the re-entry succeed) or (b) adding a
-            // pre-generate phase that pre-queries all consumer layouts
-            // before the mutex is taken. Tracked as a followup; does not
-            // reopen B6 (that was correctness; this is lock-coordination).
-            .env("CARGO_INCREMENTAL", "0")
             .args(["build"])
             .output()
             .expect("failed to spawn toylangc")
@@ -387,21 +357,6 @@ fn run_integration_project_expects_error(name: &str) {
             .env("DYLD_LIBRARY_PATH", sysroot_lib())
             .env("LD_LIBRARY_PATH", sysroot_lib())
             .env("CARGO_TARGET_DIR", &cargo_target)
-            // Retained post-B6 as a SEPARATE stopgap, not the original B6
-            // masker. Under rustc's incremental cache + warm rebuild +
-            // retained stateful `monomorphize_type` (which locks
-            // MUTABLE_STATE), `lang_layout_of → call_monomorphize_type`
-            // re-enters the held mutex from inside `generate_and_compile`
-            // and deadlocks. Cold compile (`CARGO_INCREMENTAL=0`) avoids
-            // this because `layout_of` fires during rustc's mono walk
-            // (outside the mutex) and caches the result before
-            // `generate_and_compile` runs. Retiring this stopgap requires
-            // either (a) making `monomorphize_type` stateless (removes
-            // the mutex lock, lets the re-entry succeed) or (b) adding a
-            // pre-generate phase that pre-queries all consumer layouts
-            // before the mutex is taken. Tracked as a followup; does not
-            // reopen B6 (that was correctness; this is lock-coordination).
-            .env("CARGO_INCREMENTAL", "0")
             .args(["build"])
             .output()
             .expect("failed to spawn toylangc")
