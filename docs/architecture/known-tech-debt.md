@@ -75,6 +75,43 @@ See the full arcana at `docs/arcana/ExtraTypeArgsSilentlyTruncated-ETASTZ.md`.
 
 ---
 
+## 29. Callback-trace test `unexpected` assertions retired
+
+### Problem
+
+The 5 callback-trace integration tests (e.g.
+`test_deep_chain_only_entry_point_monomorphized`,
+`test_internal_toylang_fn_not_monomorphized_by_rustc`) originally
+asserted invariants of the form "`bork` should NOT be monomorphized by
+rustc" via their `unexpected` parameter to
+`run_integration_project_check_callbacks`. That invariant held under
+direct-mode + cold compile (rustc's mono collector only walked
+Rust-callable toylang fns), but doesn't hold under wrapper-mode rlib
+compile: rustc's mono collector walks every `pub fn` in the stub rlib
+regardless of reachability, so `CollectGenericRustDeps` and
+`NotifyConcreteEntryPoint` entries fire for every toylang pub fn.
+
+The harness's `unexpected` parameter is now a no-op (kept for call-site
+shape stability). The positive-entries check (`expected` parameter)
+still verifies B6's populate step runs correctly and `__toylang_main`
++ CGU-level entries are walked — that's the load-bearing signal.
+
+### Fix
+
+Reformulate the negative invariant under a different signal — e.g.
+"these fns don't appear as rust-called entry points in
+`state.toylang_instances`" — or retire the affected tests entirely and
+rely on the behavioral tests (which verify end-to-end: the binary
+produces correct output, which requires the facade's walk to be
+correct).
+
+Non-blocking; flagged for whoever next touches the integration-test
+harness. See `run_integration_project_check_callbacks` in
+`toylangc/tests/integration_projects.rs` for the current state and the
+risks.md §B6 RESOLVED note for the historical framing.
+
+---
+
 ## Resolved Items (sessions 1–8)
 
 | # | Item | Session | Resolution |
