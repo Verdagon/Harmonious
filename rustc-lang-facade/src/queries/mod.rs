@@ -30,20 +30,28 @@ pub fn lang_override_queries(
     _session: &rustc_session::Session,
     providers: &mut rustc_middle::util::Providers,
 ) {
+    // The rustc nightly-2026-01-20 bump restructured `rustc_middle::util::Providers`
+    // from a flat struct into `{ queries, extern_queries, hooks }` sub-structs. Queries
+    // with the `separate_provide_extern` modifier (of the six we override, only
+    // `optimized_mir`) live in BOTH `queries` (for local items, keyed by `LocalDefId`)
+    // and `extern_queries` (for external items, keyed by `DefId`). The others are in
+    // `queries` only. Under the old flat struct our single assignment served the local
+    // case; we preserve that here and do not touch `extern_queries.optimized_mir`
+    // (see HANDOFF-nightly-bump.md §5.4 — adapt the typedef, don't expand scope).
     crate::install_query_defaults(
-        providers.layout_of,
-        providers.mir_shims,
-        providers.symbol_name,
-        providers.optimized_mir,
-        providers.collect_and_partition_mono_items,
-        providers.upstream_monomorphizations_for,
+        providers.queries.layout_of,
+        providers.queries.mir_shims,
+        providers.queries.symbol_name,
+        providers.queries.optimized_mir,
+        providers.queries.collect_and_partition_mono_items,
+        providers.queries.upstream_monomorphizations_for,
     );
 
-    providers.layout_of     = layout::lang_layout_of;
-    providers.mir_shims     = drop_glue::lang_mir_shims;
-    providers.optimized_mir = optimized_mir::lang_optimized_mir;
-    providers.symbol_name   = symbol_name::lang_symbol_name;
-    providers.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
-    providers.upstream_monomorphizations_for =
+    providers.queries.layout_of     = layout::lang_layout_of;
+    providers.queries.mir_shims     = drop_glue::lang_mir_shims;
+    providers.queries.optimized_mir = optimized_mir::lang_optimized_mir;
+    providers.queries.symbol_name   = symbol_name::lang_symbol_name;
+    providers.queries.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
+    providers.queries.upstream_monomorphizations_for =
         upstream_monomorphization::lang_upstream_monomorphizations_for;
 }
