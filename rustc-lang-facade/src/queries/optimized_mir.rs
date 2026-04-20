@@ -75,7 +75,7 @@ pub fn lang_optimized_mir<'tcx>(
     // with Params intact and (b) anchor each ReifyFnPointer cast on the
     // pre-substitution dep refs.
     let identity_args = GenericArgs::identity_for_item(tcx, def_id);
-    let identity_instance = Instance::new(def_id, identity_args);
+    let identity_instance = Instance::new_raw(def_id, identity_args);
 
     let body = build_dependency_body(tcx, identity_instance, &rust_deps);
     tcx.arena.alloc(body)
@@ -127,45 +127,50 @@ fn build_dependency_body<'tcx>(
     let mut stmts = Vec::new();
 
     for &(dep_def_id, dep_args) in rust_deps {
-        if tcx.def_kind(dep_def_id).is_fn_like() {
-            // Function dependency — emit a ReifyFnPointer cast. Under the
-            // optimized_mir override the dep_args may carry Params; rustc's
-            // collector substitutes them per caller when it walks this body.
-            let fn_def_ty = Ty::new_fn_def(tcx, dep_def_id, dep_args);
-            let fn_sig = tcx.fn_sig(dep_def_id).instantiate(tcx, dep_args);
-            let fn_ptr_ty = Ty::new_fn_ptr(tcx, fn_sig);
-            let fn_ptr_local = local_decls.push(LocalDecl::new(fn_ptr_ty, span));
+        // Every dep the consumer returns is fn-like by contract (functions,
+        // methods, trait methods, Phase-6 wrapper shims) — toylangc's
+        // `collect_rust_deps_recursive` only pushes function/method DefIds.
+        // The old `else` branch for type deps emitted `Rvalue::NullaryOp(SizeOf, ty)`
+        // and has been unreachable since wrappers replaced direct type
+        // registration; the `NullaryOp` Rvalue variant was also removed entirely
+        // from rustc's MIR syntax in the new nightly, forcing the issue. We
+        // panic if a non-fn dep ever reaches us, rather than silently skipping —
+        // that would hide a consumer-contract violation. Consumer authors who
+        // need type discovery should route it through the `layout_of` query
+        // path instead (which is what toylangc does via `monomorphize_type`).
+        assert!(
+            tcx.def_kind(dep_def_id).is_fn_like(),
+            "consumer returned non-fn dep {:?} from collect_generic_rust_deps; \
+             use the layout_of / monomorphize_type path for type discovery",
+            dep_def_id,
+        );
 
-            stmts.push(Statement {
-                source_info,
-                kind: StatementKind::Assign(Box::new((
-                    Place::from(fn_ptr_local),
-                    Rvalue::Cast(
-                        CastKind::PointerCoercion(
-                            ty::adjustment::PointerCoercion::ReifyFnPointer,
-                            CoercionSource::Implicit,
-                        ),
-                        Operand::Constant(Box::new(ConstOperand {
-                            span,
-                            user_ty: None,
-                            const_: Const::zero_sized(fn_def_ty),
-                        })),
-                        fn_ptr_ty,
+        // Function dependency — emit a ReifyFnPointer cast. Under the
+        // optimized_mir override the dep_args may carry Params; rustc's
+        // collector substitutes them per caller when it walks this body.
+        let fn_def_ty = Ty::new_fn_def(tcx, dep_def_id, dep_args);
+        let fn_sig = tcx.fn_sig(dep_def_id).instantiate(tcx, dep_args);
+        let fn_ptr_ty = Ty::new_fn_ptr(tcx, fn_sig);
+        let fn_ptr_local = local_decls.push(LocalDecl::new(fn_ptr_ty, span));
+
+        stmts.push(Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(fn_ptr_local),
+                Rvalue::Cast(
+                    CastKind::PointerCoercion(
+                        ty::adjustment::PointerCoercion::ReifyFnPointer(rustc_hir::Safety::Safe),
+                        CoercionSource::Implicit,
                     ),
-                ))),
-            });
-        } else {
-            // Type dependency — emit SizeOf so the collector discovers it.
-            let size_local = local_decls.push(LocalDecl::new(tcx.types.usize, span));
-            let dep_ty = Ty::new_adt(tcx, tcx.adt_def(dep_def_id), dep_args);
-            stmts.push(Statement {
-                source_info,
-                kind: StatementKind::Assign(Box::new((
-                    Place::from(size_local),
-                    Rvalue::NullaryOp(NullOp::SizeOf, dep_ty),
-                ))),
-            });
-        }
+                    Operand::Constant(Box::new(ConstOperand {
+                        span,
+                        user_ty: None,
+                        const_: Const::zero_sized(fn_def_ty),
+                    })),
+                    fn_ptr_ty,
+                ),
+            ))),
+        ));
     }
 
     // Single block: dependency statements + Unreachable terminator. The body
@@ -174,14 +179,14 @@ fn build_dependency_body<'tcx>(
     // partitioner override in `queries::partition` filters them out of the
     // CGU slice before codegen dispatch. (The earlier `CODEGEN_SKIP_HOOK`
     // fork patch was retired in stage 4a.)
-    blocks.push(BasicBlockData {
-        statements: stmts,
-        terminator: Some(Terminator {
+    blocks.push(BasicBlockData::new_stmts(
+        stmts,
+        Some(Terminator {
             source_info,
             kind: TerminatorKind::Unreachable,
         }),
-        is_cleanup: false,
-    });
+        false,
+    ));
 
     let source_scopes = IndexVec::from_elem_n(
         SourceScopeData {
