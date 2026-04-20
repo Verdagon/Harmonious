@@ -1,0 +1,6 @@
+[project]
+name = "byte_string_let_binding"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

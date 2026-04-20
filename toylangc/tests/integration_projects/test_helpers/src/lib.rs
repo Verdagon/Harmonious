@@ -32,6 +32,29 @@ pub extern "C" fn println_usize(x: usize) {
 }
 
 #[no_mangle]
+pub extern "C" fn println_i64(x: i64) {
+    println!("{}", x);
+}
+
+#[no_mangle]
+pub extern "C" fn println_u32(x: u32) {
+    println!("{}", x);
+}
+
+#[no_mangle]
+pub extern "C" fn println_u8(x: u8) {
+    println!("{}", x);
+}
+
+/// Print "ok" — used by tests that just need to verify the binary ran to
+/// completion (compile-or-not tests where the value of main isn't itself
+/// the assertion target).
+#[no_mangle]
+pub extern "C" fn println_ok() {
+    println!("ok");
+}
+
+#[no_mangle]
 pub extern "C" fn print_int(x: i32) {
     print!("{} ", x);
 }

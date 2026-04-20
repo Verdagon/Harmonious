@@ -1,0 +1,14 @@
+fn println_int(x: i32)
+
+struct Counter {
+    value: i32,
+}
+
+fn make_counter() -> Counter {
+    Counter { value: 42 }
+}
+
+fn main() {
+    let c = make_counter();
+    println_int(c.value);
+}

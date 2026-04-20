@@ -1,0 +1,9 @@
+fn println_i64(x: i64)
+
+fn big() -> i64 {
+    3000000000
+}
+
+fn main() {
+    println_i64(big());
+}

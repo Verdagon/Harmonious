@@ -1,0 +1,7 @@
+fn println_i64(x: i64)
+
+fn neg() -> i64 { -1i64 }
+
+fn main() {
+    println_i64(neg());
+}

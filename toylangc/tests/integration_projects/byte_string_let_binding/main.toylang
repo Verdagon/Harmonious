@@ -1,0 +1,6 @@
+fn println_int(x: i32)
+
+fn main() {
+    let x = b"hello";
+    println_int(42i32);
+}

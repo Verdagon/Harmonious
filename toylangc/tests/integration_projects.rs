@@ -146,21 +146,52 @@ fn test_pair_construct() {
     run_integration_project("pair_construct");
 }
 
-// TODO(stage5c.2): test_extern_fn_call hits a toylang codegen bug where a
-// fn whose body ends with an extern "C" call returning void gets emitted with
-// the WRONG return type — the body's `ret void` mismatches the declared
-// return. Repro:
+// TODO(stage5c-followup): test_extern_fn_call hits a toylang codegen bug
+// that surfaces only under the stage-5c wrapper-mode path. The toylang
+// fn `do_print()` (containing both `println_int(42)` and `println_bool(true)`
+// extern "C" calls) gets emitted with declared return `i8` but body
+// `ret void`. Mismatch fails llc.
 //
-//   fn println_bool(x: bool)
-//   fn do_print() { println_int(42); println_bool(true); }
-//   fn main() { do_print(); }
-//
-// LLVM IR shows `define i8 @__toylang_internal_do_print()` with `ret void` in
-// the body. Specific to extern "C" decls under stage 5c — investigate the
-// `coerced_return_type_for_instance` path on bool args. Re-enable canary +
-// add the project once fixed.
+// Confirmed independent of stage 5c.2's pattern via probe: toylang source
+// IS the same as a `probe_extern_void` project, but project name
+// `extern_fn_call` reproduces the bug while `probe_extern_void` does not.
+// HashMap iteration order over the toylang registry — different project
+// names hash to different orderings, exposing/hiding the bug. Pre-existing
+// codegen latent bug; the FileLoader (direct-mode) path masked it. Affects
+// 1 of 57 extern-fixture tests; no other migrated tests exercise the
+// `bool extern "C" arg + sibling extern "C" call` shape. Park here; flag
+// to TL for separate ticket.
 //
 // #[test]
 // fn test_extern_fn_call() {
 //     run_integration_project("extern_fn_call");
 // }
+
+// ============================================================================
+// Stage 5c.2 — extern-fixture migrations (in progress)
+// ============================================================================
+
+#[test]
+fn test_negate_i64() {
+    run_integration_project("negate_i64");
+}
+
+#[test]
+fn test_int_literal_infers_i64_from_return_type() {
+    run_integration_project("int_literal_infers_i64_from_return_type");
+}
+
+#[test]
+fn test_string_literal_let_binding() {
+    run_integration_project("string_literal_let_binding");
+}
+
+#[test]
+fn test_byte_string_let_binding() {
+    run_integration_project("byte_string_let_binding");
+}
+
+#[test]
+fn test_toylang_main_calls_toylang_fn() {
+    run_integration_project("toylang_main_calls_toylang_fn");
+}

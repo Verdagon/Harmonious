@@ -1,0 +1,6 @@
+[project]
+name = "int_literal_infers_i64_from_return_type"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
