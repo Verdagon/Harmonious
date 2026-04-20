@@ -1,0 +1,22 @@
+fn add(x: i32, y: i32) -> i32
+fn println_i32(x: i32)
+
+fn bottom(x: i32) -> i32 {
+    add(x, 1)
+}
+
+fn left(x: i32) -> i32 {
+    bottom(x)
+}
+
+fn right(x: i32) -> i32 {
+    bottom(x)
+}
+
+fn entry(x: i32) -> i32 {
+    add(left(x), right(x))
+}
+
+fn main() {
+    println_i32(entry(5));
+}

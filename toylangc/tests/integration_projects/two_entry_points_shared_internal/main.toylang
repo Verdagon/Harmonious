@@ -1,0 +1,19 @@
+fn double(x: i32) -> i32
+fn println_i32(x: i32)
+
+fn internal_helper(x: i32) -> i32 {
+    double(x)
+}
+
+fn entry_a(x: i32) -> i32 {
+    internal_helper(x)
+}
+
+fn entry_b(x: i32) -> i32 {
+    internal_helper(x)
+}
+
+fn main() {
+    println_i32(entry_a(5));
+    println_i32(entry_b(7));
+}

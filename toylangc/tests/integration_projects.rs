@@ -132,6 +132,159 @@ fn run_integration_project(name: &str) {
     }
 }
 
+/// Build a project with `TOYLANG_LOG_PATH` set to a per-test file; after
+/// build succeeds, read the callback log and assert the listed `expected`
+/// names are mentioned (as a `CollectGenericRustDeps` or
+/// `NotifyConcreteEntryPoint` callback) and the `unexpected` names are
+/// NOT mentioned. Mirrors the direct-mode `compile_and_run_with_env(..,
+/// [("TOYLANG_LOG_PATH", ..)])` pattern at wrapper-mode granularity.
+///
+/// Stage 5c.3: unblocks callback-trace tests without needing a per-test
+/// Rust fixture — the env var already works end-to-end through cargo +
+/// the rustc wrapper.
+fn run_integration_project_check_callbacks(
+    name: &str,
+    expected: &[&str],
+    unexpected: &[&str],
+) {
+    let project = projects_dir().join(name);
+    assert!(
+        project.is_dir(),
+        "integration project not found: {}",
+        project.display(),
+    );
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let cargo_target = shared_cargo_target_dir();
+    let log_path = build_dir.join("callback.log");
+    std::fs::create_dir_all(&build_dir).unwrap();
+
+    let build_out = Command::new(toylangc_bin())
+        .current_dir(&project)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("TOYLANG_LOG_PATH", &log_path)
+        .args(["build"])
+        .output()
+        .expect("failed to spawn toylangc");
+    assert!(
+        build_out.status.success(),
+        "{} toylangc build failed:\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    // Run the binary too — smoke check that the test's side effects still
+    // work. Some callback-check tests also assert on stdout ("ok" print).
+    // Skip the assertion on stdout here; the callback log is the primary
+    // signal and expected_output.txt is optional.
+    let bin = cargo_target.join("debug").join(name);
+    if bin.exists() {
+        let run = Command::new(&bin)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .output()
+            .unwrap_or_else(|e| panic!("{}: failed to spawn binary: {}", name, e));
+        assert!(
+            run.status.success(),
+            "{} binary exited non-zero:\nstdout: {}\nstderr: {}",
+            name,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("{}: callback log not written at {}: {}", name, log_path.display(), e));
+
+    for name_expected in expected {
+        let cgd = format!("CollectGenericRustDeps {{ name: \"{}\" }}", name_expected);
+        let ncep = format!("NotifyConcreteEntryPoint {{ name: \"{}\" }}", name_expected);
+        assert!(
+            log.contains(&cgd) || log.contains(&ncep),
+            "{}: expected callback for '{}', log:\n{}",
+            name, name_expected, log,
+        );
+    }
+    for name_unexpected in unexpected {
+        let cgd = format!("CollectGenericRustDeps {{ name: \"{}\" }}", name_unexpected);
+        let ncep = format!("NotifyConcreteEntryPoint {{ name: \"{}\" }}", name_unexpected);
+        assert!(
+            !log.contains(&cgd) && !log.contains(&ncep),
+            "{}: '{}' should NOT be monomorphized by rustc, log:\n{}",
+            name, name_unexpected, log,
+        );
+    }
+}
+
+/// Build a project that is expected to FAIL compilation. Asserts toylangc
+/// exits non-zero and the combined stdout+stderr contains every line of
+/// `expected_error.txt` (substring, same line-wise contains semantics as
+/// `run_integration_project`'s expected_output match). Error tests don't
+/// produce a binary, so we only check the compile step.
+///
+/// Stage 5c.3: replaces direct-mode `assert_matches!(err,
+/// TypeResolveError::FooBar { .. })` patterns with stderr-substring
+/// checks. Granularity loss is accepted — production users see error
+/// strings, not error enum variants; tests now match what users see.
+fn run_integration_project_expects_error(name: &str) {
+    let project = projects_dir().join(name);
+    assert!(
+        project.is_dir(),
+        "integration project not found: {}",
+        project.display(),
+    );
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let cargo_target = shared_cargo_target_dir();
+
+    let build_out = Command::new(toylangc_bin())
+        .current_dir(&project)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("CARGO_INCREMENTAL", "0")
+        .args(["build"])
+        .output()
+        .expect("failed to spawn toylangc");
+
+    assert!(
+        !build_out.status.success(),
+        "{}: expected compilation failure, but toylangc succeeded.\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let expected = std::fs::read_to_string(project.join("expected_error.txt"))
+        .unwrap_or_else(|e| panic!("{}: cannot read expected_error.txt: {}", name, e));
+    for line in expected.lines() {
+        if line.is_empty() { continue; }
+        assert!(
+            combined.contains(line),
+            "{}: expected '{}' in compiler output, got:\n{}",
+            name, line, combined,
+        );
+    }
+}
+
 // ============================================================================
 // Stage 5c.1 canary tests
 // ============================================================================
@@ -462,31 +615,103 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 // Previously-TODO'd inline text about the Vec<Point> ICE retained below
 // for git-log searchability; superseded by the category block above.
 //
-// TODO(stage5c-followup): test_toylang_main_with_vec and
-// test_vec_push_fn_call_result hit a rustc ICE during the stub rlib
-// compile: `FieldsShape::offset` panics with "index out of bounds: the
-// len is 0 but the index is 0" while rustc generates debuginfo for the
-// Point struct inside a Vec<Point, Global> monomorphization. Our
-// `layout_of` override reports Point as 0-field opaque; the source-level
-// `pub struct Point(())` has 1 tuple field; debuginfo's
-// `build_struct_type_di_node` walks source fields and indexes into
-// layout → panic.
+// Vec<consumer-type> migrations — unblocked by the stub_gen unit-struct
+// change (pub struct Foo; instead of pub struct Foo(());). See the
+// struct emission comment in stub_gen.rs for the full diagnosis.
+
+#[test]
+fn test_toylang_main_with_vec() {
+    run_integration_project("toylang_main_with_vec");
+}
+
+#[test]
+fn test_vec_push_fn_call_result() {
+    run_integration_project("vec_push_fn_call_result");
+}
+
+#[test] fn test_vec_point() { run_integration_project("vec_point"); }
+#[test] fn test_r_t_r_vec_of_ship() { run_integration_project("r_t_r_vec_of_ship"); }
+#[test] fn test_t_r_t_construct() { run_integration_project("t_r_t_construct"); }
+#[test] fn test_r_r_t_vec_of_vec() { run_integration_project("r_r_t_vec_of_vec"); }
+#[test] fn test_deep_t_r_t_r() { run_integration_project("deep_t_r_t_r"); }
+#[test] fn test_vec_of_structs_len() { run_integration_project("vec_of_structs_len"); }
+#[test] fn test_toylang_main_with_vec_v2() { run_integration_project("toylang_main_with_vec_v2"); }
+#[test] fn test_vec_method_lookup_is_exact() { run_integration_project("vec_method_lookup_is_exact"); }
+
+// ============================================================================
+// Stage 5c.3 — error-assertion tests (use the _expects_error harness)
+// ============================================================================
+
+#[test] fn test_lexer_rejects_unknown_chars() { run_integration_project_expects_error("lexer_rejects_unknown_chars"); }
+#[test] fn test_rust_free_fn_undefined_gives_error() { run_integration_project_expects_error("rust_free_fn_undefined_gives_error"); }
+#[test] fn test_main_non_void_tail_rejected() { run_integration_project_expects_error("main_non_void_tail_rejected"); }
+#[test] fn test_trait_self_not_imported_gives_error() { run_integration_project_expects_error("trait_self_not_imported_gives_error"); }
+#[test] fn test_static_call_undefined_type_gives_structured_error() { run_integration_project_expects_error("static_call_undefined_type_gives_structured_error"); }
+#[test] fn test_trait_call_unknown_trait_name_gives_structured_error() { run_integration_project_expects_error("trait_call_unknown_trait_name_gives_structured_error"); }
+#[test] fn test_trait_call_unknown_method_name_gives_structured_error() { run_integration_project_expects_error("trait_call_unknown_method_name_gives_structured_error"); }
+
+// ============================================================================
+// Stage 5c.3 — callback-trace tests. Under wrapper mode the sole Rust
+// entry point into toylang is `__toylang_main` (the generated shim in
+// user_bin/src/main.rs); every other toylang fn is an internal callee
+// discovered by the facade's deep walk. So these tests — originally
+// designed under direct mode where Rust's hand-written `main` called
+// toylang fns like `spork(5)` directly — assert a weaker but still
+// load-bearing invariant: rustc's monomorphization walk sees ONLY
+// `__toylang_main`, and every previously-rust-callable toylang fn
+// (spork, entry, a, etc.) is now also internal — no amount of deep-
+// walk discovery should leak them back into rustc's collector.
 //
-// Direct mode (FileLoader) doesn't hit this — the single-crate compile
-// doesn't seem to request debuginfo for Point through the Vec<Point>
-// path in the same way. Wrapper mode's stub-rlib compile exposes the
-// mismatch. Park alongside the bool extern-arg leak; park as TL category
-// B addendum. Revisit after other migrations land — may be fixable by
-// emitting `pub struct Point;` (unit struct) instead of `pub struct
-// Point(());` (tuple struct with unit field), or by aligning the
-// layout_of override's field count with the source-level struct def.
-//
-// #[test]
-// fn test_toylang_main_with_vec() {
-//     run_integration_project("toylang_main_with_vec");
-// }
-//
-// #[test]
-// fn test_vec_push_fn_call_result() {
-//     run_integration_project("vec_push_fn_call_result");
-// }
+// The direct-mode version of this test distinguished "Rust-called
+// toylang fn X should be monomorphized" (positive) from "internal
+// callee Y should not" (negative). Wrapper mode collapses the positive
+// case to `__toylang_main` and promotes everything else to the
+// negative case. The thing being verified — that the deep walk is
+// side-effect-free with respect to rustc's mono collector — is still
+// exercised.
+// ============================================================================
+
+#[test]
+fn test_internal_toylang_fn_not_monomorphized_by_rustc() {
+    run_integration_project_check_callbacks(
+        "internal_toylang_fn_not_monomorphized_by_rustc",
+        &["__toylang_main"],
+        &["spork", "bork"],
+    );
+}
+
+#[test]
+fn test_deep_chain_only_entry_point_monomorphized() {
+    run_integration_project_check_callbacks(
+        "deep_chain_only_entry_point_monomorphized",
+        &["__toylang_main"],
+        &["a", "b", "c"],
+    );
+}
+
+#[test]
+fn test_diamond_call_pattern() {
+    run_integration_project_check_callbacks(
+        "diamond_call_pattern",
+        &["__toylang_main"],
+        &["entry", "left", "right", "bottom"],
+    );
+}
+
+#[test]
+fn test_generic_deep_walk() {
+    run_integration_project_check_callbacks(
+        "generic_deep_walk",
+        &["__toylang_main"],
+        &["entry", "helper"],
+    );
+}
+
+#[test]
+fn test_two_entry_points_shared_internal() {
+    run_integration_project_check_callbacks(
+        "two_entry_points_shared_internal",
+        &["__toylang_main"],
+        &["entry_a", "entry_b", "internal_helper"],
+    );
+}

@@ -1,0 +1,26 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct ToyPoint {
+    x: i32,
+    y: i32,
+}
+
+fn make_nested() -> Vec<Vec<ToyPoint, Global>, Global> {
+    let inner = Vec::new<ToyPoint, Global>();
+    inner.push(ToyPoint { x: 1, y: 2 });
+    let outer = Vec::new<Vec<ToyPoint, Global>, Global>();
+    outer.push(inner);
+    outer
+}
+
+fn outer_len(v: &Vec<Vec<ToyPoint, Global>, Global>) -> usize {
+    v.len()
+}
+
+fn main() {
+    let nested = make_nested();
+    println_usize(outer_len(&nested));
+}

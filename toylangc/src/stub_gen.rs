@@ -59,10 +59,33 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         let is_generic = !toy_struct.type_params.is_empty();
 
         // Opaque struct — layout_of reports 0 fields, so rustc never indexes
-        // into the ADT's fields. We just need PhantomData to "use" generic type params.
+        // into the ADT's fields via source-level walks. Source field count
+        // must match the 0-field layout: `pub struct Foo;` (unit struct, 0
+        // source fields) works; `pub struct Foo(());` (tuple struct with
+        // one unit-typed field) silently breaks when the opaque type gets
+        // monomorphized inside Vec<Foo> etc. — rustc's debuginfo walker
+        // (`build_struct_type_di_node` + `build_generic_type_param_di_nodes`)
+        // indexes FieldsShape by source position, our layout_of returns
+        // FieldsShape::len()==0, the walk panics with "index out of bounds:
+        // the len is 0 but the index is 0". Diagnosed during 5c.2 via the
+        // Vec<Point, Global> migration tests.
+        //
+        // Generic case keeps PhantomData<(T, U, ...)> because the generic
+        // params must be "used" somewhere in the struct body or rustc
+        // errors with E0392 (`parameter `T` is never used`). The PhantomData
+        // wrapper is a single source field, same source-vs-layout field
+        // count mismatch in principle — but PhantomData<...> is itself a
+        // ZST-wrapper whose layout rustc special-cases, so the debuginfo
+        // walker doesn't recurse into it the same way it does for `()`.
+        // Non-generic tests flex the ICE; generic-type-args-with-nested-Vec
+        // tests haven't, at least in our current coverage. If a future
+        // test hits the same ICE for generics, revisit — possible fixes
+        // include splitting the struct declaration across all type params
+        // as separate phantom fields or requesting a rustc-level opt-out
+        // for opaque types.
         let item: syn::ItemStruct = if !is_generic {
             parse_quote! {
-                pub struct #ident(());
+                pub struct #ident;
             }
         } else {
             let type_params: Vec<syn::Ident> = toy_struct.type_params.iter()

@@ -1,0 +1,18 @@
+fn add_one(x: i32) -> i32
+fn println_i32(x: i32)
+
+fn c(x: i32) -> i32 {
+    add_one(x)
+}
+
+fn b(x: i32) -> i32 {
+    c(x)
+}
+
+fn a(x: i32) -> i32 {
+    b(x)
+}
+
+fn main() {
+    println_i32(a(10));
+}

@@ -1,0 +1,6 @@
+[project]
+name = "rust_free_fn_undefined_gives_error"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

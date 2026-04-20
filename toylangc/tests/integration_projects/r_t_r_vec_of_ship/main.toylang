@@ -1,0 +1,25 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct ToyShip {
+    wings: Vec<i32, Global>,
+}
+
+fn make_fleet() -> Vec<ToyShip, Global> {
+    let fleet = Vec::new<ToyShip, Global>();
+    let v = Vec::new<i32, Global>();
+    v.push(10);
+    fleet.push(ToyShip { wings: v });
+    fleet
+}
+
+fn fleet_len(f: &Vec<ToyShip, Global>) -> usize {
+    f.len()
+}
+
+fn main() {
+    let fleet = make_fleet();
+    println_usize(fleet_len(&fleet));
+}

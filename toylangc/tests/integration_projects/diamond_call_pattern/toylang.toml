@@ -1,0 +1,6 @@
+[project]
+name = "diamond_call_pattern"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

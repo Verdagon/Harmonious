@@ -1,0 +1,25 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn make_vec() -> Vec<Point, Global> {
+    let v = Vec::new<Point, Global>();
+    v.push(Point { x: 1, y: 2 });
+    v.push(Point { x: 3, y: 4 });
+    v
+}
+
+fn vec_len(v: &Vec<Point, Global>) -> usize {
+    v.len()
+}
+
+fn main() {
+    let v = make_vec();
+    println_usize(vec_len(&v));
+}

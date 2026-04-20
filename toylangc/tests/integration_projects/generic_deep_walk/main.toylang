@@ -1,0 +1,15 @@
+fn identity(x: i32) -> i32
+fn println_i32(x: i32)
+
+fn helper<T>(x: T) -> T {
+    x
+}
+
+fn entry(x: i32) -> i32 {
+    let y = helper<i32>(x);
+    identity(y)
+}
+
+fn main() {
+    println_i32(entry(42));
+}

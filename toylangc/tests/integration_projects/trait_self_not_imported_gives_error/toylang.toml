@@ -1,0 +1,6 @@
+[project]
+name = "trait_self_not_imported_gives_error"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

@@ -1,0 +1,6 @@
+[project]
+name = "static_call_undefined_type_gives_structured_error"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

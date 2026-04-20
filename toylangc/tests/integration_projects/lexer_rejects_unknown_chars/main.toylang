@@ -1,0 +1,7 @@
+fn foo() -> i32 {
+    @42
+}
+
+fn main() {
+    let _x = foo();
+}

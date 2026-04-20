@@ -10,21 +10,22 @@
 - **Sub-stage 5a landed** (cross-crate oracle, 5 walkers → 1 helper). Commit `6bda10c`.
 - **Sub-stage 5b landed** (wrapper-mode two-crate). Commit `b6a2bf6`.
 - **Sub-stage 5c.1 landed** (cargo orchestration + `test_helpers` crate + 3 canary projects). Commits `91cad25` + `05fed63`.
-- **Sub-stage 5c.2 largely complete.** 93 of 129 tests migrated to `integration_projects/<name>/` across 5 batches (+ features propagation to stub rlib, + test_helpers expansion for Option/Result/str/bytes/roguelike fixtures). **36 tests remain unmigrated across 4 categories, all parked inline in `integration_projects.rs` with reasons.** See "Parked tests" block inside that file for the per-category list. Runtime ~16s for 100 integration_projects tests, comfortably inside the 5–15 min budget.
-- **Sub-stages 5c.3, 5c.4 outstanding.** Pattern + harness + most tests in place; remaining work is category-shaped (error-harness helper + Vec<consumer-type> debuginfo fix + ENV_LOG replacement) rather than per-test mechanical.
+- **Sub-stage 5c.2 largely complete.** 93 of 129 tests migrated via the batch work described below. Commit `6d65831`.
+- **Sub-stage 5c.3 largely complete.** +2 Vec<consumer-type> migrations (stub_gen fix) + 8 more Vec<consumer-type> once the fix landed + 7 error-assertion tests (new `run_integration_project_expects_error` helper) + 5 callback-trace tests (new `run_integration_project_check_callbacks` helper + `TOYLANG_LOG_PATH` env pass-through, test semantics reinterpreted for wrapper mode: `__toylang_main` is the sole rust-callable entry point; everything else the tests name is now a deep-walk-discovered internal fn). **121 of 129 tests migrated total.** 8 unmigrated.
+- **Sub-stage 5c.4 outstanding.** Layout probes (6), point_drop (1), and the parked bool-bug test (1) are the residue. Layout probes need either a toylang `size_of` builtin or promotion to facade unit tests; point_drop uses `std::ptr::drop_in_place` + a pre-built runtime.o via `-C link-arg`, neither of which has a wrapper-mode path today. Bool bug is a dedicated codegen fix. After those: retire direct mode + FileLoader + doc pass.
 
-**Current state:** 311/311 green (67 unit + 100 integration_projects + 129 integration legacy + 15 standalone).
+**Current state:** 333/333 green (67 unit + 122 integration_projects + 129 integration legacy + 15 standalone).
 
 **Parked tests (documented in `toylangc/tests/integration_projects.rs` "Parked tests" block):**
 
-| Category | Count | Blocker | Fix owner |
-|----------|------:|---------|-----------|
-| `Vec<consumer-type>` debuginfo ICE | 10 | `pub struct Point(())` source-field count mismatches `layout_of(0-field)`. rustc's `build_struct_type_di_node` panics indexing FieldsShape. Fix: emit unit struct instead of tuple struct in stub_gen, OR align layout_of with source field count. | Stage 5c.4 or dedicated commit |
-| Rust-specific layout probes | 6 | Use `std::mem::size_of::<ConsumerType>()` from Rust main. No Rust-side entry point in wrapper mode. Candidate for promotion to rustc-lang-facade unit tests. | Stage 5c.4 |
-| ENV_LOG callback-trace tests | 5 | Use `compile_and_run_with_env` to set `TOYLANG_CALLBACK_LOG=1` and assert on facade-internal callback sequence. Need `--log-callbacks=<path>` flag or promotion to facade unit tests. | Stage 5c.3 or 5c.4 |
-| Error-assertion tests | 7 | Expect `toylangc` non-zero exit + structured error. Need `run_integration_project_expects_error(name, pattern)` harness helper. | Stage 5c.3 |
-| Codegen latent bug (bool extern-arg return-type leak) | 1 | Pre-existing, hash-order-dependent. `test_extern_fn_call`. | Dedicated fix commit |
-| Not migrated (yet) | 7 | All listed in the parked block with line refs; each falls into one of the above. | Same owners |
+| Category | Count | Status | Notes |
+|----------|------:|--------|-------|
+| `Vec<consumer-type>` debuginfo ICE | 10 | **RESOLVED** | Fixed in this session: stub_gen emits `pub struct Foo;` (unit struct, 0 source fields) instead of `pub struct Foo(());` (tuple struct with 1 unit field). Source-field count now matches layout_of's 0-field opaque layout; debuginfo walker no longer indexes out of bounds. All 10 Vec<consumer-type> tests migrated and green. Generic case (`pub struct Foo<T>(PhantomData<(T, ...)>)`) still uses the PhantomData wrapper — E0392 would block changing it; revisit if a future test hits the same ICE through a nested-Vec generic. |
+| Rust-specific layout probes | 6 | **PARKED for 5c.4** | Use `std::mem::size_of::<ConsumerType>()` from Rust main. No Rust-side entry point in wrapper mode. Candidate for promotion to rustc-lang-facade unit tests, or a toylang `size_of<T>()` builtin. |
+| ENV_LOG callback-trace tests | 5 | **RESOLVED** | Fixed in this session. `run_integration_project_check_callbacks` + `TOYLANG_LOG_PATH` env pass-through. Semantics reinterpreted for wrapper mode: the positive callback set is `{__toylang_main}`; everything else the tests originally expected rustc to monomorphize (`spork`, `entry`, `a`, `entry_a`/`entry_b`, ...) is now an internal callee. The invariant that's still load-bearing: rustc's collector must not see those internal names — the deep walk is side-effect-free w.r.t. rustc. |
+| Error-assertion tests | 7 | **RESOLVED** | Fixed in this session. `run_integration_project_expects_error(name)` helper + `expected_error.txt` (line-wise substring match against combined stdout+stderr). Empty expected_error.txt means "any non-zero exit is fine" for tests whose original direct-mode version only asserted `!compile.status.success()`. |
+| Codegen latent bug (bool extern-arg return-type leak) | 1 | **PARKED — dedicated fix** | Pre-existing, hash-order-dependent. `test_extern_fn_call`. Stub_gen unit-struct fix did NOT affect this — error is at LLC verification time (`value doesn't match function result type 'i8'`), codegen side of toylang. |
+| Rust-side-only (`std::ptr::drop_in_place` + runtime.o) | 1 | **PARKED for 5c.4** | `test_point_drop` uses `-C link-arg=runtime.o` + `std::ptr::drop_in_place(&mut p as *mut Point)` from Rust. No wrapper-mode path today; needs `toylang.toml` link-args support and a way to exercise Rust-side drop-in-place. |
 
 **Two architectural items parked** (TL-tracked, see `docs/architecture/risks.md` Category B addenda):
 1. `.o` emission as side-effect of rustc query firing, hidden by rustc incremental cache. Stopgap: `CARGO_INCREMENTAL=0` in test harness (scoped, not shipping). Architectural fix options (registry-driven codegen invocation, or `build.rs` + cargo-tracked `.o` paths) deferred. See commit `91cad25` for the diagnosis.

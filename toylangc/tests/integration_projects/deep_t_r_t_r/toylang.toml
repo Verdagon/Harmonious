@@ -1,6 +1,7 @@
 [project]
-name = "extern_fn_call"
+name = "deep_t_r_t_r"
 source = "main.toylang"
+features = ["allocator_api"]
 
 [rust-dependencies]
 test_helpers = { path = "../test_helpers" }

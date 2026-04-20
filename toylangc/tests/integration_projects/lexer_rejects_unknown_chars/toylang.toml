@@ -1,0 +1,6 @@
+[project]
+name = "lexer_rejects_unknown_chars"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

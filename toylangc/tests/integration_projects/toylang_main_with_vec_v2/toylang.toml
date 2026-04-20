@@ -1,0 +1,7 @@
+[project]
+name = "toylang_main_with_vec_v2"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

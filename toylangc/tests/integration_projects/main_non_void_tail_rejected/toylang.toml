@@ -1,0 +1,6 @@
+[project]
+name = "main_non_void_tail_rejected"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

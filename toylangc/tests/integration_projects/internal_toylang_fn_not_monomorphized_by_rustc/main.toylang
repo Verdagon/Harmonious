@@ -1,0 +1,14 @@
+fn add_ten(x: i32) -> i32
+fn println_i32(x: i32)
+
+fn bork(x: i32) -> i32 {
+    add_ten(x)
+}
+
+fn spork(x: i32) -> i32 {
+    bork(x)
+}
+
+fn main() {
+    println_i32(spork(5));
+}

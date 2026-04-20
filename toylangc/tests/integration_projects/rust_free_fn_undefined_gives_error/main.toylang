@@ -1,0 +1,3 @@
+fn main() {
+    completely_undefined_xyz()
+}

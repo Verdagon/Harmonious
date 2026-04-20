@@ -1,0 +1,6 @@
+[project]
+name = "deep_chain_only_entry_point_monomorphized"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

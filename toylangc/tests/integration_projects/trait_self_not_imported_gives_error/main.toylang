@@ -1,0 +1,7 @@
+use std::io::stdout
+use std::io::Write
+
+fn main() {
+    let out = stdout();
+    Write::write_all(&out, b"hello\n");
+}

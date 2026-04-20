@@ -1,0 +1,6 @@
+[project]
+name = "internal_toylang_fn_not_monomorphized_by_rustc"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

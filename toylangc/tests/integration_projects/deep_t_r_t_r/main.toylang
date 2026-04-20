@@ -1,0 +1,31 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_usize(x: usize)
+
+struct ToyLeaf {
+    value: i32,
+}
+
+struct ToyBranch {
+    leaves: Vec<ToyLeaf, Global>,
+}
+
+fn make_tree() -> Vec<ToyBranch, Global> {
+    let leaves = Vec::new<ToyLeaf, Global>();
+    leaves.push(ToyLeaf { value: 1 });
+    leaves.push(ToyLeaf { value: 2 });
+    let branch = ToyBranch { leaves: leaves };
+    let tree = Vec::new<ToyBranch, Global>();
+    tree.push(branch);
+    tree
+}
+
+fn tree_len(t: &Vec<ToyBranch, Global>) -> usize {
+    t.len()
+}
+
+fn main() {
+    let tree = make_tree();
+    println_usize(tree_len(&tree));
+}

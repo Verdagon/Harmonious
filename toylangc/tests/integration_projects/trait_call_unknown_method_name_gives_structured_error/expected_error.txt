@@ -1,0 +1,3 @@
+RustTypeNotImported
+writ_all
+as method name on trait

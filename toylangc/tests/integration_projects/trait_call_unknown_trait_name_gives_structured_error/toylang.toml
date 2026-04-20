@@ -1,0 +1,6 @@
+[project]
+name = "trait_call_unknown_trait_name_gives_structured_error"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

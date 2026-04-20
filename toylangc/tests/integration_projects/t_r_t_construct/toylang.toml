@@ -1,0 +1,7 @@
+[project]
+name = "t_r_t_construct"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

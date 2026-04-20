@@ -1,0 +1,6 @@
+[project]
+name = "generic_deep_walk"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
