@@ -25,7 +25,7 @@ maintenance-mode handoff, not a mid-project one.
   Post-stage-5 B6/B7 cleanup also shipped; `risks.md` Category B is
   empty of active items. **210 tests passing** (67 unit + 128
   integration_projects + 15 standalone), 0 failed, 0 ignored,
-  cold **and** warm, against vanilla `nightly-2025-01-15` installed
+  cold **and** warm, against vanilla `nightly-2026-01-20` installed
   via rustup.
 
 - **Active work:** none. No junior handoffs in flight. No unresolved
@@ -152,7 +152,7 @@ zero downside to reclaiming the disk.
   is ready.
 
 - **Rust team, implicit.** Erw now builds against vanilla rustc
-  nightly (`nightly-2025-01-15`). No active coordination required.
+  nightly (`nightly-2026-01-20`). No active coordination required.
   No upstream dependencies other than the nightly pin. When bumping
   nightly, budget ~1 week for API drift per `risks.md` Category B3
   (MIR construction surface).
@@ -347,7 +347,7 @@ The rustc fork — **now deletable**:
                                                 #
 rustup toolchain rustc-fork                     # points at ~/rust/build/host/stage2,
                                                 #   unused by erw (tests run against
-                                                #   vanilla nightly-2025-01-15 via rustup)
+                                                #   vanilla nightly-2026-01-20 via rustup)
                                                 # Safe to `rustup toolchain uninstall rustc-fork`
 ```
 
@@ -355,23 +355,23 @@ rustup toolchain rustc-fork                     # points at ~/rust/build/host/st
 
 ## 8. Commands to know
 
-All assume `nightly-2025-01-15` toolchain is installed via rustup
-(`rustup toolchain install nightly-2025-01-15`).
+All assume `nightly-2026-01-20` toolchain is installed via rustup
+(`rustup toolchain install nightly-2026-01-20`).
 
 ```bash
 # Full test suite (expect: 67 + 128 + 15 = 210 passing, 0 failed, 0 ignored)
-cargo +nightly-2025-01-15 test -p toylangc 2>&1 > /tmp/erw.txt
+cargo +nightly-2026-01-20 test -p toylangc 2>&1 > /tmp/erw.txt
 grep "test result:" /tmp/erw.txt
 
 # Check warnings
-cargo +nightly-2025-01-15 check -p toylangc 2>&1 > /tmp/erw.txt
+cargo +nightly-2026-01-20 check -p toylangc 2>&1 > /tmp/erw.txt
 tail -20 /tmp/erw.txt
 
 # Run a specific integration test
-cargo +nightly-2025-01-15 test -p toylangc --test integration_projects test_name
+cargo +nightly-2026-01-20 test -p toylangc --test integration_projects test_name
 
 # Run standalone tests (full crates.io interop suite)
-cargo +nightly-2025-01-15 test -p toylangc --test standalone_tests
+cargo +nightly-2026-01-20 test -p toylangc --test standalone_tests
 ```
 
 **Build-redirect convention** (per `CLAUDE.md`): use `>` to redirect
@@ -392,7 +392,7 @@ part of the output without re-running.
 - [ ] If the Vale response is sent, sent before handoff. If held,
       new maintainer knows the current posture.
 - [ ] Full test suite runs green on the new maintainer's machine
-      (`cargo +nightly-2025-01-15 test -p toylangc` → 210/210).
+      (`cargo +nightly-2026-01-20 test -p toylangc` → 210/210).
 - [ ] New maintainer knows about the three preserved POC/spike
       worktrees and why they're kept.
 - [ ] New maintainer knows `~/rust` and `rustc-fork` toolchain are

@@ -15,10 +15,10 @@ type system, generics, monomorphization, and standard library.
 
 ```bash
 # Build the compiler
-cargo +nightly-2025-01-15 build -p toylangc
+cargo +nightly-2026-01-20 build -p toylangc
 
-# Run the test suite (211 tests: 67 unit + 129 integration + 15 standalone)
-cargo +nightly-2025-01-15 test -p toylangc
+# Run the test suite (210 tests: 67 unit + 128 integration + 15 standalone)
+cargo +nightly-2026-01-20 test -p toylangc
 ```
 
 Then try a minimal toylang project:
@@ -32,7 +32,7 @@ source = "main.toylang"
 EOF
 echo 'fn main() {}' > main.toylang
 
-DYLD_LIBRARY_PATH=$(rustc +nightly-2025-01-15 --print sysroot)/lib \
+DYLD_LIBRARY_PATH=$(rustc +nightly-2026-01-20 --print sysroot)/lib \
   /path/to/target/debug/toylangc build
 ./.toylang-build/target/debug/smoke; echo "exit: $?"
 ```
@@ -61,7 +61,7 @@ important to understand:
 
 1. **User-facing manifest.** `toylangc build` parses it to generate the
    internal Cargo project (`Cargo.toml`, `src/main.rs` shim,
-   `rust-toolchain.toml`) and to spawn `cargo +nightly-2025-01-15 build`.
+   `rust-toolchain.toml`) and to spawn `cargo +nightly-2026-01-20 build`.
 2. **Side-channel for wrapper mode.** Cargo then invokes `toylangc` itself as
    a `RUSTC_WORKSPACE_WRAPPER` for each crate. When it reaches your primary
    crate, wrapper-mode `toylangc` re-reads the same `toylang.toml` (one

@@ -860,7 +860,7 @@ retiring both remaining fork patches via plugin-set linkage in the
 `collect_and_partition_mono_items` override. No fork patches left
 to account for.)*
 
-**Current shape:** toylang builds against vanilla `nightly-2025-01-15`
+**Current shape:** toylang builds against vanilla `nightly-2026-01-20`
 via rustup. Fork maintenance cost is zero. MIR construction churn
 (~1 person-week per 6-month rustc bump) is the remaining
 rustc-internal-API exposure, and that cost is unchanged from the

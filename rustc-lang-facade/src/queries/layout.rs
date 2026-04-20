@@ -29,8 +29,9 @@ use rustc_abi::{
 use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
 use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv, TyKind, TypeVisitableExt};
 // The provider function type. This must match rustc's Providers::layout_of signature
-// exactly — it changes between nightlies. On nightly-2025-01-15 it uses
-// PseudoCanonicalInput. On other nightlies it may use ParamEnvAnd.
+// exactly — it changes between nightlies. On nightly-2026-01-20 it uses
+// PseudoCanonicalInput (unchanged from the prior nightly-2025-01-15 pin).
+// On other nightlies it may use ParamEnvAnd.
 pub type LayoutOfFn = for<'tcx> fn(
     TyCtxt<'tcx>,
     PseudoCanonicalInput<'tcx, Ty<'tcx>>,

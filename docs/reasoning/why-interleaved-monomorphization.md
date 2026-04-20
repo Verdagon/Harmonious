@@ -831,7 +831,7 @@ swapped.
 `rustc_interface::Config::override_queries` overrides on rustc's
 existing queries — the sanctioned extension point that
 rust-analyzer, clippy, and miri all use. No fork patches: toylang
-builds against vanilla `nightly-2025-01-15` via rustup. The query
+builds against vanilla `nightly-2026-01-20` via rustup. The query
 set:
 
 - `optimized_mir` — synthesizes dep-registering bodies for consumer

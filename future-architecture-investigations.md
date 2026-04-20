@@ -18,7 +18,7 @@ no separate-crate-stubs migration) is sufficient for zero-fork via
 plugin-set `MonoItemData.linkage`. §3.2 (separate-crate stubs /
 POC #2) was explicitly not pursued — Outcome A made it unnecessary,
 so `FileLoader` + single-crate stubs stays indefinitely. **Fork:
-zero patches. Toylang builds against vanilla `nightly-2025-01-15`.**
+zero patches. Toylang builds against vanilla `nightly-2026-01-20`.**
 Everything below is retained as the investigation landscape that
 motivated the path.
 

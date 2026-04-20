@@ -2,7 +2,7 @@
 
 > **Current status:** 210 tests passing (67 unit + 128 integration_projects + 15
 > standalone), 0 failed, 0 ignored, cold **and** warm. **Zero rustc fork
-> patches — built against vanilla `nightly-2025-01-15`.** All rustc
+> patches — built against vanilla `nightly-2026-01-20`.** All rustc
 > integration flows through `Config::override_queries` and a
 > `CodegenBackend` wrapper — no fork, no FileLoader, no hook statics,
 > no `CARGO_INCREMENTAL=0` harness stopgap. Two-crate architecture:
@@ -29,7 +29,7 @@ Two-crate workspace:
 - `rustc-lang-facade` — reusable library for integrating custom languages with rustc.
 - `toylangc` — toylang consumer, the demonstrator.
 
-Built against vanilla `nightly-2025-01-15` via rustup — zero rustc fork patches. All rustc integration flows through sanctioned extension points:
+Built against vanilla `nightly-2026-01-20` via rustup — zero rustc fork patches. All rustc integration flows through sanctioned extension points:
 
 - **`Config::override_queries`** installs six query overrides (`optimized_mir`, `symbol_name`, `layout_of`, `mir_shims`, `collect_and_partition_mono_items`, `upstream_monomorphizations_for`).
 - **Stub rlib as a real cargo package** (stage 5b/5c): `toylangc build` emits a two-member workspace at `<project>/.toylang-build/` with `lang_stubs_crate/` (rlib, stub struct defs + `pub use` re-exports + extern accessor decls) and `user_bin/` (bin, `fn main() { __toylang_main(); }` shim path-depending on the stub rlib). Stage 5c.4 retired the earlier FileLoader-based stub injection.

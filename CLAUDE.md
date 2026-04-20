@@ -8,7 +8,7 @@ Two-crate workspace:
 - **`rustc-lang-facade`** — reusable library that hooks into rustc via 4 query providers (`layout_of`, `optimized_mir`, `symbol_name`, `mir_shims`)
 - **`toylangc`** — example consumer compiler for "toylang" that uses the facade
 
-Built against vanilla `nightly-2025-01-15` — zero rustc fork patches. All rustc integration flows through `Config::override_queries`: `optimized_mir` supplies synthetic dep-registering bodies, `collect_and_partition_mono_items` filters consumer items out of rustc's CGU list and forces `(External, Default)` linkage on `__lang_stubs` items directly, `symbol_name` rewrites to toylang-mangled names, `layout_of` / `mir_shims` / `upstream_monomorphizations_for` round out the set. No fork, no hook statics.
+Built against vanilla `nightly-2026-01-20` — zero rustc fork patches. All rustc integration flows through `Config::override_queries`: `optimized_mir` supplies synthetic dep-registering bodies, `collect_and_partition_mono_items` filters consumer items out of rustc's CGU list and forces `(External, Default)` linkage on `__lang_stubs` items directly, `symbol_name` rewrites to toylang-mangled names, `layout_of` / `mir_shims` / `upstream_monomorphizations_for` round out the set. No fork, no hook statics.
 
 Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Internal consumer functions are never exposed to rustc — they are discovered via deep monomorphization walk and compiled separately by an Inkwell LLVM backend. A global mutex serializes all consumer code (single-threaded).
 
@@ -29,6 +29,6 @@ Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Int
 ## Building & testing
 
 ```bash
-cargo +nightly-2025-01-15 test          # run all tests (67 unit + 128 integration_projects + 15 standalone = 210)
-cargo +nightly-2025-01-15 test --test integration_tests test_name  # run one test
+cargo +nightly-2026-01-20 test          # run all tests (67 unit + 128 integration_projects + 15 standalone = 210)
+cargo +nightly-2026-01-20 test --test integration_tests test_name  # run one test
 ```

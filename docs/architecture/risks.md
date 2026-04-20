@@ -277,15 +277,111 @@ The stable-MIR effort (now `rustc_public`) covers ~40–50% of our read-side rus
 
 ### Nightly-pin strategy
 
-Currently pinned to `nightly-2025-01-15`. Bumping is a conscious event, not a silent drift — you control when to pay the API-drift cost. Recommended strategy:
+Currently pinned to `nightly-2026-01-20`. Bumping is a conscious event, not a silent drift — you control when to pay the API-drift cost. Recommended strategy:
 
 - **Don't chase latest nightly.** Bump to a ~3-month-old nightly when you do. Gives the ecosystem time to stabilize around any rustc internals changes; avoids riding the bleeding edge.
 - **Bump in dedicated sessions.** Batch the drift repair work into its own commit/PR cycle; don't mix with feature work. Makes it easier to bisect when something breaks.
-- **Re-run the full 211-test suite** after every bump. No subset — the full suite catches the most regressions.
+- **Re-run the full 210-test suite** after every bump. No subset — the full suite catches the most regressions.
 
-### 211 tests as canary
+#### Empirical bump cost: 2025-01-15 → 2026-01-20 (≈15-month gap)
 
-The test suite is your primary regression detector. 67 unit + 129 integration + 15 standalone. Coverage:
+The 2026-04 bump serves as the first data point for calibrating the
+next one. HANDOFF-nightly-bump.md (moved to `docs/historical/`) carried
+the full staged implementation plan.
+
+**Observed drift, by surface (handoff category):**
+
+- **§4.1 `RunCompiler` → `run_compiler` free function (PR #135880).**
+  Pure mechanical call-site change, one site in facade + one in
+  toylangc. Time: ~15 min.
+
+- **§4.2 `CodegenBackend::codegen_crate` / `link` signature drift
+  (PR #141769).** Metadata parameter moved from `codegen_crate` to
+  `link`; `CodegenBackend::name()` became required; `CompiledModule`
+  gained `links_from_incr_cache`; `make_codegen_backend` closure
+  arity widened. All mechanical, one file. Time: ~20 min.
+
+- **§5.1 MIR construction drift (highest drift expected, held to
+  form).** Five items in `build_dependency_body`:
+  `Instance::new` → `Instance::new_raw`, `Statement`/`BasicBlockData`
+  became `#[non_exhaustive]` (use `Statement::new` /
+  `BasicBlockData::new_stmts`), `PointerCoercion::ReifyFnPointer`
+  gained a `Safety` arg, `Rvalue::NullaryOp` + `NullOp` removed
+  entirely (the dead else-branch became an assert). Time: ~1 hour.
+
+- **§5.2 ABI helpers.** Only `Reg`/`RegKind` privacy — re-exported
+  via `rustc_abi` so the fix is a single import path swap. No
+  `PassMode`/`CastTarget` drift. Time: ~10 min.
+
+- **§5.3 Partitioner / Outcome A.** `MonoItemPartitions` struct
+  replaced the tuple return; `Linkage` enum canonical home moved to
+  `rustc_hir::attrs`. Mechanical. **B2 did NOT fire** — the Phase-6
+  unwrap canaries (`test_option_unwrap_basic`, `test_result_unwrap_basic`,
+  `test_unwrap_arithmetic_chain`, Vec/HashMap generics) all pass
+  without linkage-mutation breakage. Outcome A held through the
+  bump. Time: ~30 min.
+
+- **§5.4 Query provider signatures.** Only `collect_and_partition_mono_items`'s
+  return type changed (see §5.3). `layout_of`'s `PseudoCanonicalInput` key
+  is unchanged from the prior pin. Time: ~0 (covered by §5.3).
+
+- **NEW surface not predicted by handoff: `rustc_middle::util::Providers`
+  restructured from flat struct into `{queries, extern_queries, hooks}`
+  sub-structs.** All 6 query override assignments needed `providers.X` →
+  `providers.queries.X`. Queries with the `separate_provide_extern`
+  modifier (of ours, only `optimized_mir`) additionally appear in
+  `extern_queries.*` with `DefId` instead of `LocalDefId` keys — we
+  override only the local (`queries.*`) path, matching prior flat-struct
+  behavior, and this suffices (Phase-6 tests still green). **Add this
+  surface to §5.4 for the next bump.** Time: ~30 min (initial
+  restructure) + ~30 min (unraveling the cascade through
+  `install_query_defaults`, `partition.rs`, etc).
+
+- **Layout drift.** `AbiAndPrefAlign` → `AbiAlign` (slimmed),
+  `memory_index` → `in_memory_order` (inverse-permutation rename),
+  `LayoutData.uninhabited: bool` is now required (was derived from
+  `BackendRepr::Uninhabited`), `randomization_seed: u64` → `Hash64`
+  (required adding `extern crate rustc_hashes`). Time: ~20 min.
+
+- **toylangc consumer-side drift beyond facade mirrors.**
+  `rustc_driver::catch_with_exit_code` closure now returns `()`
+  (was `Result<(), ErrorGuaranteed>`); `GenericArg::unpack()` →
+  `.kind()`; `TargetDataLayout::pointer_size` /
+  `pointer_align` field → method. Time: ~30 min.
+
+**Empirical total: roughly half a workday of focused drift repair
+for a Rust-fluent engineer working with the compiler telling them
+exactly what to fix.** The handoff's budget (1.5–2 weeks, worst case
+3–4) built in slack for B2 firing and for unknown MIR-construction
+restructurings more severe than what we actually hit. Both slack
+categories went unused; the bump was at the easier end of the
+predicted distribution.
+
+**Calibration update for §B3 (MIR construction churn):** the claim
+"~100% per 6-month bump" overstated the repair cost — 15 months
+of MIR drift took ~1 hour, not several days. Revise the estimate
+to "~100% of constructor call-sites need adapting per 6-month
+bump, at ~10 minutes per site." A ~50-site consumer would be a
+day's work; our ~6-site consumer was an hour.
+
+**Calibration update for §B2 (Outcome A canary):** the partitioner's
+internalization timing + the CGU-slice linkage-mutation reads both
+held through the bump, as predicted by §B2's "≥60% / 5yr hold"
+model. One data point doesn't move a probability much, but it's the
+first empirical observation of Outcome A surviving a bump, and
+shifts the posterior slightly toward holding.
+
+**New guidance:** future bumps should proactively check
+`rustc_middle::util::Providers` for ongoing restructuring — this
+surface wasn't in the handoff but was the single largest repair
+(12 errors across a cascade of files). It's plausibly on a
+trajectory of continued sub-struct reorganization as the query
+macros evolve. Grep pattern for the next bump: `providers\.\w+\s*=`
+in `rustc-lang-facade/src/queries/mod.rs`.
+
+### 210 tests as canary
+
+The test suite is your primary regression detector. 67 unit + 128 integration + 15 standalone. Coverage:
 
 - **Phase 6 tests** catch Category B2 (Outcome A assumption breakage).
 - **Phase 7 standalones** catch Category B1 (mono collector drift) and B3 (MIR construction API drift).
