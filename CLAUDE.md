@@ -32,3 +32,67 @@ Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Int
 cargo +nightly-2026-01-20 test          # run all tests (67 unit + 128 integration_projects + 15 standalone = 210)
 cargo +nightly-2026-01-20 test --test integration_tests test_name  # run one test
 ```
+
+## Build & Run Convention
+
+Always pipe `cargo run`, `cargo test`, `cargo build`, `cargo check`, and all `sbt` output into a fixed file in `./tmp/` (use the same file for the entire session/project, e.g. `./tmp/refactor-project.txt`). Come up with a name instead of refactor-project.txt, and then use the same file for the rest of the session.
+
+**Never chain a heavy command with `| tail`, `| head`, `| grep`.** Run the build/test with `>` as one command (redirecting fully to the file) and the inspection as a separate follow-up command. Chaining defeats the purpose: you lose the ability to re-analyze a different part of the output without re-running the expensive build.
+
+DO have them in separate commands:
+
+```bash
+cargo run --bin benchmark -- --model openai/gpt-oss-20b > ./tmp/fixing-bug-1047-quest.txt 2>&1
+tail -20 ./tmp/fixing-bug-1047-quest.txt
+# Later, to see a different part:
+head -40 ./tmp/fixing-bug-1047-quest.txt
+grep "error" ./tmp/fixing-bug-1047-quest.txt
+```
+
+```bash
+sbt 'testOnly dev.vale.AfterRegionsIntegrationTests' > ./tmp/fixing-borrowing-test.txt 2>&1
+grep "SUCCESS" ./tmp/fixing-borrowing-test.txt
+# Later, to see a different part:
+tail -30 ./tmp/fixing-borrowing-test.txt
+# Later, do some changes to the code, and then same command into same file:
+sbt 'testOnly dev.vale.AfterRegionsIntegrationTests' > ./tmp/fixing-borrowing-test.txt 2>&1
+grep "SUCCESS" ./tmp/fixing-borrowing-test.txt
+```
+
+DON'T chain them together like this:
+
+```bash
+# This is bad:
+cargo build --lib > ./tmp/build4.txt && grep -B2 "i_env_entry" ./tmp/build4.txt | grep "src/" | head -20
+```
+
+Instead, they must be separate entire commands.
+
+DON'T use a different file for each build like this:
+
+```bash
+sbt 'testOnly dev.vale.AfterRegionsIntegrationTests' > ./tmp/borrowing-build1.txt 2>&1
+grep "SUCCESS" ./tmp/borrowing-build1.txt
+# BAD: Don't use a different file
+sbt 'testOnly dev.vale.AfterRegionsIntegrationTests' > ./tmp/borrowing-build2.txt 2>&1
+grep "SUCCESS" ./tmp/borrowing-build2.txt
+```
+
+Instead, use the same file.
+
+
+## Use Relative Paths For Cargo Commands
+
+In `cargo` commands, don't use `/Volumes/V/...` or `/Users/verdagon/...` etc.
+
+For example, don't do this:
+
+```
+cargo check --manifest-path /Volumes/V/Sylvan/FrontendRust/Cargo.toml --tests > /Volumes/V/Sylvan/tmp/slab15-build.txt 2>&1
+```
+
+Instead, use relative paths for cargo commands:
+
+```
+cargo check --manifest-path ./FrontendRust/Cargo.toml --tests > ./tmp/slab15-build.txt 2>&1
+```
