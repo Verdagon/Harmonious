@@ -73,35 +73,38 @@ impl rustc_driver::Callbacks for LangDriver {
         }));
     }
 
-    fn after_analysis<'tcx>(
+    fn after_expansion<'tcx>(
         &mut self,
         _compiler: &rustc_interface::interface::Compiler,
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
-        // S.4 (course-correct.md quarter-of-work plan): load each upstream
-        // Sky-marked rlib's adjacent `.sky-meta` sidecar and hand the bytes
-        // to the consumer. Runs BEFORE `call_after_rust_analysis` so the
-        // consumer's after-analysis pass has access to upstream universes
-        // when later workstreams (A.3) start using them. By this point all
-        // rlibs have been loaded by rustc's metadata machinery, so
-        // `tcx.crates(())` enumerates every external crate this compile
-        // depends on (transitive deps included).
+        // Course-correct #5 / architecture §20.3: Sky's frontend runs at
+        // `after_expansion`, BEFORE rustc's typecheck walks the stub bodies.
+        // Sky's universe is populated here so any rustc query that consults
+        // Sky's predicates / overrides during analysis sees a ready universe.
         //
-        // Detection today uses the hardcoded `__lang_stubs` crate-name
-        // check via `crate::is_from_lang_stubs`. Phase 3 E.1 swaps this
-        // for marker-based detection (`__SKY_STUBS_MARKER` at the crate
-        // root) per architecture doc §4.5 / §6.3.
+        // The stub rlibs' Rust source is parsed + expanded by this point; all
+        // extern crates (including upstream Sky-marked rlibs) have been loaded
+        // by rustc's metadata machinery, so `tcx.crates(())` enumerates every
+        // external crate this compile depends on (transitive deps included).
+        // ADT defs, fn sigs, and `module_children` walks are available at
+        // this point, which is what the oracle / `load_upstream_sidecars`
+        // path needs.
         //
-        // Sidecar path: the rlib's path with extension swapped to
-        // `.sky-meta`. Matches what S.3's writer produced via
-        // `tcx.output_filenames(()).with_extension("sky-meta")` — both
-        // sides derive the path from the same basename.
+        // S.4: load each upstream Sky-marked rlib's adjacent `.sky-meta`
+        // sidecar and hand the bytes to the consumer. Runs BEFORE
+        // `call_after_rust_analysis` so the consumer's after-analysis pass
+        // has access to upstream universes.
+        //
+        // Detection uses marker-based `crate::is_from_lang_stubs` (Phase 3
+        // E.1; `__SKY_STUBS_MARKER` at the crate root per §4.5 / §6.3).
         load_upstream_sidecars(tcx);
 
-        // Phase 1.5: let consumer type-check against Rust types.
-        // This runs BEFORE monomorphization — the consumer can query tcx for
-        // Rust type info but doesn't know which concrete instantiations will
-        // be requested yet.
+        // Sky's typecheck-and-codegen-queue pass (toylang: Check 1–5 in
+        // `after_rust_analysis`). The consumer can query tcx for Rust type
+        // info but doesn't know which concrete instantiations will be
+        // requested yet — those surface via `collect_generic_rust_deps`
+        // during monomorphization.
         crate::call_after_rust_analysis(tcx);
 
         // Phase 3 (generate_and_compile) is called later, from
