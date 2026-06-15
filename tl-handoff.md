@@ -369,6 +369,40 @@ Honest follow-ups deferred from Session 9 (small, real, documented):
    so case1b's weakness is mild; add a `case1b_user_struct` variant
    if/when defending against drift in this specific direction.
 
+**Session 10 (export keyword — Sky §9 architectural property
+enforced).** Until Session 9 toylang emitted `pub fn name(...) {
+unreachable!() }` for every body-bearing fn in the stub rlib, so
+rustc DID have DefIds for non-export items even though it never
+walked their bodies. Session 10 closes that gap.
+
+- New `export` keyword in front of fn / impl decls; parser sets
+  `is_export: bool` on `ToyFunction` and `ToyImpl`. `main` is
+  implicitly export (the Rust shim names `__toylang_main`). Structs
+  are deliberately NOT gated — §10 needs opaque-with-size ADT
+  presence for layout composition.
+- stub_gen skips the `pub fn` shell for non-export body-bearing fns
+  and the entire `impl` block for non-export impls. Check 2 in
+  `after_rust_analysis` (stub-presence guard) restricted to export
+  items.
+- New `stub_gen::tests::non_export_body_bearing_fn_gets_no_stub_shell`
+  is the CI fence: builds a registry with one export + one
+  non-export fn, runs `generate`, asserts the non-export name never
+  appears as a `fn` declaration. Mirror of A.5's spirit — a CI-
+  enforceable fence against drift away from Sky §9's commitment.
+- Fixtures migrated: case1a/1b/3/5 added `export` on the Sky fn the
+  rust_caller calls; case4 marked `export impl Clone for Widget`;
+  case6_lib exported make_box/box_value/impl Clone; two layout-probe
+  fixtures (tg_of_*_layout) marked `export fn make_wrapper` because
+  they assert the layout query fires at rlib-compile time, which
+  needs the rustc-visible signature.
+
+Test counts after Session 10: **252/252 passing** (98 unit + 138
+integration + 16 standalone). All seven taxonomy cases continue to
+pass under the stricter semantics — proves the discovery + codegen
+path was already Sky-aligned at the mechanism level; what changed is
+whether rustc can name non-export items at all (it can't, which is
+the locked architectural claim).
+
 ---
 
 ## 3. The plan you're executing
@@ -880,6 +914,8 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `b56cf4c` | Phase 2 C.5 + C.6 + C.7 (Case 4 end-to-end; 7/7 cases tested) |
 | `22a1390` | Session-8 doc refresh |
 | `d65ef81` | Session 9 sharpening (case4/5/6 now architecturally correct) |
+| `a7683fc` | Session-9 doc refresh |
+| `1b738e6` | Session 10: `export` keyword + non-export items invisible to rustc |
 
 Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
 baseline.
