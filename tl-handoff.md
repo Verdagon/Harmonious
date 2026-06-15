@@ -804,22 +804,29 @@ without budgeting properly.
 
 **Update after Session 11**: Tier 1 + Tier 2 done; the uniformity sweep
 (Phases A/B/C/F) closed every site that branched on
-`type_params.is_empty()` in discovery + typecheck paths. Two compact
-options remain before committing to a Tier 3 quarter-of-work piece:
+`type_params.is_empty()` in discovery + typecheck paths. **Phase E Path 1
+also landed**: the rustc debuginfo clamp was written and verified as fork
+patch 4 (`e67de69ef35` on `per-instance-mir`). Verified by reproducing
+the previously-ICE'ing `pub struct Foo(())` shape on the patched rustc —
+253/253 tests pass. PR draft at `phase-e-rustc-pr-draft.md` ready for
+upstream submission.
 
-- **Phase E Path 1 — upstream rustc patch** (~1 day in our control + PR
-  review): write the ~5-10 LOC clamp in `build_struct_type_di_node`,
-  write a minimal Sky-free reproducer (cranelift layout-override test
-  would work), file the bug, submit. If it lands or we ship it as a
-  fourth fork patch, the struct-shape `is_generic` divergence in
-  `stub_gen.rs` can be removed in another 5-LOC change. See
-  `phase-e-investigation.md` for the precise diagnosis.
+Remaining options:
+
+- **Phase E completion** (~1 hour): with the clamp now in place locally,
+  remove the struct-shape `is_generic` branch from stub_gen and update
+  the architecture_fence to allow the now-unified shape. This adds a
+  hard local dependency on the fork patch — anyone building against
+  vanilla nightly crashes. Trade-off: closes the asymmetry; widens the
+  fork-vs-vanilla gap. Could be deferred until the upstream PR lands.
 - **Phase E Path 2 — `SkyOpaqueType<typeid>` migration** (5-10 days):
   the §10.6 locked Sky design. Substantial — every Sky struct's stub
   shape becomes a wrapper, and every Sky→rustc type-identity site
   needs to decode the const-generic typeid. High blast radius.
   Recommendation: defer until §13's comptime-type machinery lands and
   this work amortizes.
+- **Tier 3 facade-level shifts** (#7, #8, #12, #13): each is its own
+  multi-week sub-project. Don't start without explicit agreement.
 
 ### Cross-references for the next person
 
@@ -983,10 +990,11 @@ S.5's determinism test byte-compares two builds.
 nightly + rustc-fork, normalizes the disambiguator-derived bits, asserts
 LLVM IR byte-equality. Skips gracefully if vanilla isn't installed.
 
-**Fork state**: `~/rust` on `per-instance-mir` branch, 3 patches applied:
-query declaration, collector hook, default-None provider. Rebuilt for
-nightly-2026-01-20 / rustc 1.95.0-dev / commit `d940e568`. Installed as
-toolchain `rustc-fork`.
+**Fork state**: `~/rust` on `per-instance-mir` branch, **4 patches**
+applied: query declaration, collector hook, default-None provider, and
+debuginfo struct+union field clamp (Session 11's Phase E Path 1,
+commit `e67de69ef35`). Rebuilt for nightly-2026-01-20 / rustc 1.95.0-dev
+/ commit `d940e568`. Installed as toolchain `rustc-fork`.
 
 **Toolchain pin**: `rust-toolchain.toml` channel = `"rustc-fork"`. Four
 sites stay in sync (the toolchain file + `TOYLANG_NIGHTLY` in main.rs +
@@ -1026,12 +1034,13 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `0b40d98` | Honest accounting: generic-vs-non-generic uniformity audit + fix plan |
 | `8faca57` | Phase A: rename `type_params.is_empty()` to `has_abstract_args()` |
 | `5a1e7d0` | Phase B: generic bodies type-resolve eagerly, defer on TypeParam |
+| `d87638d` | Phase C + F: entry-point walk + architectural-property fence |
+| `a43569c` | Phase E investigation: rustc debuginfo ICE reproduces; recommend upstream patch |
+| `4c19bec` | Doc refresh: Session 11 uniformity sweep + Phase E investigation |
+| `8a9adc8` | Phase E patch landed in fork; verified clamp eliminates the ICE |
 
-**Uncommitted as of Session 11 end (user-fenced pending review):**
-Phase C populate rewrite in `callbacks_impl.rs` (+ 3 arch-fence-allow
-markers), Phase F new file `toylangc/tests/architecture_fence.rs` (+ 1
-marker in `type_resolve.rs`), Phase E new file `phase-e-investigation.md`,
-this Session 11 doc refresh.
+Plus fork commit `e67de69ef35` (in `~/rust` on `per-instance-mir`):
+debuginfo: clamp struct + union field walk to layout's field count.
 
 Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
 baseline.
