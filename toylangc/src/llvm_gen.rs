@@ -1583,16 +1583,45 @@ fn lower_typed_expr<'ctx>(
 
         TypedExprKind::FieldAccess { receiver, field } => {
             let recv_result = lower_typed_expr(ctx, receiver);
-            let ResolvedType::Struct { name: struct_name, .. } = &receiver.ty else {
+            // Phase 2 C.3 mirror — auto-deref through one `&T` layer for
+            // field access. Method bodies in impl blocks carry receivers
+            // typed as `Ref { inner: Struct }`; the type resolver permits
+            // `self.field` there. Codegen must:
+            //   1. Use the underlying Struct type for GEP indexing.
+            //   2. LOAD the receiver pointer first — `into_ptr` returns the
+            //      address of the receiver value (a Widget* stored on the
+            //      stack), but for field access we need the address that
+            //      pointer holds (the actual Widget). Without the load the
+            //      GEP indexes into the stack slot itself and reads
+            //      arbitrary stack bytes.
+            let auto_deref = matches!(&receiver.ty,
+                ResolvedType::Ref { inner } if matches!(**inner, ResolvedType::Struct { .. }));
+            let recv_struct_ty = match &receiver.ty {
+                ResolvedType::Ref { inner } if matches!(**inner, ResolvedType::Struct { .. })
+                    => &**inner,
+                other => other,
+            };
+            let ResolvedType::Struct { name: struct_name, .. } = recv_struct_ty else {
                 panic!("field access on non-struct");
             };
             let toy_struct = ctx.registry.structs.get(struct_name.as_str()).unwrap();
             let field_idx = toy_struct.fields.iter()
                 .position(|f| f.name == *field)
                 .unwrap() as u32;
-            let struct_ty = ctx.resolved_to_struct_type(&receiver.ty);
-            let struct_ptr = recv_result.into_ptr(&ctx.builder,
-                struct_ty.as_basic_type_enum(), "fa_recv");
+            let struct_ty = ctx.resolved_to_struct_type(recv_struct_ty);
+            let struct_ptr = if auto_deref {
+                // Receiver is `&Struct`. `into_ptr` with a ptr-typed slot
+                // returns the address of the slot; load it to get the
+                // Widget pointer the slot holds.
+                let ptr_ty = ctx.context.ptr_type(inkwell::AddressSpace::default());
+                let slot = recv_result.into_ptr(&ctx.builder,
+                    ptr_ty.as_basic_type_enum(), "fa_recv_slot");
+                ctx.builder.build_load(ptr_ty, slot, "fa_recv_deref")
+                    .unwrap().into_pointer_value()
+            } else {
+                recv_result.into_ptr(&ctx.builder,
+                    struct_ty.as_basic_type_enum(), "fa_recv")
+            };
             let gep = ctx.builder.build_struct_gep(struct_ty, struct_ptr, field_idx, field).unwrap();
             match &expr.ty {
                 ResolvedType::Struct { .. } | ResolvedType::RustType { .. } => {

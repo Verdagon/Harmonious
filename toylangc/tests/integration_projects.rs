@@ -747,6 +747,23 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 /// `RustType` returns coerced to direct register (small struct).
 /// Expected output: `42`.
 #[test] fn test_case3_rust_sky_back_to_rust() { run_integration_project("case3_rust_sky_back_to_rust"); }
+
+/// Phase 2 C — Case 4 (architecture §2.6): Sky top → Rust generic
+/// intermediary → Sky impl of Rust trait. The toylang source defines a
+/// `Widget` struct, an `impl Clone for Widget` block (Phase 2 C.1 parser),
+/// and helpers `make_widget` / `id_of`. The rust_caller obtains a
+/// Widget via `make_widget`, calls `Clone::clone(&w)` via the trait
+/// (which rustc dispatches to the toylang impl), then prints the id of
+/// the cloned Widget via `id_of`. Round-trips Sky's clone body through
+/// rustc's trait-dispatch path.
+///
+/// This is the first integration test that exercises a Sky-defined
+/// trait impl on a Sky type. C.4 emits the impl block in the stub rlib;
+/// C.5/C.6 route the symbol_name to `__toylang_impl__Widget__Clone__clone`
+/// and emit the body at that symbol.
+///
+/// Expected output: `42`.
+#[test] fn test_case4_sky_impl_rust_trait() { run_integration_project("case4_sky_impl_rust_trait"); }
 #[test] fn test_arithmetic_sub_div() { run_integration_project("arithmetic_sub_div"); }
 #[test] fn test_vec_i32() { run_integration_project("vec_i32"); }
 #[test] fn test_single_field_struct() { run_integration_project("single_field_struct"); }

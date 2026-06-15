@@ -221,6 +221,23 @@ impl ToylangCallbacks {
     ) -> String {
         state.log.push(CallbackLog::NotifyConcreteEntryPoint { name: name.to_string() });
 
+        // Phase 2 C.6 — trait-impl method shape from the facade is
+        //   `__impl_method__<Self>__<Trait>__<m>`
+        // Mangle to a concrete consumer symbol distinct from both the
+        // accessor pattern (`__toylang_accessor_*`) and free-fn pattern
+        // (`__toylang_impl_*`):
+        //   `__toylang_impl__<Self>__<Trait>__<m>`
+        if let Some(rest) = name.strip_prefix("__impl_method__") {
+            let mut sym = format!("__toylang_impl__{}", rest);
+            for arg in instance.args.iter() {
+                if let ty::GenericArgKind::Type(ty) = arg.kind() {
+                    let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
+                    sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
+                }
+            }
+            return sym;
+        }
+
         // Accessor methods come in as "StructName.field_name"
         if let Some((struct_name, field_name)) = name.split_once('.') {
             let mut sym = format!("__toylang_accessor_{}_{}", struct_name, field_name);
@@ -327,6 +344,40 @@ impl ToylangCallbacks {
             walk_and_stash_internal_callees(
                 tcx, reg, toy_fn, name, state,
             );
+        }
+        // Phase 2 C.5 — iterate trait_impls and push a ToylangInstance per
+        // method so the codegen pass below emits the body at
+        // `__toylang_impl__<Self>__<Trait>__<m>`. The DefId of the impl
+        // method in the upstream lang_stubs rlib is looked up via
+        // `oracle::find_trait_impl_method_def_id` so the codegen path can
+        // build an `Instance` for the Rust-ABI extern wrapper.
+        for toy_impl in &reg.trait_impls {
+            for method in &toy_impl.methods {
+                if method.func.body.is_none() || !method.func.type_params.is_empty() {
+                    continue;
+                }
+                let extern_symbol = format!(
+                    "__toylang_impl__{}__{}__{}",
+                    toy_impl.self_type_name, toy_impl.trait_name, method.name,
+                );
+                if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                    continue;
+                }
+                let stub_def_id = crate::oracle::find_trait_impl_method_def_id(
+                    tcx,
+                    &toy_impl.trait_name,
+                    &toy_impl.self_type_name,
+                    &method.name,
+                );
+                state.toylang_instances.push(ToylangInstance {
+                    extern_symbol,
+                    resolved_func: method.func.clone(),
+                    stub_def_id,
+                });
+                walk_and_stash_internal_callees(
+                    tcx, reg, &method.func, &method.name, state,
+                );
+            }
         }
         }
     }

@@ -452,7 +452,12 @@ pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> boo
     if is_consumer_fn(&name.to_string()) {
         return true;
     }
-    is_consumer_accessor_safe(tcx, def_id)
+    if is_consumer_accessor_safe(tcx, def_id) {
+        return true;
+    }
+    // Phase 2 C.6 — trait-impl methods on consumer types are also
+    // consumer-owned codegen targets.
+    is_consumer_trait_impl_method(tcx, def_id).is_some()
 }
 
 /// Accessor-method structural check (cross-crate-safe). Shared between
@@ -462,11 +467,22 @@ pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> boo
 /// (via `instantiate_identity` — inspection, not instantiation) and
 /// compares its ADT name against `is_consumer_type`. Safe from any
 /// phase — the `def_path_str` trap (@DPSFDOZ) isn't reached.
+///
+/// Phase 2 C.6: excludes trait-impl methods (where `impl_trait_ref` is
+/// Some). Those route through `is_consumer_trait_impl_method` instead and
+/// get a distinct mangled symbol (`__toylang_impl__<Self>__<Trait>__<m>`)
+/// so that body codegen can find them under a different key than
+/// inherent-impl accessors.
 pub(crate) fn is_consumer_accessor_safe<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
     let Some(assoc_item) = tcx.opt_associated_item(def_id) else {
         return false;
     };
     let impl_def_id = assoc_item.container_id(tcx);
+    // Phase 2 C.6 — discriminate inherent from trait impls. Trait impls go
+    // through is_consumer_trait_impl_method.
+    if tcx.impl_opt_trait_ref(impl_def_id).is_some() {
+        return false;
+    }
     // instantiate_identity: structural inspection only — we want the impl's
     // self type with its own params as placeholders so we can read the ADT
     // name. We are not producing a concrete type here.
@@ -476,6 +492,37 @@ pub(crate) fn is_consumer_accessor_safe<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) 
         return is_consumer_type(&struct_name);
     }
     false
+}
+
+/// Phase 2 C.6 — discriminate a trait-impl method on a consumer type.
+/// Returns `Some((self_type_name, trait_short_name, method_name))` when
+/// `def_id` is a method inside an `impl <RustTrait> for <ConsumerType>`
+/// block; None otherwise.
+///
+/// Used by `queries/symbol_name.rs` to build a trait-impl-specific callback
+/// name (so the consumer's `notify_concrete_entry_point_inner` can mangle
+/// to `__toylang_impl__<Self>__<Trait>__<m>` instead of the accessor
+/// pattern). Also used by the consumer-codegen-target filter.
+pub fn is_consumer_trait_impl_method<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+) -> Option<(String, String, String)> {
+    let assoc_item = tcx.opt_associated_item(def_id)?;
+    let impl_def_id = assoc_item.container_id(tcx);
+    let trait_ref = tcx.impl_opt_trait_ref(impl_def_id)?;
+    // instantiate_identity: structural inspection only — we want the impl's
+    // self type with its own params as placeholders so we can read the ADT
+    // name. Not producing a concrete type here.
+    let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
+    let ty::TyKind::Adt(adt_def, _) = self_ty.kind() else { return None; };
+    let struct_name = tcx.item_name(adt_def.did()).to_string();
+    if !is_consumer_type(&struct_name) {
+        return None;
+    }
+    let trait_def_id = trait_ref.skip_binder().def_id;
+    let trait_name = tcx.item_name(trait_def_id).to_string();
+    let method_name = tcx.item_name(def_id).to_string();
+    Some((struct_name, trait_name, method_name))
 }
 
 /// Check if a function name belongs to the consumer's language.

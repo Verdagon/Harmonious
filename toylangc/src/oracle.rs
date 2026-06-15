@@ -664,6 +664,38 @@ pub fn find_use_imported_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId>
     resolve_rust_path(tcx, name, is_fn_kind)
 }
 
+/// Phase 2 C.5: find the impl-method DefId for
+/// `impl <Trait> for <ConsumerStruct> { fn <method>(...) ... }` across the
+/// crate graph. Walks `tcx.all_impls(trait_def_id)` for every impl whose
+/// self type's ADT name matches `self_type_name`, then finds the
+/// associated item with the matching method name.
+///
+/// Returns None if the trait isn't `use`-imported, no matching impl
+/// exists, or the method name isn't on that impl. Cross-crate-safe (the
+/// stub rlib's impls show up in `all_impls` because rustc indexes them
+/// by trait DefId during metadata load).
+pub fn find_trait_impl_method_def_id(
+    tcx: TyCtxt<'_>,
+    trait_name: &str,
+    self_type_name: &str,
+    method_name: &str,
+) -> Option<DefId> {
+    let trait_def_id = find_use_imported_trait_def_id(tcx, trait_name)?;
+    for impl_def_id in tcx.all_impls(trait_def_id) {
+        // instantiate_identity: structural inspection only — we read the
+        // self type's ADT name; we are not producing a concrete type here.
+        let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
+        let ty::TyKind::Adt(adt_def, _) = self_ty.kind() else { continue; };
+        if tcx.item_name(adt_def.did()).as_str() != self_type_name { continue; }
+        for &assoc_id in tcx.associated_item_def_ids(impl_def_id) {
+            if tcx.item_name(assoc_id).as_str() == method_name {
+                return Some(assoc_id);
+            }
+        }
+    }
+    None
+}
+
 /// @ELASZ — Build a `GenericArgs` for `def_id` by letting rustc drive the
 /// per-param walk. `resolved_types` supplies the `Type` slots in
 /// declaration order (for trait methods the caller prepends `Self`;

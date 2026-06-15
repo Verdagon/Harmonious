@@ -1,0 +1,21 @@
+use std::clone::Clone
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+impl Clone for Widget {
+    fn clone(&self) -> Widget {
+        Widget { id: self.id }
+    }
+}
+
+fn make_widget(n: i32) -> Widget {
+    Widget { id: n }
+}
+
+fn id_of(w: &Widget) -> i32 {
+    w.id
+}

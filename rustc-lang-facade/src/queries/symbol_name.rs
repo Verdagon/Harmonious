@@ -40,16 +40,32 @@ pub fn lang_symbol_name<'tcx>(
         if let Some(name) = name {
             let name_str = name.to_string();
             let is_fn = crate::is_consumer_fn(&name_str);
-            let is_accessor = if !is_fn {
+            // Phase 2 C.6: classify the three consumer-owned symbol shapes.
+            // Trait-impl methods are checked BEFORE the accessor path so the
+            // shared `is_consumer_accessor_safe` excludes them (also enforced
+            // by the predicate's own `impl_trait_ref` check, but order makes
+            // the intent obvious here).
+            let trait_impl = if !is_fn {
+                crate::is_consumer_trait_impl_method(tcx, def_id)
+            } else {
+                None
+            };
+            let is_accessor = if !is_fn && trait_impl.is_none() {
                 crate::is_consumer_accessor_safe(tcx, def_id)
             } else {
                 false
             };
 
-            if is_fn || is_accessor {
-                // Build callback name (must match the one constructed in the
-                // per_instance_mir override — consumers key on this string)
-                let callback_name = if is_accessor {
+            if is_fn || is_accessor || trait_impl.is_some() {
+                // Build callback name (must match the one consumers key on
+                // in their `notify_concrete_entry_point_inner` switch).
+                let callback_name = if let Some((self_n, trait_n, method_n)) = &trait_impl {
+                    // Phase 2 C.6 — trait-impl method shape:
+                    //   `__impl_method__<Self>__<Trait>__<method>`
+                    // distinct from the accessor pattern (`<Self>.<m>`) so
+                    // consumers can route them to a separate mangler.
+                    format!("__impl_method__{}__{}__{}", self_n, trait_n, method_n)
+                } else if is_accessor {
                     if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
                         let impl_def_id = assoc_item.container_id(tcx);
                         // instantiate_identity: structural inspection only — we want the

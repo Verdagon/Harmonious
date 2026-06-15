@@ -551,7 +551,18 @@ fn resolve_expr(
 
         Expr::FieldAccess { receiver, field } => {
             let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
-            let ResolvedType::Struct { name: struct_name, field_types, .. } = &typed_recv.ty else {
+            // Phase 2 C.3 — auto-deref through a single `&T` layer for field
+            // access. Toylang's impl methods take `self: &Struct` (parser-
+            // elevated from `&self`), so any `self.field` access in a method
+            // body sees the receiver typed as `&Struct`. Mirror Rust's
+            // automatic-deref-on-field convention: peel one Ref layer if the
+            // inner type is a Struct.
+            let recv_ty_for_field = match &typed_recv.ty {
+                ResolvedType::Ref { inner } if matches!(**inner, ResolvedType::Struct { .. })
+                    => &**inner,
+                other => other,
+            };
+            let ResolvedType::Struct { name: struct_name, field_types, .. } = recv_ty_for_field else {
                 return Err(TypeResolveError::FieldAccessOnNonStruct {
                     ty: typed_recv.ty.clone(),
                     field: field.clone(),
