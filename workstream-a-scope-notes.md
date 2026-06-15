@@ -1,8 +1,13 @@
 # Workstream A — landed
 
 Status: **DONE.** Course-correct.md items #11 (rlib produces no toylang `.o`)
-and #15 (binary compile is the codegen site) are shipped. **228/228 tests
-passing** (81 unit + 132 integration + 15 standalone).
+and #15 (binary compile is the codegen site) are shipped. As of the
+post-Phase 1 D state: **243/243 tests passing** (90 unit + 137 integration
++ 16 standalone). Workstream A itself shipped at 228/228; the remaining
++15 came from later Phase 3 (multi-crate, +1), Phase 1 D (rust_caller
+fixtures for Cases 1a/1b/3/5, +4 + a small fix in
+`codegen_extern_wrapper`'s `rust_ret_type` arm for direct-coerced
+`RustType` returns), additional test infrastructure, and A.5.
 
 This file's earlier draft documented an attempted A landing that failed at
 the oracle blocker. That blocker was fixed and A re-attempted successfully

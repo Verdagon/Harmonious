@@ -2,6 +2,18 @@
 
 This document catalogs the places in the current erw prototype that are on the *wrong track* relative to the Sky architecture (`rust-interop-architecture.md`). Each entry describes a pattern that must *change*, not something that must be added.
 
+## Status snapshot (current)
+
+| Status | Items |
+|---|---|
+| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #6 (`__SKY_STUBS_MARKER`), #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs) |
+| 🟡 Partial | #10 (Instance-keyed collect_generic_rust_deps — landed; the rest needs E.5-style threading) |
+| ⏳ Remaining | #3, #4, #5, #7, #8, #9, #12, #13, #17, #18 |
+
+7 of 18 items done. The remaining items split into Tier 1 (focused refactors), Tier 2 (the wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend), and a Tier 0 architectural shift (#7/#8/#12, sidecar-loaded universe replacing `LangPredicates` + facade mutex).
+
+See `tl-handoff.md` for the narrative summary and recommended next directions.
+
 ---
 
 ## Core architectural inversions
@@ -87,26 +99,26 @@ Lines 156 / 195 (`notify_concrete_entry_point_inner` "stashing"), the `toylang_i
 
 ## Summary of the architectural pivots, in order of blast radius
 
-| # | File / spot | Wrong-track pattern | Sky direction |
-|---|---|---|---|
-| 1 | `queries/optimized_mir.rs` (whole) | DefId-keyed, Param-bearing body, rustc-side substitution | Instance-keyed `per_instance_mir`, pre-substituted body, Sky-side substitution |
-| 2 | `queries/partition.rs:80–88` | Post-partition `(External, Default)` linkage mutation (B2 risk) | Delete; default `Hidden` works |
-| 3 | `cgu_stash.rs` (whole file) | Walk rustc's unfiltered CGU slice for Sky-item discovery | Sky's frontend populates queue at after_expansion; rustc partitions are Rust-only |
-| 4 | `codegen_wrapper.rs:96–108` + `lib.rs:500–509` | Callback returns `.o` path; `join_codegen` injects via `OnceLock` channel | Sky's `codegen_crate` walks queue inline and emits via Inkwell directly |
-| 5 | `driver.rs:76` | Hook at `after_analysis` | Hook at `after_expansion` (§20.3) |
-| 6 | `lib.rs:325–327` (`is_from_lang_stubs`) | Crate-name match against `"__lang_stubs"` | Marker-based: walk `module_children` for `__SKY_STUBS_MARKER` |
-| 7 | `lib.rs:86–104, 308–311, 386–389` | Name-list-based `is_consumer_type/fn` | Sidecar-loaded universe + content-addressed typeids |
-| 8 | `lib.rs:131–136` (`monomorphize_type`) | "Give me field types so rustc composes layout" | Sky's `layout_of` walks Sky's universe recursively itself |
-| 9 | `lib.rs:170–176` + `queries/symbol_name.rs:80–82` + `callbacks_impl.rs:156,195` | `symbol_name` query as side-effect channel for internal-callee discovery | Discovery moves to frontend's after_expansion walk; symbol_name becomes pure read |
-| 10 | `lib.rs:154–160` | `collect_generic_rust_deps(LocalDefId) → Vec<(DefId, args-with-Params)>` | Instance-keyed body production (pre-substituted) |
-| 11 | `lib.rs:182` + emission point | One `.o` per Sky-marked rlib compile | Zero Sky `.o` from libs; entire reachable Sky universe codegenned at binary compile |
-| 12 | `lib.rs:197–304, 415–465` | `MUTABLE_STATE` + two-vtable + `_inner` bypass | Mostly obsolete once #4 and #9 land |
-| 13 | `main.rs:39–55, 82–155` | RUSTC_WORKSPACE_WRAPPER wrapper mode + manifest re-read (`@MRRIWMZ`) | Forked rustc statically linked with backend; cargo invokes directly via `rust-toolchain.toml` |
-| 14 | `main.rs:94` | `CARGO_PRIMARY_PACKAGE` gates activation | `__SKY_STUBS_MARKER` gates activation |
-| 15 | `main.rs:145–195`, `callbacks_impl.rs:75,191,214,387` | Rlib compile makes the `.o`; bin short-circuits | Bin compile makes the `.o`; lib compiles short-circuit Sky `.o` emission |
-| 16 | `build.rs:41–73` | Single shared `lang_stubs_crate` per project | Per-Sky-library stub rlib; workspace member per Sky crate |
-| 17 | `stub_gen.rs:59, 86–97, 117–123, 127, 148, 185` | `if !is_generic { … }` branches | Single universal path; zero type params is the degenerate case (CLAUDE.md "compiler law") |
-| 18 | `build.rs:87–124` rust_deps re-listing | Justified by "lib `.o` references rust_deps at object level" | Disappears when `.o` lives at binary compile |
+| # | Status | File / spot | Wrong-track pattern | Sky direction |
+|---|---|---|---|---|
+| 1 | ✅ | `queries/optimized_mir.rs` (whole) | DefId-keyed, Param-bearing body, rustc-side substitution | Instance-keyed `per_instance_mir`, pre-substituted body, Sky-side substitution |
+| 2 | ✅ | `queries/partition.rs:80–88` | Post-partition `(External, Default)` linkage mutation (B2 risk) | Delete; default `Hidden` works |
+| 3 | ⏳ | `cgu_stash.rs` (whole file) | Walk rustc's unfiltered CGU slice for Sky-item discovery | Sky's frontend populates queue at after_expansion; rustc partitions are Rust-only |
+| 4 | ⏳ | `codegen_wrapper.rs:96–108` + `lib.rs:500–509` | Callback returns `.o` path; `join_codegen` injects via `OnceLock` channel | Sky's `codegen_crate` walks queue inline and emits via Inkwell directly |
+| 5 | ⏳ | `driver.rs:76` | Hook at `after_analysis` | Hook at `after_expansion` (§20.3) |
+| 6 | ✅ | `lib.rs:325–327` (`is_from_lang_stubs`) | Crate-name match against `"__lang_stubs"` | Marker-based: walk `module_children` for `__SKY_STUBS_MARKER` |
+| 7 | ⏳ | `lib.rs:86–104, 308–311, 386–389` | Name-list-based `is_consumer_type/fn` | Sidecar-loaded universe + content-addressed typeids |
+| 8 | ⏳ | `lib.rs:131–136` (`monomorphize_type`) | "Give me field types so rustc composes layout" | Sky's `layout_of` walks Sky's universe recursively itself |
+| 9 | ⏳ | `lib.rs:170–176` + `queries/symbol_name.rs:80–82` + `callbacks_impl.rs:156,195` | `symbol_name` query as side-effect channel for internal-callee discovery | Discovery moves to frontend's after_expansion walk; symbol_name becomes pure read |
+| 10 | 🟡 | `lib.rs:154–160` | `collect_generic_rust_deps(LocalDefId) → Vec<(DefId, args-with-Params)>` | Instance-keyed body production (pre-substituted) — landed for the primary path; cross-crate effective-registry merging followed in E.5 |
+| 11 | ✅ | `lib.rs:182` + emission point | One `.o` per Sky-marked rlib compile | Zero Sky `.o` from libs; entire reachable Sky universe codegenned at binary compile |
+| 12 | ⏳ | `lib.rs:197–304, 415–465` | `MUTABLE_STATE` + two-vtable + `_inner` bypass | Mostly obsolete once #4 and #9 land |
+| 13 | ⏳ | `main.rs:39–55, 82–155` | RUSTC_WORKSPACE_WRAPPER wrapper mode + manifest re-read (`@MRRIWMZ`) | Forked rustc statically linked with backend; cargo invokes directly via `rust-toolchain.toml` |
+| 14 | ✅ | `main.rs:94` | `CARGO_PRIMARY_PACKAGE` gates activation | `__SKY_STUBS_MARKER` gates activation — replaced with manifest-vicinity check (the pre-expansion analog of the marker check that fires after expansion) |
+| 15 | ✅ | `main.rs:145–195`, `callbacks_impl.rs:75,191,214,387` | Rlib compile makes the `.o`; bin short-circuits | Bin compile makes the `.o`; lib compiles short-circuit Sky `.o` emission |
+| 16 | ✅ | `build.rs:41–73` | Single shared `lang_stubs_crate` per project | Per-Sky-library stub rlib; workspace member per Sky crate |
+| 17 | ⏳ | `stub_gen.rs:59, 86–97, 117–123, 127, 148, 185` | `if !is_generic { … }` branches | Single universal path; zero type params is the degenerate case (CLAUDE.md "compiler law") |
+| 18 | ⏳ | `build.rs:87–124` rust_deps re-listing | Justified by "lib `.o` references rust_deps at object level" | Comment now stale — the re-listing remains LOAD-BEARING under Workstream A's binary-codegen model (rust_caller needs direct cargo deps + force-link), but for a different reason. Item recasts as: update the build.rs comment to reflect the post-Workstream-A justification. |
 
 ---
 

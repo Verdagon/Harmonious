@@ -19,11 +19,11 @@ The master design doc is `rust-interop-architecture.md` (5,148 lines). The
 catalog of places where erw currently diverges from Sky is `course-correct.md`
 (18 items). This project — driven by the plan at
 `/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md` — adds
-tests that exercise the five "hard cases" (1b, 3, 4, 5, 6) from the
-architecture doc's seven-case taxonomy. As a side effect, four course-correct
-items land (`#6`, `#11`, `#15`, `#16`). **Items #11 and #15 are done as of
-Session 4** (sidecar load + oracle cross-crate sweep + Workstream A). Items
-#6 and #16 land in Phase 3 (multi-crate).
+tests that exercise the "hard cases" (1b, 3, 4, 5, 6) from the
+architecture doc's seven-case taxonomy. **As of Session 5, six of seven
+cases are tested** (1a, 1b, 2, 3, 5, 6); Case 4 needs Phase 2 C's toylang
+`impl rust_trait for toylang_type` language feature. **Seven course-correct
+items are done** (#1, #2, #6, #11, #14, #15, #16) and #10 is partial.
 
 ---
 
@@ -116,6 +116,61 @@ standalone). Course-correct items #11 and #15 are done. Sky-aligned shape
 at the SHAPE level for single-file programs; literal Sky shape (per-library
 publishing) lands in Phase 3.
 
+**Session 5 (Phase 3 multi-crate + Phase 1 D + cleanups + A.5).** Four
+distinct pieces of work, all landed and committed:
+
+- **Phase 3 (E.1–E.6) — multi-toylang-crate end-to-end.** E.1 (marker-based
+  `__SKY_STUBS_MARKER` detection — course-correct #6); E.2 (`[toylang-dependencies]`
+  manifest schema); E.3 (build orchestration fan-out per Sky lib); E.4
+  (oracle multi-crate iteration); E.5 (typecheck cross-crate name
+  resolution via effective_registry merge); E.6 (codegen-side upstream
+  iteration + new `test_case6_basic_multi_crate` — the first test
+  exhibiting architecture §5.5 literally: library compile produces rlib +
+  sidecar only; binary compile codegens every reachable Sky item across
+  all libs from the AST in the sidecar). Hard-won: a 0%-CPU hang at the
+  user-bin compile diagnosed via `sample` as @GCMLZ re-entrance —
+  `lang_symbol_name` calls `call_notify_concrete_entry_point` from
+  inside `generate_and_compile`, which already holds MUTABLE_STATE;
+  std::sync::Mutex isn't reentrant. Fixed with a thread-local
+  fat-pointer state-bypass in the facade (`lib.rs`). Course-correct
+  items #6 and #16 done.
+
+- **Phase 1 D — rust_caller manifest field + Cases 1a/1b/3/5.**
+  `[project.rust_caller]` optional path to a Rust source file that
+  supplies the binary's `fn main`. `write_main_shim` prepends the
+  standard extern-crate preamble and appends the rust_caller's content,
+  replacing the default `__toylang_main` shim. Four new integration
+  tests: case1a (Rust calls non-generic Sky), case1b (Rust calls
+  generic Sky with rustc-known T — FIRST test exercising Approach A with
+  non-empty `instance.args`; required extending the CGU walk in
+  `generate_with_tcx` to synthesize `FnItem` from registry + instance.args
+  for upstream generics), case5 (Rust → Sky → different Rust lib via
+  Vec stdlib), case3 (Rust → Sky → trait dispatch back to Rust top's
+  Clone impl; required a small fix in `codegen_extern_wrapper`'s
+  `rust_ret_type` arm for direct-coerced RustType returns).
+
+- **Course-correct cleanups #14 + #2.** #14: retire CARGO_PRIMARY_PACKAGE
+  env-var gate at the top of `run_wrapper_mode`; the manifest-vicinity
+  lookup below already does the right thing. #2: retire the
+  `(Linkage::External, Visibility::Default)` post-partition mutation in
+  `partition.rs` — Workstream A's binary-codegen model means the
+  Phase-6 wrappers and the toylang code that calls them live in the
+  same final binary at link time, so default Hidden linkage works. The
+  §B2 timing risk dissolves.
+
+- **A.5 byte-identical pass-through invariant** (architecture §4.4).
+  New `test_a5_byte_identical_pass_through` standalone test compiles a
+  small Rust corpus (add, struct, generic, trait_impl) with both
+  `+nightly-2026-01-20` (vanilla) and `+rustc-fork`, emits LLVM IR,
+  normalizes the disambiguator hash + module ID + LLVM-version
+  metadata, asserts byte-equality. Hard CI guard against
+  Sky's-machinery-leaks-into-pure-Rust-compiles regressions. Skips
+  gracefully when vanilla toolchain isn't installed.
+
+Test counts after Session 5: **243/243 passing** (90 unit + 137
+integration + 16 standalone). Working tree is clean — all of Sessions
+2–5's work is committed across four commits (see §11 for the hashes).
+
 ---
 
 ## 3. The plan you're executing
@@ -132,17 +187,19 @@ Three phases, ~15 weeks total:
 | 2 | 8-12 | Toylang `impl rust_trait for toylang_type` language feature (C) | 4 |
 | 3 | 13-15 | Multi-toylang-crate workspace + marker-based detection (E) | 6 |
 
-**Phase 1 — substantially complete.** S.1–S.5 done, oracle cross-crate
-sweep done, Workstream A (A.1+A.2+A.4) done. Remaining within Phase 1:
-A.5 (byte-identical pass-through corpus, CI infrastructure work),
-Workstream B (~60 LOC oracle TypeParam tolerance), Workstream D
-(rust_caller fixtures + Cases 1b/3/5 tests). Then Phase 2 (toylang
-`impl rust_trait for toylang_type`), then Phase 3 (multi-crate — this
-is where toylang's shape matches Sky literally rather than as a
-rehearsal).
+**Phases 1 and 3 — substantially complete.** Phase 1: S.1–S.5 done,
+oracle cross-crate sweep done, Workstream A done, Workstream D
+(rust_caller fixtures for Cases 1a/1b/3/5) done, A.5 done. Workstream
+B (oracle TypeParam tolerance) NOT done — minor; only matters once
+sharper trait dispatch cases come up. Phase 3: E.1–E.6 done; the first
+multi-toylang-crate test passes end-to-end. **Phase 2 (toylang `impl
+rust_trait for toylang_type`) is the largest remaining item.** It's
+the gating piece for Case 4 (Sky type implementing a Rust trait,
+consumed via a Rust generic intermediary). ~3–5 weeks per the plan's
+estimate.
 
 Detailed commit-by-commit schedule is in the master plan's "Sequencing
-recommendation" table at the end. Use that as your daily checklist.
+recommendation" table at the end.
 
 ---
 
@@ -350,76 +407,111 @@ The non-obvious rule from this session:
 
 ## 7. Where to start
 
-Phase 1's Workstream S, oracle cross-crate sweep, and Workstream A all
-landed in Session 4. The next-step menu has multiple viable entries
-depending on your time budget:
+Phase 1 (Workstream S/A/D + A.5), Phase 3 (multi-crate E.1–E.6),
+six of seven taxonomy cases (1a/1b/2/3/5/6), and seven
+course-correct items (#1, #2, #6, #11, #14, #15, #16) are all done.
+The remaining work splits into three tiers:
 
-### Option A: Phase 3 (multi-crate) — the architecturally important next move
+### Tier 1 — focused refactors (½–1 week each, single-session-friendly)
 
-**Recommended.** This is where toylang's shape LITERALLY matches Sky's
-multi-library shape rather than rehearsing it (see architecture doc §6.1).
-Course-correct items #6 (`__SKY_STUBS_MARKER`) and #16 (per-Sky-library
-stub rlibs) land here.
+These close more course-correct items without architectural risk.
 
-Estimate: 2–3 weeks of focused work. Sub-tasks per the master plan:
+- **#4 — codegen-wrapper emission channel.** Today: `call_generate_and_compile`
+  returns a `.o` path; `set_lang_obj_path` / `get_lang_obj_path` `OnceLock`
+  + Mutex round-trips it to `join_codegen` which injects it as a
+  `CompiledModule`. Architecture §5.3 wants Sky's `codegen_crate` to walk
+  Sky's queue inline and emit via Inkwell directly, returning the
+  ongoing object as a wrapper around `inner.codegen_crate`'s result. The
+  channel between phases collapses. **Estimate: 1–2 days. Touches:**
+  `rustc-lang-facade/src/codegen_wrapper.rs`, `rustc-lang-facade/src/lib.rs`
+  (the channel statics), `toylangc/src/toylang/callbacks_impl.rs`'s
+  `generate_and_compile` return shape.
 
-- **E.1** (~1–2 days): Replace `is_from_lang_stubs` (crate-name match)
-  with marker-based detection (`__SKY_STUBS_MARKER` at crate root). Land
-  first; confirm 228 existing tests still pass before any other change.
-- **E.2** (~1 day): Extend `toylang.toml` schema with `[[dependencies]]`
-  for cross-toylang-crate deps.
-- **E.3** (~2–3 days): Build orchestration — detect transitive Sky deps,
-  fan out stub_gen per library, link all stub rlibs.
-- **E.4** (~1–2 days): Oracle cross-crate walk generalization — already
-  partial (S.4 sidecar load + oracle sweep). Extend to multiple
-  upstream Sky crates.
-- **E.5** (~1–2 days): Sky-side cross-crate name resolution at typecheck.
-- **E.6** (~3–5 days): Multi-crate test fixtures exercising Sky's
-  hard-case taxonomy (real lib + real bin + real sidecar load between).
+- **#5 — hook point: `after_expansion` not `after_analysis`.** Per
+  architecture §20.3, Sky's frontend runs at after_expansion (before
+  rustc's mono collection) so Sky's universe is populated before
+  rustc's typechecker walks the stub bodies. Today erw fires at
+  after_analysis. The migration is non-trivial because today's
+  consumer-side validation depends on rustc's typecheck queries.
+  Probably means splitting toylang's after_rust_analysis into two
+  phases: "Sky-side parse + universe build" at after_expansion, and
+  "rustc-side cross-check" at after_analysis. **Estimate: 3–5 days.**
 
-### Option B: Workstream B (oracle TypeParam tolerance) — quick win
+- **Workstream B — oracle TypeParam tolerance in trait queries.** Small
+  but real: `oracle::rust_trait_method_return_type` / `_param_types`
+  panic on `TypeParam` Self today. Make them return a defer sentinel
+  so the per-Instance substituted pass can resolve later. Doesn't
+  unblock anything yet but smooths out a sharp edge that'll get hit
+  by sharper Case 3 / Case 4 variants. **Estimate: ~60 LOC, 1 day.**
 
-~60 LOC. `oracle::rust_trait_method_return_type` and `_param_types` panic
-on `TypeParam` Self today. Make them return a defer sentinel instead so
-the per-Instance substituted pass can resolve later. Doesn't unblock A
-(already done) but is small + clean.
+### Tier 2 — language feature (3–5 weeks)
 
-### Option C: Workstream D (rust_caller fixtures) — Case 1b/3/5 tests
+**Phase 2 C — toylang `impl rust_trait for toylang_type`.** Unlocks
+Case 4 (Sky type implementing a Rust trait, consumed via a Rust
+generic intermediary — "Sky exposes a trait impl that satisfies a
+Rust generic's bound"). Real toylang language-feature work: parser,
+AST, type-resolver, stub_gen impl-block emission, llvm_gen for
+trait-impl method codegen, symbol_name override extension for impl
+DefIds.
 
-~1 week. Adds `project.rust_caller: Option<String>` to `toylang.toml`,
-copies a Rust caller source into `user_bin/src/`, exposes `case_1b_*`,
-`case_3_*`, `case_5_*` fixtures with per-firing `args_fingerprint`
-assertions. Exercises the per_instance_mir Approach A path more sharply
-than today's test corpus.
+This is the most architecturally interesting remaining piece because
+it's the pattern Sky must support: a Sky-defined type implementing
+a Rust trait, where the Rust generic that bounds the trait gets
+instantiated by either Rust or Sky code. The Phase 2 C work touches
+real language design (how does toylang write `impl Clone for Widget`?
+toylang's existing syntax is `impl rust.std.clone.Clone for Widget {
+fn clone(&self) -> Widget { ... } }` per architecture §6.2's worked
+example).
 
-### Option D: A.5 (byte-identical pass-through CI)
+### Tier 3 — larger architectural shifts (multi-week)
 
-Build a small Rust corpus with both vanilla nightly and `rustc-fork`,
-compare outputs. CI infrastructure work; ~1 week including corpus
-selection.
+These rebuild facade-level assumptions that today's tests don't
+exercise sharply. Each is its own multi-week sub-project.
 
-### Option E: small cleanup pass
+- **#7 — replace `LangPredicates` with sidecar-loaded universe.**
+  Today: facade calls `is_consumer_type(name)` / `is_consumer_fn(name)`
+  via vtable. Sky wants content-addressed typeids in the sidecar. ~2
+  weeks; touches many call sites.
 
-Dead-code warnings (`compute_layout_size_align`,
-`walk_and_stash_internal_callees` if its callers are inlined), doc
-updates to `docs/architecture/rust-interop-guide.md` reflecting the
-codegen-at-binary architecture.
+- **#8 — `layout_of` walks Sky-side.** Today: facade calls
+  `monomorphize_type` callback for field types and lets rustc compose.
+  Sky wants `layout_of` to walk Sky's universe recursively itself.
+  ~1–2 weeks.
+
+- **#12 — retire `MUTABLE_STATE` + two-vtable split.** Today: facade
+  holds a Mutex around consumer state; the @GCMLZ bypass uses a
+  thread-local fat pointer (Phase 3 E.6). Once #4 (codegen channel)
+  and #9 (symbol_name side-effect) are done, the locking story can
+  fundamentally simplify. ~1–2 weeks.
+
+- **#13 — retire wrapper-mode `@MRRIWMZ`.** Largest. Today: toylangc
+  IS the rustc-via-`RUSTC_WORKSPACE_WRAPPER` wrapper, re-parsing the
+  toylang.toml in the child process. Sky wants the forked rustc binary
+  statically linked with the codegen backend. This is the "ship a Sky
+  toolchain" piece. Architecture §4.1–§4.5. ~4–6 weeks; touches
+  install, distribution, and the entire startup model.
 
 ### My recommendation
 
-**A → B → D in sequence**, with Phase 2 (impl Trait) deferred to last.
-Phase 3 (Option A) is where the real Sky alignment happens and it's the
-architecturally biggest unblock. B and D are smaller hardenings that can
-interleave with Phase 3 work or fit into shorter sessions.
+**Tier 1, in #4 → Workstream B → #5 order.** Each is a discrete win.
+Then Tier 2 (Phase 2 C) is the biggest forward-progress piece — it's
+where the language gets a feature that exercises a fundamentally new
+Sky interop pattern. Tier 3 is a quarter-of-work each; don't start
+without budgeting properly.
 
 ### Cross-references for the next person
 
 - `workstream-a-scope-notes.md` — Workstream A completion notes,
   including the two key unlocks (oracle sweep, transitive callee walk).
-  Worth reading before touching populate_toylang_instances_from_cgus.
-- `rust-interop-architecture.md` §§4.5, 6.1, 6.3, 6.5 — the
-  marker-based detection model Phase 3 E.1 implements.
-- `course-correct.md` items #6 and #16 — the divergences Phase 3 closes.
+- `phase3-e6-scope-notes.md` — Phase 3 E.6 completion notes, including
+  the @GCMLZ re-entrance root cause and the thread-local bypass fix
+  pattern.
+- `rust-interop-architecture.md` §§4.5, 6.1, 6.3, 6.5 — marker-based
+  detection (E.1) reference. §5.3 — codegen backend method sketches
+  (#4 reference). §20.3 — pipeline ordering (#5 reference). §6.2 +
+  Appendix A.3 — `impl rust_trait for sky_type` worked example
+  (Phase 2 C reference).
+- `course-correct.md` — top-of-file status table shows what's done.
 
 ---
 
@@ -539,13 +631,24 @@ convention is "patches as working tree state"). See the diff with
 
 ## 12. Status snapshot (where you start)
 
-**Tests passing**: 228/228 (81 unit + 132 integration + 15 standalone)
-when run with `integration-projects-cache` wiped.
+**Tests passing**: **243/243** (90 unit + 137 integration + 16
+standalone) when run with `integration-projects-cache` wiped.
+
+**Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, 4 ⏳ (Phase
+2 C), 5 ✅, 6 ✅.
+
+**Course-correct.md items done**: #1, #2, #6, #11, #14, #15, #16 (7/18).
+#10 partial.
 
 **Sidecars produced**: yes, ~120 files materialize during a full test run.
 The format is bincode + BLAKE3 truncated checksum with a 64-byte fixed
 header. S.4's facade-side loader reads them at user-bin compile time;
 S.5's determinism test byte-compares two builds.
+
+**Byte-identical pass-through**: guarded by `test_a5_byte_identical_pass_through`
+(standalone test). Compiles a 4-entry Rust corpus with both vanilla
+nightly + rustc-fork, normalizes the disambiguator-derived bits, asserts
+LLVM IR byte-equality. Skips gracefully if vanilla isn't installed.
 
 **Fork state**: `~/rust` on `per-instance-mir` branch, 3 patches applied:
 query declaration, collector hook, default-None provider. Rebuilt for
@@ -562,61 +665,18 @@ codegen site, driven by registry-driven discovery + transitive callee
 walk (NOT the upstream CGU walk, which finds zero stub items at user-bin
 time — see `workstream-a-scope-notes.md` for the why).
 
-**Uncommitted changes in `/Users/verdagon/erw`** (everything from
-Sessions 3 + 4 — un-staged, un-committed — you'll commit them):
+**Working tree is clean** as of Session 5. Sessions 2–5's work is on
+`main` across four commits:
 
-S.1 + S.2 + S.3 (Session 3):
-- `docs/architecture/sidecar-format.md` (new)
-- `toylangc/Cargo.toml` (added bincode + blake3)
-- `toylangc/src/main.rs` (added `mod sidecar;`)
-- `toylangc/src/sidecar.rs` (new)
-- `toylangc/src/toylang/ast.rs` (serde derives)
-- `toylangc/src/toylang/typed_ast.rs` (serde derives)
-- `toylangc/src/toylang/registry.rs` (serde derives + BTreeMap)
-- `toylangc/src/toylang/parser.rs` (BTreeMap + dropped HashMap import)
-- `toylangc/src/toylang/type_resolve.rs` (test code BTreeMap)
-- `toylangc/src/toylang/callbacks_impl.rs` (S.3 sidecar write at end of
-  after_rust_analysis)
+| Commit | What |
+|---|---|
+| `671f002` | Approach A restoration + Sidecar (S.1–S.5) + Workstream A + Phase 3 multi-crate (E.1–E.6) |
+| `1a72a64` | Phase 1 D: rust_caller manifest field + Cases 1a/1b/3/5 fixtures + tests |
+| `7278f4a` | Course-correct #14 (CARGO_PRIMARY_PACKAGE) + #2 (B2 linkage mutation) retirement |
+| `88b56d2` | A.5: byte-identical pass-through invariant CI test (§4.4) |
 
-S.4 + S.5 (Session 4 — sidecar load + determinism):
-- `rustc-lang-facade/src/lib.rs` (`on_sky_lib_loaded` trait method,
-  vtable slot, trampoline, call helper)
-- `rustc-lang-facade/src/driver.rs` (`load_upstream_sidecars`, fires
-  from `after_analysis` before `call_after_rust_analysis`)
-- `toylangc/src/toylang/callbacks_impl.rs` (S.4 trait impl,
-  `OnSkyLibLoaded` log variant, `upstream_registries` state field,
-  log-write reorder to append mode)
-- `toylangc/tests/integration_projects.rs` (`test_s4_sidecar_load_smoke`,
-  `test_s5_sidecar_determinism`)
-
-Oracle cross-crate sweep (Session 4):
-- `toylangc/src/oracle.rs` (cross-crate fallback in
-  `find_extern_fn_def_id`, new `find_extern_fn_in_stub_rlib`,
-  `find_stub_fn_in_stub_rlib`, `find_wrapper_fn_def_id` fallback)
-- `toylangc/src/toylang/callbacks_impl.rs` (`OracleCrossCrateProbe` log
-  variant + probe in user-bin `after_rust_analysis`)
-- `toylangc/tests/integration_projects.rs`
-  (`test_oracle_cross_crate_extern_fn_lookup`)
-- `toylangc/tests/integration_projects/oracle_probe/` (new minimal
-  fixture with `toylang.toml` + `main.toylang`)
-
-Workstream A (Session 4 — codegen site moved to user-bin):
-- `toylangc/src/main.rs` (`is_user_bin_compile` rename + flipped
-  `llvm_paths` allocation)
-- `toylangc/src/toylang/callbacks_impl.rs` (`is_user_bin_compile` field,
-  `ToylangInstance.stub_def_id` field, `populate_*` registry-driven
-  rewrite, inverted validation gate)
-- `toylangc/src/llvm_gen.rs` (Instance construction from `stub_def_id`)
-
-Doc updates (Session 4):
-- `workstream-a-scope-notes.md` (rewritten as completion notes —
-  previous draft documented blockers that are now fixed)
-- `tl-handoff.md` (this file, updated through Session 4)
-
-Suggested commit grouping: 6 commits matching the workstream boundaries
-(S.1, S.2, S.3, S.4 + S.5 + oracle sweep, Workstream A, doc updates).
-Or 4 if you prefer fewer (collapse S.1–S.3 + sidecar-related into one;
-oracle sweep + Workstream A into another).
+Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
+baseline.
 
 **The plan file**: `/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md`.
 Already approved.
@@ -626,59 +686,81 @@ Already approved.
 ## 13. When to escalate
 
 Ping the user (don't pivot unilaterally) if:
-- Phase 3 (multi-crate) turns out to be > 5 weeks (plan budgets ~2–3).
+
 - The rustc fork needs more patches beyond the existing 3.
-- You discover a fundamental architectural problem (e.g., bincode can't
-  handle a recursive type cleanly; cargo's target-dir layout makes
-  sidecar paths unreliable; marker-based detection doesn't survive a
-  rustc API change).
 - You hit a test failure you can't explain after wiping the cache and
   trying twice.
-- Phase 2's toylang `impl` parser turns out > 2 weeks (we budgeted ~1).
-- You're tempted to revert Workstream A. The cross-crate codegen path
-  it landed is delicate; revert would be a major architectural
-  regression. Talk to the user first.
+- Phase 2 C's toylang `impl` parser turns out > 8 weeks (the plan
+  budgets 3–5).
+- You're tempted to revert Workstream A, the @GCMLZ thread-local
+  bypass, or any of the Phase 3 multi-crate plumbing. These are
+  delicate; any revert is a major architectural regression. Talk to
+  the user first.
+- A Tier 3 item (#7, #8, #12, #13) is being started without an
+  explicit "yes, we're committing to a multi-week piece" agreement.
 
-For routine "this took longer than I estimated" — just keep going. The
-plan is approved.
+For routine "this took longer than I estimated" — just keep going.
 
-**Specific lesson from Session 4:** the handoff's original sizing for
-Workstream A (~2–3 weeks) didn't account for the oracle cross-crate
-sweep being half-done. Once that was discovered + finished, A landed in
-~2 hours. If a future workstream feels MUCH harder than estimated,
-look for half-done stage refactors blocking the obvious path. The
-codebase has several of these (course-correct.md catalogues some).
+**Lessons from prior sessions worth re-reading:**
+
+- **Session 4 — the half-done refactor pattern.** Workstream A's
+  original ~2–3 week sizing didn't account for the oracle cross-crate
+  sweep being half-done from stage 5a. Once finished, A landed in ~2
+  hours. If a future workstream feels MUCH harder than estimated,
+  look for half-done stage refactors blocking the obvious path.
+
+- **Session 5 — diagnose before reverting.** A 0%-CPU hang at the
+  user-bin compile was initially attributed to a panic + @GCMLZ unwind
+  interaction. That was wrong. `sample <pid>` on the hung process
+  showed the real cause: std::sync::Mutex same-thread re-entrance at
+  MUTABLE_STATE during `lang_symbol_name → call_notify_concrete_entry_point`
+  from inside `generate_and_compile`. Fixed in ~30 minutes once the
+  stack trace was in hand. Lesson: when a process hangs at 0% CPU
+  with no error, run `sample` BEFORE reverting and writing scope
+  notes that speculate about the cause.
 
 ---
 
 ## 14. Closing notes
 
-You're inheriting a working baseline at a major checkpoint. The mechanism
-is alive: Approach A fires per-Instance, the rustc fork is built and
-pinned, the sidecar format is specified and types ship, S.4's facade-side
-loader reads upstream sidecars at user-bin compile, the oracle helpers
-work cross-crate, and Workstream A's codegen-at-binary architecture is
-live. The test suite passes green (228/228) when run fresh.
+You're inheriting a working baseline at a **major checkpoint**, with the
+architecturally interesting interop machinery proven end-to-end. The
+mechanism is alive: Approach A fires per-Instance with concrete args
+(Case 1b exercises this directly), the rustc fork is built and pinned
+at `~/rust` (3 patches), the sidecar format is specified and types
+ship + roundtrip + deserialize at upstream-rlib-load, the oracle
+helpers work cross-crate, Workstream A's codegen-at-binary architecture
+runs every Sky body at the user-bin compile from the AST in the
+sidecar, the multi-crate plumbing works (case6 builds), the seven-case
+taxonomy has fixtures for six of seven cases (1a/1b/2/3/5/6), and the
+§4.4 byte-identical pass-through invariant is guarded by CI (A.5).
+**243/243 tests pass.**
 
-Architecturally the prototype is now SHAPE-aligned with Sky for the
-single-file-program case. The "rehearsal" comment in earlier handoffs
-still applies — toylang projects use a 2-cargo-crate split that mirrors
-Sky's lib+bin distinction. Phase 3 is where that rehearsal gets replaced
-with the LITERAL Sky shape: independent toylang libraries published with
-their own sidecars, consumed by independent toylang binaries.
+Architecturally the prototype is now **LITERAL** Sky shape for
+multi-toylang-crate projects, no longer just rehearsal. Single-file
+toylang programs still use the 2-cargo-crate split (lang_stubs_crate +
+user_bin), which is rehearsal-shape only because the "library" half is
+a derived artifact of the binary's own source. Multi-crate fixtures
+exercise the real Sky shape: independent toylang libraries published
+with their own sidecars, consumed by independent toylang binaries
+that codegen the libs' bodies at the binary compile from the sidecar's
+AST.
 
-The biggest remaining architectural piece is Phase 3 (multi-crate). It's
-the natural next move and lands course-correct items #6 + #16. Estimate
-is 2–3 weeks of focused work. Land E.1 (marker-based detection) first
-and confirm 228 tests still pass — that's the gating change.
+The biggest remaining architectural piece is **Phase 2 C** (toylang
+`impl rust_trait for toylang_type`) — the gating language feature for
+Case 4 and the most architecturally interesting remaining piece.
+Estimate 3–5 weeks of focused work. After that the Tier 3 facade-level
+shifts (#7, #8, #12, #13) are each their own multi-week sub-project.
 
-Read the architecture doc. Read course-correct.md. Read
-`workstream-a-scope-notes.md`. Then start with §7 of this document.
+Read the architecture doc. Read course-correct.md (status table at the
+top). Read `workstream-a-scope-notes.md` and `phase3-e6-scope-notes.md`
+for the load-bearing context on the current codegen path and the
+@GCMLZ bypass. Then start with §7 of this document.
 
-Good luck. The whole point is to make tests for Cases 1b, 3, 4, 5, 6
-exist so future drift back toward Approach B fails loudly. Phase 3's
-multi-crate fixtures are what makes those tests possible — until you
-have a REAL Sky library (not a rehearsal) you can't exercise the
-sharper interop cases. That goal is load-bearing.
+Good luck. The architectural goal — making tests for the seven-case
+taxonomy's hard cases EXIST so future drift back toward Approach B
+fails loudly — is mostly met. Five hard cases (1b, 3, 4, 5, 6) were
+the original target; four of those are now tested (1b, 3, 5, 6).
+Adding Case 4 closes the taxonomy.
 
 — previous engineer

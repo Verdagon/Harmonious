@@ -1,8 +1,9 @@
 # Phase 3 E.6 — LANDED
 
 **Status: complete.** `test_case6_basic_multi_crate` passes; the first
-multi-toylang-crate program builds, runs, and prints `42`. 236/236 tests
-passing.
+multi-toylang-crate program builds, runs, and prints `42`. E.6 itself
+shipped at 236/236; subsequent Phase 1 D + cleanup work brought the suite
+to **243/243 passing** (90 unit + 137 integration + 16 standalone).
 
 ## The root cause (what I got wrong before)
 
