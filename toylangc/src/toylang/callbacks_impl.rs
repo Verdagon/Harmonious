@@ -540,6 +540,71 @@ impl LangCallbacks for ToylangCallbacks {
             }
         }
 
+        // Check 6 (Phase 2 C.3): Type-resolve impl-block method bodies. Each
+        // method's `self` parameter was elevated to an explicit
+        // `self: &ToyStruct` by the parser (C.1), so the existing fn-body
+        // type-resolver handles them with no method-specific code path.
+        //
+        // Skip methods whose impl's self-type was not declared at parse time
+        // — that error was already raised in C.1; here we just avoid double-
+        // reporting. Generic methods (non-empty type_params) are deferred
+        // to the per-Instance substituted pass, same as generic free fns.
+        for toy_impl in &self.registry.trait_impls {
+            for method in &toy_impl.methods {
+                if method.func.body.is_none() || !method.func.type_params.is_empty() {
+                    continue;
+                }
+                let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
+                    if type_name.is_empty() {
+                        crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
+                            .map(|opt| opt.unwrap_or(crate::toylang::typed_ast::ResolvedType::Void))
+                    } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+                        let receiver_ty = &type_args[0];
+                        let explicit_args = &type_args[1..];
+                        crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args)
+                    } else {
+                        crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
+                    }
+                };
+                let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
+                    if type_name.is_empty() {
+                        crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
+                    } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+                        crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..])
+                    } else {
+                        crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
+                    }
+                };
+                let is_rust_trait = |name: &str| {
+                    crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
+                };
+                match crate::toylang::type_resolve::resolve_fn_body(
+                    &effective_registry,
+                    &method.func,
+                    &rust_method_ret,
+                    &rust_param_types,
+                    &is_rust_trait,
+                ) {
+                    Err(e) if e.is_deferred() => { /* same defer policy as Check 5 */ }
+                    Err(e) => errors.push(format!(
+                        "impl {} for {}::{}: {:?}",
+                        toy_impl.trait_name, toy_impl.self_type_name, method.name, e,
+                    )),
+                    Ok(_typed) => {
+                        // Phase 2 C.3 intentionally does NOT cross-check the
+                        // method signature against the Rust trait's signature
+                        // yet. That validation belongs at stub_gen time
+                        // (C.4–C.6) when the impl block is materialised — if
+                        // the toylang sig diverges, rustc itself will report
+                        // the mismatch on the generated stub source, which is
+                        // the standard "rustc error on stub rlib is a Sky
+                        // bug" path (course-correct.md §23.2). Adding a Sky-
+                        // side cross-check earlier is a future tightening.
+                    }
+                }
+            }
+        }
+
         if !errors.is_empty() {
             eprintln!("[toylang] validation failed with {} error(s):", errors.len());
             for e in &errors {

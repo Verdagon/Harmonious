@@ -317,6 +317,49 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // prior `VISIBILITY_OVERRIDE_HOOK` rustc-fork patch in favor of this
     // post-partition mutation (see @DPSFDOZ-related partition.rs docs and
     // risks.md §B2 for the Outcome A assumption stack).
+    // Phase 2 C.4: emit one Rust `impl <RustTrait> for <ToyStruct> { fn … }`
+    // block per toylang impl. The trait's short name (`Clone`) is what
+    // toylang source spells; rustc's name-resolution walks the stub rlib's
+    // `pub use` re-exports (emitted by the imports loop above) to find the
+    // full path. The method body is `unreachable!()` exactly like every
+    // other stub fn body — the consumer's per_instance_mir override (or its
+    // codegen-backend successor) supplies the real body at the user-bin
+    // compile.
+    //
+    // `&self` is reified to a `&Self` parameter in the generated Rust
+    // (rustc requires the receiver syntax, not a `self: &Self` explicit
+    // form). The remaining params and return type pass through
+    // `resolved_type_to_syn` unchanged.
+    for toy_impl in &registry.trait_impls {
+        let trait_ident = format_ident!("{}", toy_impl.trait_name);
+        let self_ident = format_ident!("{}", toy_impl.self_type_name);
+        let method_items: Vec<syn::TraitItemFn> = toy_impl.methods.iter().map(|m| {
+            let m_name = format_ident!("{}", m.name);
+            // Skip the elevated `self: &Self` first param when rendering;
+            // emit it as the receiver instead.
+            let user_params: Vec<TokenStream> = m.func.params.iter().skip(1).map(|p| {
+                let pname = format_ident!("{}", p.name);
+                let pty = resolved_type_to_syn(&p.ty);
+                quote! { #pname: #pty }
+            }).collect();
+            let ret: syn::Type = match &m.func.return_ty {
+                Some(ty) => resolved_type_to_syn(ty),
+                None => parse_quote!(()),
+            };
+            parse_quote! {
+                fn #m_name(&self, #(#user_params),*) -> #ret {
+                    unreachable!()
+                }
+            }
+        }).collect();
+        let impl_block: syn::ItemImpl = parse_quote! {
+            impl #trait_ident for #self_ident {
+                #(#method_items)*
+            }
+        };
+        items.push(syn::Item::Impl(impl_block));
+    }
+
     items.push(parse_quote! {
         #[inline(never)]
         pub unsafe fn __toylang_option_unwrap<T>(o: *mut core::option::Option<T>) -> T {
@@ -357,5 +400,56 @@ mod tests {
             "stub_gen output missing __SKY_STUBS_MARKER:\n{}",
             src
         );
+    }
+
+    /// Phase 2 C.4: a `ToyImpl` entry in the registry produces an
+    /// `impl Trait for Self { fn name(&self, …) -> Ret { unreachable!() } }`
+    /// block in the generated stub source.
+    #[test]
+    fn impl_block_emitted_for_toy_impl() {
+        use crate::toylang::registry::{
+            ToyField, ToyFunction, ToyImpl, ToyImplMethod, ToyParam, ToyStruct,
+        };
+        use crate::toylang::typed_ast::ResolvedType;
+
+        let mut reg = ToylangRegistry::default();
+        reg.structs.insert("Widget".to_string(), ToyStruct {
+            type_params: vec![],
+            fields: vec![ToyField { name: "id".to_string(), rust_type: ResolvedType::I32 }],
+        });
+        reg.imports.push("std::clone::Clone".to_string());
+        reg.trait_impls.push(ToyImpl {
+            trait_name: "Clone".to_string(),
+            self_type_name: "Widget".to_string(),
+            methods: vec![ToyImplMethod {
+                name: "clone".to_string(),
+                func: ToyFunction {
+                    type_params: vec![],
+                    params: vec![
+                        ToyParam {
+                            name: "self".to_string(),
+                            ty: ResolvedType::Ref { inner: Box::new(
+                                ResolvedType::StructRef {
+                                    name: "Widget".to_string(),
+                                    type_args: vec![],
+                                },
+                            ) },
+                        },
+                    ],
+                    return_ty: Some(ResolvedType::StructRef {
+                        name: "Widget".to_string(), type_args: vec![],
+                    }),
+                    body: None, // body irrelevant for stub emission (always unreachable!())
+                },
+            }],
+        });
+
+        let src = generate(&reg);
+        assert!(src.contains("impl Clone for Widget"),
+            "stub_gen output missing `impl Clone for Widget`:\n{}", src);
+        assert!(src.contains("fn clone(&self)"),
+            "stub_gen output missing `fn clone(&self)`:\n{}", src);
+        assert!(src.contains("unreachable!()"),
+            "stub_gen output missing `unreachable!()` body:\n{}", src);
     }
 }
