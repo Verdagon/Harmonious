@@ -77,6 +77,7 @@ fn resolved_type_to_syn(ty: &ResolvedType) -> syn::Type {
         | ResolvedType::Struct { name, type_args, .. }
         | ResolvedType::RustType { name, type_args } => {
             let ident = format_ident!("{}", name);
+            // arch-fence-allow: degenerate-case-fast-path (skip the `<>` decoration when empty).
             if type_args.is_empty() {
                 parse_quote!(#ident)
             } else {
@@ -165,16 +166,10 @@ pub fn generate(registry: &ToylangRegistry) -> String {
                 }
             });
 
-            // Extern declaration only for non-generic — `extern "C"` doesn't
-            // permit generics (Phase D site; gated on #4's inline-codegen
-            // rewrite that retires extern decls entirely).
-            // arch-fence-allow: extern-C-cannot-be-generic.
-            if toy_struct.type_params.is_empty() {
-                let accessor_sym = format_ident!("__toylang_accessor_{}_{}", name, field.name);
-                extern_fns.push(quote! {
-                    fn #accessor_sym(s: *const #ident) -> *const #field_ty;
-                });
-            }
+            // (Phase E follow-up experiment: removed accessor extern decl.
+            // The accessor symbol is emitted by Sky's codegen path, not
+            // referenced by name from any Rust source in the stub rlib.
+            // Both generic and non-generic accessors use this same path.)
         }
 
         if !accessor_methods.is_empty() {
@@ -240,30 +235,12 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             continue;
         }
 
-        // Extern declaration only for concrete (non-generic) functions.
-        // Generic functions flow through the `optimized_mir` override at
-        // monomorphization time (no extern needed; their symbols come from
-        // the consumer's backend — the partitioner override filters them
-        // out of rustc's CGU slice, replacing the retired `CODEGEN_SKIP_HOOK`).
-        // arch-fence-allow: extern-C-cannot-be-generic.
-        if toy_fn.type_params.is_empty() {
-            let sym = format!("__toylang_impl_{}", _name);
-            let fn_ident = format_ident!("{}", sym);
-            let extern_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
-                let pname = format_ident!("{}", p.name);
-                let pty = resolved_type_to_syn(&p.ty);
-                quote! { #pname: #pty }
-            }).collect();
-
-            let ret: syn::Type = match &toy_fn.return_ty {
-                Some(ty) => resolved_type_to_syn(ty),
-                None => parse_quote!(()),
-            };
-
-            extern_fns.push(quote! {
-                pub fn #fn_ident(#(#extern_params),*) -> #ret;
-            });
-        }
+        // (Phase E follow-up experiment: removed __toylang_impl_* extern
+        // decl. The symbol is emitted by Sky's codegen path; Rust callers
+        // reach it via the `symbol_name` query override rewriting
+        // `__lang_stubs::<name>` → `__toylang_impl_<name>`. No name-based
+        // lookup from Rust source. Removing this decl unifies the
+        // generic and non-generic emission paths.)
 
         // Public wrapper function (user-facing signature) — for ALL functions
         let ret: syn::Type = match &toy_fn.return_ty {

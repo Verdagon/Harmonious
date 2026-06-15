@@ -21,10 +21,20 @@
 //! That eliminated the prior struct-shape divergence from this file's
 //! scan list.
 //!
-//! Two remaining stub_gen.rs sites are gated by Rust syntax (Phase D):
-//! the two `extern "C" { pub fn ... }` block conditionals — `extern "C"`
-//! doesn't permit generic items. These carry
-//! `// arch-fence-allow: extern-C-cannot-be-generic` markers.
+//! Session 11 follow-up: the `__toylang_impl_*` and
+//! `__toylang_accessor_*` extern "C" decls in stub_gen were investigated
+//! and found vestigial — Sky's symbol_name override routes Rust callers
+//! to the Sky-emitted symbols without needing forward declarations.
+//! Removing both decl sites unified the generic and non-generic emission
+//! paths in stub_gen, eliminating the previously-flagged "Phase D" sites.
+//! What remains in the `extern "C" { ... }` block is the body-less toylang
+//! fn decls (toylang source's "talk directly to existing Rust fn" syntax,
+//! e.g., `fn println_int(x: i32);` binding to test_helpers's
+//! `#[no_mangle] pub extern "C" fn println_int(...)`). Those decls are
+//! orthogonal to toylang's own generics.
+//!
+//! The fence scans for both `type_params.is_empty()` and
+//! `type_args.is_empty()` patterns.
 //!
 //! Out of scope for this fence:
 //!   - oracle.rs / other helper modules — not on the discovery/typecheck
@@ -45,7 +55,9 @@ fn no_unmarked_type_params_branch_in_discovery() {
             .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
         let lines: Vec<&str> = src.lines().collect();
         for (lineno, line) in lines.iter().enumerate() {
-            if line.contains("type_params.is_empty()") {
+            let trips = line.contains("type_params.is_empty()")
+                || line.contains("type_args.is_empty()");
+            if trips {
                 let prev = if lineno > 0 { lines[lineno - 1] } else { "" };
                 if line.contains("arch-fence-allow") || prev.contains("arch-fence-allow") {
                     continue;
