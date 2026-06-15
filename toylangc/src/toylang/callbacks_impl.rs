@@ -289,15 +289,35 @@ impl ToylangCallbacks {
             return;
         }
 
-        // Workstream A discovery path + Phase 3 E.6: under the architecture's
-        // locked "binary compile codegens every reachable Sky item across
-        // all libs" invariant (rust-interop-architecture.md §5.5, §9.6),
-        // at user-bin time rustc does NOT queue extern non-generic items
-        // for local monomorphization, so the CGU walk finds zero stub
-        // items. We iterate the LOCAL registry first, then EACH upstream
-        // registry loaded by S.4. Upstream registries are cloned upfront
-        // so we hold one immutable borrow for the outer iteration while
-        // mutating `state` for the inner walk-and-stash.
+        // Phase C: entry-point walk replacing the registry walk.
+        //
+        // Architecture: §20.4 ("Sky's codegen queue populated from entry
+        // points: main + exports + impl methods, transitively"). Roots are
+        // export items only. Non-export Sky items reach codegen
+        // transitively via `walk_and_stash_internal_callees` from an
+        // exported caller (per §9.5).
+        //
+        // Behavior change vs Workstream A's registry walk: local
+        // non-export non-generic code with no caller from any export is
+        // no longer emitted. Aligned with §9.3 (non-exports not surfaced
+        // to rustc at all). No existing fixture relies on the dead-code
+        // emission (it'd be unreachable in any case).
+        //
+        // Roots (in order, dedup via `state.walked_entry_points`):
+        //   1+2. Local main (implicitly export, per parser.rs:382) + local
+        //        export free fns.
+        //   3.   Local export impl-block methods.
+        //   4.   Upstream export free fns.
+        //   5.   Upstream export impl-block methods.
+        //
+        // Generic exports stay non-roots — they have no concrete args at
+        // root. They reach codegen via Channel A (the CGU walk in
+        // llvm_gen.rs's accessor/stash path), driven by caller-site
+        // Instances surfaced by rustc's mono collector.
+        //
+        // Upstream registries are cloned upfront so we hold one immutable
+        // borrow for the outer iteration while mutating `state` for the
+        // inner walk-and-stash.
         let upstream_clones: Vec<crate::toylang::registry::ToylangRegistry> =
             state.upstream_registries.values().cloned().collect();
         let registries: Vec<&crate::toylang::registry::ToylangRegistry> =
@@ -305,86 +325,66 @@ impl ToylangCallbacks {
                 .chain(upstream_clones.iter())
                 .collect();
         for reg in registries {
-        for (name, toy_fn) in &reg.functions {
-            if toy_fn.body.is_none() {
-                continue;
-            }
-            // Skip generic consumer fns: emitting them from a registry-only
-            // walk would require concrete type args to substitute, but those
-            // come from caller-site Instances which the user-bin CGU list
-            // doesn't surface for extern non-generic items either. Generic
-            // surface to rustc is course-correct.md item #17 — out of scope
-            // for Workstream A. The 5 `test_generic_*` integration tests are
-            // expected to fail until that lands.
-            if toy_fn.has_abstract_args() {
-                continue;
-            }
-            let extern_symbol = compute_fn_symbol_from_type_args(name, &[]);
-            if !state.walked_entry_points.insert(extern_symbol.clone()) {
-                continue;
-            }
-            // Look up the `pub fn` shell in the upstream `__lang_stubs`
-            // rlib so the codegen pass can construct an `Instance` and
-            // emit the Rust-ABI extern wrapper. The stub's name uses
-            // toylang's mangling convention — `main` becomes
-            // `__toylang_main` (per `oracle::TOYLANG_MAIN`), everything
-            // else stays as-is.
-            let stub_name = if name == "main" {
-                crate::oracle::TOYLANG_MAIN.to_string()
-            } else {
-                name.clone()
-            };
-            let stub_def_id = crate::oracle::find_stub_fn_in_stub_rlib(tcx, &stub_name);
-            state.toylang_instances.push(ToylangInstance {
-                extern_symbol,
-                resolved_func: toy_fn.clone(),
-                stub_def_id,
-            });
-            // Transitively walk the body for consumer-to-consumer callees.
-            // This is what surfaces generic monomorphizations (e.g.
-            // `wrap<i32>` called from non-generic `wrap_i32`) — the
-            // registry walk above sees `wrap_i32` but the
-            // `wrap<i32>::<__toylang_internal_wrap__i32>` symbol it calls
-            // needs to be emitted too, and the only place it appears with
-            // concrete args is at the call site.
-            walk_and_stash_internal_callees(
-                tcx, reg, toy_fn, name, state,
-            );
-        }
-        // Phase 2 C.5 — iterate trait_impls and push a ToylangInstance per
-        // method so the codegen pass below emits the body at
-        // `__toylang_impl__<Self>__<Trait>__<m>`. The DefId of the impl
-        // method in the upstream lang_stubs rlib is looked up via
-        // `oracle::find_trait_impl_method_def_id` so the codegen path can
-        // build an `Instance` for the Rust-ABI extern wrapper.
-        for toy_impl in &reg.trait_impls {
-            for method in &toy_impl.methods {
-                if method.func.body.is_none() || method.func.has_abstract_args() {
+            // Export free fns (and main).
+            for (name, toy_fn) in &reg.functions {
+                if !toy_fn.is_export
+                    || toy_fn.body.is_none()
+                    || toy_fn.has_abstract_args()
+                {
                     continue;
                 }
-                let extern_symbol = format!(
-                    "__toylang_impl__{}__{}__{}",
-                    toy_impl.self_type_name, toy_impl.trait_name, method.name,
-                );
+                let extern_symbol = compute_fn_symbol_from_type_args(name, &[]);
                 if !state.walked_entry_points.insert(extern_symbol.clone()) {
                     continue;
                 }
-                let stub_def_id = crate::oracle::find_trait_impl_method_def_id(
-                    tcx,
-                    &toy_impl.trait_name,
-                    &toy_impl.self_type_name,
-                    &method.name,
-                );
+                // The stub's name uses toylang's mangling convention —
+                // `main` becomes `__toylang_main` (per `oracle::TOYLANG_MAIN`),
+                // everything else stays as-is.
+                let stub_name = if name == "main" {
+                    crate::oracle::TOYLANG_MAIN.to_string()
+                } else {
+                    name.clone()
+                };
+                let stub_def_id = crate::oracle::find_stub_fn_in_stub_rlib(tcx, &stub_name);
                 state.toylang_instances.push(ToylangInstance {
                     extern_symbol,
-                    resolved_func: method.func.clone(),
+                    resolved_func: toy_fn.clone(),
                     stub_def_id,
                 });
-                walk_and_stash_internal_callees(
-                    tcx, reg, &method.func, &method.name, state,
-                );
+                // Transitive walk: surfaces non-export Sky callees + generic
+                // monomorphizations reachable from this root.
+                walk_and_stash_internal_callees(tcx, reg, toy_fn, name, state);
             }
-        }
+            // Export impl-block methods.
+            for toy_impl in &reg.trait_impls {
+                if !toy_impl.is_export {
+                    continue;
+                }
+                for method in &toy_impl.methods {
+                    if method.func.body.is_none() || method.func.has_abstract_args() {
+                        continue;
+                    }
+                    let extern_symbol = format!(
+                        "__toylang_impl__{}__{}__{}",
+                        toy_impl.self_type_name, toy_impl.trait_name, method.name,
+                    );
+                    if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                        continue;
+                    }
+                    let stub_def_id = crate::oracle::find_trait_impl_method_def_id(
+                        tcx,
+                        &toy_impl.trait_name,
+                        &toy_impl.self_type_name,
+                        &method.name,
+                    );
+                    state.toylang_instances.push(ToylangInstance {
+                        extern_symbol,
+                        resolved_func: method.func.clone(),
+                        stub_def_id,
+                    });
+                    walk_and_stash_internal_callees(tcx, reg, &method.func, &method.name, state);
+                }
+            }
         }
     }
 }
@@ -804,6 +804,7 @@ impl LangCallbacks for ToylangCallbacks {
         let toy_struct = &toy_struct;
 
         // Build type-param substitution at the rustc Ty level (no round-trip through ResolvedType).
+        // arch-fence-allow: substituted-args-fast-path (no substitution needed when zero type params).
         let ty_subst: HashMap<&str, Ty<'tcx>> = if !toy_struct.type_params.is_empty() {
             if let TyKind::Adt(_, args) = ty.kind() {
                 toy_struct.type_params.iter()
@@ -975,6 +976,7 @@ pub fn resolve_caller_from_instance<'tcx>(
     instance: ty::Instance<'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> crate::toylang::registry::ToyFunction {
+    // arch-fence-allow: substituted-args-fast-path (no substitution work to do).
     if caller_fn.type_params.is_empty() {
         return caller_fn.clone();
     }
@@ -1072,6 +1074,7 @@ fn resolve_toylang_callee(
     callee_fn: &crate::toylang::registry::ToyFunction,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> crate::toylang::registry::ToyFunction {
+    // arch-fence-allow: substituted-args-fast-path (no substitution work to do).
     if callee_fn.type_params.is_empty() {
         callee_fn.clone()
     } else {

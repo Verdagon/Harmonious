@@ -374,6 +374,7 @@ fn resolve_expr(
 
         Expr::FnCall { name, type_args, args } => {
             if let Some(func) = registry.functions.get(name.as_str()) {
+            // arch-fence-allow: type-arg-arity check (zero params requires zero args; non-zero requires matching count).
             if !func.type_params.is_empty() {
                 if type_args.len() != func.type_params.len() {
                     return Err(TypeResolveError::WrongTypeArgCount {
