@@ -20,11 +20,10 @@ catalog of places where erw currently diverges from Sky is `course-correct.md`
 (18 items). This project — driven by the plan at
 `/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md` — adds
 tests that exercise the "hard cases" (1b, 3, 4, 5, 6) from the
-architecture doc's seven-case taxonomy. **As of Session 7, six of seven
-cases are tested** (1a, 1b, 2, 3, 5, 6); Case 4 needs Phase 2 C's toylang
-`impl rust_trait for toylang_type` language feature. **Eleven course-correct
-items are done** (#1, #2, #4, #5, #6, #11, #14, #15, #16, #17, #18) and #10
-is partial.
+architecture doc's seven-case taxonomy. **As of Session 8, all seven cases are tested** (1a, 1b, 2, 3, 4, 5, 6).
+Phase 2 C landed `impl rust_trait for toylang_type` end-to-end.
+**Eleven course-correct items are done** (#1, #2, #4, #5, #6, #11,
+#14, #15, #16, #17, #18) and #10 is partial.
 
 ---
 
@@ -247,8 +246,60 @@ deeper than the docs estimated.
 
 Test counts after Session 7: **246/246 passing** (no test count
 change — both refactors are byte-equivalent to the old emission).
-Working tree is clean — all of Sessions 2–7's work is committed
-across ten commits (see §12 for the hashes).
+
+**Session 8 (Phase 2 C — Case 4 end-to-end).** The toylang language
+feature `impl rust_trait for toylang_type` landed across seven
+sub-steps, closing the seven-case interop taxonomy.
+
+- **C.1 parser** (commit `6e9e7a8`): top-level `impl <Path> for
+  <Ident> { fn … }` recognised; `&self` elevated to an explicit
+  `self: &Struct` parameter (CLAUDE.md "prefer self as another
+  parameter"); 3 new parser unit tests.
+
+- **C.2 registry** (same commit): `ToyImpl { trait_name,
+  self_type_name, methods: Vec<ToyImplMethod> }`,
+  `ToylangRegistry.trait_impls: Vec<ToyImpl>` (deterministic by
+  source order).
+
+- **C.3 type resolver + C.4 stub_gen** (commit `5b1babd`):
+  Check 6 type-resolves each method body via the existing
+  `resolve_fn_body` path (no method-specific code path needed);
+  stub_gen emits one `impl <Trait> for <SelfType> { fn name(&self,
+  …) -> Ret { unreachable!() } }` block per `ToyImpl`. 1 new
+  stub_gen unit test.
+
+- **C.5 llvm_gen + C.6 symbol_name + C.7 fixture** (commit
+  `b56cf4c`):
+  - New facade helper `is_consumer_trait_impl_method` walks
+    `opt_associated_item` + `impl_opt_trait_ref` to discriminate
+    trait-impl methods on consumer types.
+  - `is_consumer_accessor_safe` now excludes them (early return when
+    `impl_opt_trait_ref` is Some) so accessor and trait-impl callback
+    names don't collide.
+  - symbol_name routes trait-impl methods to a new callback shape
+    `__impl_method__<Self>__<Trait>__<m>` → consumer mangles to
+    `__toylang_impl__<Self>__<Trait>__<m>`.
+  - New oracle helper `find_trait_impl_method_def_id` walks
+    `tcx.all_impls(trait_def_id)` to find the impl method's DefId
+    for Instance construction.
+  - `populate_toylang_instances_from_cgus` iterates
+    `registry.trait_impls`, pushes `ToylangInstance` per method so
+    the existing codegen pass emits both internal and Rust-ABI
+    extern wrapper.
+  - Auto-deref bug fix in type_resolve + llvm_gen: `Ref { Struct }`
+    receiver auto-derefs for `self.field` access. The codegen path
+    loads the receiver pointer before GEPing the field — earlier the
+    GEP indexed into the receiver's stack slot itself and printed
+    garbage (1835707572 instead of 42 the first time the fixture
+    ran).
+  - `case4_sky_impl_rust_trait/` fixture: Widget + impl Clone + Sky
+    accessors; rust_caller calls `Clone::clone(&w)` via trait
+    dispatch, prints id via Sky `id_of`.
+
+Test counts after Session 8: **251/251 passing** (97 unit + 138
+integration + 16 standalone). Working tree is clean — all of
+Sessions 2–8's work is committed across 14 commits (see §12 for the
+hashes).
 
 ---
 
@@ -266,16 +317,12 @@ Three phases, ~15 weeks total:
 | 2 | 8-12 | Toylang `impl rust_trait for toylang_type` language feature (C) | 4 |
 | 3 | 13-15 | Multi-toylang-crate workspace + marker-based detection (E) | 6 |
 
-**Phases 1 and 3 — substantially complete.** Phase 1: S.1–S.5 done,
-oracle cross-crate sweep done, Workstream A done, Workstream D
-(rust_caller fixtures for Cases 1a/1b/3/5) done, A.5 done. Workstream
-B (oracle TypeParam tolerance) NOT done — minor; only matters once
-sharper trait dispatch cases come up. Phase 3: E.1–E.6 done; the first
-multi-toylang-crate test passes end-to-end. **Phase 2 (toylang `impl
-rust_trait for toylang_type`) is the largest remaining item.** It's
-the gating piece for Case 4 (Sky type implementing a Rust trait,
-consumed via a Rust generic intermediary). ~3–5 weeks per the plan's
-estimate.
+**All three phases complete.** Phase 1: S.1–S.5 done, oracle cross-
+crate sweep done, Workstream A done, Workstream B done (oracle
+TypeParam tolerance, Session 6), Workstream D (rust_caller fixtures
+for Cases 1a/1b/3/5) done, A.5 done. Phase 2: C.1–C.7 done (Case 4
+via `impl rust_trait for toylang_type`, Session 8). Phase 3: E.1–E.6
+done. The seven-case taxonomy is fully tested.
 
 Detailed commit-by-commit schedule is in the master plan's "Sequencing
 recommendation" table at the end.
@@ -486,52 +533,42 @@ The non-obvious rule from this session:
 
 ## 7. Where to start
 
-Phase 1 (Workstream S/A/B/D + A.5), Phase 3 (multi-crate E.1–E.6),
-six of seven taxonomy cases (1a/1b/2/3/5/6), and **eleven of
-eighteen course-correct items** (#1, #2, #4, #5, #6, #11, #14, #15,
-#16, #17, #18) are all done. Session 6 swept Tier 1 cosmetic
-refactors (#4, B, #5); Session 7 closed the small cleanup tier
-(#17, #18) and audited #3 (deferred — see §2). The remaining work
-splits into the language feature for Case 4 and the deep facade-
-rebuild trio (which #3 now joins).
+Phase 1 (Workstream S/A/B/D + A.5), Phase 2 C (Case 4 language
+feature), Phase 3 (multi-crate E.1–E.6), **all seven taxonomy cases**
+(1a/1b/2/3/4/5/6), and **eleven of eighteen course-correct items**
+(#1, #2, #4, #5, #6, #11, #14, #15, #16, #17, #18) are all done.
 
-### Tier 2 — language feature (3–5 weeks)
+Session 8 closed Case 4 via the Phase 2 C feature. The seven-case
+taxonomy is now fully tested — there is no longer a "main remaining
+piece" with concrete scope; what's left is the deep facade-rebuild
+trio (#7/#8/#12 + #9 + #3, bundled) plus the wrapper-mode retirement
+(#13).
 
-**Phase 2 C — toylang `impl rust_trait for toylang_type`.** Unlocks
-Case 4 (Sky type implementing a Rust trait, consumed via a Rust
-generic intermediary — "Sky exposes a trait impl that satisfies a
-Rust generic's bound"). Real toylang language-feature work: parser,
-AST, type-resolver, stub_gen impl-block emission, llvm_gen for
-trait-impl method codegen, symbol_name override extension for impl
-DefIds.
+### Tier 2 — DONE (Session 8)
 
-This is the most architecturally interesting remaining piece because
-it's the pattern Sky must support: a Sky-defined type implementing
-a Rust trait, where the Rust generic that bounds the trait gets
-instantiated by either Rust or Sky code. The Phase 2 C work touches
-real language design (how does toylang write `impl Clone for Widget`?
-toylang's existing syntax is `impl rust.std.clone.Clone for Widget {
-fn clone(&self) -> Widget { ... } }` per architecture §6.2's worked
-example).
+Phase 2 C (toylang `impl rust_trait for toylang_type`) landed in
+seven sub-steps across three commits (see §2 Session 8). Case 4 is
+tested via `case4_sky_impl_rust_trait/`. Nothing remains in Tier 2.
 
-### Tier 2 — language feature (3–5 weeks)
+The original wording follows for posterity (this is the architecturally
+interesting pattern that's now exercised):
 
-**Phase 2 C — toylang `impl rust_trait for toylang_type`.** Unlocks
-Case 4 (Sky type implementing a Rust trait, consumed via a Rust
-generic intermediary — "Sky exposes a trait impl that satisfies a
-Rust generic's bound"). Real toylang language-feature work: parser,
-AST, type-resolver, stub_gen impl-block emission, llvm_gen for
-trait-impl method codegen, symbol_name override extension for impl
-DefIds.
-
-This is the most architecturally interesting remaining piece because
-it's the pattern Sky must support: a Sky-defined type implementing
-a Rust trait, where the Rust generic that bounds the trait gets
-instantiated by either Rust or Sky code. The Phase 2 C work touches
-real language design (how does toylang write `impl Clone for Widget`?
-toylang's existing syntax is `impl rust.std.clone.Clone for Widget {
-fn clone(&self) -> Widget { ... } }` per architecture §6.2's worked
-example).
+> Phase 2 C — toylang `impl rust_trait for toylang_type`. Unlocks
+> Case 4 (Sky type implementing a Rust trait, consumed via a Rust
+> generic intermediary — "Sky exposes a trait impl that satisfies a
+> Rust generic's bound"). Real toylang language-feature work: parser,
+> AST, type-resolver, stub_gen impl-block emission, llvm_gen for
+> trait-impl method codegen, symbol_name override extension for impl
+> DefIds.
+>
+> This is the most architecturally interesting remaining piece because
+> it's the pattern Sky must support: a Sky-defined type implementing
+> a Rust trait, where the Rust generic that bounds the trait gets
+> instantiated by either Rust or Sky code. The Phase 2 C work touches
+> real language design (how does toylang write `impl Clone for Widget`?
+> toylang's existing syntax is `impl rust.std.clone.Clone for Widget {
+> fn clone(&self) -> Widget { ... } }` per architecture §6.2's worked
+> example).
 
 ### Tier 3 — larger architectural shifts (multi-week)
 
@@ -718,11 +755,11 @@ convention is "patches as working tree state"). See the diff with
 
 ## 12. Status snapshot (where you start)
 
-**Tests passing**: **246/246** (93 unit + 137 integration + 16
+**Tests passing**: **251/251** (97 unit + 138 integration + 16
 standalone) when run with `integration-projects-cache` wiped.
 
-**Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, 4 ⏳ (Phase
-2 C), 5 ✅, 6 ✅.
+**Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, **4 ✅
+(NEW)**, 5 ✅, 6 ✅. All seven cases tested.
 
 **Course-correct.md items done**: #1, #2, #4, #5, #6, #11, #14, #15,
 #16, #17, #18 (11/18). #10 partial. #3 audited and deferred (bundled
@@ -753,8 +790,8 @@ codegen site, driven by registry-driven discovery + transitive callee
 walk (NOT the upstream CGU walk, which finds zero stub items at user-bin
 time — see `workstream-a-scope-notes.md` for the why).
 
-**Working tree is clean** as of Session 7. Sessions 2–7's work is on
-`main` across ten commits:
+**Working tree is clean** as of Session 8. Sessions 2–8's work is on
+`main` across fourteen commits:
 
 | Commit | What |
 |---|---|
@@ -769,6 +806,10 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `7c23f63` | Session-6 doc refresh (course-correct status + tl-handoff Session 6) |
 | `1c27b09` | Course-correct #18 (build.rs rust_deps re-listing comment) |
 | `4f5cc8a` | Course-correct #17 (cosmetic is_generic branches in stub_gen) |
+| `7a203b0` | Session-7 doc refresh (Tier 1 closure + #3 audit) |
+| `6e9e7a8` | Phase 2 C.1 + C.2 (parser + ToyImpl registry) |
+| `5b1babd` | Phase 2 C.3 + C.4 (typecheck + stub-rlib emission) |
+| `b56cf4c` | Phase 2 C.5 + C.6 + C.7 (Case 4 end-to-end; 7/7 cases tested) |
 
 Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
 baseline.

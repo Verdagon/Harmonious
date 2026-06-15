@@ -10,7 +10,7 @@ This document catalogs the places in the current erw prototype that are on the *
 | 🟡 Partial | #10 (Instance-keyed collect_generic_rust_deps — landed; the rest needs E.5-style threading) |
 | ⏳ Remaining | #3, #7, #8, #9, #12, #13 |
 
-11 of 18 items done. **#3 audit (Session 7) found `cgu_stash` is NOT retire-ready**: `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for two paths Workstream A's registry-driven discovery does not cover — accessor-method discovery (via `opt_associated_item`) and Case-1b generic consumer fns instantiated from Rust call sites (`__lang_stubs::wrap::<i32>(42)` from `rust_caller.rs`). Retiring the stash requires moving both discovery paths to the `after_expansion` queue the architecture wants, which is bundled with #7 (sidecar-loaded universe) and #9 (symbol_name discovery retirement) — not a mechanical cleanup. #3 stays paired with that deeper rebuild.
+11 of 18 items done. **Session 8** closed Phase 2 C (Case 4 via `impl rust_trait for toylang_type`), bringing the seven-case interop taxonomy to full coverage. Pure-cleanup work is depleted. #3 audit (Session 7) found `cgu_stash` is NOT retire-ready: `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for accessor-method discovery and Case-1b generic consumer fns instantiated from Rust call sites — paths Workstream A's registry-driven walk doesn't cover. #3 stays bundled with the deeper rebuild.
 
 The remaining items: wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend (#13), and the deep facade-rebuild trio (#7/#8/#12 + #9 + #3, the sidecar-loaded universe replacing `LangPredicates`).
 
