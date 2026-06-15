@@ -20,10 +20,10 @@ catalog of places where erw currently diverges from Sky is `course-correct.md`
 (18 items). This project — driven by the plan at
 `/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md` — adds
 tests that exercise the "hard cases" (1b, 3, 4, 5, 6) from the
-architecture doc's seven-case taxonomy. **As of Session 5, six of seven
+architecture doc's seven-case taxonomy. **As of Session 6, six of seven
 cases are tested** (1a, 1b, 2, 3, 5, 6); Case 4 needs Phase 2 C's toylang
-`impl rust_trait for toylang_type` language feature. **Seven course-correct
-items are done** (#1, #2, #6, #11, #14, #15, #16) and #10 is partial.
+`impl rust_trait for toylang_type` language feature. **Nine course-correct
+items are done** (#1, #2, #4, #5, #6, #11, #14, #15, #16) and #10 is partial.
 
 ---
 
@@ -168,8 +168,44 @@ distinct pieces of work, all landed and committed:
   gracefully when vanilla toolchain isn't installed.
 
 Test counts after Session 5: **243/243 passing** (90 unit + 137
-integration + 16 standalone). Working tree is clean — all of Sessions
-2–5's work is committed across four commits (see §11 for the hashes).
+integration + 16 standalone).
+
+**Session 6 (Tier 1 sweep — #4, B, #5).** All three Tier 1 items landed
+in one session as mechanical refactors:
+
+- **#4 codegen-wrapper emission channel** (commit `6c19e53`). Wrapped
+  rustc's own ongoing-codegen `Box<dyn Any>` in
+  `LangOngoingCodegen { inner, lang_obj_path }`; `codegen_crate`
+  returns the wrapper, `join_codegen` downcasts and extracts both.
+  Retired `FacadeMutableState.lang_obj_path` +
+  `set_lang_obj_path` / `get_lang_obj_path`. The inline-Inkwell
+  rewrite the architecture eventually wants is deferred (Sky's full
+  codegen still goes through the consumer's `generate_and_compile`
+  callback); the cross-phase channel itself is gone.
+
+- **Workstream B oracle TypeParam tolerance** (commit `01d98fd`).
+  `oracle::rust_trait_method_return_type` /
+  `rust_trait_method_param_types` now detect TypeParam in Self or
+  any type arg and return a structured "deferred" error instead of
+  panicking via `try_resolved_to_rustc_ty`. New
+  `RustTypeLookupContext::DeferredTypeParam` +
+  `UnresolvedRustType::is_deferred`; the `TypeResolveError` enum
+  gained a `RustTypeDeferred` variant; the Check 5 typecheck loop
+  silently skips deferred entries. ~80 LOC + 3 unit tests for the
+  new `contains_type_param` helper.
+
+- **#5 hook point: after_expansion not after_analysis**
+  (commit `e81cf6d`). One-line driver.rs swap. Toylang's oracle
+  queries (fn_sig / adt_def / module_children) are all available at
+  expansion-time. The handoff's 3–5-day estimate budgeted for a
+  worst-case split (Sky-side parse at after_expansion, rustc cross-
+  check at after_analysis); in practice it was a hook-point swap
+  with a comment refresh.
+
+Test counts after Session 6: **246/246 passing** (93 unit + 137
+integration + 16 standalone). Working tree is clean — all of
+Sessions 2–6's work is committed across seven commits (see §12 for
+the hashes).
 
 ---
 
@@ -407,42 +443,59 @@ The non-obvious rule from this session:
 
 ## 7. Where to start
 
-Phase 1 (Workstream S/A/D + A.5), Phase 3 (multi-crate E.1–E.6),
-six of seven taxonomy cases (1a/1b/2/3/5/6), and seven
-course-correct items (#1, #2, #6, #11, #14, #15, #16) are all done.
-The remaining work splits into three tiers:
+Phase 1 (Workstream S/A/B/D + A.5), Phase 3 (multi-crate E.1–E.6),
+six of seven taxonomy cases (1a/1b/2/3/5/6), and **nine of eighteen
+course-correct items** (#1, #2, #4, #5, #6, #11, #14, #15, #16) are
+all done. Session 6 swept Tier 1 (#4, B, #5) — the remaining work
+splits into mechanical cleanups, the language feature for Case 4,
+and the deep facade-rebuild trio.
 
-### Tier 1 — focused refactors (½–1 week each, single-session-friendly)
+### Tier 1 — mechanical cleanups (½–1 day each)
 
-These close more course-correct items without architectural risk.
+Each closes a course-correct item with negligible risk.
 
-- **#4 — codegen-wrapper emission channel.** Today: `call_generate_and_compile`
-  returns a `.o` path; `set_lang_obj_path` / `get_lang_obj_path` `OnceLock`
-  + Mutex round-trips it to `join_codegen` which injects it as a
-  `CompiledModule`. Architecture §5.3 wants Sky's `codegen_crate` to walk
-  Sky's queue inline and emit via Inkwell directly, returning the
-  ongoing object as a wrapper around `inner.codegen_crate`'s result. The
-  channel between phases collapses. **Estimate: 1–2 days. Touches:**
-  `rustc-lang-facade/src/codegen_wrapper.rs`, `rustc-lang-facade/src/lib.rs`
-  (the channel statics), `toylangc/src/toylang/callbacks_impl.rs`'s
-  `generate_and_compile` return shape.
+- **#3 — retire `cgu_stash.rs`.** Today: facade stashes upstream-CGU
+  refs in `cgu_stash.rs` (~87 LOC) so the consumer can iterate them.
+  Under Workstream A the consumer no longer needs this — discovery is
+  registry-driven at user-bin compile, not CGU-walked. Audit which
+  callbacks (if any) still consult the stash; if none, delete the
+  file + `clear_upstream_cgus` calls. Touches: `cgu_stash.rs`,
+  `driver.rs`'s `config()`, `queries/partition.rs`'s stash population.
+  **Estimate: 1–2 days.**
 
-- **#5 — hook point: `after_expansion` not `after_analysis`.** Per
-  architecture §20.3, Sky's frontend runs at after_expansion (before
-  rustc's mono collection) so Sky's universe is populated before
-  rustc's typechecker walks the stub bodies. Today erw fires at
-  after_analysis. The migration is non-trivial because today's
-  consumer-side validation depends on rustc's typecheck queries.
-  Probably means splitting toylang's after_rust_analysis into two
-  phases: "Sky-side parse + universe build" at after_expansion, and
-  "rustc-side cross-check" at after_analysis. **Estimate: 3–5 days.**
+- **#17 — `is_generic` special-casing in `stub_gen`.** The compiler-law
+  violation. Every `if !is_generic { … } else { … }` branch in
+  `stub_gen.rs` (lines 59, 86–97, 117–123, 127, 148, 185) is on the
+  wrong track. Sky picks one universal shape (zero-param is the
+  degenerate case of N-param). Touches: `toylangc/src/stub_gen.rs`.
+  **Estimate: 1–2 days.**
 
-- **Workstream B — oracle TypeParam tolerance in trait queries.** Small
-  but real: `oracle::rust_trait_method_return_type` / `_param_types`
-  panic on `TypeParam` Self today. Make them return a defer sentinel
-  so the per-Instance substituted pass can resolve later. Doesn't
-  unblock anything yet but smooths out a sharp edge that'll get hit
-  by sharper Case 3 / Case 4 variants. **Estimate: ~60 LOC, 1 day.**
+- **#18 — `build.rs` comment refresh.** Stale comment about
+  `rust_deps re-listing being needed for "lib `.o` calls
+  rust_dependencies symbols at the object level."` That justification
+  died with Workstream A; the re-listing remains load-bearing for a
+  different reason (rust_caller needs direct cargo deps + force-link
+  via `extern crate as _;`). Just update the comment to match the
+  post-Workstream-A reality. **Estimate: 30 min.**
+
+### Tier 2 — language feature (3–5 weeks)
+
+**Phase 2 C — toylang `impl rust_trait for toylang_type`.** Unlocks
+Case 4 (Sky type implementing a Rust trait, consumed via a Rust
+generic intermediary — "Sky exposes a trait impl that satisfies a
+Rust generic's bound"). Real toylang language-feature work: parser,
+AST, type-resolver, stub_gen impl-block emission, llvm_gen for
+trait-impl method codegen, symbol_name override extension for impl
+DefIds.
+
+This is the most architecturally interesting remaining piece because
+it's the pattern Sky must support: a Sky-defined type implementing
+a Rust trait, where the Rust generic that bounds the trait gets
+instantiated by either Rust or Sky code. The Phase 2 C work touches
+real language design (how does toylang write `impl Clone for Widget`?
+toylang's existing syntax is `impl rust.std.clone.Clone for Widget {
+fn clone(&self) -> Widget { ... } }` per architecture §6.2's worked
+example).
 
 ### Tier 2 — language feature (3–5 weeks)
 
@@ -631,14 +684,14 @@ convention is "patches as working tree state"). See the diff with
 
 ## 12. Status snapshot (where you start)
 
-**Tests passing**: **243/243** (90 unit + 137 integration + 16
+**Tests passing**: **246/246** (93 unit + 137 integration + 16
 standalone) when run with `integration-projects-cache` wiped.
 
 **Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, 4 ⏳ (Phase
 2 C), 5 ✅, 6 ✅.
 
-**Course-correct.md items done**: #1, #2, #6, #11, #14, #15, #16 (7/18).
-#10 partial.
+**Course-correct.md items done**: #1, #2, #4, #5, #6, #11, #14, #15,
+#16 (9/18). #10 partial.
 
 **Sidecars produced**: yes, ~120 files materialize during a full test run.
 The format is bincode + BLAKE3 truncated checksum with a 64-byte fixed
@@ -665,8 +718,8 @@ codegen site, driven by registry-driven discovery + transitive callee
 walk (NOT the upstream CGU walk, which finds zero stub items at user-bin
 time — see `workstream-a-scope-notes.md` for the why).
 
-**Working tree is clean** as of Session 5. Sessions 2–5's work is on
-`main` across four commits:
+**Working tree is clean** as of Session 6. Sessions 2–6's work is on
+`main` across nine commits:
 
 | Commit | What |
 |---|---|
@@ -674,6 +727,10 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `1a72a64` | Phase 1 D: rust_caller manifest field + Cases 1a/1b/3/5 fixtures + tests |
 | `7278f4a` | Course-correct #14 (CARGO_PRIMARY_PACKAGE) + #2 (B2 linkage mutation) retirement |
 | `88b56d2` | A.5: byte-identical pass-through invariant CI test (§4.4) |
+| `dc52833` | Session-5 doc refresh (course-correct table, tl-handoff §7 tiered options) |
+| `6c19e53` | Course-correct #4 (codegen-wrapper emission channel) |
+| `01d98fd` | Workstream B (oracle TypeParam tolerance in trait queries) |
+| `e81cf6d` | Course-correct #5 (after_expansion hook point) |
 
 Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
 baseline.

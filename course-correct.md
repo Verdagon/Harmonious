@@ -6,11 +6,11 @@ This document catalogs the places in the current erw prototype that are on the *
 
 | Status | Items |
 |---|---|
-| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #6 (`__SKY_STUBS_MARKER`), #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs) |
+| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #4 (codegen channel), #5 (after_expansion hook), #6 (`__SKY_STUBS_MARKER`), #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs) |
 | 🟡 Partial | #10 (Instance-keyed collect_generic_rust_deps — landed; the rest needs E.5-style threading) |
-| ⏳ Remaining | #3, #4, #5, #7, #8, #9, #12, #13, #17, #18 |
+| ⏳ Remaining | #3, #7, #8, #9, #12, #13, #17, #18 |
 
-7 of 18 items done. The remaining items split into Tier 1 (focused refactors), Tier 2 (the wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend), and a Tier 0 architectural shift (#7/#8/#12, sidecar-loaded universe replacing `LangPredicates` + facade mutex).
+9 of 18 items done. The remaining items split into mechanical cleanups (#3 cgu_stash retirement now that no callback consumes it, #17 stub_gen `is_generic` cleanup, #18 build.rs comment refresh), the wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend (#13), and the deep facade-rebuild trio (#7/#8/#12 + #9, the sidecar-loaded universe replacing `LangPredicates`).
 
 See `tl-handoff.md` for the narrative summary and recommended next directions.
 
@@ -104,8 +104,8 @@ Lines 156 / 195 (`notify_concrete_entry_point_inner` "stashing"), the `toylang_i
 | 1 | ✅ | `queries/optimized_mir.rs` (whole) | DefId-keyed, Param-bearing body, rustc-side substitution | Instance-keyed `per_instance_mir`, pre-substituted body, Sky-side substitution |
 | 2 | ✅ | `queries/partition.rs:80–88` | Post-partition `(External, Default)` linkage mutation (B2 risk) | Delete; default `Hidden` works |
 | 3 | ⏳ | `cgu_stash.rs` (whole file) | Walk rustc's unfiltered CGU slice for Sky-item discovery | Sky's frontend populates queue at after_expansion; rustc partitions are Rust-only |
-| 4 | ⏳ | `codegen_wrapper.rs:96–108` + `lib.rs:500–509` | Callback returns `.o` path; `join_codegen` injects via `OnceLock` channel | Sky's `codegen_crate` walks queue inline and emits via Inkwell directly |
-| 5 | ⏳ | `driver.rs:76` | Hook at `after_analysis` | Hook at `after_expansion` (§20.3) |
+| 4 | ✅ | `codegen_wrapper.rs:96–108` + `lib.rs:500–509` | Callback returns `.o` path; `join_codegen` injects via `OnceLock` channel | Sky's `codegen_crate` walks queue inline and emits via Inkwell directly — landed as a `LangOngoingCodegen { inner, lang_obj_path }` wrapper around rustc's own ongoing-codegen `Box<dyn Any>`; the OnceLock channel + `FacadeMutableState.lang_obj_path` are retired. The inline-Inkwell rewrite is deferred (still calls consumer's `generate_and_compile`), but the cross-phase channel is gone. |
+| 5 | ✅ | `driver.rs:76` | Hook at `after_analysis` | Hook at `after_expansion` (§20.3) — landed as a hook-point swap; toylang's oracle queries (fn_sig, adt_def, module_children) are all available at expansion-time. |
 | 6 | ✅ | `lib.rs:325–327` (`is_from_lang_stubs`) | Crate-name match against `"__lang_stubs"` | Marker-based: walk `module_children` for `__SKY_STUBS_MARKER` |
 | 7 | ⏳ | `lib.rs:86–104, 308–311, 386–389` | Name-list-based `is_consumer_type/fn` | Sidecar-loaded universe + content-addressed typeids |
 | 8 | ⏳ | `lib.rs:131–136` (`monomorphize_type`) | "Give me field types so rustc composes layout" | Sky's `layout_of` walks Sky's universe recursively itself |
