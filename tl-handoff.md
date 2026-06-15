@@ -811,12 +811,18 @@ the previously-ICE'ing `pub struct Foo(())` shape on the patched rustc —
 253/253 tests pass. PR draft at `phase-e-rustc-pr-draft.md` ready for
 upstream submission.
 
-**Phase E completion landed** (Session 11): stub_gen's struct shape is
-now universal — `pub struct Foo<P...>(PhantomData<(P...)>);` at every N
-— via the fork patch. The architecture fence was extended to scan
-stub_gen.rs; the only remaining `is_generic` branches there are the two
-`extern "C"` decl sites, properly marked
-`arch-fence-allow: extern-C-cannot-be-generic`.
+**Phase E completion + vestigial-extern cleanup landed** (Session 11):
+stub_gen's struct shape is now universal —
+`pub struct Foo<P...>(PhantomData<(P...)>);` at every N — via fork
+patch 4 (the debuginfo clamp). Additionally, the
+`__toylang_impl_*` and `__toylang_accessor_*` extern "C" decls in
+stub_gen were investigated and found vestigial (Sky's `symbol_name`
+override routes Rust callers without needing forward decls; Sky's
+codegen emits accessor symbols directly). Removing both eliminated
+every generic-vs-non-generic asymmetry in stub_gen — the previously-
+flagged "Phase D" sites turned out to be independently fixable. The
+architecture fence now scans for both `type_params.is_empty()` and
+`type_args.is_empty()`.
 
 Remaining options:
 
@@ -1039,6 +1045,10 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `a43569c` | Phase E investigation: rustc debuginfo ICE reproduces; recommend upstream patch |
 | `4c19bec` | Doc refresh: Session 11 uniformity sweep + Phase E investigation |
 | `8a9adc8` | Phase E patch landed in fork; verified clamp eliminates the ICE |
+| `70e3069` | Doc refresh (Path 1 landed) |
+| `c17cf7e` | Phase E completion (struct shape unification) |
+| `747d0e6` | Doc refresh (E closed) |
+| `ed4e07e` | Remove vestigial extern decls; close last gen/non-gen asymmetry in stub_gen |
 
 Plus fork commit `e67de69ef35` (in `~/rust` on `per-instance-mir`):
 debuginfo: clamp struct + union field walk to layout's field count.
