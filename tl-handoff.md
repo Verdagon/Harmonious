@@ -297,9 +297,77 @@ sub-steps, closing the seven-case interop taxonomy.
     dispatch, prints id via Sky `id_of`.
 
 Test counts after Session 8: **251/251 passing** (97 unit + 138
-integration + 16 standalone). Working tree is clean — all of
-Sessions 2–8's work is committed across 14 commits (see §12 for the
-hashes).
+integration + 16 standalone).
+
+**Session 9 (honest fixture audit + sharpening).** Re-reading the case
+fixtures against the architecture doc's worked examples revealed that
+several of them are *partial* tests of the architectural case rather
+than the sharp version. The seven-case taxonomy fixtures were meant
+to make drift toward Approach B "fail loudly"; a weak fixture for the
+hardest case doesn't do that.
+
+Audit findings (pre-Session-9 state):
+
+| Case | Architectural shape | Pre-9 fixture | Sharp? |
+|---|---|---|---|
+| 1a | Rust → Sky non-generic | non-generic call | ✅ |
+| 1b | Rust → Sky generic w/ **Rust-defined** T | `identity::<i32>(42)` — stdlib type | ⚠️ exercises Approach-A mechanism (non-empty `instance.args`) but with a stdlib type, not a user-struct (the architectural distinguishing case). case3 below covers the user-struct path. |
+| 2 | Sky → Rust generic | existing fixtures (`Vec::new<i32, Global>()`) | ✅ |
+| 3 | Rust → Sky generic → trait dispatch back to Rust | `clone_it::<MyCounter>` with MyCounter Clone-derived in rust_caller | ✅ — the genuinely sharp test |
+| 4 | **Sky top** → Rust **generic** intermediary → Sky impl of Rust trait | **Rust** top → direct `Clone::clone(&w)`, no Rust generic middle, Sky top inverted to Rust top | ❌ wrong shape — closer to case1a+trait-dispatch than to architectural Case 4 |
+| 5 | Rust → Sky **generic** middle → different Rust | Sky middle is non-generic `count_three()` | ⚠️ structurally case-1a-layered-over-case-2; the "1b-layered-over-2" hardness isn't exercised |
+| 6 | Sky → Rust **generic** middle → different Sky | both Sky pieces non-generic, no Rust middle | ⚠️ tests "Sky lib depends on Sky lib" but not the architectural difficulty (rustc walking a Rust generic body and dispatching to the other Sky's trait impl) |
+
+What's actually exercised at the mechanism level pre-Session-9:
+
+- ✅ Approach A with non-empty `instance.args` — case1b (i32), case3 (MyCounter).
+- ✅ Sky → Rust trait dispatch with substituted Self — case3.
+- ✅ Sky stub rlib impl block compiles + rustc dispatches to it — case4 (pre-9).
+- ❌ **Rustc walks an extern Rust generic body, sees a trait method
+  call, dispatches to a Sky-defined impl.** Load-bearing for Case 4
+  *and* Case 6 architecturally; **no pre-9 fixture exercised it.**
+
+Session 9's sharpening work:
+
+- New `some_rust_lib/` test crate ships a true Rust generic
+  intermediary (`pub fn duplicate<T: Clone>(x: &T) -> T { x.clone() }`)
+  with no `extern "C"` decoration — the architecturally important
+  shape that `test_helpers` cannot carry because its surface is
+  C-ABI-only.
+- case4 rewritten with the correct shape: Sky top, Rust generic middle
+  (`duplicate::<Widget>(&w)`), Sky impl of `Clone for Widget`. Now
+  exercises rustc walking `duplicate<Widget>`'s body, queueing
+  `<Widget as Clone>::clone`, and firing Sky's emission path.
+- case5 rewritten with a generic Sky middle (`store_in_vec<T>(x: T) ->
+  usize` — 1b layered over 2).
+- case6 rewritten with a Rust generic intermediary between the two
+  Sky crates — Sky-app calls Rust `duplicate::<Pair>` which dispatches
+  to Sky-lib's `Clone for Pair`.
+
+Test counts after Session 9: **251/251 passing** (97 unit + 138
+integration + 16 standalone) — the sharpening is byte-equivalent at
+the test-count level because the existing case4/5/6 tests were
+already counted; what changed is *what they actually test*.
+
+Honest follow-ups deferred from Session 9 (small, real, documented):
+
+1. **8-byte two-field struct return type via Rust ABI through Sky's
+   extern wrapper.** When case6 first ran with `Pair { first: i32,
+   second: i32 }` (8 bytes), the extern wrapper for
+   `__toylang_impl__Pair__Clone__clone` came back with signature
+   `define { i8, i8 } @… (ptr)` — only 2 bytes of return data.
+   abi_helpers' coerced-return computation treats the 8-byte
+   opaque-with-size layout as if it were 2 bytes somewhere along the
+   pipeline. case6 was simplified to a single-i32-field `Box` to
+   unblock; the two-field-struct gap stands. Not specific to Phase
+   2 C — touches the generic small-struct return path that should
+   also affect non-trait-method consumer fns. Investigate next.
+
+2. **case1b user-struct variant.** case1b still uses `identity::<i32>`
+   (stdlib type). A sharper variant would mirror case3's MyCounter
+   pattern. case3 already covers the user-struct-as-T path mechanism,
+   so case1b's weakness is mild; add a `case1b_user_struct` variant
+   if/when defending against drift in this specific direction.
 
 ---
 
@@ -810,6 +878,8 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `6e9e7a8` | Phase 2 C.1 + C.2 (parser + ToyImpl registry) |
 | `5b1babd` | Phase 2 C.3 + C.4 (typecheck + stub-rlib emission) |
 | `b56cf4c` | Phase 2 C.5 + C.6 + C.7 (Case 4 end-to-end; 7/7 cases tested) |
+| `22a1390` | Session-8 doc refresh |
+| `d65ef81` | Session 9 sharpening (case4/5/6 now architecturally correct) |
 
 Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
 baseline.
