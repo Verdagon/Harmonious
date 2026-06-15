@@ -238,6 +238,15 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             continue;
         }
 
+        // Session 10 — Sky architecture §9. Non-export body-bearing fns get
+        // NO `pub fn` shell in the stub rlib (no DefId for rustc to name).
+        // `main` is implicitly export (the parser already sets is_export=true
+        // for it). The non-export discovery path runs entirely Sky-side via
+        // `walk_and_stash_internal_callees` + `__toylang_internal_*` symbols.
+        if !toy_fn.is_export {
+            continue;
+        }
+
         // Extern declaration only for concrete (non-generic) functions.
         // Generic functions flow through the `optimized_mir` override at
         // monomorphization time (no extern needed; their symbols come from
@@ -331,6 +340,14 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // form). The remaining params and return type pass through
     // `resolved_type_to_syn` unchanged.
     for toy_impl in &registry.trait_impls {
+        // Session 10 — Sky architecture §9. Non-export impl blocks get no
+        // stub-rlib presence. Today every Rust caller path through a trait
+        // impl method requires the impl to be export (rustc dispatches via
+        // its DefId). A non-export impl would still emit Sky-internal
+        // method bodies via the codegen queue but never surface to rustc.
+        if !toy_impl.is_export {
+            continue;
+        }
         let trait_ident = format_ident!("{}", toy_impl.trait_name);
         let self_ident = format_ident!("{}", toy_impl.self_type_name);
         let method_items: Vec<syn::TraitItemFn> = toy_impl.methods.iter().map(|m| {
@@ -402,6 +419,63 @@ mod tests {
         );
     }
 
+    /// Session 10 — Sky architecture §9. The architectural commitment:
+    /// non-export body-bearing fns get NO `pub fn` shell in the stub rlib.
+    /// This test fences the property at the stub_gen output level — if a
+    /// future change accidentally emits a shell for a non-export item, the
+    /// test fails loudly. Mirror of architecture A.5's spirit (the
+    /// byte-identical-pass-through invariant): a CI-enforceable
+    /// architectural commitment.
+    #[test]
+    fn non_export_body_bearing_fn_gets_no_stub_shell() {
+        use crate::toylang::registry::{ToyFunction, ToyParam};
+        use crate::toylang::typed_ast::ResolvedType;
+        use crate::toylang::ast::Block;
+
+        let mut reg = ToylangRegistry::default();
+        // An export fn — should appear in the stub source.
+        reg.functions.insert("exported_fn".to_string(), ToyFunction {
+            type_params: vec![],
+            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
+            return_ty: Some(ResolvedType::I32),
+            body: Some(Block { stmts: vec![], ret: None }),
+            is_export: true,
+        });
+        // A NON-export fn — must NOT appear.
+        reg.functions.insert("internal_only".to_string(), ToyFunction {
+            type_params: vec![],
+            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
+            return_ty: Some(ResolvedType::I32),
+            body: Some(Block { stmts: vec![], ret: None }),
+            is_export: false,
+        });
+
+        let src = generate(&reg);
+
+        // Sanity: export emitted.
+        assert!(
+            src.contains("pub fn exported_fn"),
+            "stub source should include exported fn, got:\n{}", src,
+        );
+        // Architectural property: non-export NOT emitted.
+        assert!(
+            !src.contains("pub fn internal_only"),
+            "ARCHITECTURAL REGRESSION: non-export fn `internal_only` leaked into stub source. \
+             Sky §9 / Session 10 commitment: non-export items must not surface to rustc. \
+             Got:\n{}",
+            src,
+        );
+        // Also assert the symbol isn't anywhere as a fn declaration —
+        // catches creative patterns that aren't `pub fn` but still surface
+        // a DefId rustc can name.
+        assert!(
+            !src.contains("fn internal_only"),
+            "ARCHITECTURAL REGRESSION: any form of `fn internal_only` in stub source. \
+             Got:\n{}",
+            src,
+        );
+    }
+
     /// Phase 2 C.4: a `ToyImpl` entry in the registry produces an
     /// `impl Trait for Self { fn name(&self, …) -> Ret { unreachable!() } }`
     /// block in the generated stub source.
@@ -421,10 +495,12 @@ mod tests {
         reg.trait_impls.push(ToyImpl {
             trait_name: "Clone".to_string(),
             self_type_name: "Widget".to_string(),
+            is_export: true,
             methods: vec![ToyImplMethod {
                 name: "clone".to_string(),
                 func: ToyFunction {
                     type_params: vec![],
+                    is_export: true,
                     params: vec![
                         ToyParam {
                             name: "self".to_string(),

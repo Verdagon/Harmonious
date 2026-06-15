@@ -478,6 +478,7 @@ mod tests {
             "wrap".to_string(),
             ToyFunction {
                 type_params: vec!["T".to_string()],
+                is_export: false,
                 params: vec![ToyParam {
                     name: "x".to_string(),
                     ty: ResolvedType::TypeParam("T".to_string()),

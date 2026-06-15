@@ -45,6 +45,13 @@ pub struct ToyImpl {
     pub trait_name: String,
     pub self_type_name: String,
     pub methods: Vec<ToyImplMethod>,
+    /// Session 10 — Sky architecture §9. Source-level `export impl Trait for
+    /// Type { ... }`. Currently REQUIRED to be true for any Rust caller to
+    /// dispatch through the impl (rustc needs a DefId for the impl methods).
+    /// Sky's locked design likewise treats impl blocks as inherently boundary-
+    /// crossing items.
+    #[serde(default)]
+    pub is_export: bool,
 }
 
 /// A method inside a `ToyImpl`. Stored as `ToyFunction` plus the method's
@@ -70,4 +77,12 @@ pub struct ToyFunction {
     pub params: Vec<ToyParam>,
     pub return_ty: Option<ResolvedType>,
     pub body: Option<crate::toylang::ast::Block>,
+    /// Session 10 — Sky architecture §9. True iff the source declared
+    /// `export fn …`. Non-export body-bearing fns get NO `pub fn` shell in
+    /// the stub rlib (architectural commitment that rustc cannot name them).
+    /// `main` is implicitly exported because the Rust shim references
+    /// `__toylang_main`. Body-less (extern) declarations are always emitted
+    /// regardless of this flag — they declare Rust functions, not Sky items.
+    #[serde(default)]
+    pub is_export: bool,
 }

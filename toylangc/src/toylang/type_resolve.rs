@@ -854,6 +854,7 @@ mod tests {
             params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::TypeParam("T".to_string()) }],
             return_ty: Some(ResolvedType::TypeParam("T".to_string())),
             body: Some(Block { stmts: vec![], ret: Some(Expr::Var("x".to_string())) }),
+            is_export: false,
         });
         ToylangRegistry { structs, functions, imports: vec![], trait_impls: vec![] }
     }
@@ -931,6 +932,7 @@ mod tests {
             params: vec![],
             return_ty: Some(ResolvedType::I32),
             body: Some(Block { stmts: vec![], ret: Some(Expr::IntLit(42, ResolvedType::I32)) }),
+            is_export: false,
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
         let ret = typed.ret.unwrap();
@@ -957,6 +959,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
         let ret = typed.ret.unwrap();
@@ -993,6 +996,7 @@ mod tests {
                     fields: vec![("value".to_string(), Expr::Var("x".to_string()))],
                 }),
             }),
+            is_export: false,
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
         let ret = typed.ret.unwrap();
@@ -1023,6 +1027,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
         let ret = typed.ret.unwrap();
@@ -1061,6 +1066,7 @@ mod tests {
                     fields: vec![("wings".to_string(), Expr::Var("v".to_string()))],
                 }),
             }),
+            is_export: false,
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
 
@@ -1087,6 +1093,7 @@ mod tests {
             params: vec![],
             return_ty: Some(ResolvedType::I32),
             body: Some(Block { stmts: vec![], ret: Some(Expr::Var("x".to_string())) }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::UndefinedVariable { name }) = result else { panic!("expected UndefinedVariable error") };
@@ -1102,6 +1109,7 @@ mod tests {
             params: vec![],
             return_ty: Some(ResolvedType::StructRef { name: "Nonexistent".to_string(), type_args: vec![] }),
             body: Some(Block { stmts: vec![], ret: Some(Expr::IntLit(1, ResolvedType::I32)) }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::UndefinedStruct { name }) = result else { panic!("expected UndefinedStruct error") };
@@ -1119,6 +1127,7 @@ mod tests {
             body: Some(Block { stmts: vec![], ret: Some(Expr::FnCall {
                 name: "nonexistent".to_string(), type_args: vec![], args: vec![],
             }) }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::UndefinedFunction { name }) = result else { panic!("expected UndefinedFunction error") };
@@ -1138,6 +1147,7 @@ mod tests {
                 type_args: vec![],
                 fields: vec![("nonexistent".to_string(), Expr::IntLit(1, ResolvedType::I32))],
             }) }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::FieldNotFound { struct_name, field_name }) = result else { panic!("expected FieldNotFound error") };
@@ -1158,6 +1168,7 @@ mod tests {
                 type_args: vec![],
                 fields: vec![],
             }) }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::UndefinedStruct { name }) = result else { panic!("expected UndefinedStruct error") };
@@ -1186,6 +1197,7 @@ mod tests {
                     field: "nonexistent".to_string(),
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::FieldNotFound { struct_name, field_name }) = result else { panic!("expected FieldNotFound error") };
@@ -1211,6 +1223,7 @@ mod tests {
                     field: "foo".to_string(),
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::FieldAccessOnNonStruct { ty, field }) = result else { panic!("expected FieldAccessOnNonStruct error") };
@@ -1241,6 +1254,7 @@ mod tests {
                     args: vec![Expr::IntLit(1, ResolvedType::I32)],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::MethodCallOnUnsupportedType { method, .. }) = result else { panic!("expected MethodCallOnUnsupportedType error") };
@@ -1266,6 +1280,7 @@ mod tests {
                     args: vec![Expr::IntLit(1, ResolvedType::I32)],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::MethodCallOnUnsupportedType { ty, method }) = result else { panic!("expected MethodCallOnUnsupportedType error") };
@@ -1286,6 +1301,7 @@ mod tests {
                 type_args: vec![ResolvedType::I32, ResolvedType::I64],
                 args: vec![Expr::IntLit(42, ResolvedType::I32)],
             }) }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::WrongTypeArgCount { func_name, expected, got }) = result else { panic!("expected WrongTypeArgCount error") };
@@ -1307,6 +1323,7 @@ mod tests {
                 type_args: vec![],
                 args: vec![Expr::IntLit(42, ResolvedType::I32)],
             }) }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::WrongTypeArgCount { func_name, expected, got }) = result else { panic!("expected WrongTypeArgCount error") };
@@ -1331,6 +1348,7 @@ mod tests {
                     else_body: Some(Box::new(Block { stmts: vec![], ret: Some(Expr::IntLit(0, ResolvedType::I32)) })),
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::IfConditionNotBool { ty }) = result else { panic!("expected IfConditionNotBool error") };
@@ -1352,6 +1370,7 @@ mod tests {
                 }],
                 ret: Some(Expr::IntLit(0, ResolvedType::I32)),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::WhileConditionNotBool { ty }) = result else { panic!("expected WhileConditionNotBool error") };
@@ -1374,6 +1393,7 @@ mod tests {
                     else_body: Some(Box::new(Block { stmts: vec![], ret: Some(Expr::BoolLit(true)) })),
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::IfElseTypeMismatch { then_ty, else_ty }) = result else { panic!("expected IfElseTypeMismatch error") };
@@ -1396,6 +1416,7 @@ mod tests {
                 ],
                 ret: Some(Expr::Var("x".to_string())),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::AssignTypeMismatch { name, expected, got }) = result
@@ -1419,6 +1440,7 @@ mod tests {
                 stmts: vec![],
                 ret: Some(Expr::Var("x".to_string())),
             }),
+            is_export: false,
         });
         reg
     }
@@ -1441,6 +1463,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::ArgTypeMismatch { func_name, param_index, expected, got }) = result
@@ -1469,6 +1492,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::ArgTypeMismatch { param_index, expected, got, .. }) = result
@@ -1494,6 +1518,7 @@ mod tests {
                     args: vec![Expr::BoolLit(true)],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::ArgTypeMismatch { func_name, param_index, expected, got }) = result
@@ -1522,6 +1547,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -1547,6 +1573,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         // Extra args are resolved with Void expected — no type error raised
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
@@ -1595,6 +1622,7 @@ mod tests {
                     args: vec![],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::UndefinedFunction { name }) = result
@@ -1618,6 +1646,7 @@ mod tests {
                 })],
                 ret: None,
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
         assert!(result.is_ok(), "void-returning free fn should resolve: {:?}", result);
@@ -1641,6 +1670,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
         assert!(result.is_ok(), "correct args should pass: {:?}", result);
@@ -1666,6 +1696,7 @@ mod tests {
                     ],
                 }),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::ArgTypeMismatch { func_name, param_index, expected, got }) = result
@@ -1698,6 +1729,7 @@ mod tests {
                 }],
                 ret: Some(Expr::Var("result".to_string())),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
         assert!(result.is_ok(), "expected Ok: {:?}", result);
@@ -1722,6 +1754,7 @@ mod tests {
                 }],
                 ret: Some(Expr::IntLit(0, ResolvedType::I32)),
             }),
+            is_export: false,
         };
         let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
         let Err(TypeResolveError::UndefinedVariable { name }) = result
@@ -1740,6 +1773,7 @@ mod tests {
                 stmts: vec![],
                 ret: Some(Expr::ByteStringLit(vec![104, 101, 108, 108, 111])),
             }),
+            is_export: false,
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
         let ret = typed.ret.unwrap();
@@ -1760,6 +1794,7 @@ mod tests {
                 stmts: vec![],
                 ret: Some(Expr::StringLit("hello".to_string())),
             }),
+            is_export: false,
         };
         let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
         let ret = typed.ret.unwrap();

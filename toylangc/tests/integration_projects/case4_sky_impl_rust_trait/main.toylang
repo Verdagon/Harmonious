@@ -7,7 +7,7 @@ struct Widget {
     id: i32,
 }
 
-impl Clone for Widget {
+export impl Clone for Widget {
     fn clone(&self) -> Widget {
         Widget { id: self.id }
     }

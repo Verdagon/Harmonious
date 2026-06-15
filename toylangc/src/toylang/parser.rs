@@ -333,8 +333,15 @@ impl Parser {
         let mut trait_impls: Vec<crate::toylang::registry::ToyImpl> = Vec::new();
 
         loop {
+            // Session 10 — optional `export` keyword in front of fn / impl /
+            // struct decls. Sky architecture §9 says non-export items have no
+            // rustc DefId; stub_gen consults `is_export` to decide whether to
+            // emit the `pub fn` shell.
+            let is_export = if let Token::Ident(s) = self.peek() {
+                if s == "export" { self.consume(); true } else { false }
+            } else { false };
             match self.peek() {
-                Token::Ident(s) if s == "use" => {
+                Token::Ident(s) if s == "use" && !is_export => {
                     self.consume(); // eat "use"
                     let mut path_segments = vec![self.expect_ident()?];
                     while self.peek() == &Token::DoubleColon {
@@ -344,6 +351,12 @@ impl Parser {
                     imports.push(path_segments.join("::"));
                 }
                 Token::Ident(s) if s == "struct" => {
+                    // Session 10 — structs always emit a `pub struct` in the
+                    // stub rlib regardless of `export`. Architecture §10
+                    // requires opaque-with-size ADT presence so rustc can
+                    // compute `Vec<T>` etc. layouts. The `export` keyword
+                    // therefore applies only to fn / impl items.
+                    let _ = is_export;
                     let (name, s) = self.parse_struct(&struct_names)?;
                     if name.starts_with("__toylang_") {
                         return Err(ParseError::ReservedName { name });
@@ -355,21 +368,29 @@ impl Parser {
                     structs.insert(name, s);
                 }
                 Token::Ident(s) if s == "fn" => {
-                    let (name, f) = self.parse_fn(&struct_names)?;
+                    let (name, mut f) = self.parse_fn(&struct_names)?;
                     if name.starts_with("__toylang_") {
                         return Err(ParseError::ReservedName { name });
                     }
                     if functions.contains_key(&name) {
                         return Err(ParseError::DuplicateFunction { name });
                     }
+                    // `main` is implicitly exported — the auto-generated Rust
+                    // shim (`fn main() { __toylang_main(); }`) names the
+                    // `__toylang_main` symbol so stub_gen must keep emitting
+                    // the wrapper for it regardless of source-level annotation.
+                    f.is_export = is_export || name == "main";
                     functions.insert(name, f);
                 }
                 Token::Ident(s) if s == "impl" => {
-                    let toy_impl = self.parse_impl(&struct_names)?;
+                    let mut toy_impl = self.parse_impl(&struct_names)?;
+                    toy_impl.is_export = is_export;
                     trait_impls.push(toy_impl);
                 }
-                Token::Eof => break,
-                t => return Err(ParseError::UnexpectedTopLevelToken { got: format!("{:?}", t) }),
+                Token::Eof if !is_export => break,
+                t => return Err(ParseError::UnexpectedTopLevelToken {
+                    got: format!("export-prefixed item but got {:?}", t),
+                }),
             }
         }
 
@@ -445,7 +466,7 @@ impl Parser {
         }
         self.expect(Token::RBrace)?;
 
-        Ok(ToyImpl { trait_name, self_type_name, methods })
+        Ok(ToyImpl { trait_name, self_type_name, methods, is_export: false })
     }
 
     /// Phase 2 C.1: parse one method inside an `impl ... for ... {}` block.
@@ -527,6 +548,7 @@ impl Parser {
             params,
             return_ty,
             body: Some(body),
+            is_export: false, // overridden by impl-block caller if export prefix present
         }))
     }
 
@@ -602,9 +624,9 @@ impl Parser {
         if self.peek() == &Token::LBrace {
             self.expect(Token::LBrace)?;
             let body = self.parse_fn_body(&type_params, struct_names)?;
-            Ok((name, ToyFunction { type_params, params, return_ty, body: Some(body) }))
+            Ok((name, ToyFunction { type_params, params, return_ty, body: Some(body), is_export: false }))
         } else {
-            Ok((name, ToyFunction { type_params, params, return_ty, body: None }))
+            Ok((name, ToyFunction { type_params, params, return_ty, body: None, is_export: false }))
         }
     }
 

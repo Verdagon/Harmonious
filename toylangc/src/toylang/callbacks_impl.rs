@@ -481,9 +481,14 @@ impl LangCallbacks for ToylangCallbacks {
             }
         }
 
-        // Check 2: Every toylang function with a body has a stub
+        // Check 2: Every EXPORT toylang function with a body has a stub.
+        // Session 10 — Sky architecture §9: non-export items don't get a
+        // rustc-visible stub by design; their bodies live entirely Sky-side.
+        // The check applies only to items the source explicitly exposed.
+        // `main` is implicitly export (handled by the parser).
         for (name, func) in &self.registry.functions {
             if func.body.is_none() { continue; }
+            if !func.is_export { continue; }
             let stub_name = if name == "main" { crate::oracle::TOYLANG_MAIN } else { name.as_str() };
             if find_stub_fn_def_id(tcx, stub_name).is_none() {
                 errors.push(format!("function '{}' has no stub in __lang_stubs (expected '{}')", name, stub_name));
@@ -1000,6 +1005,8 @@ fn resolve_caller_from_type_args(
         body: caller_fn.body.as_ref().map(|b| {
             crate::toylang::type_resolve::substitute_type_params_in_body(b, subst)
         }),
+        // Substituted callee inherits the original's export status.
+        is_export: caller_fn.is_export,
     }
 }
 

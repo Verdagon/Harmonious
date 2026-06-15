@@ -4,16 +4,16 @@ struct Box {
     value: i32,
 }
 
-impl Clone for Box {
+export impl Clone for Box {
     fn clone(&self) -> Box {
         Box { value: self.value }
     }
 }
 
-fn make_box(v: i32) -> Box {
+export fn make_box(v: i32) -> Box {
     Box { value: v }
 }
 
-fn box_value(b: &Box) -> i32 {
+export fn box_value(b: &Box) -> i32 {
     b.value
 }

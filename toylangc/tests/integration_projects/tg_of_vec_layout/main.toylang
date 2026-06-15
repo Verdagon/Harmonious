@@ -12,7 +12,9 @@ struct ToyWrapper<T> {
     inner: T,
 }
 
-fn make_wrapper(v: Vec<i32, Global>) -> ToyWrapper<Vec<i32, Global>> {
+// `export` required for the layout-probe semantics (see
+// tg_of_toypoint_layout/main.toylang for the full reasoning).
+export fn make_wrapper(v: Vec<i32, Global>) -> ToyWrapper<Vec<i32, Global>> {
     ToyWrapper<Vec<i32, Global>> { inner: v }
 }
 

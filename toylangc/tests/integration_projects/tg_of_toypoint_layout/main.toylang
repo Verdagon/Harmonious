@@ -17,7 +17,13 @@ struct ToyWrapper<T> {
     inner: T,
 }
 
-fn make_wrapper(p: ToyPoint) -> ToyWrapper<ToyPoint> {
+// `export` is required (Session 10 / Sky §9): the test asserts that
+// rustc queries `layout_of(ToyWrapper<ToyPoint>)` during the rlib
+// compile, which happens because the stub rlib has the signature
+// `pub fn make_wrapper(...) -> ToyWrapper<ToyPoint>` rustc has to
+// resolve. Without `export` the stub is omitted and no layout probe
+// fires at this phase.
+export fn make_wrapper(p: ToyPoint) -> ToyWrapper<ToyPoint> {
     ToyWrapper<ToyPoint> { inner: p }
 }
 
