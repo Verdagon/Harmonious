@@ -92,17 +92,21 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
     );
 
     let exit_code = rustc_driver::catch_with_exit_code(|| {
-        let is_primary = std::env::var("CARGO_PRIMARY_PACKAGE").is_ok();
-
-        if !is_primary {
-            run_plain_rustc(&argv);
-            return;
-        }
-
         // Per @MRRIWMZ, this is read site 2 of toylang.toml. Build mode parses
         // it first to orchestrate cargo; wrapper mode re-parses it here to
         // locate the .toylang source, using the manifest as a single source of
         // truth instead of an env var side-channel.
+        //
+        // **Activation gate** (course-correct.md #14): the presence of a
+        // `toylang.toml` in the vicinity of `CARGO_MANIFEST_DIR` is the sole
+        // signal that this rustc invocation should run toylang's machinery.
+        // The prior `CARGO_PRIMARY_PACKAGE=1` gate is retired: it broke for
+        // toylang libs depended on by other toylang projects (where cargo
+        // doesn't mark the dep "primary"), and it added nothing the
+        // manifest lookup doesn't already cover. Per architecture §4.5 the
+        // canonical Sky activation signal is the `__SKY_STUBS_MARKER` in
+        // the local crate's items, which fires after expansion; the
+        // manifest-vicinity check is its pre-expansion analog.
         //
         // Lookup order:
         //   1. CARGO_MANIFEST_DIR itself. Phase 3 E.6: each stub crate dir
@@ -115,16 +119,16 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
         //      (`<user-dir>/.toylang-build/user_bin/`) where the toylang.toml
         //      lives two directories up.
         //
-        // If nothing is found this isn't a toylang-authored package (e.g., an
-        // auxiliary crate cargo happens to have set primary on) — pass through
-        // to plain rustc rather than panicking on manifest parse.
-        let cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .unwrap_or_else(|_| panic!("wrapper mode: CARGO_MANIFEST_DIR not set"));
-        let manifest_path = Path::new(&cargo_manifest_dir)
-            .ancestors()
-            .take(4)
-            .map(|d| d.join("toylang.toml"))
-            .find(|p| p.exists());
+        // If nothing is found this isn't a toylang-authored package — pass
+        // through to plain rustc.
+        let cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR");
+        let manifest_path = cargo_manifest_dir.ok().and_then(|d| {
+            Path::new(&d)
+                .ancestors()
+                .take(4)
+                .map(|dir| dir.join("toylang.toml"))
+                .find(|p| p.exists())
+        });
         let manifest_path = match manifest_path {
             Some(p) => p,
             None => {

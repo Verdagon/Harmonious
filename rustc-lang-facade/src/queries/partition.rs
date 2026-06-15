@@ -19,21 +19,36 @@
 //!
 //! Stage 4a's CGU filter replaced the `CODEGEN_SKIP_HOOK` fork patch (stage
 //! 4b retired the hook once the filter was proven exhaustive — both stages
-//! now shipped). The `(Linkage::External, Visibility::Default)` mutation
-//! below replaced the `VISIBILITY_OVERRIDE_HOOK` fork patch (stage 4c).
-//! Together these two post-partition mutations are the load-bearing piece
-//! of the Outcome A assumption — see `docs/architecture/risks.md` §B2 for
-//! the timing assumptions (internalization runs inside upstream's default
-//! partitioner, and the LLVM backend reads `data.linkage` from the returned
-//! CGU slice without re-derivation) and what breaks if they shift.
+//! now shipped).
 //!
-//! `is_from_lang_stubs` (crate-name check) is the canonical cross-phase-safe
-//! predicate — see `@DPSFDOZ`. Do not introduce `def_path_str`-based
-//! matching here; partitioner-time is one of the non-diagnostic contexts
-//! where `def_path_str` ICEs.
+//! **course-correct.md #2 — partitioner linkage-mutation retirement.**
+//! Prior to Workstream A this file also forced
+//! `(Linkage::External, Visibility::Default)` on every item that survived
+//! the filter but still lived inside `__lang_stubs` (namely the Phase-6
+//! `#[inline(never)]` generic wrappers like `__toylang_option_unwrap<T>`).
+//! That was the B2 partitioner-timing risk from `docs/architecture/risks.md`
+//! — the mutation depended on the assumption that `internalize_symbols` ran
+//! INSIDE upstream's partitioner before our override saw the result, AND
+//! that the LLVM backend read `data.linkage` from the returned CGU slice
+//! without re-deriving from attributes. Both assumptions held empirically
+//! but were unannounced rustc internals.
+//!
+//! Per architecture §5.2, Workstream A's "binary compile codegens
+//! everything" model eliminates the need. The Phase-6 wrappers are emitted
+//! into one or another stub rlib; toylang's code that calls them is
+//! emitted into the SAME final binary at the user-bin compile (no longer
+//! into a per-lib `.o`). Linker sees both ends at final link, so default
+//! `Hidden` linkage on a `pub fn` in an rlib suffices. The mutation is
+//! removed; if a Phase-6 unwrap test starts failing with a link error
+//! after a nightly bump, the right diagnosis is "incremental partitioner
+//! has changed something else," not "we need the External mutation back."
+//!
+//! `is_from_lang_stubs` (now marker-based per E.1) is the canonical
+//! cross-phase-safe predicate — see `@DPSFDOZ`. Do not introduce
+//! `def_path_str`-based matching here; partitioner-time is one of the
+//! non-diagnostic contexts where `def_path_str` ICEs.
 
-use rustc_hir::attrs::Linkage;
-use rustc_middle::mir::mono::{CodegenUnit, MonoItemData, MonoItemPartitions, Visibility};
+use rustc_middle::mir::mono::{CodegenUnit, MonoItemPartitions};
 use rustc_middle::ty::TyCtxt;
 
 pub type CollectAndPartitionFn = for<'tcx> fn(
@@ -57,18 +72,11 @@ pub fn lang_collect_and_partition_mono_items<'tcx>(
     // collector-discovered Instances of accessor methods and consumer fns.
     crate::stash_upstream_cgus(upstream_cgus);
 
-    // Reconstruct each CGU with consumer items removed. For items that
-    // survive the filter but still live inside `__lang_stubs` (namely the
-    // Phase-6 `#[inline(never)]` generic wrappers like
-    // `__toylang_option_unwrap<T>` / `__toylang_result_unwrap<T, E>` —
-    // real Rust functions whose bodies rustc must codegen), force
-    // `(Linkage::External, Visibility::Default)`. That's what retires
-    // fork patch 5 (`VISIBILITY_OVERRIDE_HOOK`): the hook used to apply
-    // this linkage via `mono_item_linkage_and_visibility`; now the plugin
-    // applies it directly in the CGU slice the LLVM backend reads. The
-    // linkage stored in `MonoItemData` is what rustc_codegen_llvm reads
-    // at emission time — it is never re-derived, so the override
-    // survives to the final `.o`.
+    // Reconstruct each CGU with consumer items removed. Items that survive
+    // the filter (notably the Phase-6 `#[inline(never)]` generic wrappers
+    // in __lang_stubs) flow through with their default
+    // `MonoItemData` — no linkage mutation. See module docs for the §B2
+    // history this retires.
     let mut filtered_cgus: Vec<CodegenUnit<'tcx>> = Vec::with_capacity(upstream_cgus.len());
     for cgu in upstream_cgus.iter() {
         let mut new_cgu = CodegenUnit::new(cgu.name());
@@ -77,16 +85,7 @@ pub fn lang_collect_and_partition_mono_items<'tcx>(
             if crate::is_consumer_codegen_target(tcx, def_id) {
                 continue;
             }
-            let final_data = if crate::is_from_lang_stubs(tcx, def_id) {
-                MonoItemData {
-                    linkage: Linkage::External,
-                    visibility: Visibility::Default,
-                    ..data
-                }
-            } else {
-                data
-            };
-            new_cgu.items_mut().insert(mono_item, final_data);
+            new_cgu.items_mut().insert(mono_item, data);
         }
         if cgu.is_primary() {
             new_cgu.make_primary();
