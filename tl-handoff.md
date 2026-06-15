@@ -20,10 +20,11 @@ catalog of places where erw currently diverges from Sky is `course-correct.md`
 (18 items). This project — driven by the plan at
 `/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md` — adds
 tests that exercise the "hard cases" (1b, 3, 4, 5, 6) from the
-architecture doc's seven-case taxonomy. **As of Session 6, six of seven
+architecture doc's seven-case taxonomy. **As of Session 7, six of seven
 cases are tested** (1a, 1b, 2, 3, 5, 6); Case 4 needs Phase 2 C's toylang
-`impl rust_trait for toylang_type` language feature. **Nine course-correct
-items are done** (#1, #2, #4, #5, #6, #11, #14, #15, #16) and #10 is partial.
+`impl rust_trait for toylang_type` language feature. **Eleven course-correct
+items are done** (#1, #2, #4, #5, #6, #11, #14, #15, #16, #17, #18) and #10
+is partial.
 
 ---
 
@@ -203,9 +204,51 @@ in one session as mechanical refactors:
   with a comment refresh.
 
 Test counts after Session 6: **246/246 passing** (93 unit + 137
-integration + 16 standalone). Working tree is clean — all of
-Sessions 2–6's work is committed across seven commits (see §12 for
-the hashes).
+integration + 16 standalone).
+
+**Session 7 (Tier 1 mechanical cleanups — #17, #18, #3 audit).** Two
+mechanical items closed; #3 deferred after an audit revealed it's
+deeper than the docs estimated.
+
+- **#18 build.rs comment refresh** (commit `1c27b09`). The stale
+  rationale ("toylang's emitted `.o` (bundled into the rlib) calls
+  into rust_dependencies symbols at the OBJECT-FILE level") died with
+  Workstream A. Rewrote it to explain the actual current load-bearing
+  reason: Phase 1 D's `rust_caller.rs` lives inside user_bin and names
+  rust_dependencies directly (`use serde::...`), so cargo must pass
+  `--extern serde=...` to user_bin's rustc — which requires the
+  direct re-listing. Without it, the compile fails at "unresolved
+  import" before linking.
+
+- **#17 stub_gen `is_generic` special-casing** (commit `4f5cc8a`).
+  Two of the four `!is_generic` branches were purely cosmetic
+  (the impl-block header `impl Foo` vs `impl<T> Foo<T>`, the wrapper-
+  fn header `pub fn foo(…)` vs `pub fn foo<T>(…)`) — unified via new
+  `generics_for_impl_block` + `fn_generics_clause` helpers that return
+  empty token streams for the zero-param case. Two divergences stay
+  and are now explicitly documented as gated by external constraints:
+  struct shape (rustc debuginfo-walker ICE on opaque non-generic
+  ADTs with any source field) and extern decls (`extern "C"` doesn't
+  permit generics; Sky retires this whole mechanism when #4's inline-
+  codegen rewrite lands).
+
+- **#3 `cgu_stash.rs` retirement — AUDITED, NOT LANDED.** The audit
+  found `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for
+  two paths that don't go through Workstream A's registry-driven
+  discovery: (1) accessor-method discovery via `opt_associated_item`,
+  and (2) Case-1b generic consumer fns instantiated from Rust call
+  sites (`__lang_stubs::wrap::<i32>(42)` from a `rust_caller.rs`,
+  where the registry walk intentionally skips generics because it has
+  no caller args). Retiring the stash requires moving both discovery
+  paths to the `after_expansion` queue the architecture wants —
+  that's bundled with #7 (sidecar-loaded universe) and #9 (symbol_name
+  discovery retirement), not a mechanical cleanup. #3 stays paired
+  with that deeper rebuild.
+
+Test counts after Session 7: **246/246 passing** (no test count
+change — both refactors are byte-equivalent to the old emission).
+Working tree is clean — all of Sessions 2–7's work is committed
+across ten commits (see §12 for the hashes).
 
 ---
 
@@ -444,39 +487,13 @@ The non-obvious rule from this session:
 ## 7. Where to start
 
 Phase 1 (Workstream S/A/B/D + A.5), Phase 3 (multi-crate E.1–E.6),
-six of seven taxonomy cases (1a/1b/2/3/5/6), and **nine of eighteen
-course-correct items** (#1, #2, #4, #5, #6, #11, #14, #15, #16) are
-all done. Session 6 swept Tier 1 (#4, B, #5) — the remaining work
-splits into mechanical cleanups, the language feature for Case 4,
-and the deep facade-rebuild trio.
-
-### Tier 1 — mechanical cleanups (½–1 day each)
-
-Each closes a course-correct item with negligible risk.
-
-- **#3 — retire `cgu_stash.rs`.** Today: facade stashes upstream-CGU
-  refs in `cgu_stash.rs` (~87 LOC) so the consumer can iterate them.
-  Under Workstream A the consumer no longer needs this — discovery is
-  registry-driven at user-bin compile, not CGU-walked. Audit which
-  callbacks (if any) still consult the stash; if none, delete the
-  file + `clear_upstream_cgus` calls. Touches: `cgu_stash.rs`,
-  `driver.rs`'s `config()`, `queries/partition.rs`'s stash population.
-  **Estimate: 1–2 days.**
-
-- **#17 — `is_generic` special-casing in `stub_gen`.** The compiler-law
-  violation. Every `if !is_generic { … } else { … }` branch in
-  `stub_gen.rs` (lines 59, 86–97, 117–123, 127, 148, 185) is on the
-  wrong track. Sky picks one universal shape (zero-param is the
-  degenerate case of N-param). Touches: `toylangc/src/stub_gen.rs`.
-  **Estimate: 1–2 days.**
-
-- **#18 — `build.rs` comment refresh.** Stale comment about
-  `rust_deps re-listing being needed for "lib `.o` calls
-  rust_dependencies symbols at the object level."` That justification
-  died with Workstream A; the re-listing remains load-bearing for a
-  different reason (rust_caller needs direct cargo deps + force-link
-  via `extern crate as _;`). Just update the comment to match the
-  post-Workstream-A reality. **Estimate: 30 min.**
+six of seven taxonomy cases (1a/1b/2/3/5/6), and **eleven of
+eighteen course-correct items** (#1, #2, #4, #5, #6, #11, #14, #15,
+#16, #17, #18) are all done. Session 6 swept Tier 1 cosmetic
+refactors (#4, B, #5); Session 7 closed the small cleanup tier
+(#17, #18) and audited #3 (deferred — see §2). The remaining work
+splits into the language feature for Case 4 and the deep facade-
+rebuild trio (which #3 now joins).
 
 ### Tier 2 — language feature (3–5 weeks)
 
@@ -531,11 +548,28 @@ exercise sharply. Each is its own multi-week sub-project.
   Sky wants `layout_of` to walk Sky's universe recursively itself.
   ~1–2 weeks.
 
+- **#9 — retire `symbol_name` side-effect channel.** Today: rustc's
+  `symbol_name` query firing on a consumer Instance triggers
+  `notify_concrete_entry_point` which stashes the Instance for
+  internal-callee discovery (`@SyMINCZ` trap-fence). Sky's discovery
+  moves to the `after_expansion` queue (§20.4); `symbol_name`
+  becomes a pure read. Bundled with #3 (the CGU stash retirement —
+  see §2's Session 7 audit). ~1–2 weeks.
+
 - **#12 — retire `MUTABLE_STATE` + two-vtable split.** Today: facade
   holds a Mutex around consumer state; the @GCMLZ bypass uses a
-  thread-local fat pointer (Phase 3 E.6). Once #4 (codegen channel)
-  and #9 (symbol_name side-effect) are done, the locking story can
-  fundamentally simplify. ~1–2 weeks.
+  thread-local fat pointer (Phase 3 E.6). Once #4's deeper inline-
+  codegen rewrite and #9's symbol_name retirement land, the locking
+  story fundamentally simplifies. ~1–2 weeks.
+
+- **#3 — retire `cgu_stash.rs`.** Session 7 audit (§2) showed this
+  is bundled with #7 + #9: the consumer's accessor-method discovery
+  and Case-1b generic-from-Rust discovery both still rely on rustc's
+  CGU walk; moving both to the after_expansion queue is the same
+  architectural shift those items name. Order-of-operations: land
+  the sidecar-loaded universe (#7) so the queue exists, retire the
+  symbol_name discovery channel (#9), then delete the stash (#3).
+  ~comes free with the above.
 
 - **#13 — retire wrapper-mode `@MRRIWMZ`.** Largest. Today: toylangc
   IS the rustc-via-`RUSTC_WORKSPACE_WRAPPER` wrapper, re-parsing the
@@ -691,7 +725,8 @@ standalone) when run with `integration-projects-cache` wiped.
 2 C), 5 ✅, 6 ✅.
 
 **Course-correct.md items done**: #1, #2, #4, #5, #6, #11, #14, #15,
-#16 (9/18). #10 partial.
+#16, #17, #18 (11/18). #10 partial. #3 audited and deferred (bundled
+with #7/#9, not a mechanical cleanup).
 
 **Sidecars produced**: yes, ~120 files materialize during a full test run.
 The format is bincode + BLAKE3 truncated checksum with a 64-byte fixed
@@ -718,8 +753,8 @@ codegen site, driven by registry-driven discovery + transitive callee
 walk (NOT the upstream CGU walk, which finds zero stub items at user-bin
 time — see `workstream-a-scope-notes.md` for the why).
 
-**Working tree is clean** as of Session 6. Sessions 2–6's work is on
-`main` across nine commits:
+**Working tree is clean** as of Session 7. Sessions 2–7's work is on
+`main` across ten commits:
 
 | Commit | What |
 |---|---|
@@ -731,6 +766,9 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `6c19e53` | Course-correct #4 (codegen-wrapper emission channel) |
 | `01d98fd` | Workstream B (oracle TypeParam tolerance in trait queries) |
 | `e81cf6d` | Course-correct #5 (after_expansion hook point) |
+| `7c23f63` | Session-6 doc refresh (course-correct status + tl-handoff Session 6) |
+| `1c27b09` | Course-correct #18 (build.rs rust_deps re-listing comment) |
+| `4f5cc8a` | Course-correct #17 (cosmetic is_generic branches in stub_gen) |
 
 Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
 baseline.

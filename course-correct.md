@@ -6,11 +6,13 @@ This document catalogs the places in the current erw prototype that are on the *
 
 | Status | Items |
 |---|---|
-| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #4 (codegen channel), #5 (after_expansion hook), #6 (`__SKY_STUBS_MARKER`), #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs) |
+| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #4 (codegen channel), #5 (after_expansion hook), #6 (`__SKY_STUBS_MARKER`), #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs), #17 (cosmetic is_generic branches unified in stub_gen), #18 (build.rs comment refreshed) |
 | 🟡 Partial | #10 (Instance-keyed collect_generic_rust_deps — landed; the rest needs E.5-style threading) |
-| ⏳ Remaining | #3, #7, #8, #9, #12, #13, #17, #18 |
+| ⏳ Remaining | #3, #7, #8, #9, #12, #13 |
 
-9 of 18 items done. The remaining items split into mechanical cleanups (#3 cgu_stash retirement now that no callback consumes it, #17 stub_gen `is_generic` cleanup, #18 build.rs comment refresh), the wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend (#13), and the deep facade-rebuild trio (#7/#8/#12 + #9, the sidecar-loaded universe replacing `LangPredicates`).
+11 of 18 items done. **#3 audit (Session 7) found `cgu_stash` is NOT retire-ready**: `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for two paths Workstream A's registry-driven discovery does not cover — accessor-method discovery (via `opt_associated_item`) and Case-1b generic consumer fns instantiated from Rust call sites (`__lang_stubs::wrap::<i32>(42)` from `rust_caller.rs`). Retiring the stash requires moving both discovery paths to the `after_expansion` queue the architecture wants, which is bundled with #7 (sidecar-loaded universe) and #9 (symbol_name discovery retirement) — not a mechanical cleanup. #3 stays paired with that deeper rebuild.
+
+The remaining items: wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend (#13), and the deep facade-rebuild trio (#7/#8/#12 + #9 + #3, the sidecar-loaded universe replacing `LangPredicates`).
 
 See `tl-handoff.md` for the narrative summary and recommended next directions.
 
@@ -103,7 +105,7 @@ Lines 156 / 195 (`notify_concrete_entry_point_inner` "stashing"), the `toylang_i
 |---|---|---|---|---|
 | 1 | ✅ | `queries/optimized_mir.rs` (whole) | DefId-keyed, Param-bearing body, rustc-side substitution | Instance-keyed `per_instance_mir`, pre-substituted body, Sky-side substitution |
 | 2 | ✅ | `queries/partition.rs:80–88` | Post-partition `(External, Default)` linkage mutation (B2 risk) | Delete; default `Hidden` works |
-| 3 | ⏳ | `cgu_stash.rs` (whole file) | Walk rustc's unfiltered CGU slice for Sky-item discovery | Sky's frontend populates queue at after_expansion; rustc partitions are Rust-only |
+| 3 | ⏳ | `cgu_stash.rs` (whole file) | Walk rustc's unfiltered CGU slice for Sky-item discovery | Sky's frontend populates queue at after_expansion; rustc partitions are Rust-only. **Session 7 audit:** `llvm_gen.rs:1938` still uses the stash for accessor-method discovery (`opt_associated_item`) and Case-1b generic instantiations from Rust call sites — paths Workstream A's registry-driven walk doesn't cover. Retirement is bundled with #7 + #9. |
 | 4 | ✅ | `codegen_wrapper.rs:96–108` + `lib.rs:500–509` | Callback returns `.o` path; `join_codegen` injects via `OnceLock` channel | Sky's `codegen_crate` walks queue inline and emits via Inkwell directly — landed as a `LangOngoingCodegen { inner, lang_obj_path }` wrapper around rustc's own ongoing-codegen `Box<dyn Any>`; the OnceLock channel + `FacadeMutableState.lang_obj_path` are retired. The inline-Inkwell rewrite is deferred (still calls consumer's `generate_and_compile`), but the cross-phase channel is gone. |
 | 5 | ✅ | `driver.rs:76` | Hook at `after_analysis` | Hook at `after_expansion` (§20.3) — landed as a hook-point swap; toylang's oracle queries (fn_sig, adt_def, module_children) are all available at expansion-time. |
 | 6 | ✅ | `lib.rs:325–327` (`is_from_lang_stubs`) | Crate-name match against `"__lang_stubs"` | Marker-based: walk `module_children` for `__SKY_STUBS_MARKER` |
@@ -117,8 +119,8 @@ Lines 156 / 195 (`notify_concrete_entry_point_inner` "stashing"), the `toylang_i
 | 14 | ✅ | `main.rs:94` | `CARGO_PRIMARY_PACKAGE` gates activation | `__SKY_STUBS_MARKER` gates activation — replaced with manifest-vicinity check (the pre-expansion analog of the marker check that fires after expansion) |
 | 15 | ✅ | `main.rs:145–195`, `callbacks_impl.rs:75,191,214,387` | Rlib compile makes the `.o`; bin short-circuits | Bin compile makes the `.o`; lib compiles short-circuit Sky `.o` emission |
 | 16 | ✅ | `build.rs:41–73` | Single shared `lang_stubs_crate` per project | Per-Sky-library stub rlib; workspace member per Sky crate |
-| 17 | ⏳ | `stub_gen.rs:59, 86–97, 117–123, 127, 148, 185` | `if !is_generic { … }` branches | Single universal path; zero type params is the degenerate case (CLAUDE.md "compiler law") |
-| 18 | ⏳ | `build.rs:87–124` rust_deps re-listing | Justified by "lib `.o` references rust_deps at object level" | Comment now stale — the re-listing remains LOAD-BEARING under Workstream A's binary-codegen model (rust_caller needs direct cargo deps + force-link), but for a different reason. Item recasts as: update the build.rs comment to reflect the post-Workstream-A justification. |
+| 17 | ✅ | `stub_gen.rs:59, 86–97, 117–123, 127, 148, 185` | `if !is_generic { … }` branches | Single universal path; zero type params is the degenerate case (CLAUDE.md "compiler law") — landed for the two purely-cosmetic branches (impl-block header, wrapper-fn header) via `generics_for_impl_block` + `fn_generics_clause` helpers. Two divergences stay (struct shape gated by a rustc debuginfo ICE; extern decls gated by `extern "C"` not permitting generics — Sky retires extern decls entirely when #4's inline-codegen rewrite lands). The remaining split is documented mechanism, not a compiler-law violation. |
+| 18 | ✅ | `build.rs:87–124` rust_deps re-listing | Justified by "lib `.o` references rust_deps at object level" | Comment refreshed (Session 7) — the re-listing remains load-bearing under Workstream A's binary-codegen model because Phase 1 D's `rust_caller.rs` lives inside user_bin and names rust_dependencies directly. Without the direct cargo dep, user_bin's compile fails at "unresolved import" before linking. |
 
 ---
 
