@@ -5,6 +5,59 @@ use syn::parse_quote;
 use crate::toylang::registry::ToylangRegistry;
 use crate::toylang::typed_ast::ResolvedType;
 
+/// Course-correct #17: zero-param is the degenerate case of N-param.
+/// Returns `(impl_generics, ty_generics)` for an `impl ... Name ... { … }`
+/// block. For zero type params both are empty token streams; for N params
+/// they are `<A, B, …>` (so `impl<A, B> Name<A, B>`).
+fn generics_for_impl_block(type_params: &[String]) -> (TokenStream, TokenStream) {
+    if type_params.is_empty() {
+        return (TokenStream::new(), TokenStream::new());
+    }
+    let idents: Vec<syn::Ident> = type_params.iter().map(|p| format_ident!("{}", p)).collect();
+    let impl_generics = quote! { <#(#idents),*> };
+    let ty_generics = quote! { <#(#idents),*> };
+    (impl_generics, ty_generics)
+}
+
+/// Course-correct #17: returns the `<A, B>` generics clause for a function
+/// declaration. Empty token stream for zero params (the degenerate case),
+/// `<A, B, …>` for N.
+fn fn_generics_clause(type_params: &[String]) -> TokenStream {
+    if type_params.is_empty() {
+        return TokenStream::new();
+    }
+    let idents: Vec<syn::Ident> = type_params.iter().map(|p| format_ident!("{}", p)).collect();
+    quote! { <#(#idents),*> }
+}
+
+// Course-correct #17 — two divergences in this file are NOT cosmetic and
+// stay as-is until a deeper architectural change unblocks them:
+//
+//   1. Struct shape (lines ~94): non-generic emits `pub struct Foo;` (a
+//      unit struct, zero source fields), generic emits
+//      `pub struct Foo<T>(PhantomData<T>)` (one PhantomData source field).
+//      The asymmetry is forced by a rustc debuginfo-walker ICE when an
+//      opaque non-generic ADT has any source-level field — see the
+//      inline comment at the site. PhantomData<T> is special-cased
+//      enough to dodge the ICE for the generic case; a unit `()` field
+//      doesn't.
+//
+//   2. Extern decls (lines ~126, ~198): only emitted for non-generic
+//      items. Rust's `extern "C" { ... }` doesn't permit generic items;
+//      the symbol-per-monomorphization problem (architecture §5.1
+//      Option B failure) is real and there's no syntactic workaround.
+//      Sky's locked design retires this entire mechanism by emitting
+//      all Sky bodies in the binary compile via the codegen plugin (no
+//      per-symbol extern decl needed); that work waits on the deeper
+//      half of course-correct #4 (Sky's `codegen_crate` walks the queue
+//      inline via Inkwell). Until then toylang's emission still needs
+//      the extern decls for the non-generic path.
+//
+// The split here is documented mechanism, not the compiler-law
+// violation the original course-correct entry flagged. The cosmetic
+// divergences (impl-block header, fn declaration header) ARE unified
+// above.
+
 /// Convert a ResolvedType to a syn::Type for use in Rust stub code.
 fn resolved_type_to_syn(ty: &ResolvedType) -> syn::Type {
     match ty {
@@ -132,20 +185,15 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         }
 
         if !accessor_methods.is_empty() {
-            let impl_block: syn::Item = if !is_generic {
-                parse_quote! {
-                    impl #ident {
-                        #(#accessor_methods)*
-                    }
-                }
-            } else {
-                let type_params: Vec<syn::Ident> = toy_struct.type_params.iter()
-                    .map(|p| format_ident!("{}", p))
-                    .collect();
-                parse_quote! {
-                    impl<#(#type_params),*> #ident<#(#type_params),*> {
-                        #(#accessor_methods)*
-                    }
+            // Course-correct #17: one universal impl-block shape. Zero type
+            // params is the degenerate case of N — `generics_for_impl_block`
+            // returns an empty `<>` clause and an empty self-type generic
+            // list when N=0, producing `impl Foo { … }` exactly as the prior
+            // non-generic branch did.
+            let (impl_generics, ty_generics) = generics_for_impl_block(&toy_struct.type_params);
+            let impl_block: syn::Item = parse_quote! {
+                impl #impl_generics #ident #ty_generics {
+                    #(#accessor_methods)*
                 }
             };
             impl_blocks.push(impl_block);
@@ -232,20 +280,14 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             quote! { #pname: #pty }
         }).collect();
 
-        let wrapper: syn::Item = if toy_fn.type_params.is_empty() {
-            parse_quote! {
-                pub fn #wrapper_ident(#(#user_params),*) -> #ret {
-                    unreachable!()
-                }
-            }
-        } else {
-            let fn_type_params: Vec<syn::Ident> = toy_fn.type_params.iter()
-                .map(|p| format_ident!("{}", p))
-                .collect();
-            parse_quote! {
-                pub fn #wrapper_ident<#(#fn_type_params),*>(#(#user_params),*) -> #ret {
-                    unreachable!()
-                }
+        // Course-correct #17: one universal wrapper-fn shape. Zero type
+        // params is the degenerate case — `fn_generics_clause` is empty for
+        // N=0, producing `pub fn foo(…)` exactly as the prior non-generic
+        // branch did.
+        let fn_generics = fn_generics_clause(&toy_fn.type_params);
+        let wrapper: syn::Item = parse_quote! {
+            pub fn #wrapper_ident #fn_generics (#(#user_params),*) -> #ret {
+                unreachable!()
             }
         };
         wrapper_fns.push(wrapper);
