@@ -86,3 +86,18 @@ pub struct ToyFunction {
     #[serde(default)]
     pub is_export: bool,
 }
+
+impl ToyFunction {
+    /// True iff this function takes Sky-side type parameters that haven't
+    /// been substituted yet. Gates the eager-typecheck and registry-walk
+    /// passes — abstract-arg fns can only be processed once concrete args
+    /// arrive (via the per-Instance substituted pass for typecheck, and
+    /// via the CGU walk or transitive walk for codegen).
+    ///
+    /// CLAUDE.md compiler law: non-generic is the degenerate case of generic.
+    /// This helper expresses the architectural intent ("skip items whose args
+    /// are still abstract") rather than the degenerate-case shortcut.
+    pub fn has_abstract_args(&self) -> bool {
+        !self.type_params.is_empty()
+    }
+}

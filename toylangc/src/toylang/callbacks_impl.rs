@@ -316,7 +316,7 @@ impl ToylangCallbacks {
             // surface to rustc is course-correct.md item #17 — out of scope
             // for Workstream A. The 5 `test_generic_*` integration tests are
             // expected to fail until that lands.
-            if !toy_fn.type_params.is_empty() {
+            if toy_fn.has_abstract_args() {
                 continue;
             }
             let extern_symbol = compute_fn_symbol_from_type_args(name, &[]);
@@ -359,7 +359,7 @@ impl ToylangCallbacks {
         // build an `Instance` for the Rust-ABI extern wrapper.
         for toy_impl in &reg.trait_impls {
             for method in &toy_impl.methods {
-                if method.func.body.is_none() || !method.func.type_params.is_empty() {
+                if method.func.body.is_none() || method.func.has_abstract_args() {
                     continue;
                 }
                 let extern_symbol = format!(
@@ -547,7 +547,7 @@ impl LangCallbacks for ToylangCallbacks {
 
         // Check 5: Type-resolve non-generic function bodies
         for (name, func) in &self.registry.functions {
-            if func.body.is_none() || !func.type_params.is_empty() { continue; }
+            if func.body.is_none() || func.has_abstract_args() { continue; }
             let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
                 if type_name.is_empty() {
                     crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
@@ -613,7 +613,7 @@ impl LangCallbacks for ToylangCallbacks {
         // to the per-Instance substituted pass, same as generic free fns.
         for toy_impl in &self.registry.trait_impls {
             for method in &toy_impl.methods {
-                if method.func.body.is_none() || !method.func.type_params.is_empty() {
+                if method.func.body.is_none() || method.func.has_abstract_args() {
                     continue;
                 }
                 let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
