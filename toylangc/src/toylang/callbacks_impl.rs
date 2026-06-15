@@ -513,6 +513,10 @@ impl LangCallbacks for ToylangCallbacks {
                 crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
             };
             match crate::toylang::type_resolve::resolve_fn_body(&effective_registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait) {
+                Err(e) if e.is_deferred() => {
+                    // Workstream B — query needs concrete args; the per-Instance
+                    // substituted pass will redo it. Don't surface as user error.
+                }
                 Err(e) => errors.push(format!("function '{}': {:?}", name, e)),
                 Ok(typed) => {
                     // Per @MBMRVZ, if main has no declared return type (so its

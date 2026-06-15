@@ -31,6 +31,20 @@ pub enum RustTypeLookupContext {
     // associated item on the trait. Typically a typo at the call site.
     // `name` on the surrounding UnresolvedRustType holds the method name.
     TraitMethodName { trait_name: String },
+    // Workstream B — Self or a type arg of a Rust trait method query is still
+    // a TypeParam at registry-build time. The per-Instance substituted pass
+    // will redo the query with concrete args; callers should treat this as a
+    // "defer" signal, not a user-facing error. See `UnresolvedRustType::is_deferred`.
+    DeferredTypeParam { trait_name: String, method: String },
+}
+
+impl UnresolvedRustType {
+    /// True iff this error should be silently skipped at the eager-typecheck
+    /// pass because resolution depends on concrete args only known at the
+    /// per-Instance substituted pass.
+    pub fn is_deferred(&self) -> bool {
+        matches!(self.context, RustTypeLookupContext::DeferredTypeParam { .. })
+    }
 }
 
 impl std::fmt::Display for RustTypeLookupContext {
@@ -52,6 +66,8 @@ impl std::fmt::Display for RustTypeLookupContext {
                 write!(f, "as trait name in trait call `::{}`", method),
             Self::TraitMethodName { trait_name } =>
                 write!(f, "as method name on trait `{}`", trait_name),
+            Self::DeferredTypeParam { trait_name, method } =>
+                write!(f, "as TypeParam in trait call `{}::{}` (deferred to substituted pass)", trait_name, method),
         }
     }
 }
@@ -783,6 +799,16 @@ pub fn rust_trait_method_param_types<'tcx>(
     receiver_ty: &crate::toylang::typed_ast::ResolvedType,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+    // Workstream B — if Self or any type arg is still a TypeParam, defer.
+    // The per-Instance substituted pass will redo the query with concrete args.
+    if contains_type_param(receiver_ty) || type_args.iter().any(contains_type_param) {
+        return Err(UnresolvedRustType {
+            name: "<TypeParam>".to_string(),
+            context: RustTypeLookupContext::DeferredTypeParam {
+                trait_name: trait_name.to_string(), method: method_name.to_string(),
+            },
+        });
+    }
     let Some(trait_def_id) = find_use_imported_trait_def_id(tcx, trait_name) else { return Ok(None) };
     let self_resolved = strip_ref(receiver_ty);
     let self_ctx = RustTypeLookupContext::TraitCallSelf {
@@ -818,6 +844,24 @@ pub fn strip_ref(ty: &crate::toylang::typed_ast::ResolvedType) -> &crate::toylan
     }
 }
 
+/// Workstream B — does `ty` (anywhere reachable through nested generics or
+/// `Ref` wrappers) contain a `TypeParam`? The trait-method oracle queries use
+/// this to defer when Self or any type arg is still abstract at registry-build
+/// time. The per-Instance substituted pass redoes the query with concrete args.
+pub fn contains_type_param(ty: &crate::toylang::typed_ast::ResolvedType) -> bool {
+    use crate::toylang::typed_ast::ResolvedType;
+    match ty {
+        ResolvedType::TypeParam(_) => true,
+        ResolvedType::Ref { inner } => contains_type_param(inner),
+        ResolvedType::StructRef { type_args, .. }
+        | ResolvedType::RustType { type_args, .. } => type_args.iter().any(contains_type_param),
+        ResolvedType::Struct { type_args, field_types, .. } =>
+            type_args.iter().any(contains_type_param)
+            || field_types.iter().any(contains_type_param),
+        _ => false,
+    }
+}
+
 /// Query rustc for a trait method's return type.
 /// `trait_name` is the trait (e.g. "Write"), `receiver_ty` is the concrete receiver
 /// type (e.g. &Stdout or Stdout), `method_name` is the method (e.g. "write_all").
@@ -829,6 +873,16 @@ pub fn rust_trait_method_return_type<'tcx>(
     receiver_ty: &crate::toylang::typed_ast::ResolvedType,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
+    // Workstream B — if Self or any type arg is still a TypeParam, defer.
+    // The per-Instance substituted pass will redo the query with concrete args.
+    if contains_type_param(receiver_ty) || type_args.iter().any(contains_type_param) {
+        return Err(UnresolvedRustType {
+            name: "<TypeParam>".to_string(),
+            context: RustTypeLookupContext::DeferredTypeParam {
+                trait_name: trait_name.to_string(), method: method_name.to_string(),
+            },
+        });
+    }
     // Per @IVTDBTZ, this lookup can legitimately fail when the dispatch
     // classifier misfires or when the trait isn't `use`-imported; return
     // a structured error instead of panicking so the user sees an
@@ -884,4 +938,50 @@ pub fn rust_trait_method_return_type<'tcx>(
         ty::TypingEnv::fully_monomorphized(), sig,
     );
     Ok(rustc_ty_to_resolved_type(tcx, sig.output()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toylang::typed_ast::ResolvedType;
+
+    #[test]
+    fn contains_type_param_detects_direct() {
+        assert!(contains_type_param(&ResolvedType::TypeParam("T".into())));
+        assert!(!contains_type_param(&ResolvedType::I32));
+    }
+
+    #[test]
+    fn contains_type_param_walks_ref_and_generics() {
+        let inner = ResolvedType::Ref { inner: Box::new(ResolvedType::TypeParam("T".into())) };
+        assert!(contains_type_param(&inner));
+        let nested = ResolvedType::RustType {
+            name: "Vec".into(),
+            type_args: vec![ResolvedType::TypeParam("T".into())],
+        };
+        assert!(contains_type_param(&nested));
+        let concrete = ResolvedType::RustType {
+            name: "Vec".into(),
+            type_args: vec![ResolvedType::I32],
+        };
+        assert!(!contains_type_param(&concrete));
+    }
+
+    #[test]
+    fn unresolved_rust_type_is_deferred_only_for_deferred_context() {
+        let deferred = UnresolvedRustType {
+            name: "<TypeParam>".into(),
+            context: RustTypeLookupContext::DeferredTypeParam {
+                trait_name: "Clone".into(), method: "clone".into(),
+            },
+        };
+        assert!(deferred.is_deferred());
+        let non_deferred = UnresolvedRustType {
+            name: "Foo".into(),
+            context: RustTypeLookupContext::TraitCallSelf {
+                trait_name: "Clone".into(), method: "clone".into(),
+            },
+        };
+        assert!(!non_deferred.is_deferred());
+    }
 }

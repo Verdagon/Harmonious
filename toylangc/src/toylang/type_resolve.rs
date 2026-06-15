@@ -39,13 +39,30 @@ pub enum TypeResolveError {
     // trait-call Self, return type, nested generic arg, etc.) wasn't
     // `use`-imported. The context tells the user where the type was needed.
     RustTypeNotImported { name: String, context: String },
+    // Workstream B — a Rust trait-method query was deferred because Self or a
+    // type arg is still a `TypeParam`. The per-Instance substituted pass redoes
+    // the query with concrete args. Callers should treat this as "skip, don't
+    // surface as user error."
+    RustTypeDeferred { context: String },
+}
+
+impl TypeResolveError {
+    /// True iff this is a Workstream-B-style deferred query that the eager
+    /// typecheck pass should silently skip.
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, TypeResolveError::RustTypeDeferred { .. })
+    }
 }
 
 impl From<crate::oracle::UnresolvedRustType> for TypeResolveError {
     fn from(e: crate::oracle::UnresolvedRustType) -> Self {
-        TypeResolveError::RustTypeNotImported {
-            name: e.name,
-            context: e.context.to_string(),
+        if e.is_deferred() {
+            TypeResolveError::RustTypeDeferred { context: e.context.to_string() }
+        } else {
+            TypeResolveError::RustTypeNotImported {
+                name: e.name,
+                context: e.context.to_string(),
+            }
         }
     }
 }
