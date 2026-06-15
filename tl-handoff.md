@@ -403,6 +403,69 @@ path was already Sky-aligned at the mechanism level; what changed is
 whether rustc can name non-export items at all (it can't, which is
 the locked architectural claim).
 
+**Session 10 post-audit: the generic-vs-non-generic uniformity
+claim.** A natural follow-up question: are generic and non-generic
+toylang fns handled exactly the same way? Honest answer:
+**mostly, but not entirely.** Auditing the codebase, four sites
+still branch on `type_params.is_empty()`:
+
+| # | Site | Reason | Forced? |
+|---|---|---|---|
+| 1 | `populate_toylang_instances_from_cgus` registry walk | Skips generic fns at the top level — "no concrete args to substitute at the top level." Transitive generic discovery via `walk_and_stash_internal_callees` still works. | Implementation pragma |
+| 2 | Check 5 eager typecheck (`after_rust_analysis`) | Skips generic fn bodies because resolving them needs concrete T. Generic bodies get typechecked lazily inside `codegen_internal_function`. | Implementation pragma |
+| 3 | stub_gen `extern "C" { pub fn ... }` block | Rust's `extern "C"` syntactically doesn't permit generics. The non-generic case emits the extern decl; generic case omits it. | External (Rust syntax) |
+| 4 | stub_gen `pub struct` shape | Rustc's debuginfo walker ICEs on opaque non-generic ADTs with any source field. Non-generic emits `pub struct Foo;`; generic uses `pub struct Foo<T>(PhantomData<T>)`. | External (rustc ICE) |
+
+What's already uniform:
+
+- **Approach A substitution mechanism**: `resolve_caller_from_instance`
+  has a fast-path return for empty type_params but is otherwise
+  identical — `instance.args` is just empty for non-generics.
+- **Body codegen** once the body is resolved: `codegen_internal_function`
+  operates on a resolved body with concrete types; doesn't care about
+  genericity.
+- **Symbol mangling**: generics get type-arg suffixes
+  (`__toylang_internal_wrap__i32`); non-generics get no suffix —
+  same code path, the suffix loop just iterates zero items.
+- **Impl-block + wrapper-fn headers in stub_gen** (Session 7's #17
+  work): unified via `generics_for_impl_block` /
+  `fn_generics_clause` helpers that return empty token streams for
+  zero params.
+
+The honest framing of sites 1 + 2: they branch on `type_params.is_empty()`
+as a *degenerate-case shortcut* for the semantically-correct
+condition "skip items whose args are still abstract." For non-generics
+the condition is never true; for generics at the top level it's
+always true. Same outcome, but the code does the cheap check
+instead of expressing the intent.
+
+Sites 3 + 4 are forced by external constraints and stay until those
+constraints lift — site 3 via course-correct #4's inline-codegen
+rewrite, site 4 via a rustc bug fix or a different opaque-stub
+mechanism.
+
+## How we fix all of it (planned, not yet started)
+
+| Phase | Site(s) | Approach | Estimate |
+|---|---|---|---|
+| **A** | 1, 2 (cosmetic) | Rename the predicate to `has_abstract_args()` so the call sites document the architectural intent rather than the shortcut. Body unchanged. Establishes the vocabulary for B. | ~2 hours |
+| **B** | 2 (semantic) | Drop the type-params skip in Check 5. Call `resolve_fn_body` on generic bodies; reuse Workstream B's `RustTypeDeferred` error variant to silently skip queries the body can't answer until substitution. Net effect: generic toylang fns get Sky-side type errors earlier (at after_rust_analysis instead of at codegen). | ~1 day |
+| **C** | 1 (architectural) | Rebuild discovery around Sky's after_expansion entry-point walk (§20.4). Start from main + exports + impl methods, transitively enumerate every call site's substituted Instance, push to the queue. Generic and non-generic items both arrive via the same channel for the Sky→Sky path. Rust→Sky generic instantiations (Case 1b/4/6) still flow through rustc's CGU walk — that's a separate, architecturally-justified discovery channel. | ~3–5 days |
+| **D** | 3 (forced — coupled with #4) | When course-correct #4's deeper rewrite lands (Sky's `codegen_crate` walks the queue and emits via Inkwell inline), the extern-decl pattern dies entirely. stub_gen no longer needs to emit `extern "C" { pub fn ... }` blocks at all. Site 3 vanishes by becoming dead code. | bundled with #4 |
+| **E** | 4 (forced — external) | Two options: (1) file a rustc bug + patch the debuginfo walker upstream so opaque non-generic ADTs with source fields don't ICE — then unify struct shape on `pub struct Foo(PhantomData<()>)`. (2) Investigate whether a different opaque-stub pattern dodges the ICE (the architecture mentions `SkyOpaqueType<const T: u64>` as the universal wrapper; a non-generic could be `SkyOpaqueType<typeid>` with empty type args). | ~1 day investigation, then either a rustc patch (~1 week) or the wrapper-migration (~3–5 days) |
+
+**Recommended sequencing:** A → B → C in one Phase-A/B/C focused
+session (~1 week total). D follows whenever #4 lands. E is a
+research thread that can run independently in the background.
+
+**Architectural-property fence:** the moment Phase C lands, add a
+test that mirrors Session 10's commit pattern: walk
+`registry.functions` + `registry.trait_impls`, assert there is NO
+branch on `type_params.is_empty()` left in the discovery + typecheck
+paths (grep-based in CI). Same role A.5 plays for the byte-
+identical invariant and `non_export_body_bearing_fn_gets_no_stub_shell`
+plays for §9.
+
 ---
 
 ## 3. The plan you're executing
