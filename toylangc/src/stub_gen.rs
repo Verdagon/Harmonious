@@ -10,6 +10,7 @@ use crate::toylang::typed_ast::ResolvedType;
 /// block. For zero type params both are empty token streams; for N params
 /// they are `<A, B, …>` (so `impl<A, B> Name<A, B>`).
 fn generics_for_impl_block(type_params: &[String]) -> (TokenStream, TokenStream) {
+    // arch-fence-allow: degenerate-case-fast-path (empty token stream encodes "no generics").
     if type_params.is_empty() {
         return (TokenStream::new(), TokenStream::new());
     }
@@ -23,6 +24,7 @@ fn generics_for_impl_block(type_params: &[String]) -> (TokenStream, TokenStream)
 /// declaration. Empty token stream for zero params (the degenerate case),
 /// `<A, B, …>` for N.
 fn fn_generics_clause(type_params: &[String]) -> TokenStream {
+    // arch-fence-allow: degenerate-case-fast-path (empty token stream encodes "no generics").
     if type_params.is_empty() {
         return TokenStream::new();
     }
@@ -30,19 +32,18 @@ fn fn_generics_clause(type_params: &[String]) -> TokenStream {
     quote! { <#(#idents),*> }
 }
 
-// Course-correct #17 — two divergences in this file are NOT cosmetic and
-// stay as-is until a deeper architectural change unblocks them:
+// Course-correct #17 — three of four divergences in this file are closed.
+// One remains, gated by Rust syntax:
 //
-//   1. Struct shape (lines ~94): non-generic emits `pub struct Foo;` (a
-//      unit struct, zero source fields), generic emits
-//      `pub struct Foo<T>(PhantomData<T>)` (one PhantomData source field).
-//      The asymmetry is forced by a rustc debuginfo-walker ICE when an
-//      opaque non-generic ADT has any source-level field — see the
-//      inline comment at the site. PhantomData<T> is special-cased
-//      enough to dodge the ICE for the generic case; a unit `()` field
-//      doesn't.
+//   1. Struct shape: CLOSED (Phase E completion). Universal shape
+//      `pub struct Foo<P...>(PhantomData<(P...)>);` at every N including
+//      N=0. Was previously gated by a rustc debuginfo-walker ICE on
+//      opaque non-generic ADTs with any source-level field; ICE
+//      eliminated by fork patch 4 (`e67de69ef35` on per-instance-mir)
+//      which clamps build_struct_type_di_node's source-field walk to
+//      min(source.len(), layout.fields.count()).
 //
-//   2. Extern decls (lines ~126, ~198): only emitted for non-generic
+//   2. Extern decls (~lines 167, 220): only emitted for non-generic
 //      items. Rust's `extern "C" { ... }` doesn't permit generic items;
 //      the symbol-per-monomorphization problem (architecture §5.1
 //      Option B failure) is real and there's no syntactic workaround.
@@ -51,7 +52,8 @@ fn fn_generics_clause(type_params: &[String]) -> TokenStream {
 //      per-symbol extern decl needed); that work waits on the deeper
 //      half of course-correct #4 (Sky's `codegen_crate` walks the queue
 //      inline via Inkwell). Until then toylang's emission still needs
-//      the extern decls for the non-generic path.
+//      the extern decls for the non-generic path. The two sites carry
+//      `arch-fence-allow: extern-C-cannot-be-generic` markers.
 //
 // The split here is documented mechanism, not the compiler-law
 // violation the original course-correct entry flagged. The cosmetic
@@ -117,44 +119,32 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // Generate opaque struct definitions + accessor methods
     for (name, toy_struct) in &registry.structs {
         let ident = format_ident!("{}", name);
-        let is_generic = !toy_struct.type_params.is_empty();
 
-        // Opaque struct — layout_of reports 0 fields, so rustc never indexes
-        // into the ADT's fields via source-level walks. Source field count
-        // must match the 0-field layout: `pub struct Foo;` (unit struct, 0
-        // source fields) works; `pub struct Foo(());` (tuple struct with
-        // one unit-typed field) silently breaks when the opaque type gets
-        // monomorphized inside Vec<Foo> etc. — rustc's debuginfo walker
-        // (`build_struct_type_di_node` + `build_generic_type_param_di_nodes`)
-        // indexes FieldsShape by source position, our layout_of returns
-        // FieldsShape::len()==0, the walk panics with "index out of bounds:
-        // the len is 0 but the index is 0". Diagnosed during 5c.2 via the
-        // Vec<Point, Global> migration tests.
+        // Phase E completion: universal struct shape, non-generic is the
+        // degenerate case of generic (CLAUDE.md compiler law).
         //
-        // Generic case keeps PhantomData<(T, U, ...)> because the generic
-        // params must be "used" somewhere in the struct body or rustc
-        // errors with E0392 (`parameter `T` is never used`). The PhantomData
-        // wrapper is a single source field, same source-vs-layout field
-        // count mismatch in principle — but PhantomData<...> is itself a
-        // ZST-wrapper whose layout rustc special-cases, so the debuginfo
-        // walker doesn't recurse into it the same way it does for `()`.
-        // Non-generic tests flex the ICE; generic-type-args-with-nested-Vec
-        // tests haven't, at least in our current coverage. If a future
-        // test hits the same ICE for generics, revisit — possible fixes
-        // include splitting the struct declaration across all type params
-        // as separate phantom fields or requesting a rustc-level opt-out
-        // for opaque types.
-        let item: syn::ItemStruct = if !is_generic {
-            parse_quote! {
-                pub struct #ident;
-            }
-        } else {
-            let type_params: Vec<syn::Ident> = toy_struct.type_params.iter()
-                .map(|p| format_ident!("{}", p))
-                .collect();
-            parse_quote! {
-                pub struct #ident<#(#type_params),*>(std::marker::PhantomData<(#(#type_params),*)>);
-            }
+        //   0 type params: `pub struct Foo(PhantomData<()>);`
+        //   1 type param:  `pub struct Foo<T>(PhantomData<(T)>);`
+        //   N type params: `pub struct Foo<A, B, ...>(PhantomData<(A, B, ...)>);`
+        //
+        // Single PhantomData<(P1, P2, ...)> source field at every N. The
+        // empty-tuple `()` case is what previously ICE'd on rustc's
+        // debuginfo walker (build_struct_type_di_node iterated source
+        // FieldDefs and queried fields.offset(i) for i out of bounds when
+        // layout_of reports 0 fields). Fork patch 4 (`e67de69ef35` on
+        // per-instance-mir) clamps that walk to min(source.len(),
+        // layout.fields.count()), making the universal shape safe.
+        //
+        // PhantomData was already the chosen wrapper for the generic case
+        // because of rustc's "all generics must be used" rule (E0392). At
+        // N=0 the rule is vacuously satisfied; PhantomData<()> still works
+        // and keeps the shape uniform.
+        let generics_clause = fn_generics_clause(&toy_struct.type_params);
+        let type_params_idents: Vec<syn::Ident> = toy_struct.type_params.iter()
+            .map(|p| format_ident!("{}", p))
+            .collect();
+        let item: syn::ItemStruct = parse_quote! {
+            pub struct #ident #generics_clause (std::marker::PhantomData<(#(#type_params_idents),*)>);
         };
         items.push(syn::Item::Struct(item));
 
@@ -175,8 +165,11 @@ pub fn generate(registry: &ToylangRegistry) -> String {
                 }
             });
 
-            // Extern declaration only for non-generic (mir_built intercepts these)
-            if !is_generic {
+            // Extern declaration only for non-generic — `extern "C"` doesn't
+            // permit generics (Phase D site; gated on #4's inline-codegen
+            // rewrite that retires extern decls entirely).
+            // arch-fence-allow: extern-C-cannot-be-generic.
+            if toy_struct.type_params.is_empty() {
                 let accessor_sym = format_ident!("__toylang_accessor_{}_{}", name, field.name);
                 extern_fns.push(quote! {
                     fn #accessor_sym(s: *const #ident) -> *const #field_ty;
@@ -252,6 +245,7 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         // monomorphization time (no extern needed; their symbols come from
         // the consumer's backend — the partitioner override filters them
         // out of rustc's CGU slice, replacing the retired `CODEGEN_SKIP_HOOK`).
+        // arch-fence-allow: extern-C-cannot-be-generic.
         if toy_fn.type_params.is_empty() {
             let sym = format!("__toylang_impl_{}", _name);
             let fn_ident = format_ident!("{}", sym);

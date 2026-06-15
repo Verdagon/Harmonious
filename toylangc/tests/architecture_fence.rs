@@ -15,10 +15,18 @@
 //! count — those sites carry a `// arch-fence-allow: <reason>` marker so this
 //! test ignores them.
 //!
-//! Two paths are out of scope for this fence:
-//!   - stub_gen.rs sites (extern "C" decl synthesis, struct shape ICE
-//!     workaround) — gated on external constraints (Rust syntax, rustc
-//!     debuginfo bug). Tracked as Phases D and E.
+//! After Phase E Path 1 landed (fork patch 4, the debuginfo clamp), the
+//! struct-shape ICE workaround was retired and the universal
+//! `pub struct Foo<P...>(PhantomData<(P...)>);` shape is used at every N.
+//! That eliminated the prior struct-shape divergence from this file's
+//! scan list.
+//!
+//! Two remaining stub_gen.rs sites are gated by Rust syntax (Phase D):
+//! the two `extern "C" { pub fn ... }` block conditionals — `extern "C"`
+//! doesn't permit generic items. These carry
+//! `// arch-fence-allow: extern-C-cannot-be-generic` markers.
+//!
+//! Out of scope for this fence:
 //!   - oracle.rs / other helper modules — not on the discovery/typecheck
 //!     path; their type-param branches are usually well-formedness checks.
 
@@ -29,6 +37,7 @@ fn no_unmarked_type_params_branch_in_discovery() {
     let scan = [
         "src/toylang/callbacks_impl.rs",
         "src/toylang/type_resolve.rs",
+        "src/stub_gen.rs",
     ];
     let mut violations = Vec::new();
     for path in scan {
