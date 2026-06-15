@@ -330,6 +330,7 @@ impl Parser {
             std::collections::BTreeMap::new();
         let mut imports: Vec<String> = Vec::new();
         let mut struct_names: Vec<String> = Vec::new();
+        let mut trait_impls: Vec<crate::toylang::registry::ToyImpl> = Vec::new();
 
         loop {
             match self.peek() {
@@ -363,12 +364,170 @@ impl Parser {
                     }
                     functions.insert(name, f);
                 }
+                Token::Ident(s) if s == "impl" => {
+                    let toy_impl = self.parse_impl(&struct_names)?;
+                    trait_impls.push(toy_impl);
+                }
                 Token::Eof => break,
                 t => return Err(ParseError::UnexpectedTopLevelToken { got: format!("{:?}", t) }),
             }
         }
 
-        Ok(ToylangRegistry { structs, functions, imports })
+        Ok(ToylangRegistry { structs, functions, imports, trait_impls })
+    }
+
+    /// Phase 2 C.1: parse a toylang `impl <TraitPath> for <ToyStruct> { fn … }`
+    /// block. Restrictions for the initial implementation:
+    ///
+    ///   - The trait path is parsed as a `::`-separated path, but only the
+    ///     last segment is used as the trait identifier. The trait must be
+    ///     `use`-imported elsewhere in the source — the oracle resolves the
+    ///     short name to a Rust DefId via the stub rlib's `pub use`
+    ///     re-exports (the same path Sky's source uses today).
+    ///   - The self type must be a non-generic toylang struct that was
+    ///     declared earlier in this source file. Generic-impl support is
+    ///     deferred (the architectural mechanism is the same; the parser
+    ///     extension is the only addition).
+    ///   - Each method's first parameter must be `&self` (taken-by-reference).
+    ///     The parser elevates `&self` to an explicit `self: &ToyStruct`
+    ///     `ToyParam` so downstream code (type-resolver, codegen) treats it
+    ///     uniformly with any other parameter (CLAUDE.md "prefer treating
+    ///     `self` as just another parameter").
+    fn parse_impl(&mut self, struct_names: &[String])
+        -> Result<crate::toylang::registry::ToyImpl, ParseError>
+    {
+        use crate::toylang::registry::{ToyImpl, ToyImplMethod};
+        self.consume(); // eat "impl"
+
+        // Parse the trait path as `::`-separated segments; keep only the last.
+        let mut path_segments = vec![self.expect_ident()?];
+        while self.peek() == &Token::DoubleColon {
+            self.consume();
+            path_segments.push(self.expect_ident()?);
+        }
+        let trait_name = path_segments
+            .last()
+            .expect("path_segments is non-empty by construction")
+            .clone();
+
+        // `for` keyword.
+        match self.peek() {
+            Token::Ident(s) if s == "for" => { self.consume(); }
+            t => return Err(ParseError::UnexpectedToken {
+                expected: "for".to_string(),
+                got: format!("{:?}", t),
+            }),
+        }
+
+        let self_type_name = self.expect_ident()?;
+        if !struct_names.iter().any(|n| n == &self_type_name) {
+            return Err(ParseError::UnexpectedTopLevelToken {
+                got: format!("impl for unknown struct `{}` (declare the struct above the impl block)",
+                    self_type_name),
+            });
+        }
+
+        self.expect(Token::LBrace)?;
+        let mut methods: Vec<ToyImplMethod> = Vec::new();
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            match self.peek() {
+                Token::Ident(s) if s == "fn" => {
+                    let (m_name, m_func) = self.parse_impl_method(
+                        &self_type_name, struct_names,
+                    )?;
+                    methods.push(ToyImplMethod { name: m_name, func: m_func });
+                }
+                t => return Err(ParseError::UnexpectedToken {
+                    expected: "fn".to_string(),
+                    got: format!("{:?}", t),
+                }),
+            }
+        }
+        self.expect(Token::RBrace)?;
+
+        Ok(ToyImpl { trait_name, self_type_name, methods })
+    }
+
+    /// Phase 2 C.1: parse one method inside an `impl ... for ... {}` block.
+    /// Reuses the existing fn-body parser; the only special handling is
+    /// `&self` at the head of the parameter list, which the parser elevates
+    /// to an explicit `self: &Struct` `ToyParam` so downstream code doesn't
+    /// need a "receiver" code path.
+    fn parse_impl_method(
+        &mut self,
+        self_type_name: &str,
+        struct_names: &[String],
+    ) -> Result<(String, ToyFunction), ParseError> {
+        use crate::toylang::registry::{ToyParam};
+        use crate::toylang::typed_ast::ResolvedType;
+
+        self.consume(); // eat "fn"
+        let name = self.expect_ident()?;
+        if name.starts_with("__toylang_") {
+            return Err(ParseError::ReservedName { name });
+        }
+
+        // Method-level generics: <T, U>. Reuse the same shape as fns.
+        let mut type_params = Vec::new();
+        if self.peek() == &Token::LAngle {
+            self.consume();
+            while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
+                type_params.push(self.expect_ident()?);
+                if self.peek() == &Token::Comma { self.consume(); }
+            }
+            self.expect(Token::RAngle)?;
+        }
+
+        self.expect(Token::LParen)?;
+        // Receiver: must be `&self` (taken by shared ref). Elevate to an
+        // explicit first parameter `self: &Struct`.
+        let mut params: Vec<ToyParam> = Vec::new();
+        if self.peek() == &Token::Ampersand {
+            self.consume();
+            match self.peek() {
+                Token::Ident(s) if s == "self" => { self.consume(); }
+                t => return Err(ParseError::UnexpectedToken {
+                    expected: "self".to_string(),
+                    got: format!("{:?}", t),
+                }),
+            }
+            // Build `self: &Struct`. ResolvedType::Ref { inner: StructRef }.
+            let self_struct = ResolvedType::StructRef {
+                name: self_type_name.to_string(),
+                type_args: Vec::new(),
+            };
+            params.push(ToyParam {
+                name: "self".to_string(),
+                ty: ResolvedType::Ref { inner: Box::new(self_struct) },
+            });
+            if self.peek() == &Token::Comma { self.consume(); }
+        } else {
+            // No receiver — disallow for now; trait impls almost always have one.
+            return Err(ParseError::UnexpectedToken {
+                expected: "&self".to_string(),
+                got: format!("{:?}", self.peek()),
+            });
+        }
+        // Remaining parameters.
+        let rest = self.parse_params(&type_params, struct_names)?;
+        params.extend(rest);
+        self.expect(Token::RParen)?;
+
+        let return_ty = if self.peek() == &Token::Arrow {
+            self.consume();
+            Some(self.parse_type(&type_params, struct_names)?)
+        } else {
+            None
+        };
+
+        self.expect(Token::LBrace)?;
+        let body = self.parse_fn_body(&type_params, struct_names)?;
+        Ok((name, ToyFunction {
+            type_params,
+            params,
+            return_ty,
+            body: Some(body),
+        }))
     }
 
     fn parse_struct(&mut self, struct_names: &[String]) -> Result<(String, ToyStruct), ParseError> {
@@ -931,6 +1090,48 @@ mod tests {
         let result = parse("fn f(x: *wrong i32) { }");
         let Err(ParseError::ExpectedPointerQualifier { got }) = result else { panic!("expected ExpectedPointerQualifier") };
         assert_eq!(got, "wrong");
+    }
+
+    #[test]
+    fn test_parse_impl_basic() {
+        // Phase 2 C.1 — minimal impl-block round-trip.
+        let src = "
+            use std::clone::Clone
+            struct Widget { id: i32 }
+            impl Clone for Widget {
+                fn clone(&self) -> Widget {
+                    Widget { id: 0 }
+                }
+            }
+        ";
+        let reg = parse(src).expect("parse should succeed");
+        assert_eq!(reg.trait_impls.len(), 1);
+        let imp = &reg.trait_impls[0];
+        assert_eq!(imp.trait_name, "Clone");
+        assert_eq!(imp.self_type_name, "Widget");
+        assert_eq!(imp.methods.len(), 1);
+        assert_eq!(imp.methods[0].name, "clone");
+        // First param of the method is the elevated `self: &Widget`.
+        assert_eq!(imp.methods[0].func.params.len(), 1);
+        assert_eq!(imp.methods[0].func.params[0].name, "self");
+    }
+
+    #[test]
+    fn test_parse_impl_unknown_self_type_errors() {
+        // Phase 2 C.1 — impl for a struct that doesn't exist is rejected.
+        let src = "impl Clone for NotDeclared { fn clone(&self) -> i32 { 0 } }";
+        let result = parse(src);
+        assert!(matches!(result, Err(ParseError::UnexpectedTopLevelToken { .. })),
+            "expected UnexpectedTopLevelToken for unknown self type, got {:?}", result);
+    }
+
+    #[test]
+    fn test_parse_impl_requires_self_receiver() {
+        // Phase 2 C.1 — methods inside an impl block must take `&self`.
+        let src = "struct W { x: i32 } impl Clone for W { fn clone() -> i32 { 0 } }";
+        let result = parse(src);
+        assert!(matches!(&result, Err(ParseError::UnexpectedToken { expected, .. }) if expected == "&self"),
+            "expected UnexpectedToken with expected=\"&self\", got {:?}", result);
     }
 
     #[test]

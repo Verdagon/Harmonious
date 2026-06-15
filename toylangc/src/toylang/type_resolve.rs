@@ -844,7 +844,7 @@ mod tests {
             return_ty: Some(ResolvedType::TypeParam("T".to_string())),
             body: Some(Block { stmts: vec![], ret: Some(Expr::Var("x".to_string())) }),
         });
-        ToylangRegistry { structs, functions, imports: vec![] }
+        ToylangRegistry { structs, functions, imports: vec![], trait_impls: vec![] }
     }
 
     #[test]

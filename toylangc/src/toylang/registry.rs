@@ -29,6 +29,32 @@ pub struct ToylangRegistry {
     pub functions: BTreeMap<String, ToyFunction>,
     /// Rust `use` imports (e.g. "std::alloc::Global"). Emitted as `pub use` in stubs.
     pub imports: Vec<String>,
+    /// Phase 2 C: toylang `impl rust_trait for toylang_type` blocks. Each entry
+    /// is one source-level impl block; the methods inside are stored as
+    /// `ToyFunction`s with the implicit `self` parameter elevated to an
+    /// explicit `&ToyStruct` first parameter (architecture §6.2; Case 4).
+    pub trait_impls: Vec<ToyImpl>,
+}
+
+/// Phase 2 C: a toylang `impl <RustTrait> for <ToyStruct> { fn … }` block.
+/// `trait_name` is the short name of the Rust trait (e.g. "Clone"); it must
+/// be `use`-imported elsewhere in the source so the oracle can resolve its
+/// DefId. `self_type_name` is the toylang struct the impl is for.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToyImpl {
+    pub trait_name: String,
+    pub self_type_name: String,
+    pub methods: Vec<ToyImplMethod>,
+}
+
+/// A method inside a `ToyImpl`. Stored as `ToyFunction` plus the method's
+/// source-level name; the `params` of the inner function include `self` as a
+/// `&ToyStruct` first parameter (synthesized by the parser from the
+/// `&self` token).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToyImplMethod {
+    pub name: String,
+    pub func: ToyFunction,
 }
 
 /// A parsed parameter in a Toylang function signature.
