@@ -1,0 +1,10 @@
+use std::alloc::Global
+use std::vec::Vec
+
+fn count_three() -> usize {
+    let v = Vec::new<i32, Global>();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.len()
+}

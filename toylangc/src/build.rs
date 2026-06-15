@@ -113,9 +113,14 @@ pub fn build_project(manifest_path: &Path) -> i32 {
         eprintln!("toylangc: {}", e);
         return 1;
     }
-    if let Err(e) =
-        write_main_shim(&user_dir, manifest, &root.toylang_dep_names, &name_index, &crate_names)
-    {
+    if let Err(e) = write_main_shim(
+        &user_dir,
+        &project_dir,
+        manifest,
+        &root.toylang_dep_names,
+        &name_index,
+        &crate_names,
+    ) {
         eprintln!("toylangc: {}", e);
         return 1;
     }
@@ -408,6 +413,7 @@ fn render_dep(spec: &DepSpec, project_dir: &Path) -> String {
 
 fn write_main_shim(
     user_dir: &Path,
+    project_dir: &Path,
     manifest: &Manifest,
     root_toylang_dep_names: &[String],
     name_index: &std::collections::BTreeMap<String, usize>,
@@ -424,17 +430,29 @@ fn write_main_shim(
     for name in manifest.rust_dependencies.keys() {
         s.push_str(&format!("extern crate {} as _;\n", name));
     }
-    // Phase 3 E.6: force-link each toylang dep at the USER-BIN compile so
-    // (a) rustc loads the crate metadata (needed for S.4's sidecar walk
-    // to find the dep in `tcx.crates(())`), and (b) the linker keeps the
-    // dep's emitted symbols even though the user_bin's Rust source doesn't
-    // reference them directly.
     for dep_name in root_toylang_dep_names {
         let idx = name_index[dep_name];
         s.push_str(&format!("extern crate {} as _;\n", all_crate_names[idx]));
     }
     s.push_str("\n");
-    s.push_str("fn main() { __toylang_main(); }\n");
+
+    // Phase 1 D: if `project.rust_caller` is set, append the file's contents
+    // (which must define its own `fn main`) instead of the default toylang
+    // shim. Exercises Case 1a/1b/3/5 of the seven-case taxonomy where the
+    // binary's top-level is Rust source. The toylang source can still define
+    // `fn main` if it wants — `__toylang_main` is emitted but never called.
+    if let Some(rel) = manifest.project.rust_caller.as_ref() {
+        let caller_path = project_dir.join(rel);
+        let content = fs::read_to_string(&caller_path).map_err(|e| {
+            format!("cannot read rust_caller {}: {}", caller_path.display(), e)
+        })?;
+        s.push_str(&content);
+        if !content.ends_with('\n') {
+            s.push('\n');
+        }
+    } else {
+        s.push_str("fn main() { __toylang_main(); }\n");
+    }
 
     fs::write(user_dir.join("src/main.rs"), s)
         .map_err(|e| format!("cannot write src/main.rs: {}", e))

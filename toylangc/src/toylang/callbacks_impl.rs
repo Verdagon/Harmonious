@@ -810,7 +810,7 @@ fn resolved_to_rustc_ty_with_subst<'tcx>(
 }
 
 /// Resolve a ToyFunction for a concrete rustc Instance by substituting type params.
-fn resolve_caller_from_instance<'tcx>(
+pub fn resolve_caller_from_instance<'tcx>(
     caller_fn: &crate::toylang::registry::ToyFunction,
     instance: ty::Instance<'tcx>,
     tcx: TyCtxt<'tcx>,

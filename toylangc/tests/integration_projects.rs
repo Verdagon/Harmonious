@@ -708,6 +708,45 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 ///   - the @GCMLZ re-entrance bypass via thread-local state pointer (E.6.C)
 /// Expected output: `42` (from `double_it(21) = 21 * 2`).
 #[test] fn test_case6_basic_multi_crate() { run_integration_project("case6_app"); }
+/// Phase 1 D / Case 1a: Rust program (top-level) calls a non-generic
+/// toylang function exported from `__lang_stubs`. Exercises:
+///   - `[project.rust_caller]` manifest field
+///   - `write_main_shim` rust_caller path
+///   - Cross-language Rust→toylang call resolution through the
+///     `symbol_name` override redirecting `__lang_stubs::add_one` →
+///     `__toylang_impl_add_one`
+/// Expected output: `42` (from `add_one(41) = 42`).
+#[test] fn test_case1a_rust_caller_basic() { run_integration_project("case1a_rust_caller"); }
+/// Phase 1 D / Case 1b: Rust program calls a Sky GENERIC fn with a
+/// rustc-known type as T. This is the first test that exercises
+/// Approach A's `per_instance_mir` query with non-empty `instance.args`:
+/// rustc's mono collector queues `Instance(identity_def_id, [i32])`, the
+/// per_instance_mir provider fires, Sky substitutes T=i32 Sky-side, the
+/// CGU walk in `generate_with_tcx` synthesizes a `FnItem` from the
+/// registry + instance.args, codegen emits `__toylang_impl_identity__i32`.
+/// Without the synthesis path, generic toylang fns instantiated only by
+/// Rust call sites would never be codegenned (the registry-driven
+/// discovery in populate_* intentionally skips generics).
+/// Expected output: `42` (identity(42) = 42).
+#[test] fn test_case1b_rust_calls_generic() { run_integration_project("case1b_rust_calls_generic"); }
+/// Phase 1 D / Case 5: Rust program → Sky middle → DIFFERENT Rust lib.
+/// rust_caller calls `__lang_stubs::count_three()`; the Sky body
+/// internally calls Vec::new + Vec::push + Vec::len from std (a
+/// different Rust crate). Exercises the transitive Sky→Rust dep walk
+/// surfaced through per_instance_mir's ReifyFnPointer casts.
+/// Expected output: `3`.
+#[test] fn test_case5_rust_sky_vec() { run_integration_project("case5_rust_sky_vec"); }
+/// Phase 1 D / Case 3: Rust program → Sky generic with a Rust-defined T
+/// → Sky body dispatches `Clone::clone` back to the Rust top's impl.
+/// `rust_caller.rs` defines `MyCounter` with `#[derive(Clone)]`, calls
+/// `__lang_stubs::clone_it::<MyCounter>(&c)`. Sky's clone_it body is
+/// `Clone::clone(x)`; substituted with T=MyCounter at per_instance_mir
+/// time, the trait dispatch resolves to `<MyCounter as Clone>::clone`
+/// which rustc compiles from the user_bin's impl. Required a small fix
+/// in `codegen_extern_wrapper`'s `rust_ret_type` computation to handle
+/// `RustType` returns coerced to direct register (small struct).
+/// Expected output: `42`.
+#[test] fn test_case3_rust_sky_back_to_rust() { run_integration_project("case3_rust_sky_back_to_rust"); }
 #[test] fn test_arithmetic_sub_div() { run_integration_project("arithmetic_sub_div"); }
 #[test] fn test_vec_i32() { run_integration_project("vec_i32"); }
 #[test] fn test_single_field_struct() { run_integration_project("single_field_struct"); }

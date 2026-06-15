@@ -893,7 +893,24 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
             | ResolvedType::Bool | ResolvedType::Usize => {
                 Some(ctx.resolved_to_inkwell(&ret_resolved))
             }
-            ResolvedType::RustType { .. } => None, // opaque types use sret or indirect
+            ResolvedType::RustType { .. } => {
+                // Phase 1 D Case 3: when rustc's ABI coerces a small
+                // user-defined Rust struct to a direct register return
+                // (e.g., `struct MyCounter { count: i32 }` returned as
+                // `i32`), the rust_ret_type must be the coerced LLVM type
+                // — not None. The earlier `RustType => None` arm assumed
+                // all RustTypes go through sret, which holds for opaque
+                // toylang views of Rust types in toylang source but not
+                // for user-defined types arriving via per_instance_mir
+                // substitution from a Rust call site. Same pattern as the
+                // `Struct` arm below.
+                match &coerced {
+                    rustc_lang_facade::abi_helpers::CoercedReturn::Direct(coerced_str) => {
+                        Some(parse_coerced_type(ctx, coerced_str))
+                    }
+                    _ => None,
+                }
+            }
             ResolvedType::Struct { .. } => {
                 match &coerced {
                     rustc_lang_facade::abi_helpers::CoercedReturn::Direct(coerced_str) => {
@@ -1952,25 +1969,40 @@ pub fn generate_with_tcx<'tcx>(
             }
 
             // For regular consumer functions from MonoItems: record the Instance
-            // so we can generate an extern wrapper. The resolved_func comes from
-            // toylang_instances (populated by walk_and_stash_internal_callees,
-            // driven by notify_concrete_entry_point).
+            // so we can generate an extern wrapper.
+            //
+            // Phase 1 D Case 1b: the resolved_func may come from either
+            // `state.toylang_instances` (already-walked, populated by
+            // walk_and_stash_internal_callees for non-generics + transitively)
+            // OR, for generic consumer fns instantiated only via Rust
+            // call sites (`__lang_stubs::identity::<i32>(42)` from a
+            // `rust_caller` source), be synthesized here from the registry
+            // entry + the concrete Instance args. The synthesis is what
+            // makes Case 1b possible — without it, generic toylang fns
+            // never get codegenned at the user-bin compile because the
+            // registry-driven discovery in `populate_toylang_instances_from_cgus`
+            // intentionally skips generics (no caller-args to substitute
+            // with from registry alone).
             let name = tcx.item_name(def_id).to_string();
             let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main".to_string() } else { name.clone() };
-            if registry.functions.get(&registry_name).is_none() { continue; }
+            let Some(toy_fn) = registry.functions.get(&registry_name) else { continue; };
             let extern_symbol = crate::toylang::callbacks_impl::compute_fn_symbol(
                 &registry_name, tcx, instance,
             );
-            // Find the matching toylang_instance and promote it to have an Instance
-            if let Some(inst) = state.toylang_instances.iter().find(|i| i.extern_symbol == extern_symbol) {
-                if seen_symbols.insert(extern_symbol.clone()) {
-                    fn_items.push(FnItem {
-                        resolved_func: inst.resolved_func.clone(),
-                        instance: Some(instance),
-                        extern_symbol,
-                    });
-                }
-            }
+            if !seen_symbols.insert(extern_symbol.clone()) { continue; }
+            let resolved_func = if let Some(inst) = state.toylang_instances
+                .iter()
+                .find(|i| i.extern_symbol == extern_symbol)
+            {
+                inst.resolved_func.clone()
+            } else {
+                crate::toylang::callbacks_impl::resolve_caller_from_instance(toy_fn, instance, tcx)
+            };
+            fn_items.push(FnItem {
+                resolved_func,
+                instance: Some(instance),
+                extern_symbol,
+            });
         }
     }
 

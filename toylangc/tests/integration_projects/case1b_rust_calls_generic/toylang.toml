@@ -1,0 +1,7 @@
+[project]
+name = "case1b_rust_calls_generic"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

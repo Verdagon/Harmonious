@@ -38,6 +38,16 @@ pub struct Project {
     pub edition: String,
     #[serde(default)]
     pub features: Vec<String>,
+    /// Phase 1 D: optional path (relative to the project dir) to a Rust
+    /// source file that supplies the binary's `fn main`. When set, the
+    /// user_bin's `src/main.rs` is composed by prepending the standard
+    /// `use __lang_stubs::*;` + force-link `extern crate` preamble and then
+    /// appending the rust_caller file's contents — replacing the default
+    /// `fn main() { __toylang_main(); }` shim entirely. Used to exercise
+    /// Cases 1a/1b/3/5 of the seven-case taxonomy where the binary's
+    /// top-level is Rust source rather than toylang's `main`.
+    #[serde(default)]
+    pub rust_caller: Option<String>,
 }
 
 fn default_edition() -> String {
@@ -305,6 +315,33 @@ regex = { version = "1", features = ["unicode"] }
             }
             _ => panic!("expected Detailed variant"),
         }
+    }
+
+    #[test]
+    fn test_parse_rust_caller() {
+        let m = parse_str(
+            r#"
+[project]
+name = "app"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.project.rust_caller.as_deref(), Some("rust_caller.rs"));
+    }
+
+    #[test]
+    fn test_parse_no_rust_caller() {
+        let m = parse_str(
+            r#"
+[project]
+name = "app"
+source = "main.toylang"
+"#,
+        )
+        .unwrap();
+        assert!(m.project.rust_caller.is_none());
     }
 
     #[test]

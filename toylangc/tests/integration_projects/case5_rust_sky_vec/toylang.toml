@@ -1,0 +1,8 @@
+[project]
+name = "case5_rust_sky_vec"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
