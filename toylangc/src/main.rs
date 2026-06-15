@@ -9,6 +9,7 @@ mod oracle;
 mod sidecar;
 mod stub_gen;
 mod toylang;
+mod typeid;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

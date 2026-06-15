@@ -34,6 +34,44 @@ pub struct ToylangRegistry {
     /// `ToyFunction`s with the implicit `self` parameter elevated to an
     /// explicit `&ToyStruct` first parameter (architecture §6.2; Case 4).
     pub trait_impls: Vec<ToyImpl>,
+    /// Phase E Path 2 — content-addressed typeids for Sky structs
+    /// (architecture §10.6 / §10.8). Each entry maps a stable `u64` typeid
+    /// (computed via `crate::typeid::compute(name, &[])` over a Sky struct's
+    /// qualified identity) to the source-level `(name, type_args)` pair that
+    /// produced it. The decoding side — the `layout_of` override fired on
+    /// `__ToylangOpaque<HASH>` — uses this table to recover the Sky type and
+    /// dispatch to the existing size/align computation. Populated by
+    /// `populate_typeid_table` after the typing pass finishes, before the
+    /// sidecar is written; serialized so downstream compiles can decode
+    /// upstream typeids that originated in a previously-compiled Sky library.
+    ///
+    /// `BTreeMap` for sidecar byte-equality (same rationale as `structs` /
+    /// `functions` above). `#[serde(default)]` because pre-Path-2 sidecars
+    /// don't carry the field; loading one yields an empty table, which is
+    /// harmless until Phase 3 starts referencing typeids that would need it.
+    #[serde(default)]
+    pub typeid_table: BTreeMap<u64, (String, Vec<ResolvedType>)>,
+}
+
+impl ToylangRegistry {
+    /// Phase E Path 2 / Phase 1.3 — populate the typeid table by hashing
+    /// every Sky struct in `structs`. Idempotent: calling repeatedly produces
+    /// the same table.
+    ///
+    /// The mapping is `compute(name, &[]) → (name.clone(), vec![])` per
+    /// architecture §10.4.5 Path 2's "per-struct identity, not
+    /// per-instantiation" interpretation — `Wrapper<i32>` and `Wrapper<i64>`
+    /// share `HASH_FOR_WRAPPER` and disambiguate at the type level via their
+    /// own generic args slot. Per-instantiation typeids are reserved for
+    /// non-export and comptime-produced types (§10.7 Cases 2 + 3), out of
+    /// scope for this phase.
+    pub fn populate_typeid_table(&mut self) {
+        self.typeid_table.clear();
+        for name in self.structs.keys() {
+            let typeid = crate::typeid::compute(name, &[]);
+            self.typeid_table.insert(typeid, (name.clone(), Vec::new()));
+        }
+    }
 }
 
 /// Phase 2 C: a toylang `impl <RustTrait> for <ToyStruct> { fn … }` block.

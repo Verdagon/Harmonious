@@ -394,7 +394,15 @@ impl Parser {
             }
         }
 
-        Ok(ToylangRegistry { structs, functions, imports, trait_impls })
+        Ok(ToylangRegistry {
+            structs,
+            functions,
+            imports,
+            trait_impls,
+            // Phase E Path 2: populated by `populate_typeid_table` in
+            // callbacks_impl.rs after typing finishes; empty here is fine.
+            typeid_table: std::collections::BTreeMap::new(),
+        })
     }
 
     /// Phase 2 C.1: parse a toylang `impl <TraitPath> for <ToyStruct> { fn … }`

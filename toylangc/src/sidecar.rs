@@ -561,5 +561,40 @@ mod tests {
         assert!(recovered.structs.is_empty());
         assert!(recovered.functions.is_empty());
         assert!(recovered.imports.is_empty());
+        assert!(recovered.typeid_table.is_empty());
+    }
+
+    /// Phase E Path 2 / Phase 1.3 — `populate_typeid_table` hashes every
+    /// struct in the registry into the typeid_table. Verifies population is
+    /// idempotent + survives a sidecar round-trip (the architecture-§10.8
+    /// "downstream compiles decode upstream typeids" property).
+    #[test]
+    fn typeid_table_populates_and_round_trips() {
+        let mut original = sample_registry();
+        original.populate_typeid_table();
+        assert_eq!(
+            original.typeid_table.len(),
+            original.structs.len(),
+            "one entry per struct",
+        );
+
+        // Each table entry's name matches the struct name; args are empty per
+        // the Path 2 "per-struct identity" interpretation.
+        for (typeid, (name, args)) in &original.typeid_table {
+            assert!(original.structs.contains_key(name));
+            assert!(args.is_empty());
+            assert_eq!(*typeid, crate::typeid::compute(name, &[]));
+        }
+
+        // Round-trip preserves the table.
+        let bytes = serialize_sidecar(&original).expect("serialize");
+        let recovered = deserialize_sidecar(&bytes).expect("deserialize");
+        assert_eq!(recovered.typeid_table, original.typeid_table);
+
+        // Idempotency: re-running populate on the recovered registry produces
+        // the same table.
+        let mut recovered2 = recovered.clone();
+        recovered2.populate_typeid_table();
+        assert_eq!(recovered2.typeid_table, original.typeid_table);
     }
 }

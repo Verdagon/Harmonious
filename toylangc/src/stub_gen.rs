@@ -123,6 +123,16 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // recognized as Sky stub rlibs without a predicate change.
     items.push(parse_quote! { pub const __SKY_STUBS_MARKER: () = (); });
 
+    // Phase E Path 2 — emit the universal opaque wrapper (architecture §10.6).
+    // Every Sky struct's stub representation contains a `__ToylangOpaque<HASH>`
+    // field carrying its content-addressed typeid. The wrapper itself has zero
+    // source fields, so the rustc debuginfo walker iterates zero times when
+    // it recurses into a wrapper instantiation — sidestepping the
+    // source-vs-layout-field-count assumption (§10.4.5) that fork patch 4
+    // patches defensively. Phase 3 starts using this declaration; Phase 1.2
+    // just emits it without any current consumer.
+    items.push(parse_quote! { pub struct __ToylangOpaque<const T: u64>; });
+
     // Emit pub use for each toylang import
     for import_path in &registry.imports {
         let path: syn::Path = syn::parse_str(import_path)
@@ -400,6 +410,30 @@ mod tests {
             src.contains("pub const __SKY_STUBS_MARKER"),
             "stub_gen output missing __SKY_STUBS_MARKER:\n{}",
             src
+        );
+    }
+
+    /// Phase E Path 2 — every stub rlib declares the universal opaque wrapper
+    /// (architecture §10.6). The wrapper itself has zero source fields and is
+    /// referenced by every Sky struct's representation under Phase 3+ as the
+    /// `(__ToylangOpaque<HASH>, …)` newtype carrier. If stub_gen stops
+    /// emitting it, downstream Sky struct emission can't reference it and the
+    /// stub compile fails with E0412. Mirror of `marker_emitted_at_crate_root`.
+    #[test]
+    fn toylang_opaque_wrapper_emitted_at_crate_root() {
+        let reg = ToylangRegistry::default();
+        let src = generate(&reg);
+        assert!(
+            src.contains("pub struct __ToylangOpaque"),
+            "stub_gen output missing __ToylangOpaque wrapper:\n{}",
+            src
+        );
+        // The wrapper has a const u64 generic parameter — verify the shape
+        // hasn't drifted (e.g. someone replaced it with a type param `<T>`).
+        assert!(
+            src.contains("const T : u64") || src.contains("const T: u64"),
+            "wrapper signature drifted from `<const T: u64>`:\n{}",
+            src,
         );
     }
 

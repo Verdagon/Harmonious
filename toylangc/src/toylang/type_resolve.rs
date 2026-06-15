@@ -868,7 +868,13 @@ mod tests {
             body: Some(Block { stmts: vec![], ret: Some(Expr::Var("x".to_string())) }),
             is_export: false,
         });
-        ToylangRegistry { structs, functions, imports: vec![], trait_impls: vec![] }
+        ToylangRegistry {
+            structs,
+            functions,
+            imports: vec![],
+            trait_impls: vec![],
+            typeid_table: std::collections::BTreeMap::new(),
+        }
     }
 
     #[test]

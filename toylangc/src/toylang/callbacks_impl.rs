@@ -696,7 +696,16 @@ impl LangCallbacks for ToylangCallbacks {
         // the rlib's exactly except for the `.sky-meta` extension. This is
         // what `docs/architecture/sidecar-format.md` requires.
         let sidecar_path = tcx.output_filenames(()).with_extension("sky-meta");
-        let bytes = crate::sidecar::serialize_sidecar(&self.registry)
+        // Phase E Path 2 / Phase 1.3 — populate the typeid table just
+        // before serialization. Cheap (one BLAKE3 hash per struct) and keeps
+        // the table fresh against any registry edits earlier in the typing
+        // pass. We clone to populate because `after_rust_analysis` takes
+        // `&self`; serialization is otherwise pure with respect to the
+        // registry. Architecture §10.8: the table ships in the sidecar so
+        // downstream compiles can decode upstream typeids.
+        let mut registry_for_sidecar: ToylangRegistry = (*self.registry).clone();
+        registry_for_sidecar.populate_typeid_table();
+        let bytes = crate::sidecar::serialize_sidecar(&registry_for_sidecar)
             .unwrap_or_else(|e| panic!("[toylang] sidecar serialize failed: {}", e));
         std::fs::write(&sidecar_path, &bytes).unwrap_or_else(|e| {
             panic!(
