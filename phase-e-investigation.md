@@ -188,5 +188,36 @@ without external dependencies.
 
 ## Files touched this investigation
 
-None. The reproduction experiment was temporary; restored before commit.
-This document is the deliverable.
+None at the time of the original write-up. The reproduction experiment
+was temporary; restored before commit.
+
+## Update (later same session) — patch written
+
+After committing the investigation, Path 1 was started. The
+defensive clamp was written against `~/rust` (rustc 1.95.0-dev,
+commit `d940e568`) at two sites:
+
+1. `compiler/rustc_codegen_llvm/src/debuginfo/metadata.rs::build_struct_type_di_node`
+   — the original ICE site. Clamps the source-field iter to
+   `min(variant_def.fields.len(), struct_type_and_layout.fields.count())`.
+2. `compiler/rustc_codegen_llvm/src/debuginfo/metadata.rs::build_union_type_di_node`
+   — same pattern (source iter → `union_ty_and_layout.field(cx, i)`).
+   Sibling clamp.
+
+`build_enum_variant_struct_type_di_node` audited; it iterates the
+layout's field count FIRST and then indexes source, so the underreport
+case Sky hits doesn't reach it. No clamp needed there.
+
+Verification status: rustc rebuild in progress at write time; will
+re-run the `r_t_r_vec_of_ship` reproducer with `pub struct Foo(())` in
+stub_gen post-rebuild to confirm the ICE is gone.
+
+PR description draft in `phase-e-rustc-pr-draft.md`.
+
+The patches now add a fourth and fifth modification to our fork's
+working tree (alongside the three Approach-A patches). They are NOT
+load-bearing for our existing 253/253 baseline — they don't change
+behavior on unoverridden layouts — so toylangc with the current
+`pub struct Foo;` stub shape continues to work identically. The
+patches only become observable when stub_gen is migrated to the
+unified shape that triggered the ICE.
