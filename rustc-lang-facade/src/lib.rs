@@ -293,7 +293,7 @@ struct StatefulVtable {
 // for reads. This allows query providers to read config without contending
 // with the mutable state mutex.
 //
-// Mutable state (consumer_state, lang_obj_path) is behind its own Mutex.
+// Mutable state (consumer_state) is behind its own Mutex.
 // Only callbacks that need &mut consumer_state lock this mutex.
 //
 // This separation prevents deadlocks: generate_and_compile holds the mutable
@@ -315,10 +315,9 @@ pub(crate) struct FacadeConfig {
 unsafe impl Send for FacadeConfig {}
 unsafe impl Sync for FacadeConfig {}
 
-/// Mutable state: consumer-owned state + codegen output path.
+/// Mutable state: consumer-owned state.
 pub(crate) struct FacadeMutableState {
     consumer_state: Box<dyn Any + Send + Sync>,
-    pub lang_obj_path: Option<PathBuf>,
 }
 
 // Safety: consumer_state is Box<dyn Any + Send + Sync>.
@@ -627,18 +626,6 @@ pub(crate) fn default_upstream_monomorphizations_for()
         .expect("default upstream_monomorphizations_for not saved")
 }
 
-/// Store the compiled .o path after generate_and_compile.
-pub(crate) fn set_lang_obj_path(obj_path: PathBuf) {
-    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    g.lang_obj_path = Some(obj_path);
-}
-
-/// Read the compiled .o path for injection into CodegenResults.
-pub(crate) fn get_lang_obj_path() -> Option<PathBuf> {
-    MUTABLE_STATE.get()
-        .and_then(|m| m.lock().unwrap().lang_obj_path.clone())
-}
-
 // Trampoline functions — monomorphized for a specific C, then stored as fn pointers.
 //
 // Predicate trampolines (LangPredicates) take no `state`; stateful trampolines
@@ -798,7 +785,6 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     });
     let _ = MUTABLE_STATE.set(std::sync::Mutex::new(FacadeMutableState {
         consumer_state,
-        lang_obj_path: None,
     }));
     // Stage 4c retired `VISIBILITY_OVERRIDE_HOOK`: the partitioner override
     // in `queries::partition` now forces `(External, Default)` directly on
