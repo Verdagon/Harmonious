@@ -584,6 +584,17 @@ fn resolve_expr(
         Expr::MethodCall { receiver, method, args } => {
             let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
 
+            // Phase B — if the receiver's type contains a TypeParam (e.g.,
+            // `fn foo<T>(x: T) { x.clone() }`), defer to the per-Instance
+            // substituted pass. Without this guard, the existing match arms
+            // below would hit MethodCallOnUnsupportedType for `TypeParam`,
+            // which is a hard error rather than a deferred one.
+            if crate::oracle::contains_type_param(&typed_recv.ty) {
+                return Err(TypeResolveError::RustTypeDeferred {
+                    context: format!("method `.{}` on receiver containing TypeParam", method),
+                });
+            }
+
             let (rust_name, rust_type_args) = match &typed_recv.ty {
                 ResolvedType::RustType { name, type_args } => (name.as_str(), type_args.as_slice()),
                 ResolvedType::Ref { inner } => match inner.as_ref() {

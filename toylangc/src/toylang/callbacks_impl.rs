@@ -547,7 +547,11 @@ impl LangCallbacks for ToylangCallbacks {
 
         // Check 5: Type-resolve non-generic function bodies
         for (name, func) in &self.registry.functions {
-            if func.body.is_none() || func.has_abstract_args() { continue; }
+            // Phase B: typecheck generic bodies too. Rust trait/method
+            // queries with TypeParam args now return RustTypeDeferred (via
+            // oracle's contains_type_param guard), which `is_deferred()`
+            // silently skips below.
+            if func.body.is_none() { continue; }
             let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
                 if type_name.is_empty() {
                     crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
@@ -613,7 +617,8 @@ impl LangCallbacks for ToylangCallbacks {
         // to the per-Instance substituted pass, same as generic free fns.
         for toy_impl in &self.registry.trait_impls {
             for method in &toy_impl.methods {
-                if method.func.body.is_none() || method.func.has_abstract_args() {
+                // Phase B: typecheck generic impl-method bodies too.
+                if method.func.body.is_none() {
                     continue;
                 }
                 let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {

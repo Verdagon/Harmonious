@@ -31,11 +31,17 @@ pub enum RustTypeLookupContext {
     // associated item on the trait. Typically a typo at the call site.
     // `name` on the surrounding UnresolvedRustType holds the method name.
     TraitMethodName { trait_name: String },
-    // Workstream B — Self or a type arg of a Rust trait method query is still
-    // a TypeParam at registry-build time. The per-Instance substituted pass
-    // will redo the query with concrete args; callers should treat this as a
-    // "defer" signal, not a user-facing error. See `UnresolvedRustType::is_deferred`.
-    DeferredTypeParam { trait_name: String, method: String },
+    // Workstream B / Phase B — A query input was still a TypeParam at
+    // registry-build time. The per-Instance substituted pass will redo the
+    // query with concrete args; callers should treat this as a "defer" signal,
+    // not a user-facing error. See `UnresolvedRustType::is_deferred`.
+    //
+    // `query` is a human-readable description of which query was deferred,
+    // e.g. "trait call `Clone::clone`", "inherent method `Vec::push`",
+    // "free function `wrap`", "method `.clone()` on receiver containing
+    // TypeParam". Used in the Display impl for diagnostics if this ever leaks
+    // past `is_deferred()`.
+    DeferredTypeParam { query: String },
 }
 
 impl UnresolvedRustType {
@@ -66,8 +72,8 @@ impl std::fmt::Display for RustTypeLookupContext {
                 write!(f, "as trait name in trait call `::{}`", method),
             Self::TraitMethodName { trait_name } =>
                 write!(f, "as method name on trait `{}`", trait_name),
-            Self::DeferredTypeParam { trait_name, method } =>
-                write!(f, "as TypeParam in trait call `{}::{}` (deferred to substituted pass)", trait_name, method),
+            Self::DeferredTypeParam { query } =>
+                write!(f, "as TypeParam in {} (deferred to substituted pass)", query),
         }
     }
 }
@@ -495,6 +501,16 @@ pub fn rust_method_return_type<'tcx>(
     method_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
+    // Phase B — if any type arg is still a TypeParam, defer to the
+    // per-Instance substituted pass.
+    if type_args.iter().any(contains_type_param) {
+        return Err(UnresolvedRustType {
+            name: "<TypeParam>".to_string(),
+            context: RustTypeLookupContext::DeferredTypeParam {
+                query: format!("inherent method `{}::{}`", type_name, method_name),
+            },
+        });
+    }
     let type_def_id = find_rust_type_def_id(tcx, type_name)
         .ok_or_else(|| UnresolvedRustType {
             name: type_name.to_string(),
@@ -782,6 +798,15 @@ pub fn rust_free_fn_return_type<'tcx>(
     name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> Result<Option<crate::toylang::typed_ast::ResolvedType>, UnresolvedRustType> {
+    // Phase B — if any type arg is still a TypeParam, defer.
+    if type_args.iter().any(contains_type_param) {
+        return Err(UnresolvedRustType {
+            name: "<TypeParam>".to_string(),
+            context: RustTypeLookupContext::DeferredTypeParam {
+                query: format!("free function `{}`", name),
+            },
+        });
+    }
     let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
     let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args)?;
     Ok(Some(rustc_ty_to_resolved_type(tcx, sig.output())))
@@ -794,6 +819,15 @@ pub fn rust_free_fn_param_types<'tcx>(
     name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+    // Phase B — if any type arg is still a TypeParam, defer.
+    if type_args.iter().any(contains_type_param) {
+        return Err(UnresolvedRustType {
+            name: "<TypeParam>".to_string(),
+            context: RustTypeLookupContext::DeferredTypeParam {
+                query: format!("free function `{}`", name),
+            },
+        });
+    }
     let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
     let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args)?;
     Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
@@ -807,6 +841,15 @@ pub fn rust_method_param_types<'tcx>(
     method_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+    // Phase B — if any type arg is still a TypeParam, defer.
+    if type_args.iter().any(contains_type_param) {
+        return Err(UnresolvedRustType {
+            name: "<TypeParam>".to_string(),
+            context: RustTypeLookupContext::DeferredTypeParam {
+                query: format!("inherent method `{}::{}`", type_name, method_name),
+            },
+        });
+    }
     let Some(type_def_id) = find_rust_type_def_id(tcx, type_name) else { return Ok(None) };
     let Some(method_def_id) = find_inherent_method(tcx, type_def_id, method_name) else { return Ok(None) };
     let arg_ctx = RustTypeLookupContext::InherentMethodTypeArg {
@@ -837,7 +880,7 @@ pub fn rust_trait_method_param_types<'tcx>(
         return Err(UnresolvedRustType {
             name: "<TypeParam>".to_string(),
             context: RustTypeLookupContext::DeferredTypeParam {
-                trait_name: trait_name.to_string(), method: method_name.to_string(),
+                query: format!("trait call `{}::{}`", trait_name, method_name),
             },
         });
     }
@@ -911,7 +954,7 @@ pub fn rust_trait_method_return_type<'tcx>(
         return Err(UnresolvedRustType {
             name: "<TypeParam>".to_string(),
             context: RustTypeLookupContext::DeferredTypeParam {
-                trait_name: trait_name.to_string(), method: method_name.to_string(),
+                query: format!("trait call `{}::{}`", trait_name, method_name),
             },
         });
     }
@@ -1004,7 +1047,7 @@ mod tests {
         let deferred = UnresolvedRustType {
             name: "<TypeParam>".into(),
             context: RustTypeLookupContext::DeferredTypeParam {
-                trait_name: "Clone".into(), method: "clone".into(),
+                query: "trait call `Clone::clone`".into(),
             },
         };
         assert!(deferred.is_deferred());
