@@ -4,6 +4,7 @@ source = "main.toylang"
 
 [rust-dependencies]
 test_helpers = { path = "../test_helpers" }
+some_rust_lib = { path = "../some_rust_lib" }
 
 [toylang-dependencies]
 case6_lib = { path = "../case6_lib" }

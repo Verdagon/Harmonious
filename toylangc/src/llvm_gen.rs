@@ -161,7 +161,34 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
             ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before codegen", name),
-            ResolvedType::StructRef { name, .. } => panic!("StructRef '{}' should be resolved to Struct before codegen", name),
+            ResolvedType::StructRef { name, type_args } => {
+                // Session 9 sharpening — when the call-site lowering surfaces
+                // a `StructRef` (e.g., the return type of a Rust generic
+                // intermediary like `duplicate<Widget>(&w)` where the oracle
+                // produced `StructRef "Widget"` rather than the fully-flattened
+                // `Struct`), resolve it lazily via the registry instead of
+                // bailing. The registry has the struct definition by name;
+                // we only need to mirror `resolve_struct_fields`' work for
+                // this one type.
+                //
+                // The eager `resolve_struct_fields` calls at function
+                // boundaries (params + return type) still fire — this fallback
+                // catches transient StructRefs in expression positions that
+                // the earlier pass didn't reach.
+                let resolved = crate::toylang::type_resolve::resolve_struct_fields(
+                    &ResolvedType::StructRef { name: name.clone(), type_args: type_args.clone() },
+                    self.registry,
+                ).unwrap_or_else(|e| {
+                    panic!("failed to resolve StructRef '{}' lazily in codegen: {:?}", name, e)
+                });
+                if matches!(&resolved, ResolvedType::StructRef { .. }) {
+                    // Registry didn't have the struct — that's the original
+                    // "should be resolved before codegen" condition, surface
+                    // the panic so the diagnostic remains useful.
+                    panic!("StructRef '{}' could not be resolved by registry", name);
+                }
+                self.resolved_to_inkwell(&resolved)
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 [project]
 name = "case4_sky_impl_rust_trait"
 source = "main.toylang"
-rust_caller = "rust_caller.rs"
 
 [rust-dependencies]
 test_helpers = { path = "../test_helpers" }
+some_rust_lib = { path = "../some_rust_lib" }

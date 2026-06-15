@@ -1,4 +1,5 @@
 use std::clone::Clone
+use some_rust_lib::duplicate
 
 fn println_i32(x: i32)
 
@@ -12,10 +13,12 @@ impl Clone for Widget {
     }
 }
 
-fn make_widget(n: i32) -> Widget {
-    Widget { id: n }
-}
-
 fn id_of(w: &Widget) -> i32 {
     w.id
+}
+
+fn main() {
+    let w = Widget { id: 42 };
+    let copy = duplicate<Widget>(&w);
+    println_i32(id_of(&copy));
 }

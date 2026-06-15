@@ -213,6 +213,7 @@ fn run_toylang_compile(
         is_user_bin_compile,
         upstream_fn_names: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         upstream_type_names: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        upstream_structs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     rustc_lang_facade::driver::run_compiler(toylang_callbacks, &args);

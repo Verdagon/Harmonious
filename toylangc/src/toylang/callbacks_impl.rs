@@ -116,6 +116,12 @@ pub struct ToylangCallbacks {
     pub upstream_fn_names: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Same as `upstream_fn_names` but for consumer types (struct names).
     pub upstream_type_names: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Session 9 — full ToyStruct definitions from upstream Sky libs, keyed
+    /// by struct name. Mirrors what's in `ToylangState.upstream_registries`
+    /// but accessible from `&self` predicates (e.g. `monomorphize_type`)
+    /// that don't get state access. Populated alongside `upstream_type_names`
+    /// in `on_sky_lib_loaded`.
+    pub upstream_structs: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::toylang::registry::ToyStruct>>>,
     /// True at the user-bin compile under two-crate wrapper mode (course-
     /// correct.md items #11 + #15, Workstream A). The renaming + semantic
     /// flip from the prior `is_downstream_of_stubs` is part of A's
@@ -747,6 +753,13 @@ impl LangCallbacks for ToylangCallbacks {
             let mut tys = self.upstream_type_names.lock().unwrap();
             for name in registry.structs.keys() { tys.insert(name.clone()); }
         }
+        // Session 9 — mirror full ToyStruct definitions for upstream-aware
+        // `monomorphize_type` (Case 6: rustc queries layout of
+        // `case6_lib::Pair` during the binary's Rust-generic walk).
+        {
+            let mut structs = self.upstream_structs.lock().unwrap();
+            for (name, ts) in &registry.structs { structs.insert(name.clone(), ts.clone()); }
+        }
         ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
 
@@ -760,8 +773,25 @@ impl LangCallbacks for ToylangCallbacks {
         // so `lang_layout_of` can re-enter during `generate_and_compile`
         // without deadlocking. Former `CallbackLog::MonomorphizeType`
         // log push retired — wasn't consumed by any test.
-        let toy_struct = self.registry.structs.get(name)
-            .unwrap_or_else(|| panic!("[toylang] monomorphize_type: struct '{}' not in registry", name));
+        //
+        // Session 9 — Case 6 sharpening: when the app's binary compile
+        // queries `layout_of` for a struct defined in an upstream Sky
+        // library (Pair lives in case6_lib, queried from case6_app), the
+        // struct isn't in the local registry. Fall back to the upstream
+        // registries S.4 deposited so cross-Sky-crate layouts work. The
+        // local registry takes precedence to preserve shadowing semantics
+        // when names collide.
+        let toy_struct_local = self.registry.structs.get(name).cloned();
+        let toy_struct: crate::toylang::registry::ToyStruct = if let Some(ts) = toy_struct_local {
+            ts
+        } else {
+            self.upstream_structs.lock().unwrap().get(name).cloned()
+                .unwrap_or_else(|| panic!(
+                    "[toylang] monomorphize_type: struct '{}' not in local or upstream registries",
+                    name,
+                ))
+        };
+        let toy_struct = &toy_struct;
 
         // Build type-param substitution at the rustc Ty level (no round-trip through ResolvedType).
         let ty_subst: HashMap<&str, Ty<'tcx>> = if !toy_struct.type_params.is_empty() {
