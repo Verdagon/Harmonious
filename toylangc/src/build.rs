@@ -157,13 +157,23 @@ fn write_workspace_toml(build_dir: &Path, stub_dir_names: &[String]) -> Result<(
 }
 
 /// User-bin Cargo.toml. Depends on `__lang_stubs` by path AND re-lists
-/// every user rust_dependencies entry directly. The re-listing matters
-/// because toylang's emitted `.o` (bundled into the rlib via the codegen
-/// wrapper) calls into rust_dependencies symbols at the OBJECT-FILE level
-/// — cargo's transitive-dep linking only follows Rust metadata references,
-/// which the rlib's `extern "C" { pub fn foo(...); }` decls don't create.
-/// Without the bin-side dep, the linker sees the toylang `.o`'s undefined
-/// `_foo` symbol and has nothing to satisfy it.
+/// every user rust_dependencies entry directly.
+///
+/// Why re-list (post-Workstream A): under the binary-codegen model
+/// (course-correct #11 + #15), toylang's emitted `.o` lives at the
+/// user-bin compile, not bundled into the rlib. The undefined-symbol
+/// concern from the pre-Workstream-A era is gone (the rlib no longer
+/// references rust_deps symbols).
+///
+/// What remains load-bearing: rust_caller (Phase 1 D fixtures for cases
+/// 1a/1b/3/5) writes Rust source compiled inside user_bin that names
+/// the rust_dependencies directly (`use serde::...`, etc.), so cargo
+/// must pass `--extern serde=...` to the user_bin's rustc. That happens
+/// only when serde is a direct cargo dep of user_bin — the rlib's
+/// transitive dep doesn't create the `--extern` flag.
+///
+/// Without the direct re-listing, user_bin's compile would fail with
+/// "unresolved import `serde`" before linking ever ran.
 fn write_user_bin_cargo_toml(
     user_dir: &Path,
     project_dir: &Path,
