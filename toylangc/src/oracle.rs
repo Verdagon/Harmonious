@@ -71,55 +71,14 @@ use rustc_hir::def::DefKind;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::DefId;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-
-// Thread-local map from Param name to the Param's index in its owning
-// item's generics. Set by `ActiveParamMap::install` at the start of a
-// deps walk (see `callbacks_impl::collect_generic_rust_deps_inner`) and
-// cleared automatically when the returned guard drops. `try_resolved_to_rustc_ty`
-// consults this map when it encounters `ResolvedType::TypeParam` so the
-// converter can rebuild the rustc `TyKind::Param` at the right index. No
-// map → TypeParam still panics (the fast path for codegen and
-// non-generic walks). Per-worker (rayon) scope: the guard's lifetime
-// bounds the Param-aware region on the firing worker thread; no cross-
-// thread contamination.
-thread_local! {
-    static ACTIVE_PARAM_INDICES: RefCell<Option<HashMap<String, u32>>> = const { RefCell::new(None) };
-}
-
-/// Scope guard that installs a Param-name → Param-index mapping into the
-/// thread-local consulted by `try_resolved_to_rustc_ty`. Drop clears the
-/// mapping. Nested installations are not supported and will panic — the
-/// deps walker is single-shot per `collect_generic_rust_deps` call.
-pub struct ActiveParamMap {
-    _priv: (),
-}
-
-impl ActiveParamMap {
-    pub fn install(map: HashMap<String, u32>) -> Self {
-        ACTIVE_PARAM_INDICES.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            assert!(slot.is_none(), "nested ActiveParamMap install");
-            *slot = Some(map);
-        });
-        Self { _priv: () }
-    }
-}
-
-impl Drop for ActiveParamMap {
-    fn drop(&mut self) {
-        ACTIVE_PARAM_INDICES.with(|cell| {
-            cell.borrow_mut().take();
-        });
-    }
-}
-
-fn lookup_active_param_index(name: &str) -> Option<u32> {
-    ACTIVE_PARAM_INDICES.with(|cell| {
-        cell.borrow().as_ref().and_then(|m| m.get(name).copied())
-    })
-}
+// ActiveParamMap retired in W3 (course-correct.md item #1 / Approach A
+// restoration). Under Approach B's identity-args path, `try_resolved_to_rustc_ty`
+// could hit a `ResolvedType::TypeParam("T")` and needed a thread-local index
+// map to rebuild the rustc `TyKind::Param`. Under Approach A, Sky-side
+// substitution in `collect_generic_rust_deps_inner` replaces every TypeParam
+// with the concrete `ResolvedType` *before* this converter sees it. The
+// TypeParam arm in `try_resolved_to_rustc_ty` now panics unconditionally —
+// a Param reaching it is a substitution bug, not a routine case to recover from.
 
 /// Cross-crate-aware DefId resolver. Searches for an item named `name` whose
 /// `Res::Def` kind passes `kind_filter`. Search order:
@@ -155,13 +114,22 @@ fn resolve_rust_path(
     ) {
         return Some(def_id);
     }
-    // Extern __lang_stubs rlib. Under the two-crate architecture this is
+    // Extern Sky stub rlib(s). Under the two-crate architecture this is
     // the user-bin side lookup path that resolves re-exports carried by
-    // the stub rlib (e.g. `pub use std::io::Stdout;`).
-    let stubs_cnum = tcx.crates(()).iter().copied().find(|&c| {
-        tcx.crate_name(c).as_str() == "__lang_stubs"
-    })?;
-    match_module_child_extern(tcx, stubs_cnum.as_def_id(), name, kind_filter)
+    // the stub rlib (e.g. `pub use std::io::Stdout;`). Phase 3 E.1 swapped
+    // the crate-name match for marker-based detection: any extern crate
+    // carrying `__SKY_STUBS_MARKER` (the facade's `is_from_lang_stubs`
+    // predicate) is a candidate. There is currently always exactly one
+    // such crate; multi-crate (E.3) will iterate.
+    for c in tcx.crates(()).iter().copied() {
+        if !rustc_lang_facade::is_from_lang_stubs(tcx, c.as_def_id()) {
+            continue;
+        }
+        if let Some(def_id) = match_module_child_extern(tcx, c.as_def_id(), name, kind_filter) {
+            return Some(def_id);
+        }
+    }
+    None
 }
 
 fn match_module_child_local(
@@ -290,21 +258,20 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
         ResolvedType::Str => Ok(tcx.types.str_),
         ResolvedType::ByteSlice => Ok(ty::Ty::new_slice(tcx, tcx.types.u8)),
         ResolvedType::TypeParam(name) => {
-            // Under the `optimized_mir` override path, Params flow through the
-            // deps walker. `ActiveParamMap::install` records each Param's
-            // index in the caller's generics; we rebuild the rustc
-            // `TyKind::Param` from (index, name). Outside of a Param-aware
-            // scope (e.g., codegen, non-generic walks) this arm still panics
-            // — which preserves the pre-stage-3 invariant that Params are
-            // substituted before reaching codegen.
-            let Some(index) = lookup_active_param_index(name) else {
-                panic!(
-                    "TypeParam '{}' reached try_resolved_to_rustc_ty outside a \
-                     Param-aware scope (no ActiveParamMap installed)",
-                    name
-                );
-            };
-            Ok(ty::Ty::new_param(tcx, index, rustc_span::Symbol::intern(name)))
+            // Approach A invariant: Sky-side substitution in
+            // `callbacks_impl::collect_generic_rust_deps_inner` (or the layout
+            // / type-resolution paths that use this converter) has already
+            // replaced every TypeParam with the concrete ResolvedType from
+            // the relevant Instance's args. A Param reaching this converter
+            // means upstream substitution missed an entry — that's a bug, not
+            // something to recover from.
+            panic!(
+                "TypeParam '{}' reached try_resolved_to_rustc_ty; \
+                 Sky-side substitution should have replaced it with the \
+                 concrete ResolvedType before this point (course-correct.md \
+                 item #1, Approach A invariant)",
+                name,
+            )
         }
     }
 }
@@ -443,14 +410,40 @@ pub fn wrapper_fn_name(type_name: &str, method_name: &str) -> Option<&'static st
         .map(|(_, _, w)| *w)
 }
 
-/// Find a wrapper function in __lang_stubs by name.
+/// Find a wrapper function in __lang_stubs by name. The Phase-6 wrappers
+/// (`__toylang_option_unwrap<T>` etc.) are emitted by `stub_gen` as ordinary
+/// `pub fn` items at the `__lang_stubs` crate root, so this lookup matches
+/// the crate-root `Fn` pattern (not the `extern "C" { pub fn ... }` foreign
+/// pattern that `find_extern_fn_def_id` handles).
 fn find_wrapper_fn_def_id(tcx: TyCtxt<'_>, wrapper_name: &str) -> Option<DefId> {
+    // Local walk: works at the rlib compile where __lang_stubs IS the
+    // local crate.
     for local_def_id in tcx.hir_crate_items(()).definitions() {
         let def_id = local_def_id.to_def_id();
         if tcx.def_kind(def_id) != DefKind::Fn { continue; }
         if tcx.item_name(def_id).as_str() != wrapper_name { continue; }
         if rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
             return Some(def_id);
+        }
+    }
+    // Cross-crate fallback (stage-5a oracle sweep completion, like
+    // `find_extern_fn_def_id`): under the two-crate architecture the
+    // user-bin compile sees `__lang_stubs` as extern. `redirect_to_wrapper`
+    // is called from the codegen path (`llvm_gen.rs:360`) and from the
+    // recursive dep walker (`callbacks_impl.rs:937`); both surfaces are
+    // exercised at user-bin time once Workstream A moves codegen there.
+    // Phase 3 E.6: iterate ALL marker-bearing crates (see
+    // `find_extern_fn_in_stub_rlib`).
+    use rustc_hir::def::Res;
+    for c in tcx.crates(()).iter().copied() {
+        if !rustc_lang_facade::is_from_lang_stubs(tcx, c.as_def_id()) {
+            continue;
+        }
+        for child in tcx.module_children(c.as_def_id()) {
+            if child.ident.as_str() != wrapper_name { continue; }
+            if let Res::Def(DefKind::Fn, def_id) = child.res {
+                return Some(def_id);
+            }
         }
     }
     None
@@ -552,7 +545,86 @@ pub fn find_extern_fn_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
             foreign_match = Some(def_id);
         }
     }
-    foreign_match
+    if let Some(found) = foreign_match {
+        return Some(found);
+    }
+    // Cross-crate fallback (completes the stage-5a oracle sweep that
+    // landed `resolve_rust_path` for the `use`-imported lookups but
+    // never extended `find_extern_fn_def_id` to extern crates). Under
+    // the two-crate architecture the user-bin compile's local HIR holds
+    // only the `fn main() { __toylang_main(); }` shim — every
+    // `extern "C" { pub fn println_i32; }` declaration lives in the
+    // upstream `__lang_stubs` rlib. Without this fallback any user-bin
+    // codegen path that resolves an extern fn name (e.g. the call-site
+    // resolution at `llvm_gen.rs:1173`) would panic, which is the
+    // blocker that surfaced when Workstream A's prototype tried to
+    // move codegen to user-bin time.
+    find_extern_fn_in_stub_rlib(tcx, name)
+}
+
+/// Find a `pub fn <name>` defined at the `__lang_stubs` rlib's crate root
+/// (NOT inside an `extern "C" {}` block). `stub_gen` emits these for every
+/// consumer fn with a body — they're the `unreachable!()`-bodied Rust
+/// shells that match a toylang fn's signature so rustc has a DefId for
+/// the call site. The user-bin compile, post-Workstream-A, needs these
+/// DefIds to construct rustc `Instance`s for ABI-aware extern-wrapper
+/// codegen (`__toylang_impl_*` emission). Returns None if no match.
+pub fn find_stub_fn_in_stub_rlib(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
+    // Phase 3 E.6: iterate ALL marker-bearing crates (see
+    // `find_extern_fn_in_stub_rlib` for the why).
+    use rustc_hir::def::Res;
+    for c in tcx.crates(()).iter().copied() {
+        if !rustc_lang_facade::is_from_lang_stubs(tcx, c.as_def_id()) {
+            continue;
+        }
+        for child in tcx.module_children(c.as_def_id()) {
+            if child.ident.as_str() != name { continue; }
+            if let Res::Def(DefKind::Fn, def_id) = child.res {
+                if !tcx.is_foreign_item(def_id) {
+                    return Some(def_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Walk the `__lang_stubs` extern crate root + each `extern "C"` foreign-mod
+/// child, looking for a foreign fn named `name`. Returns the foreign-item's
+/// DefId. Symmetric with the local walk in `find_extern_fn_def_id`'s loop
+/// (matches the `extern "C" { pub fn ...; }` shape `stub_gen` emits).
+fn find_extern_fn_in_stub_rlib(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {
+    // Phase 3 E.1/E.6: iterate ALL marker-bearing crates, not just the first.
+    // Under multi-toylang-project builds the dep's stub rlib may come up in
+    // `tcx.crates(())` before the root's, so a `.find()`-then-search shape
+    // would search the wrong crate and miss legitimate extern fns.
+    use rustc_hir::def::Res;
+    for c in tcx.crates(()).iter().copied() {
+        if !rustc_lang_facade::is_from_lang_stubs(tcx, c.as_def_id()) {
+            continue;
+        }
+        let stubs_root = c.as_def_id();
+        // The crate root's direct children include the `extern "C" {}`
+        // block as a ForeignMod. Foreign fns are children of that ForeignMod,
+        // not of the crate root, so we recurse one level into each ForeignMod.
+        for child in tcx.module_children(stubs_root) {
+            if let Res::Def(kind, mid) = child.res {
+                if kind == DefKind::ForeignMod {
+                    for fchild in tcx.module_children(mid) {
+                        if fchild.ident.as_str() != name { continue; }
+                        if let Res::Def(fkind, fdid) = fchild.res {
+                            if fkind == DefKind::Fn && tcx.is_foreign_item(fdid) {
+                                return Some(fdid);
+                            }
+                        }
+                    }
+                } else if kind == DefKind::Fn && child.ident.as_str() == name {
+                    return Some(mid);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn find_rust_type_def_id(tcx: TyCtxt<'_>, name: &str) -> Option<DefId> {

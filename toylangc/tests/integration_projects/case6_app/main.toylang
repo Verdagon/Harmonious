@@ -1,0 +1,6 @@
+fn println_i32(x: i32)
+
+fn main() {
+    let y = double_it(21);
+    println_i32(y);
+}

@@ -3,7 +3,6 @@ use super::registry::{
     ToyField, ToyFunction, ToyParam, ToyStruct, ToylangRegistry,
 };
 use super::typed_ast::ResolvedType;
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -323,8 +322,12 @@ impl Parser {
     }
 
     fn parse_program(&mut self) -> Result<ToylangRegistry, ParseError> {
-        let mut structs: HashMap<String, ToyStruct> = HashMap::new();
-        let mut functions: HashMap<String, ToyFunction> = HashMap::new();
+        // BTreeMap (not HashMap) per the sidecar determinism requirement —
+        // see docs/architecture/sidecar-format.md.
+        let mut structs: std::collections::BTreeMap<String, ToyStruct> =
+            std::collections::BTreeMap::new();
+        let mut functions: std::collections::BTreeMap<String, ToyFunction> =
+            std::collections::BTreeMap::new();
         let mut imports: Vec<String> = Vec::new();
         let mut struct_names: Vec<String> = Vec::new();
 

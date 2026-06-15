@@ -785,7 +785,7 @@ mod tests {
     fn test_is_rust_trait(_name: &str) -> bool { false }
 
     fn make_registry() -> ToylangRegistry {
-        let mut structs = std::collections::HashMap::new();
+        let mut structs = std::collections::BTreeMap::new();
         structs.insert("Counter".to_string(), ToyStruct {
             type_params: vec![],
             fields: vec![ToyField { name: "value".to_string(), rust_type: ResolvedType::I32 }],
@@ -819,7 +819,7 @@ mod tests {
                 rust_type: ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32] },
             }],
         });
-        let mut functions = std::collections::HashMap::new();
+        let mut functions = std::collections::BTreeMap::new();
         functions.insert("wrap".to_string(), ToyFunction {
 
             type_params: vec!["T".to_string()],

@@ -5,7 +5,7 @@ use std::process::Command;
 // tests cannot import from a `[[bin]]`-only crate, so the pin is carried
 // independently. See HANDOFF-nightly-bump.md §3.2 and the `TOYLANG_NIGHTLY`
 // doc comment in main.rs for the bump-site inventory.
-const TOYLANG_NIGHTLY: &str = "nightly-2026-01-20";
+const TOYLANG_NIGHTLY: &str = "rustc-fork";
 
 fn toylangc_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_toylangc"))

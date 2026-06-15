@@ -16,12 +16,12 @@
 //! See `docs/architecture/risks.md` §B6 and `@GCMLZ` for the full story,
 //! including the `_inner` bypass used during codegen to avoid re-locking.
 //!
-//! @SMINCZ — computing a symbol name here does NOT force rustc to codegen
+//! @SyMINCZ — computing a symbol name here does NOT force rustc to codegen
 //! the `Instance`. It is a pure read. Codegen for consumer-referenced Rust
 //! generics is driven exclusively by the `ReifyFnPointer` casts synthesized
-//! in the `optimized_mir` override's `build_dependency_body`. A reader who
+//! in the `per_instance_mir` override's `build_dependency_body`. A reader who
 //! sees this file as "the place where the consumer's symbol enters LLVM IR"
-//! and assumes it also drives codegen is in the trap the @SMINCZ arcana
+//! and assumes it also drives codegen is in the trap the @SyMINCZ arcana
 //! documents.
 
 use rustc_middle::ty::{self, Instance, TyCtxt};
@@ -48,7 +48,7 @@ pub fn lang_symbol_name<'tcx>(
 
             if is_fn || is_accessor {
                 // Build callback name (must match the one constructed in the
-                // optimized_mir override — consumers key on this string)
+                // per_instance_mir override — consumers key on this string)
                 let callback_name = if is_accessor {
                     if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
                         let impl_def_id = assoc_item.container_id(tcx);

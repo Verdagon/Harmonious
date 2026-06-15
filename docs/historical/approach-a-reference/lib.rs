@@ -1,12 +1,8 @@
 //! rustc-lang-facade: a library for integrating custom languages with rustc.
 //!
 //! Consumers implement the `LangCallbacks` trait and call `run_compiler()`.
-//! The library handles query overrides, `CodegenBackend` wrapping, and the
-//! rustc driver lifecycle. Stub-crate generation is the consumer's
-//! responsibility — under the two-crate architecture (stage 5b/5c.4) the
-//! `__lang_stubs` rlib is produced on disk by the consumer's build step
-//! and compiled by cargo as ordinary Rust, so the facade has no stub-
-//! injection surface.
+//! The library handles query overrides, stub injection, codegen backend
+//! wrapping, and the rustc driver lifecycle.
 
 #![feature(rustc_private)]
 
@@ -15,7 +11,6 @@ extern crate rustc_codegen_llvm;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
-extern crate rustc_hashes;
 extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_interface;
@@ -29,15 +24,13 @@ extern crate rustc_target;
 pub mod abi_helpers;
 pub mod codegen_wrapper;
 pub mod driver;
+pub mod file_loader;
 pub mod mir_helpers;
 pub mod queries;
 
-mod cgu_stash;
-pub use cgu_stash::upstream_cgus;
-pub(crate) use cgu_stash::{clear_upstream_cgus, stash_upstream_cgus};
-
 use std::path::PathBuf;
 
+use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
 
@@ -51,12 +44,9 @@ pub struct MonomorphizeTypeResult<'tcx> {
 
 /// The main interface between the library and a consumer language.
 ///
-/// The library identifies consumer items by the crate they live in — every
-/// stub item is in the `__lang_stubs` rlib — and by the `is_consumer_type`
-/// / `is_consumer_fn` predicates the consumer supplies on `LangPredicates`.
-/// Under the two-crate architecture (stage 5b/5c.4) `__lang_stubs` is a
-/// real on-disk rlib produced by the consumer's build step; the prior
-/// `generate_stubs` FileLoader-injected shape is retired.
+/// The library identifies consumer items automatically by tracking which DefIds
+/// came from the stub file (injected via generate_stubs). The consumer does not
+/// need to provide is_lang_type / is_lang_fn methods.
 ///
 /// Must be Send + Sync because rustc query providers run on Rayon worker threads.
 use std::any::Any;
@@ -91,15 +81,27 @@ pub trait LangPredicates: Send + Sync {
     /// Check if a function name belongs to the consumer's language.
     fn is_consumer_fn(&self, name: &str) -> bool;
 
-    // Stage 4c retired `visibility_override`: the partitioner override in
-    // `queries::partition` now forces `(External, Default)` on
-    // `__lang_stubs` items directly. No trait method needed.
-    //
-    // Stage 5c.4 retired `generate_stubs`: under the two-crate architecture
-    // the stub rlib's `src/lib.rs` is written by the consumer's build-mode
-    // path (e.g. `toylangc build`'s `write_stub_crate`), not injected into
-    // rustc at compile time. The facade no longer needs to know how to
-    // generate stubs.
+    /// Generate the Rust source code to inject via FileLoader.
+    fn generate_stubs(&self) -> String;
+
+    /// Optionally override an item's linkage and visibility during CGU
+    /// partitioning. Returning `None` defers to rustc's normal logic;
+    /// returning `Some((linkage, vis))` short-circuits `mono_item_visibility`
+    /// and prevents internalization.
+    ///
+    /// Used to keep symbols in the consumer's stub module visible to the
+    /// externally-linked consumer .o file (rustc's CGU partitioner cannot
+    /// see those references and would otherwise internalize the symbols).
+    ///
+    /// Default impl returns `None` — consumers that don't need this hook
+    /// can ignore it.
+    fn visibility_override<'tcx>(
+        &self,
+        _tcx: TyCtxt<'tcx>,
+        _instance: ty::Instance<'tcx>,
+    ) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
+        None
+    }
 }
 
 /// Stateful callbacks: each takes `&mut dyn Any state` (downcast to your
@@ -112,37 +114,17 @@ pub trait LangCallbacks: LangPredicates {
     fn create_state(&self) -> Box<dyn Any + Send + Sync>;
 
     /// Monomorphize a consumer type for concrete type args.
-    ///
-    /// Stateless: no `&mut dyn Any state` param. Called from
-    /// `lang_layout_of`, which can re-enter during
-    /// `generate_and_compile` (whose trampoline holds MUTABLE_STATE).
-    /// Under rustc incremental cache + warm rebuild, `layout_of` queries
-    /// that fired cold during the mono walk get skipped on cache hit and
-    /// fire later when `codegen_extern_wrapper` calls
-    /// `coerced_return_type_for_instance → fn_abi_of_instance → layout_of`
-    /// — now inside the outer mutex. A stateful callback would re-lock
-    /// MUTABLE_STATE from `call_monomorphize_type` and deadlock. The
-    /// stateless signature lets the facade dispatcher skip the lock.
-    ///
-    /// Correspondingly, no per-call logging can happen here; the former
-    /// `CallbackLog::MonomorphizeType` entry is retired (unused by any
-    /// test or diagnostic).
     fn monomorphize_type<'tcx>(
         &self,
+        state: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         ty: Ty<'tcx>,
     ) -> MonomorphizeTypeResult<'tcx>;
 
-    /// Called from the `per_instance_mir` query override for each concrete
-    /// consumer Instance. Returns the Rust items this consumer Instance
+    /// Called from the `per_instance_mir` query provider for each consumer
+    /// function Instance. Returns the Rust items this consumer function
     /// transitively depends on, as `(DefId, GenericArgsRef)` pairs.
-    ///
-    /// **Approach A contract (rust-interop-architecture.md §3.1, §19.1).** The
-    /// caller passes a fully concrete `Instance<'tcx>` — `instance.args` are
-    /// already substituted Sky-side. The returned `GenericArgsRef`s for each
-    /// dep must likewise be concrete in Sky's universe; Param-bearing args
-    /// returned here trip a `debug_assert` in the facade's `build_dependency_body`.
     ///
     /// Because rustc does not see internal consumer→consumer callees, the
     /// implementation must walk the consumer side transitively to gather
@@ -158,6 +140,7 @@ pub trait LangCallbacks: LangPredicates {
         state: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
+        def_id: LocalDefId,
         instance: ty::Instance<'tcx>,
     ) -> Vec<(DefId, GenericArgsRef<'tcx>)>;
 
@@ -179,34 +162,6 @@ pub trait LangCallbacks: LangPredicates {
 
     /// Called after rustc's analysis phase completes.
     fn after_rust_analysis<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>);
-
-    /// Called once per upstream Sky-marked rlib loaded into the local
-    /// compile, BEFORE `after_rust_analysis`. The facade discovers the
-    /// rlib by walking `tcx.crates(())` and checking each crate root for
-    /// the `__lang_stubs` marker (Phase 3 E.1 will replace the hardcoded
-    /// crate-name check with `__SKY_STUBS_MARKER` per the architecture
-    /// doc §4.5 / §6.3), then locates the adjacent `.sky-meta` sidecar
-    /// via `tcx.used_crate_source(c).rlib` with the extension swapped,
-    /// reads the file, and invokes this callback with the raw bytes.
-    ///
-    /// The facade deliberately knows nothing about the consumer's payload
-    /// shape — it just hands over the bytes. The consumer is responsible
-    /// for deserialization (toylang routes through
-    /// `crate::sidecar::deserialize_sidecar`) and for merging the loaded
-    /// universe into its own state.
-    ///
-    /// Per the S.4 Workstream-S task (course-correct.md quarter-of-work
-    /// plan): the loader lands here; downstream A.3 will consume the
-    /// loaded registries to populate the codegen queue at the user-bin
-    /// compile. S.4 itself does NOT change codegen behavior — toylang
-    /// just stashes the registry for later workstreams.
-    fn on_sky_lib_loaded<'tcx>(
-        &self,
-        state: &mut dyn Any,
-        tcx: TyCtxt<'tcx>,
-        crate_name: &str,
-        sidecar_bytes: &[u8],
-    );
 
     /// Compile the consumer's function bodies and return the path to the .o file.
     fn generate_and_compile<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)>;
@@ -231,18 +186,21 @@ use std::sync::OnceLock;
 struct PredicateVtable {
     is_consumer_type: fn(&(dyn Any + Send + Sync), &str) -> bool,
     is_consumer_fn: fn(&(dyn Any + Send + Sync), &str) -> bool,
+
+    visibility_override: for<'tcx> fn(
+        &(dyn Any + Send + Sync),
+        TyCtxt<'tcx>,
+        ty::Instance<'tcx>,
+    ) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)>,
 }
 
 /// Vtable for the stateful (`LangCallbacks`) callback family. Helpers
 /// dispatching through this vtable lock `MUTABLE_STATE` for the duration of
 /// the call.
 struct StatefulVtable {
-    // `monomorphize_type` takes no state (unlike the other entries in
-    // this vtable). Dispatch via `call_monomorphize_type` skips the
-    // mutex — see trait method's doc comment for the re-entrancy
-    // rationale.
     monomorphize_type: for<'tcx> fn(
         &(dyn Any + Send + Sync),
+        &mut (dyn Any + Send + Sync),
         &str,
         TyCtxt<'tcx>,
         Ty<'tcx>,
@@ -253,6 +211,7 @@ struct StatefulVtable {
         &mut (dyn Any + Send + Sync),
         &str,
         TyCtxt<'tcx>,
+        LocalDefId,
         ty::Instance<'tcx>,
     ) -> Vec<(DefId, GenericArgsRef<'tcx>)>,
 
@@ -268,14 +227,6 @@ struct StatefulVtable {
         &(dyn Any + Send + Sync),
         &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
-    ),
-
-    on_sky_lib_loaded: for<'tcx> fn(
-        &(dyn Any + Send + Sync),
-        &mut (dyn Any + Send + Sync),
-        TyCtxt<'tcx>,
-        &str,
-        &[u8],
     ),
 
     generate_and_compile: for<'tcx> fn(
@@ -332,12 +283,6 @@ static CONFIG: OnceLock<FacadeConfig> = OnceLock::new();
 static DEFAULT_LAYOUT_OF: OnceLock<queries::layout::LayoutOfFn> = OnceLock::new();
 static DEFAULT_MIR_SHIMS: OnceLock<queries::drop_glue::MirShimsFn> = OnceLock::new();
 static DEFAULT_SYMBOL_NAME: OnceLock<queries::symbol_name::SymbolNameFn> = OnceLock::new();
-// No DEFAULT_PER_INSTANCE_MIR: the upstream default returns None unconditionally
-// (see comment near `default_collect_and_partition`).
-static DEFAULT_COLLECT_AND_PARTITION: OnceLock<queries::partition::CollectAndPartitionFn> =
-    OnceLock::new();
-static DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR:
-    OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsForFn> = OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock::new();
@@ -349,79 +294,38 @@ pub(crate) fn is_consumer_type(name: &str) -> bool {
     (c.predicate_vtable.is_consumer_type)(&*c.callbacks, name)
 }
 
-/// Check if a DefId is from a Sky stub rlib (i.e., its containing crate
-/// exposes `__SKY_STUBS_MARKER` at the crate root).
+/// Check if a DefId is from the __lang_stubs module (the consumer's injected stubs).
 ///
-/// **Marker-based detection** (Phase 3 E.1; architecture §4.5, §6.3, §6.5):
-/// rather than matching the crate name against the hardcoded literal
-/// `"__lang_stubs"`, the predicate walks the crate root's children for
-/// a `pub const __SKY_STUBS_MARKER: () = ();` declaration. This decouples
-/// "is this a Sky stub rlib?" from the cargo package name, which is the
-/// gating change for the multi-Sky-library shape Phase 3 builds toward
-/// (each Sky library publishes its own stub rlib named after the library,
-/// not a shared `__lang_stubs` crate).
-///
-/// Local vs cross-crate: during the rlib compile, the stub crate IS the
-/// LOCAL crate, so we walk `module_children_local(CRATE_DEF_ID)`. During
-/// the user-bin compile, the stub crate is loaded as an extern rlib, so
-/// we walk `module_children(crate_root_def_id)`. Both yield the same
-/// answer for the same logical crate; the local/extern split is just
-/// rustc-internal API plumbing.
-///
-/// Per-`CrateNum` cached because the predicate fires in hot paths
-/// (every consumer-item filter call, every accessor lookup). The cache
-/// is per rustc process; cargo spawns one rustc subprocess per crate, so
-/// the cache is effectively per-invocation.
+/// Per @DPSFDOZ, this uses `def_path_str` and is therefore safe ONLY from
+/// callers that run inside `generate_and_compile` (where rustc's diagnostic
+/// machinery is permissive). Calling this from a query provider, the
+/// partitioner, or any other normal-compilation hot path will ICE with
+/// `'trimmed_def_paths' called, diagnostics were expected but none were
+/// emitted`. For those contexts, use `is_from_lang_stubs_safe` which walks
+/// `DefPathData` structurally.
 pub fn is_from_lang_stubs(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    let cnum = def_id.krate;
-    let cache = SKY_STUBS_CRATES.get_or_init(|| {
-        std::sync::Mutex::new(rustc_data_structures::fx::FxHashMap::default())
-    });
-    if let Some(&cached) = cache.lock().unwrap().get(&cnum) {
-        return cached;
-    }
-    let result = crate_has_sky_marker(tcx, cnum);
-    cache.lock().unwrap().insert(cnum, result);
-    result
+    let path = tcx.def_path_str(def_id);
+    path.starts_with("__lang_stubs::")
 }
 
-/// Per-`CrateNum` cache for `is_from_lang_stubs`. See its doc.
-static SKY_STUBS_CRATES: OnceLock<
-    std::sync::Mutex<rustc_data_structures::fx::FxHashMap<rustc_span::def_id::CrateNum, bool>>,
-> = OnceLock::new();
-
-/// The `__SKY_STUBS_MARKER` walk that backs `is_from_lang_stubs`.
+/// Cross-crate-safe variant of `is_from_lang_stubs`. Unlike that helper
+/// (which uses `def_path_str` and is @DPSFDOZ-gated to diagnostic
+/// contexts), this version walks `DefPathData` structurally and is safe
+/// to call from any phase — the partitioner, pre-`generate_and_compile`
+/// hooks, and any future cross-crate paths.
 ///
-/// We require the marker to be *defined* in the crate being checked, not
-/// merely re-exported into it. Toylang's user-bin emits
-/// `use __lang_stubs::*;` at the crate root for ergonomics; that glob
-/// brings `__SKY_STUBS_MARKER` into the user-bin's own `module_children`
-/// listing as a re-export. Without the parentage check the user-bin would
-/// look like a stub rlib to the predicate, and the CGU filter would
-/// remove `fn main` from codegen, producing a missing-`_main` link error.
+/// Slightly more expensive than `is_from_lang_stubs` (an iterator walk
+/// vs a string check), but both are dominated by the `tcx.def_path` query
+/// underneath so the difference is imperceptible.
 ///
-/// The check: among children named `__SKY_STUBS_MARKER`, accept only ones
-/// whose `Res::Def(_, def_id)` lives in the crate we're walking. The
-/// re-export's DefId points back at the stub rlib's marker (different
-/// crate), so it's correctly rejected.
-fn crate_has_sky_marker(tcx: TyCtxt<'_>, cnum: rustc_span::def_id::CrateNum) -> bool {
-    use rustc_hir::def::Res;
-    let marker = rustc_span::Symbol::intern("__SKY_STUBS_MARKER");
-    if cnum == rustc_hir::def_id::LOCAL_CRATE {
-        tcx.module_children_local(rustc_hir::def_id::CRATE_DEF_ID)
-            .iter()
-            .any(|c| {
-                c.ident.name == marker
-                    && matches!(c.res.expect_non_local::<rustc_hir::def_id::DefId>(), Res::Def(_, def_id) if def_id.krate == cnum)
-            })
-    } else {
-        tcx.module_children(cnum.as_def_id())
-            .iter()
-            .any(|c| {
-                c.ident.name == marker
-                    && matches!(c.res, Res::Def(_, def_id) if def_id.krate == cnum)
-            })
-    }
+/// Prefer this over `is_from_lang_stubs` when the call site might run
+/// outside `generate_and_compile`, or for the compile-time guarantee
+/// that @DPSFDOZ cannot bite.
+pub fn is_from_lang_stubs_safe(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    use rustc_hir::definitions::DefPathData;
+    tcx.def_path(def_id).data.iter().any(|d| {
+        matches!(d.data, DefPathData::TypeNs(name) if name.as_str() == "__lang_stubs")
+    })
 }
 
 /// Is this DefId a consumer-owned function whose real implementation
@@ -435,16 +339,15 @@ fn crate_has_sky_marker(tcx: TyCtxt<'_>, cnum: rustc_span::def_id::CrateNum) -> 
 ///    or it's an accessor method on a consumer type.
 ///
 /// This is the filter the facade uses both (a) to decide whether to
-/// synthesize a dep-discovery body for the item in the `per_instance_mir`
-/// override (which drives rustc's monomorphization collector) and (b)
-/// to remove the item from the CGU slice in the partitioner override
-/// so rustc's codegen backend never sees it. Items inside
-/// `__lang_stubs` that are NOT consumer fns — notably the Phase-6
-/// `#[inline(never)]` wrappers like `__toylang_option_unwrap` — fall
-/// through to rustc's default codegen; they are real Rust functions
-/// whose symbol must be callable at link time.
+/// synthesize a dep-discovery body for the item (in the MIR override
+/// that drives rustc's monomorphization collector) and (b) to tell
+/// rustc's codegen to skip emitting a body at the item's symbol.
+/// Items inside `__lang_stubs` that are NOT consumer fns — notably
+/// the Phase-6 `#[inline(never)]` wrappers like `__toylang_option_unwrap`
+/// — fall through to rustc's default codegen; they are real Rust
+/// functions whose symbol must be callable at link time.
 pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
-    if !is_from_lang_stubs(tcx, def_id) {
+    if !is_from_lang_stubs_safe(tcx, def_id) {
         return false;
     }
     let Some(name) = tcx.opt_item_name(def_id) else {
@@ -453,17 +356,12 @@ pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> boo
     if is_consumer_fn(&name.to_string()) {
         return true;
     }
-    is_consumer_accessor_safe(tcx, def_id)
+    is_consumer_accessor_structural(tcx, def_id)
 }
 
 /// Accessor-method structural check (cross-crate-safe). Shared between
-/// the partitioner-override consumer filter, the `per_instance_mir`
-/// override's consumer filter, and `queries/symbol_name.rs`. Walks
-/// `opt_associated_item` to find the impl's self type structurally
-/// (via `instantiate_identity` — inspection, not instantiation) and
-/// compares its ADT name against `is_consumer_type`. Safe from any
-/// phase — the `def_path_str` trap (@DPSFDOZ) isn't reached.
-pub(crate) fn is_consumer_accessor_safe<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+/// the codegen-skip hook and the MIR-override filter.
+fn is_consumer_accessor_structural<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
     let Some(assoc_item) = tcx.opt_associated_item(def_id) else {
         return false;
     };
@@ -486,17 +384,8 @@ pub(crate) fn is_consumer_fn(name: &str) -> bool {
     (c.predicate_vtable.is_consumer_fn)(&*c.callbacks, name)
 }
 
-/// Call the consumer's monomorphize_type. Lock-free — reads only from
-/// CONFIG (immutable `OnceLock`). Safe to call during
-/// `generate_and_compile` (whose trampoline holds MUTABLE_STATE) without
-/// risking re-entrant deadlock. The callback itself is stateless by
-/// contract (see trait docs).
-///
-/// `pub` so consumers can invoke it from their generate-phase code to
-/// log layout values directly (useful for tests that need a cache-
-/// independent log source — `lang_layout_of`'s eprintln fires via
-/// the query provider, which incremental can skip on cache hit).
-pub fn call_monomorphize_type<'tcx>(
+/// Call the consumer's monomorphize_type. Holds the mutable state mutex for the entire call.
+pub(crate) fn call_monomorphize_type<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
@@ -504,19 +393,19 @@ pub fn call_monomorphize_type<'tcx>(
     let c = CONFIG.get().expect("config not installed");
     let func = c.stateful_vtable.monomorphize_type;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
+    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
     // Safety: callbacks is immutable (from CONFIG, no lock needed).
-    (func)(unsafe { &*callbacks_ptr }, name, tcx, ty)
+    // state is mutable (from MUTABLE_STATE, lock held for the entire call).
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, ty)
 }
 
 /// Call the consumer's collect_generic_rust_deps. Holds the mutable state mutex
 /// for the entire call.
-///
-/// Approach A: the caller (per_instance_mir override) passes a concrete
-/// `Instance<'tcx>`; the consumer returns concrete deps after Sky-side
-/// substitution.
 pub(crate) fn call_collect_generic_rust_deps<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
     instance: ty::Instance<'tcx>,
 ) -> Vec<(DefId, GenericArgsRef<'tcx>)> {
     let c = CONFIG.get().expect("config not installed");
@@ -524,7 +413,7 @@ pub(crate) fn call_collect_generic_rust_deps<'tcx>(
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
     let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance)
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, def_id, instance)
 }
 
 /// Call the consumer's notify_concrete_entry_point. Holds the mutable state
@@ -537,17 +426,6 @@ pub(crate) fn call_notify_concrete_entry_point<'tcx>(
     let c = CONFIG.get().expect("config not installed");
     let func = c.stateful_vtable.notify_concrete_entry_point;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
-    // @GCMLZ + Phase 3 E.6: if this call is reentering from inside
-    // `trampoline_generate_and_compile` (i.e. via a query provider like
-    // `lang_symbol_name`), MUTABLE_STATE is already held by this same
-    // thread. Re-locking on std's Mutex would deadlock. Use the
-    // trampoline-stashed state pointer instead. The pointer is only
-    // dereferenced within the trampoline's stack frame so aliasing is
-    // not a soundness issue — Rust query execution is single-threaded
-    // per session.
-    if let Some(state_ptr) = try_get_generate_and_compile_state() {
-        return (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance);
-    }
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
     let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance)
@@ -561,22 +439,6 @@ pub(crate) fn call_after_rust_analysis<'tcx>(tcx: TyCtxt<'tcx>) {
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
     let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
-}
-
-/// Call the consumer's on_sky_lib_loaded. Holds the mutable state mutex for
-/// the entire call. Per S.4 (course-correct.md quarter-of-work plan): the
-/// facade hands the consumer the raw sidecar bytes; the consumer deserializes.
-pub(crate) fn call_on_sky_lib_loaded<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    crate_name: &str,
-    sidecar_bytes: &[u8],
-) {
-    let c = CONFIG.get().expect("config not installed");
-    let func = c.stateful_vtable.on_sky_lib_loaded;
-    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
-    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx, crate_name, sidecar_bytes)
 }
 
 /// Call the consumer's generate_and_compile. Per @GCMLZ, holds MUTABLE_STATE
@@ -593,6 +455,29 @@ pub(crate) fn call_generate_and_compile<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
+/// Bridge function registered into rustc_monomorphize's
+/// `VISIBILITY_OVERRIDE_HOOK` static at startup. The partitioner calls
+/// this as a plain `fn` pointer; it forwards through `predicate_vtable`
+/// to the consumer's `visibility_override` impl.
+///
+/// Lock-free: dispatches a `LangPredicates` callback which by definition
+/// has no `&mut state` to lock. This is what makes adding partitioner-time
+/// hooks safe — the trait family enforces it structurally, no prose
+/// invariant required. See @GCMLZ for the broader locking story this
+/// pattern resolves.
+///
+/// Returns `None` if config isn't installed yet (very early init), so
+/// the partitioner falls through to its default logic harmlessly.
+fn facade_visibility_override<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
+    let c = CONFIG.get()?;
+    let func = c.predicate_vtable.visibility_override;
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
+    (func)(unsafe { &*callbacks_ptr }, tcx, instance)
+}
+
 /// Read saved default query providers. Per @GCMLZ, no locking — stored in
 /// OnceLock so they're safe to call during generate_and_compile.
 pub(crate) fn default_layout_of() -> queries::layout::LayoutOfFn {
@@ -605,26 +490,6 @@ pub(crate) fn default_mir_shims() -> queries::drop_glue::MirShimsFn {
 
 pub(crate) fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
     *DEFAULT_SYMBOL_NAME.get().expect("default symbol_name not saved")
-}
-
-// No `default_per_instance_mir` accessor: vanilla rustc's default provider
-// (installed by `rustc_mir_transform::provide` per the fork's patch 3) always
-// returns None. There's no upstream behavior to delegate to. The
-// `per_instance.rs` override returns None directly for non-consumer items;
-// rustc's collector then queries `instance_mir` via the fork's patch 2.
-
-pub(crate) fn default_collect_and_partition() -> queries::partition::CollectAndPartitionFn {
-    *DEFAULT_COLLECT_AND_PARTITION
-        .get()
-        .expect("default collect_and_partition_mono_items not saved")
-}
-
-pub(crate) fn default_upstream_monomorphizations_for()
-    -> queries::upstream_monomorphization::UpstreamMonomorphizationsForFn
-{
-    *DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR
-        .get()
-        .expect("default upstream_monomorphizations_for not saved")
 }
 
 /// Store the compiled .o path after generate_and_compile.
@@ -659,13 +524,22 @@ fn trampoline_is_consumer_fn<C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().is_consumer_fn(name)
 }
 
+fn trampoline_visibility_override<'tcx, C: LangCallbacks + 'static>(
+    data: &(dyn Any + Send + Sync),
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> Option<(rustc_middle::mir::mono::Linkage, rustc_middle::mir::mono::Visibility)> {
+    data.downcast_ref::<C>().unwrap().visibility_override(tcx, instance)
+}
+
 fn trampoline_monomorphize_type<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
+    state: &mut (dyn Any + Send + Sync),
     name: &str,
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
 ) -> MonomorphizeTypeResult<'tcx> {
-    data.downcast_ref::<C>().unwrap().monomorphize_type(name, tcx, ty)
+    data.downcast_ref::<C>().unwrap().monomorphize_type(state, name, tcx, ty)
 }
 
 fn trampoline_collect_generic_rust_deps<'tcx, C: LangCallbacks + 'static>(
@@ -673,9 +547,10 @@ fn trampoline_collect_generic_rust_deps<'tcx, C: LangCallbacks + 'static>(
     state: &mut (dyn Any + Send + Sync),
     name: &str,
     tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
     instance: ty::Instance<'tcx>,
 ) -> Vec<(DefId, GenericArgsRef<'tcx>)> {
-    data.downcast_ref::<C>().unwrap().collect_generic_rust_deps(state, name, tcx, instance)
+    data.downcast_ref::<C>().unwrap().collect_generic_rust_deps(state, name, tcx, def_id, instance)
 }
 
 fn trampoline_notify_concrete_entry_point<'tcx, C: LangCallbacks + 'static>(
@@ -696,84 +571,12 @@ fn trampoline_after_rust_analysis<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().after_rust_analysis(state, tcx)
 }
 
-fn trampoline_on_sky_lib_loaded<'tcx, C: LangCallbacks + 'static>(
-    data: &(dyn Any + Send + Sync),
-    state: &mut (dyn Any + Send + Sync),
-    tcx: TyCtxt<'tcx>,
-    crate_name: &str,
-    sidecar_bytes: &[u8],
-) {
-    data.downcast_ref::<C>().unwrap().on_sky_lib_loaded(state, tcx, crate_name, sidecar_bytes)
-}
-
 fn trampoline_generate_and_compile<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     state: &mut (dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
 ) -> Option<(PathBuf, Vec<String>)> {
-    // Phase 3 E.6 / @GCMLZ: expose the held state pointer via a thread-local
-    // so that query providers (e.g. `lang_symbol_name`) which re-enter the
-    // facade during `generate_and_compile` can reach the consumer state
-    // WITHOUT re-locking MUTABLE_STATE.
-    //
-    // The deadlock this prevents: at the user-bin compile, when toylang's
-    // codegen calls `tcx.symbol_name(instance)` for an upstream consumer
-    // function (Case 6, an item from a Sky library), rustc fires
-    // `lang_symbol_name`, which calls `call_notify_concrete_entry_point`,
-    // which (without this bypass) tries to lock MUTABLE_STATE — already
-    // held by THIS thread from the outer `call_generate_and_compile`. std's
-    // Mutex isn't reentrant, so the same thread blocks waiting on itself.
-    // (Single-project tests don't hit this because their symbol_name
-    // queries get cached by rustc during the earlier mono walk, before
-    // generate_and_compile starts.)
-    let state_ptr: *mut (dyn Any + Send + Sync) = state;
-    set_generate_and_compile_state(state_ptr);
-    let result = data.downcast_ref::<C>().unwrap().generate_and_compile(state, tcx);
-    clear_generate_and_compile_state();
-    result
-}
-
-/// Width-erased fat-pointer storage for the trampoline's held state. The
-/// thread-local stores both halves of `*mut dyn Trait`; the read site
-/// transmutes back. The pointer is only valid while the trampoline's
-/// stack frame is alive.
-#[derive(Copy, Clone)]
-struct GcState {
-    data: *mut (),
-    vtable: *mut (),
-}
-
-std::thread_local! {
-    static GENERATE_AND_COMPILE_FAT_STATE: std::cell::Cell<Option<GcState>> = const {
-        std::cell::Cell::new(None)
-    };
-}
-
-fn set_generate_and_compile_state(s: *mut (dyn Any + Send + Sync)) {
-    // SAFETY: `*mut dyn Trait` is `(*mut (), *mut ())` per Rust's current
-    // ABI. We split via transmute, recombine on read. Pointer is only
-    // dereferenced while the trampoline's stack frame is alive.
-    let raw: [*mut (); 2] = unsafe { std::mem::transmute(s) };
-    GENERATE_AND_COMPILE_FAT_STATE.with(|c| {
-        c.set(Some(GcState { data: raw[0], vtable: raw[1] }))
-    });
-}
-
-fn clear_generate_and_compile_state() {
-    GENERATE_AND_COMPILE_FAT_STATE.with(|c| c.set(None));
-}
-
-/// If we're inside `generate_and_compile`'s trampoline (which already holds
-/// MUTABLE_STATE), return the held state pointer so re-entrant callbacks
-/// can mutate state without re-locking.
-fn try_get_generate_and_compile_state() -> Option<*mut (dyn Any + Send + Sync)> {
-    GENERATE_AND_COMPILE_FAT_STATE.with(|c| {
-        c.get().map(|gc| {
-            let raw: [*mut (); 2] = [gc.data, gc.vtable];
-            // SAFETY: reverses the split in `set_generate_and_compile_state`.
-            unsafe { std::mem::transmute::<[*mut (); 2], *mut (dyn Any + Send + Sync)>(raw) }
-        })
-    })
+    data.downcast_ref::<C>().unwrap().generate_and_compile(state, tcx)
 }
 
 /// Install callbacks for use by query overrides. Phase 1 of globals init.
@@ -786,13 +589,13 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         predicate_vtable: PredicateVtable {
             is_consumer_type: trampoline_is_consumer_type::<C>,
             is_consumer_fn: trampoline_is_consumer_fn::<C>,
+            visibility_override: trampoline_visibility_override::<C>,
         },
         stateful_vtable: StatefulVtable {
             monomorphize_type: trampoline_monomorphize_type::<C>,
             collect_generic_rust_deps: trampoline_collect_generic_rust_deps::<C>,
             notify_concrete_entry_point: trampoline_notify_concrete_entry_point::<C>,
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
-            on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
             generate_and_compile: trampoline_generate_and_compile::<C>,
         },
     });
@@ -800,35 +603,30 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         consumer_state,
         lang_obj_path: None,
     }));
-    // Stage 4c retired `VISIBILITY_OVERRIDE_HOOK`: the partitioner override
-    // in `queries::partition` now forces `(External, Default)` directly on
-    // `__lang_stubs` items' `MonoItemData`. rustc_codegen_llvm reads the
-    // linkage straight from the CGU struct at emission time and never
-    // re-derives it, so the plugin-applied override survives to the final
-    // `.o` — no fork hook needed.
-    //
-    // Stage 4b retired `CODEGEN_SKIP_HOOK`: the partitioner override in
-    // `queries::partition` removes consumer items from rustc's CGU slice
-    // before codegen dispatch ever sees them, so the hook is unreachable.
-    // Fork patch 3 is deleted alongside this commit.
+    // Register the partitioner visibility-override hook so the rustc fork
+    // can call back into the consumer. Idempotent — `set` returns Err if
+    // already installed (e.g. test re-entry); we ignore.
+    let _ = rustc_monomorphize::partitioning::VISIBILITY_OVERRIDE_HOOK
+        .set(facade_visibility_override);
+    // Register the codegen-skip hook: rustc's MonoItemExt::define asks
+    // "should I skip codegen for this Instance?" for every MonoItem::Fn.
+    // We answer "yes" for consumer-owned items (consumer fns + accessor
+    // methods) — their real definitions come from the consumer's own
+    // `.o` at link time. Other items inside `__lang_stubs` (notably the
+    // Phase-6 `#[inline(never)]` unwrap wrappers) are real Rust fns
+    // whose bodies rustc must codegen normally. Structurally parallel
+    // to the visibility-override hook above.
+    let _ = rustc_codegen_ssa::mono_item::CODEGEN_SKIP_HOOK
+        .set(|tcx, instance| is_consumer_codegen_target(tcx, instance.def_id()));
 }
 
 /// Save the original query providers. Phase 2 of globals init.
-///
-/// `per_instance_mir` is intentionally absent — its upstream default returns
-/// None unconditionally (the fork's patch 3), so the override file returns
-/// None directly instead of calling through a saved default.
 pub(crate) fn install_query_defaults(
     layout_of: queries::layout::LayoutOfFn,
     mir_shims: queries::drop_glue::MirShimsFn,
     symbol_name: queries::symbol_name::SymbolNameFn,
-    collect_and_partition: queries::partition::CollectAndPartitionFn,
-    upstream_monomorphizations_for:
-        queries::upstream_monomorphization::UpstreamMonomorphizationsForFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
-    let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
-    let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR.set(upstream_monomorphizations_for);
 }

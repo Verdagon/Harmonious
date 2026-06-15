@@ -1,0 +1,3 @@
+[project]
+name = "case6_lib"
+source = "main.toylang"

@@ -1,3 +1,7 @@
 [toolchain]
-channel = "nightly-2026-01-20"
-components = ["rustc-dev", "rust-src", "llvm-tools-preview"]
+# Forked rustc with the 3 per_instance_mir patches applied (course-correct.md
+# item #1 / rust-interop-architecture.md §3.2). Built from nightly-2026-01-20
+# upstream (rustc 1.95.0-dev, commit d940e568). Rebuild procedure:
+# docs/historical/rebuilding-rustc-fork.md. To revert to vanilla, set
+# channel = "nightly-2026-01-20".
+channel = "rustc-fork"

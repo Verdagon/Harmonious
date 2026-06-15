@@ -78,6 +78,26 @@ impl rustc_driver::Callbacks for LangDriver {
         _compiler: &rustc_interface::interface::Compiler,
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
+        // S.4 (course-correct.md quarter-of-work plan): load each upstream
+        // Sky-marked rlib's adjacent `.sky-meta` sidecar and hand the bytes
+        // to the consumer. Runs BEFORE `call_after_rust_analysis` so the
+        // consumer's after-analysis pass has access to upstream universes
+        // when later workstreams (A.3) start using them. By this point all
+        // rlibs have been loaded by rustc's metadata machinery, so
+        // `tcx.crates(())` enumerates every external crate this compile
+        // depends on (transitive deps included).
+        //
+        // Detection today uses the hardcoded `__lang_stubs` crate-name
+        // check via `crate::is_from_lang_stubs`. Phase 3 E.1 swaps this
+        // for marker-based detection (`__SKY_STUBS_MARKER` at the crate
+        // root) per architecture doc §4.5 / §6.3.
+        //
+        // Sidecar path: the rlib's path with extension swapped to
+        // `.sky-meta`. Matches what S.3's writer produced via
+        // `tcx.output_filenames(()).with_extension("sky-meta")` — both
+        // sides derive the path from the same basename.
+        load_upstream_sidecars(tcx);
+
         // Phase 1.5: let consumer type-check against Rust types.
         // This runs BEFORE monomorphization — the consumer can query tcx for
         // Rust type info but doesn't know which concrete instantiations will
@@ -91,5 +111,68 @@ impl rustc_driver::Callbacks for LangDriver {
         // knowledge of what deps exist.
 
         Compilation::Continue
+    }
+}
+
+/// Walk every upstream crate; for each one that's a Sky-marked rlib,
+/// locate the adjacent `.sky-meta` sidecar, read its bytes, and hand them
+/// to the consumer via `on_sky_lib_loaded`. See `after_analysis` for the
+/// design rationale; this function is the mechanical implementation.
+///
+/// Missing-sidecar policy: per architecture doc §7.6 ("Missing sidecar is
+/// a hard error"), if a marker-bearing rlib has no adjacent sidecar we
+/// panic with a clear message. The marker means Sky machinery was
+/// supposed to be active during the rlib's compile; an absent sidecar
+/// indicates corrupted or out-of-sync target state and proceeding would
+/// produce runtime panics from `unreachable!()` stub bodies.
+fn load_upstream_sidecars(tcx: TyCtxt<'_>) {
+    use rustc_hir::def_id::CRATE_DEF_INDEX;
+    use rustc_span::def_id::DefId;
+
+    for cnum in tcx.crates(()).iter().copied() {
+        let crate_root = DefId { krate: cnum, index: CRATE_DEF_INDEX };
+        if !crate::is_from_lang_stubs(tcx, crate_root) {
+            continue;
+        }
+        let crate_name = tcx.crate_name(cnum).to_string();
+        let source = tcx.used_crate_source(cnum);
+        // CrateSource carries an `Option<PathBuf>` per artifact kind.
+        // Prefer rlib; fall back to rmeta only if rlib is absent (won't
+        // happen in practice — Sky libs always ship rlibs — but be
+        // defensive).
+        let Some(rlib_path) = source.rlib.as_ref().or(source.rmeta.as_ref()) else {
+            panic!(
+                "[facade] Sky-marked crate `{}` has no rlib/rmeta path; \
+                 cannot locate adjacent .sky-meta sidecar",
+                crate_name,
+            );
+        };
+        // Map the rlib path to its adjacent `.sky-meta` sidecar. Cargo's
+        // rlib filename carries a `lib` prefix (`liblang_stubs-HASH.rlib`),
+        // but S.3 writes the sidecar via `tcx.output_filenames(())
+        // .with_extension("sky-meta")` whose filestem is the bare crate
+        // name (no `lib` prefix). So we strip the `lib` prefix from the
+        // rlib's filename before swapping extension. (`.rmeta` paths
+        // from a metadata-only build follow the same convention.)
+        let sidecar_path = {
+            let dir = rlib_path.parent().unwrap_or(std::path::Path::new("."));
+            let stem = rlib_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let stripped = stem.strip_prefix("lib").unwrap_or(stem);
+            dir.join(format!("{}.sky-meta", stripped))
+        };
+        let sidecar_bytes = std::fs::read(&sidecar_path).unwrap_or_else(|e| {
+            panic!(
+                "[facade] Sky sidecar missing for crate `{}`\n  \
+                 expected at: {}\n  \
+                 crate marker present: yes\n  \
+                 hint: rebuild `{}` with the Sky toolchain (architecture doc §7.6)\n  \
+                 underlying error: {}",
+                crate_name,
+                sidecar_path.display(),
+                crate_name,
+                e,
+            )
+        });
+        crate::call_on_sky_lib_loaded(tcx, &crate_name, &sidecar_bytes);
     }
 }

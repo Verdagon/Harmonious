@@ -6,11 +6,10 @@ extern crate rustc_middle;
 extern crate rustc_span;
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 
 use rustc_lang_facade::{LangCallbacks, LangPredicates, MonomorphizeTypeResult};
@@ -25,17 +24,55 @@ use crate::toylang::registry::ToylangRegistry;
 #[allow(dead_code)]
 pub enum CallbackLog {
     MonomorphizeType { name: String },
-    CollectGenericRustDeps { name: String },
+    /// `args_fingerprint` is the Debug print of `instance.args` recorded
+    /// at the moment the `per_instance_mir` callback fires. Under Approach A
+    /// (course-correct.md item #1), this is the load-bearing positive
+    /// evidence that the query fired per concrete Instance with substituted
+    /// args, distinguishing it from Approach B's per-DefId firing on
+    /// identity args. Tests that exercise multiple monomorphizations of
+    /// the same consumer fn assert on distinct fingerprints; tests that
+    /// exercise a single concrete instantiation assert the fingerprint
+    /// contains the concrete type name (not "Param(").
+    CollectGenericRustDeps { name: String, args_fingerprint: String },
     NotifyConcreteEntryPoint { name: String },
     AfterRustAnalysis,
+    /// Fired once per upstream Sky-marked rlib loaded into this compile.
+    /// `crate_name` is the rlib's crate name (e.g. `"__lang_stubs"`).
+    /// `n_structs` / `n_functions` are the counts after deserialization —
+    /// useful for the S.4 smoke test, which asserts the loaded registry is
+    /// non-empty. Sidecars are loaded from the user-bin compile (the rlib
+    /// compile has no upstream Sky-marked deps under wrapper mode), so
+    /// this entry appears only in user-bin runs.
+    OnSkyLibLoaded { crate_name: String, n_structs: usize, n_functions: usize },
+    /// Fired once per user-bin compile (post-Workstream-A oracle sweep
+    /// completion: course-correct.md items #11 + #15 prep). Counts how
+    /// many of the registry's body-less (extern) functions
+    /// `find_extern_fn_def_id` could resolve via the cross-crate fallback
+    /// path in `oracle.rs::find_extern_fn_in_stub_rlib`. `total` is the
+    /// number of body-less fns probed; `resolved` is the number whose
+    /// DefId was successfully recovered from the upstream `__lang_stubs`
+    /// rlib's `module_children`. Under a correctly-functioning fallback
+    /// every body-less fn resolves (`resolved == total`); a regression in
+    /// the fallback (e.g. someone reverts it to local-only) trips the
+    /// smoke test by surfacing a mismatch.
+    OracleCrossCrateProbe { resolved: usize, total: usize },
     GenerateAndCompile,
 }
 
 /// A toylang function instance discovered during the deep monomorphization walk.
+///
+/// `stub_def_id` carries the rustc DefId of the `pub fn <name>` shell in the
+/// `__lang_stubs` rlib's source. It's `Some` when populated at the user-bin
+/// compile via Workstream A's registry-driven discovery path; the codegen
+/// pass uses it to construct an `Instance::new_raw(def_id, empty_args)` for
+/// ABI-aware extern-wrapper emission (`__toylang_impl_*`). At the rlib
+/// compile this field stays `None` (CGU-walk-driven discovery surfaces
+/// real `Instance`s directly, and the old code path didn't need this).
 #[derive(Clone)]
 pub struct ToylangInstance {
     pub extern_symbol: String,
     pub resolved_func: crate::toylang::registry::ToyFunction,
+    pub stub_def_id: Option<rustc_span::def_id::DefId>,
 }
 
 /// Mutable state accumulated during compilation. Stored in the facade's global
@@ -55,24 +92,45 @@ pub struct ToylangState {
     /// transitively-reached deps from a second entry point are re-collected
     /// rather than silently skipped.
     pub walked_entry_points: HashSet<String>,
+    /// Registries deserialized from upstream Sky-marked rlibs' `.sky-meta`
+    /// sidecars at facade-load time. Populated by `on_sky_lib_loaded`
+    /// (S.4 of the course-correct quarter-of-work plan). Keyed by the
+    /// upstream crate name. S.4 only LANDS the loader — the registries
+    /// are not yet consumed by codegen here; Workstream A.3 will read
+    /// them at the user-bin compile to populate the codegen queue.
+    /// `BTreeMap` (rather than `HashMap`) so iteration order is
+    /// deterministic — same reasoning as `ToylangRegistry` (S.2 §7.4).
+    pub upstream_registries: BTreeMap<String, ToylangRegistry>,
 }
 
 pub struct ToylangCallbacks {
     pub registry: Arc<ToylangRegistry>,
     /// (ll_path, obj_path) for LLVM compilation. None if no external codegen.
     pub llvm_paths: Option<(PathBuf, PathBuf)>,
-    /// Stage 5b: true when this callbacks instance is the downstream user-bin
-    /// compile in the two-crate wrapper mode. The stub rlib's compile has
-    /// already walked the consumer side and produced `.o`; here we install
-    /// facade overrides so cross-crate queries route correctly, but skip the
-    /// internal-callee walk in `notify_concrete_entry_point_inner` (callees
-    /// are already in the rlib's `.o`) and skip `after_rust_analysis`
-    /// validation (already validated upstream). `llvm_paths` is also forced
-    /// to None upstream of construction so `generate_and_compile` short-
-    /// circuits without producing a colliding `.o`. False in the rlib's own
-    /// compile. (Direct mode, once the third case, was retired in 5c.4 —
-    /// every toylang compile now flows through wrapper mode.)
-    pub is_downstream_of_stubs: bool,
+    /// Phase 3 E.6: names of body-bearing functions defined in UPSTREAM
+    /// Sky-marked rlibs (loaded via S.4's `on_sky_lib_loaded`). The
+    /// `is_consumer_fn` / `is_consumer_type` predicates are called from
+    /// `symbol_name` and other queries that only see `&self` (no access
+    /// to `ToylangState`), so we mirror the relevant subset of upstream
+    /// state into this set as upstreams arrive.
+    pub upstream_fn_names: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Same as `upstream_fn_names` but for consumer types (struct names).
+    pub upstream_type_names: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// True at the user-bin compile under two-crate wrapper mode (course-
+    /// correct.md items #11 + #15, Workstream A). The renaming + semantic
+    /// flip from the prior `is_downstream_of_stubs` is part of A's
+    /// codegen-ownership pivot:
+    ///
+    /// - **rlib compile (false):** owns validation in `after_rust_analysis`
+    ///   and sidecar write (S.3). Skips codegen — `llvm_paths` is None
+    ///   so `generate_and_compile` short-circuits before
+    ///   `populate_toylang_instances_from_cgus` and the Inkwell pass.
+    /// - **user-bin compile (true):** owns codegen. The
+    ///   `populate_toylang_instances_from_cgus` step iterates the
+    ///   registry directly (the CGU walk that worked at the rlib compile
+    ///   finds nothing here — rustc doesn't queue extern non-generic
+    ///   items for local mono). Validation is skipped (already ran upstream).
+    pub is_user_bin_compile: bool,
 }
 
 /// Downcast `&mut dyn Any` to `&mut ToylangState`.
@@ -85,19 +143,24 @@ impl ToylangCallbacks {
     /// respect to `ToylangState` (only `log` is appended); internal-callee
     /// stashing happens in `notify_concrete_entry_point_inner`.
     ///
-    /// Per @SMINCZ, the returned `(DefId, GenericArgsRef)` pairs become
-    /// `ReifyFnPointer` casts in the `optimized_mir` override's synthesized
+    /// Per @SyMINCZ, the returned `(DefId, GenericArgsRef)` pairs become
+    /// `ReifyFnPointer` casts in the `per_instance_mir` override's synthesized
     /// body, which is what forces rustc's mono collector to emit the Rust
-    /// symbols. Args may contain `ty::TyKind::Param` placeholders — rustc's
-    /// collector substitutes per caller during its walk.
+    /// symbols. Under Approach A, this provider receives a fully concrete
+    /// `Instance<'tcx>` and substitutes its `args` Sky-side before walking the
+    /// body — every returned `GenericArgsRef` is concrete in toylang's universe
+    /// (no `ty::TyKind::Param` placeholders).
     pub fn collect_generic_rust_deps_inner<'tcx>(
         &self,
         state: &mut ToylangState,
         name: &str,
         tcx: TyCtxt<'tcx>,
-        def_id: LocalDefId,
+        instance: ty::Instance<'tcx>,
     ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
-        state.log.push(CallbackLog::CollectGenericRustDeps { name: name.to_string() });
+        state.log.push(CallbackLog::CollectGenericRustDeps {
+            name: name.to_string(),
+            args_fingerprint: format!("{:?}", instance.args),
+        });
 
         // Accessor methods ("StructName.field_name") have no body and no deps.
         if name.contains('.') {
@@ -113,30 +176,17 @@ impl ToylangCallbacks {
             return vec![];
         }
 
-        // Build the param-name → Param-index map from the caller's identity
-        // generics. The walker below runs the UNSUBSTITUTED body (Params in
-        // place of concrete types); as the body is type-resolved and deps
-        // are built, oracle helpers consult this map to rebuild rustc
-        // `TyKind::Param` values when they encounter `ResolvedType::TypeParam`.
-        // Dropped at end of this function, clearing the thread-local.
-        let identity_args = ty::GenericArgs::identity_for_item(tcx, def_id.to_def_id());
-        let generics = tcx.generics_of(def_id.to_def_id());
-        let mut param_name_to_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        for param in generics.own_params.iter() {
-            if matches!(param.kind, ty::GenericParamDefKind::Type { .. }) {
-                param_name_to_index.insert(param.name.to_string(), param.index);
-            }
-        }
-        let _param_guard = crate::oracle::ActiveParamMap::install(param_name_to_index);
-
-        // `resolve_caller_from_identity_args` is an identity-args substitution:
-        // each type_param `T` maps to `ResolvedType::TypeParam("T")`, so the
-        // body is effectively unchanged. Kept as a single code path so
-        // `collect_rust_deps_recursive`'s signature (which takes an already-
-        // resolved `ToyFunction`) doesn't need to branch.
-        let resolved_caller = resolve_caller_from_identity_args(toy_fn);
-        let identity_instance = ty::Instance::new_raw(def_id.to_def_id(), identity_args);
-        let extern_symbol = compute_fn_symbol(registry_name, tcx, identity_instance);
+        // Sky-side substitution (Approach A, course-correct.md item #1): map
+        // each of `caller_fn.type_params` to the concrete `ResolvedType`
+        // recovered from `instance.args`. The resolved body has no remaining
+        // `TypeParam` references — downstream oracle helpers see only
+        // concrete types, and the deps the walker collects carry concrete
+        // `GenericArgsRef`s. The retired Approach B path constructed
+        // `identity_for_item` here and installed an `ActiveParamMap`
+        // thread-local so the converter could rebuild Params; that whole
+        // mechanism is gone.
+        let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
+        let extern_symbol = compute_fn_symbol(registry_name, tcx, instance);
         // Local cycle guard — prevents infinite recursion on cyclic consumer
         // code. Intentionally NOT shared with `state.walked_entry_points`; see
         // @GCMLZ context and the commit introducing the callback split for the
@@ -203,159 +253,118 @@ impl ToylangCallbacks {
     /// but its result is what we'd have ended up with anyway. Cached
     /// equals fresh equals correct.
     ///
-    /// Gated on `!self.is_downstream_of_stubs`: the user-bin compile
-    /// doesn't own consumer codegen and shouldn't populate the queue
-    /// (would leave stale state with no `generate_and_compile` to drain).
+    /// Gated on `self.is_user_bin_compile` (Workstream A inversion): the
+    /// rlib compile no longer owns consumer codegen. The user-bin compile
+    /// is the sole codegen site. The rlib compile's `generate_and_compile`
+    /// short-circuits via `llvm_paths = None` before reaching this populate.
     pub fn populate_toylang_instances_from_cgus<'tcx>(
         &self,
         state: &mut ToylangState,
         tcx: TyCtxt<'tcx>,
     ) {
-        if self.is_downstream_of_stubs {
+        if !self.is_user_bin_compile {
             return;
         }
 
-        let cgus = rustc_lang_facade::upstream_cgus(tcx);
-        for cgu in cgus.iter() {
-            for (&mono_item, _) in cgu.items() {
-                let rustc_middle::mir::mono::MonoItem::Fn(instance) = mono_item else { continue };
-                let def_id = instance.def_id();
-                if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
-                    continue;
-                }
-
-                // Accessors (associated items) are handled inline in
-                // `generate_with_tcx`; the instance list here is only
-                // for consumer fns with bodies.
-                if tcx.opt_associated_item(def_id).is_some() {
-                    continue;
-                }
-
-                let name = tcx.item_name(def_id).to_string();
-                let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main".to_string() } else { name.clone() };
-                let Some(toy_fn) = self.registry.functions.get(registry_name.as_str()) else {
-                    // Non-consumer fn in __lang_stubs (e.g., Phase-6
-                    // `__toylang_option_unwrap<T>` wrappers). Skip.
-                    continue;
-                };
-                if toy_fn.body.is_none() {
-                    continue;
-                }
-
-                let extern_symbol = compute_fn_symbol(&registry_name, tcx, instance);
-                if !state.walked_entry_points.insert(extern_symbol.clone()) {
-                    continue;
-                }
-
-                let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
-                state.toylang_instances.push(ToylangInstance {
-                    extern_symbol: extern_symbol.clone(),
-                    resolved_func: resolved_caller.clone(),
-                });
-                walk_and_stash_internal_callees(
-                    tcx, &self.registry, &resolved_caller, &registry_name, state,
-                );
-
-                // Emit `[toylang] layout_of intercepted for: <ty>
-                // size=N align=M` for each consumer type in this
-                // Instance's signature. `lang_layout_of`'s eprintln
-                // fires from the query provider, which incremental
-                // cache skips on hit; emitting here (during populate,
-                // always runs) makes the layout log incremental-safe
-                // for tests that assert on the stderr — e.g.
-                // `test_point_layout`. Lock-free now that
-                // `monomorphize_type` is stateless.
-                emit_layout_log_for_instance(tcx, instance);
+        // Workstream A discovery path + Phase 3 E.6: under the architecture's
+        // locked "binary compile codegens every reachable Sky item across
+        // all libs" invariant (rust-interop-architecture.md §5.5, §9.6),
+        // at user-bin time rustc does NOT queue extern non-generic items
+        // for local monomorphization, so the CGU walk finds zero stub
+        // items. We iterate the LOCAL registry first, then EACH upstream
+        // registry loaded by S.4. Upstream registries are cloned upfront
+        // so we hold one immutable borrow for the outer iteration while
+        // mutating `state` for the inner walk-and-stash.
+        let upstream_clones: Vec<crate::toylang::registry::ToylangRegistry> =
+            state.upstream_registries.values().cloned().collect();
+        let registries: Vec<&crate::toylang::registry::ToylangRegistry> =
+            std::iter::once(self.registry.as_ref())
+                .chain(upstream_clones.iter())
+                .collect();
+        for reg in registries {
+        for (name, toy_fn) in &reg.functions {
+            if toy_fn.body.is_none() {
+                continue;
             }
+            // Skip generic consumer fns: emitting them from a registry-only
+            // walk would require concrete type args to substitute, but those
+            // come from caller-site Instances which the user-bin CGU list
+            // doesn't surface for extern non-generic items either. Generic
+            // surface to rustc is course-correct.md item #17 — out of scope
+            // for Workstream A. The 5 `test_generic_*` integration tests are
+            // expected to fail until that lands.
+            if !toy_fn.type_params.is_empty() {
+                continue;
+            }
+            let extern_symbol = compute_fn_symbol_from_type_args(name, &[]);
+            if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                continue;
+            }
+            // Look up the `pub fn` shell in the upstream `__lang_stubs`
+            // rlib so the codegen pass can construct an `Instance` and
+            // emit the Rust-ABI extern wrapper. The stub's name uses
+            // toylang's mangling convention — `main` becomes
+            // `__toylang_main` (per `oracle::TOYLANG_MAIN`), everything
+            // else stays as-is.
+            let stub_name = if name == "main" {
+                crate::oracle::TOYLANG_MAIN.to_string()
+            } else {
+                name.clone()
+            };
+            let stub_def_id = crate::oracle::find_stub_fn_in_stub_rlib(tcx, &stub_name);
+            state.toylang_instances.push(ToylangInstance {
+                extern_symbol,
+                resolved_func: toy_fn.clone(),
+                stub_def_id,
+            });
+            // Transitively walk the body for consumer-to-consumer callees.
+            // This is what surfaces generic monomorphizations (e.g.
+            // `wrap<i32>` called from non-generic `wrap_i32`) — the
+            // registry walk above sees `wrap_i32` but the
+            // `wrap<i32>::<__toylang_internal_wrap__i32>` symbol it calls
+            // needs to be emitted too, and the only place it appears with
+            // concrete args is at the call site.
+            walk_and_stash_internal_callees(
+                tcx, reg, toy_fn, name, state,
+            );
+        }
         }
     }
 }
 
-/// For each consumer ADT type reachable from the Instance's signature,
-/// emit the `[toylang] layout_of intercepted for: <ty> size=N
-/// align=M` log line. Safe inside `generate_and_compile` (MUTABLE_STATE
-/// held) because `call_monomorphize_type` is lock-free.
-fn emit_layout_log_for_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) {
-    let fn_sig = tcx.fn_sig(instance.def_id()).instantiate(tcx, instance.args);
-    let sig = fn_sig.skip_binder();
-    let mut seen: HashSet<String> = HashSet::new();
-    for ty in sig.inputs().iter().copied().chain(std::iter::once(sig.output())) {
-        walk_ty_for_layout_log(tcx, ty, &mut seen);
-    }
-}
-
-fn walk_ty_for_layout_log<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-    seen: &mut HashSet<String>,
-) {
-    use rustc_middle::ty::TypeVisitableExt;
-    if let ty::TyKind::Adt(adt_def, args) = ty.kind() {
-        let name = tcx.item_name(adt_def.did()).to_string();
-        let has_params = args.iter().any(|a| a.has_param());
-        if !has_params
-            && rustc_lang_facade::is_from_lang_stubs(tcx, adt_def.did())
-        {
-            if seen.insert(format!("{:?}", ty)) {
-                let result = rustc_lang_facade::call_monomorphize_type(
-                    &name, tcx, ty,
-                );
-                let (size, align) = compute_layout_size_align(tcx, &result.field_types);
-                eprintln!(
-                    "[toylang] layout_of intercepted for: {:?} size={} align={}",
-                    ty, size, align,
-                );
-            }
-        }
-        // Recurse into generic args so consumer types nested in
-        // `Vec<ToyPoint>` etc. get their log entries too.
-        for arg in args.iter() {
-            if let ty::GenericArgKind::Type(inner) = arg.kind() {
-                walk_ty_for_layout_log(tcx, inner, seen);
-            }
-        }
-    }
-}
-
-/// Compute `(size, align)` for a consumer type given its resolved
-/// field types. Mirrors `rustc-lang-facade::queries::layout::
-/// build_layout`'s arithmetic; we just need the numbers, not a full
-/// `TyAndLayout`.
-fn compute_layout_size_align<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    field_types: &[Ty<'tcx>],
-) -> (u64, u64) {
-    let mut offset = 0u64;
-    let mut max_align = 1u64;
-    for &field_ty in field_types {
-        let layout = tcx.layout_of(
-            rustc_middle::ty::PseudoCanonicalInput {
-                value: field_ty,
-                typing_env: rustc_middle::ty::TypingEnv::fully_monomorphized(),
-            },
-        ).expect("layout of field type");
-        let fsz = layout.size.bytes();
-        let falign = layout.align.abi.bytes();
-        max_align = max_align.max(falign);
-        offset = (offset + falign - 1) & !(falign - 1);
-        offset += fsz;
-    }
-    let size = (offset + max_align - 1) & !(max_align - 1);
-    (size, max_align)
-}
+// Workstream A retired three helpers:
+//   - emit_layout_log_for_instance
+//   - walk_ty_for_layout_log
+//   - compute_layout_size_align
+// They used to fire from the per-Instance CGU walk in
+// populate_toylang_instances_from_cgus, emitting the
+// `[toylang] layout_of intercepted for: <ty> size=N align=M` log line
+// per consumer ADT in each Instance's signature. Under Workstream A's
+// registry-driven discovery there are no per-Instance signatures to
+// walk, so this code path went dark. The layout-probe tests
+// (test_point_layout etc.) continue to pass because the `lang_layout_of`
+// query provider in the facade emits its own log line on each
+// interception. If a future test surfaces a gap (e.g., layouts hit by
+// transitive callees but not by direct query firings), the re-engineering
+// option is to construct an Instance per registry item and walk its
+// signature — but it's not currently needed.
 
 impl LangPredicates for ToylangCallbacks {
     fn is_consumer_type(&self, name: &str) -> bool {
-        self.registry.structs.contains_key(name)
+        if self.registry.structs.contains_key(name) { return true; }
+        // Phase 3 E.6: also accept types defined in upstream Sky libs.
+        self.upstream_type_names.lock().unwrap().contains(name)
     }
 
     fn is_consumer_fn(&self, name: &str) -> bool {
-        // Only toylang-defined functions (with bodies) are consumer functions.
-        // Extern functions (body-less) are real Rust functions and must not be intercepted.
         if name == crate::oracle::TOYLANG_MAIN {
             return self.registry.functions.get("main").map_or(false, |f| f.body.is_some());
         }
-        self.registry.functions.get(name).map_or(false, |f| f.body.is_some())
+        if self.registry.functions.get(name).map_or(false, |f| f.body.is_some()) {
+            return true;
+        }
+        // Phase 3 E.6: also accept body-bearing fns from upstream Sky libs.
+        self.upstream_fn_names.lock().unwrap().contains(name)
     }
 
     // Stage 4c retired the `visibility_override` trait method: the
@@ -376,15 +385,33 @@ impl LangCallbacks for ToylangCallbacks {
     fn after_rust_analysis<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) {
         state(s).log.push(CallbackLog::AfterRustAnalysis);
 
-        // Stage 5b: validation already ran in the upstream stub-rlib compile,
-        // where every consumer item + every Rust type is local. The downstream
-        // user-bin compile sees those same items via the extern `__lang_stubs`
-        // rlib's `module_children`; re-running the checks here would either
-        // be redundant (type-resolution helpers from 5a route cross-crate
-        // already) or fail (the local-definition walks in `find_extern_fn_def_id`
-        // and friends only see the bin's `fn main()` shim). Bail to preserve
-        // the rlib-compile's validation as the single source of truth.
-        if self.is_downstream_of_stubs {
+        // Workstream A: validation lives at the rlib compile only. The
+        // user-bin compile trusts the rlib-compile's validation as the
+        // single source of truth — any invalid registry would have
+        // already aborted upstream. The cross-crate oracle sweep
+        // (find_extern_fn_def_id et al.) means user-bin lookups would
+        // also work mechanically, but re-running validation would just
+        // duplicate work.
+        if self.is_user_bin_compile {
+            // Workstream-A oracle sweep probe: exercise the cross-crate
+            // fallback in `find_extern_fn_def_id` (and by extension the
+            // shared `find_extern_fn_in_stub_rlib` helper). The fallback's
+            // surfaces (codegen + dep-walker) don't fire at user-bin time
+            // YET — they will once A.4 inverts the codegen gating — so
+            // without this probe the cross-crate path is dark code. The
+            // probe iterates the registry's body-less (extern) fns and
+            // counts how many resolve. A correctly-functioning fallback
+            // resolves all of them.
+            let mut resolved: usize = 0;
+            let mut total: usize = 0;
+            for (name, func) in &self.registry.functions {
+                if func.body.is_some() { continue; }
+                total += 1;
+                if crate::oracle::find_extern_fn_def_id(tcx, name).is_some() {
+                    resolved += 1;
+                }
+            }
+            state(s).log.push(CallbackLog::OracleCrossCrateProbe { resolved, total });
             return;
         }
 
@@ -428,6 +455,34 @@ impl LangCallbacks for ToylangCallbacks {
             }
         }
 
+        // Phase 3 E.5: build an "effective registry" that merges the local
+        // registry with any upstream toylang library registries loaded via
+        // S.4's `on_sky_lib_loaded`. The merge is read-only — `self.registry`
+        // is unchanged — and is used ONLY by the type-resolve pass below.
+        // Validation Checks 1-4 above intentionally stay on the local
+        // registry: they verify that every LOCAL toylang item has a rustc-
+        // visible stub, which is a per-crate invariant. Upstream items are
+        // verified at their own crate's compile.
+        //
+        // Collision policy: local entries win silently. A proper diagnostic
+        // for name collisions is E.6 follow-up work.
+        let effective_registry = {
+            let mut effective = (*self.registry).clone();
+            for upstream in state(s).upstream_registries.values() {
+                for (name, func) in &upstream.functions {
+                    effective.functions
+                        .entry(name.clone())
+                        .or_insert_with(|| func.clone());
+                }
+                for (name, st) in &upstream.structs {
+                    effective.structs
+                        .entry(name.clone())
+                        .or_insert_with(|| st.clone());
+                }
+            }
+            effective
+        };
+
         // Check 5: Type-resolve non-generic function bodies
         for (name, func) in &self.registry.functions {
             if func.body.is_none() || !func.type_params.is_empty() { continue; }
@@ -457,7 +512,7 @@ impl LangCallbacks for ToylangCallbacks {
             let is_rust_trait = |name: &str| {
                 crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
             };
-            match crate::toylang::type_resolve::resolve_fn_body(&self.registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait) {
+            match crate::toylang::type_resolve::resolve_fn_body(&effective_registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait) {
                 Err(e) => errors.push(format!("function '{}': {:?}", name, e)),
                 Ok(typed) => {
                     // Per @MBMRVZ, if main has no declared return type (so its
@@ -488,6 +543,91 @@ impl LangCallbacks for ToylangCallbacks {
             }
             panic!("[toylang] aborting due to validation errors");
         }
+
+        // S.3 (course-correct quarter-of-work plan): write the `.sky-meta`
+        // sidecar adjacent to the rlib that rustc is about to emit. The
+        // user_bin compile reads it via the facade's sidecar loader (S.4),
+        // populating the universe needed for binary-compile codegen (A.3 / A.4).
+        //
+        // We hook here in `after_rust_analysis` because (a) the registry is
+        // fully populated by this point, (b) rustc has computed
+        // `output_filenames` so the rlib path is known, and (c) this fires
+        // ONCE per rlib compile (gated above on `!is_user_bin_compile`),
+        // which is exactly when the sidecar should be produced.
+        //
+        // `OutputFilenames::with_extension` joins out_directory + filestem
+        // and sets the extension — yielding a path whose basename matches
+        // the rlib's exactly except for the `.sky-meta` extension. This is
+        // what `docs/architecture/sidecar-format.md` requires.
+        let sidecar_path = tcx.output_filenames(()).with_extension("sky-meta");
+        let bytes = crate::sidecar::serialize_sidecar(&self.registry)
+            .unwrap_or_else(|e| panic!("[toylang] sidecar serialize failed: {}", e));
+        std::fs::write(&sidecar_path, &bytes).unwrap_or_else(|e| {
+            panic!(
+                "[toylang] sidecar write failed at {}: {}",
+                sidecar_path.display(),
+                e,
+            )
+        });
+        // Diagnostic eprintln gated on TOYLANG_LOG_PATH so it doesn't
+        // pollute the build stderr that layout-probe tests grep.
+        if std::env::var("TOYLANG_LOG_PATH").is_ok() {
+            eprintln!(
+                "[toylang] wrote sidecar: {} ({} bytes)",
+                sidecar_path.display(),
+                bytes.len(),
+            );
+        }
+    }
+
+    fn on_sky_lib_loaded<'tcx>(
+        &self,
+        s: &mut dyn Any,
+        _tcx: TyCtxt<'tcx>,
+        crate_name: &str,
+        sidecar_bytes: &[u8],
+    ) {
+        let ts = state(s);
+        // Deserialize unconditionally. The facade's missing-file path
+        // already panicked if the sidecar wasn't readable; a deserialize
+        // failure here means the bytes are present but malformed, which
+        // is a hard-error condition per architecture doc §7.6.
+        let registry = crate::sidecar::deserialize_sidecar(sidecar_bytes)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[toylang] failed to deserialize sidecar for crate `{}`: {}",
+                    crate_name, e,
+                )
+            });
+        let n_structs = registry.structs.len();
+        let n_functions = registry.functions.len();
+        ts.log.push(CallbackLog::OnSkyLibLoaded {
+            crate_name: crate_name.to_string(),
+            n_structs,
+            n_functions,
+        });
+        // Insertion order matters only for diagnostics; cross-crate name
+        // collisions between Sky libs are out of scope until Phase 3 E
+        // (multi-crate). For now we trust the facade to call us at most
+        // once per crate.
+        // Phase 3 E.6: mirror the body-bearing fn names + struct names into
+        // the callbacks-level sets so `is_consumer_fn` / `is_consumer_type`
+        // (called via the predicate vtable, which doesn't see state) recognize
+        // them. The `symbol_name` query override then redirects cross-crate
+        // consumer-fn calls (e.g. the user-bin's main calling case6_lib::double_it)
+        // to the consumer emitter's `__toylang_impl_*` symbol that codegen
+        // produces from the populate-upstream iteration.
+        {
+            let mut fns = self.upstream_fn_names.lock().unwrap();
+            for (name, func) in &registry.functions {
+                if func.body.is_some() { fns.insert(name.clone()); }
+            }
+        }
+        {
+            let mut tys = self.upstream_type_names.lock().unwrap();
+            for name in registry.structs.keys() { tys.insert(name.clone()); }
+        }
+        ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
 
     fn monomorphize_type<'tcx>(
@@ -532,9 +672,9 @@ impl LangCallbacks for ToylangCallbacks {
         s: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
-        def_id: LocalDefId,
+        instance: ty::Instance<'tcx>,
     ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
-        self.collect_generic_rust_deps_inner(state(s), name, tcx, def_id)
+        self.collect_generic_rust_deps_inner(state(s), name, tcx, instance)
     }
 
     fn notify_concrete_entry_point<'tcx>(
@@ -551,8 +691,6 @@ impl LangCallbacks for ToylangCallbacks {
         let ts = state(s);
         ts.log.push(CallbackLog::GenerateAndCompile);
 
-        let (ref ll_path, ref obj_path) = self.llvm_paths.as_ref()?;
-
         // B6 fix: populate state.toylang_instances from the CGU list + a
         // transitive internal-callee walk, up front and deterministically.
         // Prior art accumulated state as a side effect of the per-item
@@ -560,27 +698,65 @@ impl LangCallbacks for ToylangCallbacks {
         // incremental cache could skip on cache hit, leaving state empty
         // and the emitted `.o` symbol-less. See risks.md §B6 for the
         // full diagnosis and risks.md §B6 RESOLVED marker for this fix.
+        // Workstream A inverted the gate: short-circuits on the RLIB
+        // compile (produces only stubs + sidecar); runs on USER-BIN
+        // (the codegen site).
         self.populate_toylang_instances_from_cgus(ts, tcx);
 
-        // Dump callback log to file if requested (for test assertions).
-        // Done before codegen so the log captures the monomorphization-
-        // phase callbacks + the B6 population step, not any internal
-        // codegen logs. `NotifyConcreteEntryPoint` entries come from
-        // `notify_concrete_entry_point_inner`'s log push (still live);
-        // under incremental cache these entries may be cache-skipped at
-        // the query-provider layer, which is fine — the B6 populate step
-        // above is the load-bearing source of truth for consumer-codegen
-        // inputs and runs deterministically every compile regardless of
-        // cache state. (The former `CARGO_INCREMENTAL=0` test-harness
-        // stopgap was retired by the B6 architectural fix.)
+        // S.4: dump the log BEFORE the `llvm_paths` early-return so
+        // user-bin compiles (where `llvm_paths` is None) also surface
+        // their entries (specifically `OnSkyLibLoaded` from the S.4
+        // sidecar load). Append mode rather than overwrite so the rlib
+        // compile's earlier entries (CollectGenericRustDeps for main,
+        // NotifyConcreteEntryPoint, etc.) survive when the user-bin
+        // compile runs second within the same `toylangc build`. Each
+        // test wipes the build dir before invoking toylangc so the
+        // append never inherits cross-test bleed-over.
         if let Ok(path) = std::env::var("TOYLANG_LOG_PATH") {
+            use std::fs::OpenOptions;
+            use std::io::Write;
             let lines: Vec<String> = ts.log.iter().map(|entry| format!("{:?}", entry)).collect();
-            std::fs::write(&path, lines.join("\n")).expect("failed to write callback log");
+            let mut blob = lines.join("\n");
+            blob.push('\n');
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("failed to open callback log for append");
+            f.write_all(blob.as_bytes()).expect("failed to write callback log");
         }
+
+        let (ref ll_path, ref obj_path) = self.llvm_paths.as_ref()?;
+
+        // Phase 3 E.6: build an effective registry merging local + upstream
+        // so codegen treats upstream consumer fns (e.g. case6_lib's double_it
+        // when compiling case6_app's user-bin) as toylang fns rather than
+        // Rust extern decls. Without this, the FnCall codegen path at
+        // `llvm_gen.rs:1161` sees `double_it` missing from the local
+        // registry and emits a `declare i32 @__toylang_impl_double_it(i32)`
+        // alongside the populate-iteration loop's `define i32 @__toylang_impl_double_it(...)`,
+        // and LLVM disambiguates the latter to `.1` — leaving the
+        // unmangled symbol undefined at link time.
+        let effective_registry = {
+            let mut effective = (*self.registry).clone();
+            for upstream in ts.upstream_registries.values() {
+                for (name, func) in &upstream.functions {
+                    effective.functions
+                        .entry(name.clone())
+                        .or_insert_with(|| func.clone());
+                }
+                for (name, st) in &upstream.structs {
+                    effective.structs
+                        .entry(name.clone())
+                        .or_insert_with(|| st.clone());
+                }
+            }
+            effective
+        };
 
         // Walk MonoItems and codegen each consumer instance inline (same 'tcx scope).
         let (llvm_ir, rust_symbols) = crate::llvm_gen::generate_with_tcx(
-            tcx, &self.registry, self, ts,
+            tcx, &effective_registry, self, ts,
         );
         std::fs::write(ll_path, &llvm_ir)
             .expect("toylang: failed to write .ll file");
@@ -653,29 +829,10 @@ fn resolve_caller_from_instance<'tcx>(
     resolve_caller_from_type_args(caller_fn, &subst)
 }
 
-/// Identity-args variant of `resolve_caller_from_instance`: each type param `T`
-/// substitutes to `ResolvedType::TypeParam("T")` so the returned `ToyFunction`
-/// is structurally unchanged (body retains Param references). The
-/// `type_params: vec![]` canonicalization mirrors the concrete-args path, so
-/// `collect_rust_deps_recursive` and `type_resolve_body` see the same shape
-/// regardless of path — Param resolution at dep sites is handled via the
-/// `oracle::ActiveParamMap` thread-local installed in
-/// `collect_generic_rust_deps_inner`.
-fn resolve_caller_from_identity_args(
-    caller_fn: &crate::toylang::registry::ToyFunction,
-) -> crate::toylang::registry::ToyFunction {
-    if caller_fn.type_params.is_empty() {
-        return caller_fn.clone();
-    }
-    let mut subst = std::collections::HashMap::new();
-    for param_name in caller_fn.type_params.iter() {
-        subst.insert(
-            param_name.clone(),
-            crate::toylang::typed_ast::ResolvedType::TypeParam(param_name.clone()),
-        );
-    }
-    resolve_caller_from_type_args(caller_fn, &subst)
-}
+// `resolve_caller_from_identity_args` retired in W3 (course-correct.md item #1
+// Approach A restoration). Its sole caller was `collect_generic_rust_deps_inner`'s
+// identity-args path; under Approach A that function uses
+// `resolve_caller_from_instance` with concrete args directly.
 
 /// Resolve a ToyFunction by substituting type params with concrete ResolvedTypes.
 fn resolve_caller_from_type_args(
@@ -917,6 +1074,7 @@ fn walk_and_stash_internal_callees<'tcx>(
             state.toylang_instances.push(ToylangInstance {
                 extern_symbol: callee_symbol,
                 resolved_func: resolved_callee.clone(),
+                stub_def_id: None,
             });
             walk_and_stash_internal_callees(
                 tcx, registry, &resolved_callee, callee_name, state,

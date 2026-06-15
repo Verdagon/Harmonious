@@ -46,6 +46,14 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     let mut wrapper_fns: Vec<syn::Item> = Vec::new();
     let mut impl_blocks: Vec<syn::Item> = Vec::new();
 
+    // Emit the `__SKY_STUBS_MARKER` (architecture §6.3). The facade's
+    // `is_from_lang_stubs` predicate walks crate-root children for this
+    // marker rather than matching against the literal crate name, so
+    // future per-Sky-library stub rlibs (Phase 3 E.2/E.3, named after
+    // the Sky library rather than the shared `__lang_stubs`) are still
+    // recognized as Sky stub rlibs without a predicate change.
+    items.push(parse_quote! { pub const __SKY_STUBS_MARKER: () = (); });
+
     // Emit pub use for each toylang import
     for import_path in &registry.imports {
         let path: syn::Path = syn::parse_str(import_path)
@@ -285,4 +293,27 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     let file: syn::File = syn::parse2(tokens)
         .expect("stub_gen produced invalid Rust — this is a bug");
     prettyplease::unparse(&file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toylang::registry::ToylangRegistry;
+
+    /// Regression guard for Phase 3 E.1: the stub rlib's generated source
+    /// must declare `__SKY_STUBS_MARKER` at the crate root. The facade's
+    /// `is_from_lang_stubs` predicate walks for this marker; if stub_gen
+    /// silently stops emitting it the predicate returns false everywhere
+    /// and tests fail in mysterious unrelated ways (no consumer items
+    /// filtered out of CGUs, no `per_instance_mir` override fires, etc.).
+    #[test]
+    fn marker_emitted_at_crate_root() {
+        let reg = ToylangRegistry::default();
+        let src = generate(&reg);
+        assert!(
+            src.contains("pub const __SKY_STUBS_MARKER"),
+            "stub_gen output missing __SKY_STUBS_MARKER:\n{}",
+            src
+        );
+    }
 }

@@ -21,7 +21,7 @@ use std::sync::Mutex;
 // tests cannot import from a `[[bin]]`-only crate, so the pin is carried
 // independently. See HANDOFF-nightly-bump.md §3.2 and the `TOYLANG_NIGHTLY`
 // doc comment in main.rs for the bump-site inventory.
-const TOYLANG_NIGHTLY: &str = "nightly-2026-01-20";
+const TOYLANG_NIGHTLY: &str = "rustc-fork";
 
 /// Serialize `toylangc build` invocations across test threads.
 ///
@@ -230,8 +230,12 @@ fn run_integration_project_check_callbacks(
         .unwrap_or_else(|e| panic!("{}: callback log not written at {}: {}", name, log_path.display(), e));
 
     for name_expected in expected {
-        let cgd = format!("CollectGenericRustDeps {{ name: \"{}\" }}", name_expected);
-        let ncep = format!("NotifyConcreteEntryPoint {{ name: \"{}\" }}", name_expected);
+        // Prefix match: CollectGenericRustDeps carries a trailing
+        // `args_fingerprint: "..."` field that varies per Instance (Approach A
+        // restoration, course-correct.md item #1). NotifyConcreteEntryPoint
+        // doesn't, but we use the same prefix-match shape for symmetry.
+        let cgd = format!("CollectGenericRustDeps {{ name: \"{}\"", name_expected);
+        let ncep = format!("NotifyConcreteEntryPoint {{ name: \"{}\"", name_expected);
         assert!(
             log.contains(&cgd) || log.contains(&ncep),
             "{}: expected callback for '{}', log:\n{}",
@@ -250,6 +254,113 @@ fn run_integration_project_check_callbacks(
     // weaker "these fns don't appear as rust-called entry points"
     // check under a different signal.
     let _ = unexpected;
+}
+
+/// Build a project and return the parsed list of
+/// `(callback_name, args_fingerprint)` pairs from every
+/// `CollectGenericRustDeps` log entry, in the order they were written.
+///
+/// Approach A regression-protection (course-correct.md item #1 Test A):
+/// under Approach A, `per_instance_mir` fires per concrete `Instance` and the
+/// recorded `args_fingerprint` carries the substituted args. Tests that
+/// exercise multiple monomorphizations of the same consumer fn assert that
+/// the fingerprints are distinct; tests that exercise a single concrete
+/// instantiation assert the fingerprint contains the concrete type name
+/// and does NOT contain `Param(` (which would indicate identity-args
+/// behavior leaking back in).
+///
+/// Returns the entries verbatim — callers do whatever assertion shape fits
+/// the property under test. The full log is included in any panic messages
+/// (via callers) so diagnostics are actionable.
+fn collect_generic_rust_deps_firings(name: &str) -> Vec<(String, String)> {
+    let project = projects_dir().join(name);
+    assert!(
+        project.is_dir(),
+        "integration project not found: {}",
+        project.display(),
+    );
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let cargo_target = shared_cargo_target_dir();
+    let log_path = build_dir.join("callback.log");
+    std::fs::create_dir_all(&build_dir).unwrap();
+
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            .env("TOYLANG_LOG_PATH", &log_path)
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
+    assert!(
+        build_out.status.success(),
+        "{} toylangc build failed:\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    // Smoke-run the produced binary so we know the build is actually correct,
+    // not just superficially passing — same pattern as the callback-trace
+    // harness above.
+    let bin = cargo_target.join("debug").join(name);
+    if bin.exists() {
+        let run = Command::new(&bin)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .output()
+            .unwrap_or_else(|e| panic!("{}: failed to spawn binary: {}", name, e));
+        assert!(
+            run.status.success(),
+            "{} binary exited non-zero:\nstdout: {}\nstderr: {}",
+            name,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!("{}: callback log not written at {}: {}", name, log_path.display(), e)
+    });
+
+    // Each CollectGenericRustDeps line looks like:
+    //   CollectGenericRustDeps { name: "wrap", args_fingerprint: "[i32]" }
+    // We parse with a tolerant pattern — anything between the quoted fields
+    // is captured verbatim. Avoid pulling in a regex dep; the format is fixed
+    // by the Debug derive on CallbackLog and lives in toylangc itself.
+    let mut out = Vec::new();
+    for line in log.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("CollectGenericRustDeps { name: \"") else {
+            continue;
+        };
+        let Some(name_end) = rest.find("\", args_fingerprint: \"") else {
+            panic!(
+                "{}: malformed CollectGenericRustDeps log line: {:?}",
+                name, line,
+            );
+        };
+        let cb_name = rest[..name_end].to_string();
+        let after_sep = &rest[name_end + "\", args_fingerprint: \"".len()..];
+        // Strip the trailing `" }` to recover the fingerprint.
+        let Some(fp) = after_sep.strip_suffix("\" }") else {
+            panic!(
+                "{}: malformed CollectGenericRustDeps log line (no trailing brace): {:?}",
+                name, line,
+            );
+        };
+        out.push((cb_name, fp.to_string()));
+    }
+    out
 }
 
 /// Build a project, capture toylangc's stderr, and assert that it
@@ -585,6 +696,18 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 #[test] fn test_large_struct() { run_integration_project("large_struct"); }
 #[test] fn test_generic_with_i64() { run_integration_project("generic_with_i64"); }
 #[test] fn test_arithmetic() { run_integration_project("arithmetic"); }
+/// Phase 3 E.6: the first multi-toylang-crate integration test. case6_app
+/// (the binary) depends on case6_lib (a toylang library that exports
+/// `double_it`). The build exercises:
+///   - `[toylang-dependencies]` manifest schema (E.2)
+///   - per-Sky-library stub rlibs + workspace fan-out (E.3)
+///   - marker-based `is_from_lang_stubs` (E.1)
+///   - cross-crate name resolution via `effective_registry` (E.5)
+///   - upstream-iteration in `populate_toylang_instances_from_cgus` (E.6.A)
+///   - `is_consumer_fn` upstream mirror (E.6.B)
+///   - the @GCMLZ re-entrance bypass via thread-local state pointer (E.6.C)
+/// Expected output: `42` (from `double_it(21) = 21 * 2`).
+#[test] fn test_case6_basic_multi_crate() { run_integration_project("case6_app"); }
 #[test] fn test_arithmetic_sub_div() { run_integration_project("arithmetic_sub_div"); }
 #[test] fn test_vec_i32() { run_integration_project("vec_i32"); }
 #[test] fn test_single_field_struct() { run_integration_project("single_field_struct"); }
@@ -743,6 +866,418 @@ fn test_two_entry_points_shared_internal() {
         &["__toylang_main"],
         &["entry_a", "entry_b", "internal_helper"],
     );
+}
+
+// ============================================================================
+// Approach A regression test (course-correct.md item #1 Test A).
+//
+// SCOPE NOTE. Under Approach A, `per_instance_mir` fires per concrete
+// `Instance` carrying Sky-side-substituted `instance.args`. In a Sky-shaped
+// compiler whose stub rlib exposes generic consumer items, distinct
+// monomorphizations would fire distinct `args_fingerprint` values, and that
+// would be the sharpest A-vs-B discriminator. Toylang's stub rlib exposes
+// ONLY non-generic consumer items (Sky's interop Cases 1b/3/4/5/6 aren't in
+// toylang's scope; see stub_gen.rs's `if !is_generic { ... }` branches and
+// course-correct.md item #17). So in toylang every firing carries `args =
+// []` and there's no per-Instance fingerprint variation to assert.
+//
+// What this test DOES catch:
+//   1. The `args_fingerprint` field exists in the CallbackLog variant (i.e.,
+//      the Approach A trait-signature flip hasn't been reverted). If the
+//      variant is changed back to `{ name: String }` only, the harness's
+//      log parser panics on malformed lines.
+//   2. The fingerprint is structured Debug output of an args list (starts
+//      with `[`, ends with `]`).
+//
+// What protects against the REAL silent regressions (without needing this
+// test):
+//   - **Compile-time:** `queries/mod.rs` references
+//     `providers.queries.per_instance_mir`. If the fork patches are
+//     reverted (vanilla rustc has no such field), the facade fails to
+//     compile.
+//   - **Debug-build:** the `debug_assert!(!instance.args.has_param())` and
+//     `!args.has_param()` checks in `queries/per_instance.rs`'s
+//     `build_dependency_body` fire if any caller (the toylang inner) leaks
+//     Param-bearing args. Any restoration of identity_args / ActiveParamMap
+//     trips this assert during the existing 210-test suite.
+//
+// If Sky picks up this codebase and `__lang_stubs` starts exposing generic
+// consumer items, replace this test with the sharper distinct-fingerprint
+// assertion described in the SCOPE NOTE — that test would have real teeth.
+// ============================================================================
+
+#[test]
+fn test_approach_a_callback_log_shape() {
+    // Any existing fixture works — we only need to look at the recorded log
+    // shape. r_t_r_vec_of_ship has multiple consumer Instances (fleet_len,
+    // make_fleet, __toylang_main, Spaceship.wings) so we get good coverage
+    // of the firing pattern without a new fixture.
+    let firings = collect_generic_rust_deps_firings("r_t_r_vec_of_ship");
+    assert!(
+        firings.iter().any(|(name, _)| name == "__toylang_main"),
+        "expected at least one __toylang_main firing; got: {:?}",
+        firings,
+    );
+    for (name, fp) in &firings {
+        // The fingerprint is a Debug print of `instance.args`, which is a
+        // GenericArgsRef — a slice-like type that Debug-prints as `[...]`.
+        // An empty args list prints as `[]`. We don't care WHAT is in the
+        // brackets (toylang's surface always produces `[]`); we care that
+        // the field is present and structured.
+        assert!(
+            fp.starts_with('[') && fp.ends_with(']'),
+            "args_fingerprint for `{}` should be a Debug-printed list `[...]`; \
+             got {:?} (full firings: {:?}). \
+             If this fails, the CallbackLog::CollectGenericRustDeps variant has \
+             been reverted from {{ name, args_fingerprint }} back to {{ name }} — \
+             Approach A's trait signature (taking ty::Instance<'tcx>) has likely \
+             been reverted to LocalDefId.",
+            name, fp, firings,
+        );
+    }
+}
+
+// ============================================================================
+// S.4 smoke test (course-correct.md quarter-of-work plan, Workstream S).
+//
+// Asserts the facade-side sidecar loader (rustc-lang-facade/src/driver.rs's
+// `load_upstream_sidecars`) fires `on_sky_lib_loaded` for the upstream
+// `__lang_stubs` rlib at the user-bin compile, and that the deserialized
+// registry carries the expected items.
+//
+// Mechanism: each toylangc build produces TWO rustc invocations — the rlib
+// compile (writes the sidecar via S.3) and the user-bin compile (loads
+// upstream sidecars via S.4). The user-bin compile appends its log
+// entries to the shared callback log. We grep for the
+// `OnSkyLibLoaded { crate_name: "__lang_stubs", n_structs, n_functions }`
+// entry and parse the counts.
+//
+// What this test catches:
+//   1. The facade-side detection + path resolution survives (any change
+//      to `tcx.used_crate_source` shape, the lib-prefix-strip logic, or
+//      the crates-walk iteration would surface as a missing entry).
+//   2. The S.3-written sidecar deserializes successfully on the read side
+//      (any format-version drift between writer and reader trips
+//      `SidecarError::FormatVersion` and the toylang impl panics).
+//   3. The loaded registry is non-empty (a degenerate empty payload would
+//      indicate the registry wasn't populated before serialization).
+//
+// What protects against silent regressions independently of this test:
+//   - `OpenOptions::new().create(true).append(true)` in
+//     `callbacks_impl.rs::generate_and_compile` is what surfaces the
+//     user-bin compile's log; reverting it to `std::fs::write` would
+//     clobber the rlib's prior log content. Existing tests that grep
+//     for `CollectGenericRustDeps`/`NotifyConcreteEntryPoint` would
+//     stay green (those still come from the rlib compile), so this
+//     test is the load-bearing surface for "user-bin log entries
+//     reach disk."
+// ============================================================================
+
+#[test]
+fn test_s4_sidecar_load_smoke() {
+    // Re-use an existing fixture — we only care about the user-bin
+    // compile's S.4-driven log entries. `arithmetic` is one of the
+    // smallest fixtures, fast to build.
+    let project = projects_dir().join("arithmetic");
+    assert!(project.is_dir(), "fixture not found: {}", project.display());
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+    let cargo_target = shared_cargo_target_dir();
+    let log_path = build_dir.join("callback.log");
+    std::fs::create_dir_all(&build_dir).unwrap();
+
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            .env("TOYLANG_LOG_PATH", &log_path)
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
+    assert!(
+        build_out.status.success(),
+        "arithmetic toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("callback log not written at {}: {}", log_path.display(), e));
+
+    // The Debug print of `OnSkyLibLoaded` looks like:
+    //   OnSkyLibLoaded { crate_name: "__lang_stubs", n_structs: 0, n_functions: N }
+    // We do a structured prefix match — same pattern as the existing
+    // `CollectGenericRustDeps` parsing in `collect_generic_rust_deps_firings`.
+    let entry_line = log.lines().map(str::trim).find(|line| {
+        line.starts_with("OnSkyLibLoaded { crate_name: \"__lang_stubs\"")
+    }).unwrap_or_else(|| {
+        panic!(
+            "expected OnSkyLibLoaded entry for `__lang_stubs` in callback log; \
+             got:\n{}",
+            log,
+        )
+    });
+
+    // Parse `n_functions: N`. Anything > 0 is fine — toylang's `arithmetic`
+    // fixture has a `main` fn that lands in the registry.
+    let n_fns: usize = {
+        let key = "n_functions: ";
+        let start = entry_line.find(key).unwrap_or_else(|| {
+            panic!("OnSkyLibLoaded entry missing `n_functions` field: {:?}", entry_line)
+        }) + key.len();
+        let rest = &entry_line[start..];
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest[..end].parse().unwrap_or_else(|e| {
+            panic!("could not parse n_functions in {:?}: {}", entry_line, e)
+        })
+    };
+    assert!(
+        n_fns > 0,
+        "expected loaded __lang_stubs registry to carry at least one function; \
+         got n_functions=0 in {:?}",
+        entry_line,
+    );
+}
+
+// ============================================================================
+// Workstream-A oracle sweep smoke test (course-correct.md items #11 + #15
+// prep). Asserts the cross-crate fallback in
+// `oracle.rs::find_extern_fn_def_id` actually resolves extern fns at
+// user-bin compile time, exercising the path that Workstream A's
+// production callers (codegen + dep walker) will need once A.4 inverts
+// the codegen gating.
+//
+// Today the production callers fire at the rlib compile (where lookups
+// are local and succeed trivially), so the cross-crate fallback is dark
+// code without an explicit probe. The probe lives in
+// `callbacks_impl::after_rust_analysis`'s user-bin branch — it iterates
+// the registry's body-less fns and counts how many `find_extern_fn_def_id`
+// resolves. The log line `OracleCrossCrateProbe { resolved: N, total: N }`
+// is what this test greps for.
+//
+// What this test catches:
+//   - Any reversion of `find_extern_fn_in_stub_rlib` to local-only
+//     iteration would surface as `resolved < total`.
+//   - Any rustc API drift in `module_children` / `Res::Def` /
+//     `is_foreign_item` would manifest as a panic or zero resolves.
+// ============================================================================
+
+#[test]
+fn test_oracle_cross_crate_extern_fn_lookup() {
+    // Use a dedicated fixture (not `arithmetic`) so we don't race with
+    // `test_arithmetic`'s wipe-outside-the-lock pattern. The fixture is
+    // a sibling project under `tests/integration_projects/` so the
+    // `../test_helpers` relative path still resolves.
+    let project = projects_dir().join("oracle_probe");
+    assert!(project.is_dir(), "fixture not found: {}", project.display());
+    let build_dir = project.join(".toylang-build");
+    let cargo_target = shared_cargo_target_dir();
+    let log_path = build_dir.join("callback.log");
+
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            .env("TOYLANG_LOG_PATH", &log_path)
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
+    assert!(
+        build_out.status.success(),
+        "oracle_probe toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("callback log not written at {}: {}", log_path.display(), e));
+
+    // Parse the OracleCrossCrateProbe entry. Debug format:
+    //   OracleCrossCrateProbe { resolved: N, total: M }
+    let entry = log.lines().map(str::trim).find(|line| {
+        line.starts_with("OracleCrossCrateProbe ")
+    }).unwrap_or_else(|| {
+        panic!(
+            "expected OracleCrossCrateProbe entry in callback log; \
+             got:\n{}",
+            log,
+        )
+    });
+
+    let parse_field = |key: &str| -> usize {
+        let kpat = format!("{}: ", key);
+        let start = entry.find(&kpat).unwrap_or_else(|| {
+            panic!("OracleCrossCrateProbe missing `{}` field: {:?}", key, entry)
+        }) + kpat.len();
+        let rest = &entry[start..];
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest[..end].parse().unwrap_or_else(|e| {
+            panic!("could not parse `{}` in {:?}: {}", key, entry, e)
+        })
+    };
+    let resolved = parse_field("resolved");
+    let total = parse_field("total");
+
+    assert!(
+        total > 0,
+        "expected `oracle_probe` registry to have at least one extern fn; \
+         got total=0 in {:?}",
+        entry,
+    );
+    assert_eq!(
+        resolved, total,
+        "cross-crate oracle fallback failed to resolve some extern fns: \
+         resolved={}, total={}. The likely cause is a reversion of the \
+         `find_extern_fn_in_stub_rlib` fallback in `oracle.rs` to local-only \
+         iteration. Full log:\n{}",
+        resolved, total, log,
+    );
+}
+
+// ============================================================================
+// S.5 sidecar determinism CI invariant (course-correct.md quarter-of-work
+// plan, Workstream S final).
+//
+// Builds a fixture twice — wiping the target dir + the project's
+// `.toylang-build` between runs — and asserts the two produced
+// `.sky-meta` files are byte-identical. This is the architecture doc
+// §7.4 determinism invariant tested end-to-end. Sidecar S.2 already
+// has a unit-level `payload_determinism` test; this test guards the
+// FULL pipeline (typing pass output, `BTreeMap` iteration, bincode
+// fixed-int encoding, BLAKE3 checksum) against silent drift.
+//
+// Isolation: uses a dedicated `CARGO_TARGET_DIR` under
+// `target/s5-determinism-<run>/` so two consecutive builds don't share
+// cargo's fingerprint cache (which could mask a non-deterministic
+// pipeline by reusing cached output).
+//
+// If this test fails, the failure is structural — the test prints the
+// first byte index where the two outputs differ to give a starting
+// point for diagnosis. Common causes:
+//   - HashMap iteration order leaking into a structurally-walked field
+//     (BTreeMap is the standing guard; check that any new collections
+//     in `ToylangRegistry`/`ToyStruct`/`ToyFunction` are BTreeMap, not
+//     HashMap).
+//   - Bincode config drift (S.2 pins fixed-int + little-endian; any
+//     change to `bincode_cfg()` could introduce length-varying
+//     encoding that's input-dependent).
+//   - A new timestamp / random ID / host-path field added to a
+//     serialized type.
+// ============================================================================
+
+#[test]
+fn test_s5_sidecar_determinism() {
+    let project = projects_dir().join("arithmetic");
+    assert!(project.is_dir(), "fixture not found: {}", project.display());
+
+    // Per-run isolated target dirs so cargo's cross-run fingerprint cache
+    // can't mask non-determinism by reusing a prior `.sky-meta`. Cleaned
+    // up at function exit on a best-effort basis (test failure aborts
+    // before cleanup; the dir lives under `target/` and gets swept by
+    // `cargo clean`).
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    let target_a = base.join("s5-determinism-a");
+    let target_b = base.join("s5-determinism-b");
+    for d in [&target_a, &target_b] {
+        if d.exists() {
+            std::fs::remove_dir_all(d).unwrap_or_else(|e| {
+                panic!("failed to wipe {}: {}", d.display(), e)
+            });
+        }
+    }
+
+    let build_once = |target_dir: &Path| -> Vec<u8> {
+        let build_dir = project.join(".toylang-build");
+        if build_dir.exists() {
+            std::fs::remove_dir_all(&build_dir).unwrap();
+        }
+        let build_out = {
+            let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+            Command::new(toylangc_bin())
+                .current_dir(&project)
+                .env("DYLD_LIBRARY_PATH", sysroot_lib())
+                .env("LD_LIBRARY_PATH", sysroot_lib())
+                .env("CARGO_TARGET_DIR", target_dir)
+                .args(["build"])
+                .output()
+                .expect("failed to spawn toylangc")
+        };
+        assert!(
+            build_out.status.success(),
+            "build failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&build_out.stdout),
+            String::from_utf8_lossy(&build_out.stderr),
+        );
+
+        // Locate the produced sidecar. S.3 writes it adjacent to the rlib
+        // at `target_dir/debug/deps/__lang_stubs-<hash>.sky-meta`. Exactly
+        // one such file is expected — the per-run target dir holds only
+        // this fixture's stubs.
+        let deps = target_dir.join("debug/deps");
+        let mut candidates: Vec<PathBuf> = std::fs::read_dir(&deps)
+            .unwrap_or_else(|e| panic!("read_dir {}: {}", deps.display(), e))
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("__lang_stubs-") && n.ends_with(".sky-meta"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        candidates.sort();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one __lang_stubs-*.sky-meta in {}; found: {:?}",
+            deps.display(),
+            candidates,
+        );
+        std::fs::read(&candidates[0])
+            .unwrap_or_else(|e| panic!("read {}: {}", candidates[0].display(), e))
+    };
+
+    let bytes_a = build_once(&target_a);
+    let bytes_b = build_once(&target_b);
+
+    if bytes_a != bytes_b {
+        let mismatch_at = bytes_a
+            .iter()
+            .zip(bytes_b.iter())
+            .position(|(x, y)| x != y)
+            .unwrap_or_else(|| std::cmp::min(bytes_a.len(), bytes_b.len()));
+        panic!(
+            "sidecar determinism regression: build A produced {} bytes, \
+             build B produced {} bytes; first mismatch at byte {}.\n\
+             a[{}] = {:?}, b[{}] = {:?}\n\
+             See `test_s5_sidecar_determinism` comment for common causes.",
+            bytes_a.len(),
+            bytes_b.len(),
+            mismatch_at,
+            mismatch_at,
+            bytes_a.get(mismatch_at),
+            mismatch_at,
+            bytes_b.get(mismatch_at),
+        );
+    }
+
+    // Best-effort cleanup. Leaving these dirs around on test success is
+    // not catastrophic — next run wipes them — but keeping `target/`
+    // tidy avoids surprises.
+    let _ = std::fs::remove_dir_all(&target_a);
+    let _ = std::fs::remove_dir_all(&target_b);
 }
 
 // ============================================================================

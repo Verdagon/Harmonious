@@ -3,11 +3,13 @@
 //! Produced by the type resolution pass (`type_resolve.rs`) from the untyped
 //! AST (`ast.rs`). Consumed by the LLVM backend (`llvm_gen.rs`).
 
+use serde::{Deserialize, Serialize};
+
 /// A type representation used throughout the compiler.
 /// Most variants are fully resolved. `TypeParam` appears only in the registry
 /// for uninstantiated generic function params/return types and struct fields.
 /// After type resolution, the typed AST never contains `TypeParam`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ResolvedType {
     I32,
     I64,

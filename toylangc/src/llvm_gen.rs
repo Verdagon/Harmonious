@@ -1974,12 +1974,24 @@ pub fn generate_with_tcx<'tcx>(
         }
     }
 
-    // Add internal-only toylang instances (discovered during deep walk, not in MonoItems)
+    // Add toylang instances populated by `populate_toylang_instances_from_cgus`.
+    // Under Workstream A (course-correct.md items #11 + #15) this iterates
+    // the user-bin compile's registry-driven discovery output. Each instance
+    // that carries a `stub_def_id` (looked up via the upstream `__lang_stubs`
+    // rlib's `pub fn` shell) gets promoted to `instance: Some(...)` here so
+    // it qualifies for extern-wrapper codegen below — without that promotion
+    // we'd only emit the internal symbol and link would fail with
+    // `__toylang_impl_<name>` undefined. The `def_id`-only Instance
+    // (`Instance::new_raw(def_id, empty_args)`) carries enough info for
+    // `fn_abi_of_instance` to compute the Rust ABI for non-generic fns.
     for inst in &state.toylang_instances {
         if seen_symbols.insert(inst.extern_symbol.clone()) {
+            let instance = inst.stub_def_id.map(|def_id| {
+                ty::Instance::new_raw(def_id, ty::GenericArgs::empty())
+            });
             fn_items.push(FnItem {
                 resolved_func: inst.resolved_func.clone(),
-                instance: None,
+                instance,
                 extern_symbol: inst.extern_symbol.clone(),
             });
         }

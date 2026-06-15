@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// Binary operator.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -16,7 +18,7 @@ pub enum BinOp {
 }
 
 /// A Toylang expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum Expr {
     IntLit(i64, crate::toylang::typed_ast::ResolvedType),
@@ -45,7 +47,7 @@ pub enum Expr {
 }
 
 /// A Toylang statement.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Stmt {
     Let { name: String, expr: Expr },
     ExprStmt(Expr),
@@ -54,7 +56,7 @@ pub enum Stmt {
 }
 
 /// A parsed Toylang function body.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub ret: Option<Expr>, // trailing expression — becomes return value
