@@ -356,3 +356,213 @@ fn test_standalone_clap() {
 fn test_standalone_reqwest_get() {
     run_standalone_test("reqwest_get_test", "reqwest_get ok");
 }
+
+// ============================================================================
+// A.5 — byte-identical pass-through invariant (architecture §4.4)
+//
+// Architecture invariant: Sky's `rustc` binary, when compiling a crate
+// without `__SKY_STUBS_MARKER`, must produce semantically identical output
+// to vanilla nightly rustc for the same inputs. The compiled function
+// bodies must match byte-for-byte at the LLVM IR level after normalizing
+// the disambiguator hash that rustc seeds from its compiler version
+// string. See `a5-pass-through-scope-notes.md` for why we compare LLVM
+// IR rather than raw `.o` bytes, and for the disambiguator-normalization
+// reasoning.
+//
+// If this test ever fails, something in Sky's startup (panic-handler
+// install, init() side effects, CodegenBackend init wiring, etc.) is
+// leaking observable behavior into pure-Rust compiles. The §4.4
+// invariant is the hardest one to maintain; this test is its CI guard.
+// ============================================================================
+
+/// Replace rustc-internal disambiguator hashes with stable placeholders so
+/// byte-comparison ignores per-compiler-version naming differences.
+///
+/// Two patterns get normalized:
+///   * `<crate>.<HEX>-cgu.<N>` in `ModuleID` / `source_filename` headers.
+///     The HEX is a 16-char lowercase hex hash derived from rustc's
+///     crate-disambiguator seed.
+///   * `Cs<BASE62>_` in v0 mangled symbol names (e.g. `_RNvCs7rqY1Ew9Lo4_5...`).
+///     The BASE62 is rustc's crate-disambiguator encoded into v0 mangling.
+///
+/// Both hashes change between rustc builds with different version strings
+/// (the fork identifies as `1.95.0-dev` and vanilla as
+/// `1.95.0-nightly (d940e5684 2026-01-19)`) even when the compiled code
+/// is bit-for-bit identical. We normalize them out so the comparison
+/// reflects the architectural intent: same compiled code.
+fn normalize_disambiguator(ir: &str) -> String {
+    // Pre-pass: replace the producer-version line. LLVM IR carries a
+    // `!{!"rustc version <whatever>"}` metadata tuple recording the
+    // emitter; the embedded string differs between vanilla and fork by
+    // construction (different `-V` output) and isn't load-bearing for
+    // the compiled-code-equality invariant.
+    let lines_normalized: String = ir
+        .lines()
+        .map(|line| {
+            if let Some(idx) = line.find(r#"!"rustc version "#) {
+                let prefix = &line[..idx];
+                format!("{}!\"rustc version NORMALIZED\"}}", prefix)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ir = lines_normalized.as_str();
+
+    let mut out = String::with_capacity(ir.len());
+    let bytes = ir.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Pattern 1: `Cs<base62>+_` after `_RN` or in a symbol context.
+        // Recognize `Cs` followed by 1+ alphanumerics, ending with `_`.
+        if i + 2 < bytes.len() && bytes[i] == b'C' && bytes[i + 1] == b's' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+            if j > i + 2 && j < bytes.len() && bytes[j] == b'_' {
+                out.push_str("CsX_");
+                i = j + 1;
+                continue;
+            }
+        }
+        // Pattern 2: `<hex16>-cgu.` after a `.`. The hex hash is the
+        // CGU disambiguator embedded in ModuleID.
+        if bytes[i] == b'.' && i + 17 < bytes.len() {
+            let rest = &bytes[i + 1..];
+            let is_hex16 = rest[..16].iter().all(|b| b.is_ascii_hexdigit());
+            let cgu_suffix = &rest[16..21];
+            if is_hex16 && cgu_suffix == b"-cgu." {
+                out.push_str(".HASH-cgu.");
+                i += 1 + 16 + 5;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Compile `src` with the named toolchain, return the emitted LLVM IR
+/// (as a normalized string per `normalize_disambiguator`).
+fn emit_normalized_ir(toolchain: &str, source: &str, crate_name: &str) -> String {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_path = tmp.path().join("a5_input.rs");
+    std::fs::write(&src_path, source).expect("write source");
+    let ir_path = tmp.path().join("a5_output.ll");
+    let out = Command::new("rustc")
+        .arg(format!("+{}", toolchain))
+        .args([
+            "--crate-type", "rlib",
+            "--crate-name", crate_name,
+            "--emit=llvm-ir",
+            "-C", "debuginfo=0",
+            "-C", "metadata=a5fixedseed",
+            "--remap-path-prefix",
+        ])
+        .arg(format!("{}=A5", tmp.path().display()))
+        .arg("-o")
+        .arg(&ir_path)
+        .arg(&src_path)
+        .output()
+        .unwrap_or_else(|e| panic!("rustc +{} spawn failed: {}", toolchain, e));
+    assert!(
+        out.status.success(),
+        "rustc +{} failed:\nstdout: {}\nstderr: {}",
+        toolchain,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let raw = std::fs::read_to_string(&ir_path).expect("read IR");
+    normalize_disambiguator(&raw)
+}
+
+/// Source-snippet corpus for the A.5 pass-through check. Kept inline (vs
+/// a separate corpus/ tree) because adding cases here is the quickest
+/// path to expanded coverage as Sky's startup grows. Each entry is
+/// `(crate_name, source)`. Cases are intentionally simple — the
+/// invariant is about Sky's machinery being dormant, not about
+/// exercising rustc's full codegen.
+fn a5_corpus() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("a5_add", "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"),
+        (
+            "a5_struct",
+            "pub struct Foo(pub i32);\n\
+pub fn make(x: i32) -> Foo { Foo(x) }\n\
+pub fn unwrap_foo(f: Foo) -> i32 { f.0 }\n",
+        ),
+        (
+            "a5_generic",
+            "pub fn identity<T>(x: T) -> T { x }\n\
+pub fn use_i32() -> i32 { identity(42) }\n\
+pub fn use_bool() -> bool { identity(true) }\n",
+        ),
+        (
+            "a5_trait_impl",
+            "pub struct Counter { pub n: i32 }\n\
+impl std::ops::Add for Counter {\n\
+    type Output = Counter;\n\
+    fn add(self, rhs: Counter) -> Counter { Counter { n: self.n + rhs.n } }\n\
+}\n\
+pub fn sum_two(a: i32, b: i32) -> i32 { (Counter { n: a } + Counter { n: b }).n }\n",
+        ),
+    ]
+}
+
+#[test]
+fn test_a5_byte_identical_pass_through() {
+    // Detect the rustc-fork (active) + the vanilla nightly the fork was
+    // built against. The latter pin is the same one declared at
+    // `rust-toolchain.toml`'s upstream tracking point. If `+nightly-...`
+    // isn't installed, skip (printing why) rather than failing — A.5 is
+    // an architectural invariant guard, not a critical test.
+    const VANILLA: &str = "nightly-2026-01-20";
+    const FORK: &str = "rustc-fork";
+
+    let probe = Command::new("rustc")
+        .arg(format!("+{}", VANILLA))
+        .arg("-V")
+        .output();
+    if probe.as_ref().map(|o| !o.status.success()).unwrap_or(true) {
+        eprintln!("[a5] skipping: vanilla toolchain +{} not available", VANILLA);
+        return;
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for (name, source) in a5_corpus() {
+        let vanilla_ir = emit_normalized_ir(VANILLA, source, name);
+        let fork_ir = emit_normalized_ir(FORK, source, name);
+        if vanilla_ir != fork_ir {
+            // Find first differing line for a useful diagnostic.
+            let mut first_diff: Option<(usize, String, String)> = None;
+            for (i, (v, f)) in vanilla_ir.lines().zip(fork_ir.lines()).enumerate() {
+                if v != f {
+                    first_diff = Some((i + 1, v.to_string(), f.to_string()));
+                    break;
+                }
+            }
+            let detail = match first_diff {
+                Some((n, v, f)) => format!(
+                    "{}: first differing line {}:\n  vanilla: {}\n  fork:    {}",
+                    name, n, v, f,
+                ),
+                None => format!(
+                    "{}: line-by-line match but byte sizes differ ({} vs {})",
+                    name,
+                    vanilla_ir.len(),
+                    fork_ir.len(),
+                ),
+            };
+            failures.push(detail);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "A.5 byte-identical pass-through invariant violated:\n{}",
+        failures.join("\n\n"),
+    );
+}
