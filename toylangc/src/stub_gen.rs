@@ -32,28 +32,41 @@ fn fn_generics_clause(type_params: &[String]) -> TokenStream {
     quote! { <#(#idents),*> }
 }
 
-// Course-correct #17 — three of four divergences in this file are closed.
-// One remains, gated by Rust syntax:
+// Course-correct #17 — all four documented divergences in this file are
+// CLOSED as of Session 11. Recorded here for archaeological reference:
 //
-//   1. Struct shape: CLOSED (Phase E completion). Universal shape
+//   1. Struct shape: CLOSED via Phase E completion. Universal shape
 //      `pub struct Foo<P...>(PhantomData<(P...)>);` at every N including
 //      N=0. Was previously gated by a rustc debuginfo-walker ICE on
 //      opaque non-generic ADTs with any source-level field; ICE
 //      eliminated by fork patch 4 (`e67de69ef35` on per-instance-mir)
 //      which clamps build_struct_type_di_node's source-field walk to
-//      min(source.len(), layout.fields.count()).
+//      min(source.len(), layout.fields.count()). See `phase-e-investigation.md`.
 //
-//   2. Extern decls (~lines 167, 220): only emitted for non-generic
-//      items. Rust's `extern "C" { ... }` doesn't permit generic items;
-//      the symbol-per-monomorphization problem (architecture §5.1
-//      Option B failure) is real and there's no syntactic workaround.
-//      Sky's locked design retires this entire mechanism by emitting
-//      all Sky bodies in the binary compile via the codegen plugin (no
-//      per-symbol extern decl needed); that work waits on the deeper
-//      half of course-correct #4 (Sky's `codegen_crate` walks the queue
-//      inline via Inkwell). Until then toylang's emission still needs
-//      the extern decls for the non-generic path. The two sites carry
-//      `arch-fence-allow: extern-C-cannot-be-generic` markers.
+//   2. Cosmetic impl-block + wrapper-fn header divergences: CLOSED via
+//      `generics_for_impl_block` / `fn_generics_clause` helpers — both
+//      return an empty TokenStream for N=0 so the caller doesn't branch.
+//
+//   3. `__toylang_impl_*` extern decl (Sky-emitted wrapper symbols):
+//      CLOSED via removal. Vestigial — Sky's `symbol_name` query
+//      override is the bridge between Rust callers and Sky-emitted
+//      symbols; no forward declaration is needed (architecture §6.2).
+//      Predated the symbol_name routing and never got cleaned up until
+//      the Session 11 audit.
+//
+//   4. `__toylang_accessor_*` extern decl (struct field accessor symbols):
+//      CLOSED via removal. Vestigial — no Rust source ever referenced
+//      these by name; Sky's codegen emitted them as concrete symbols.
+//
+// The `extern "C" { ... }` block that remains carries only body-less
+// toylang fn decls (e.g., `fn println_int(x: i32);` in toylang source
+// → `extern "C" { pub fn println_int(...); }`). These describe REAL Rust
+// functions the user provides elsewhere (e.g., test_helpers); the linker
+// resolves them at final link. By their nature these decls can't take
+// toylang-source generics — they're declaring foreign Rust fns whose
+// ABIs are fixed. The remaining `is_generic`-style branches in this file
+// (helpers + cosmetic emission of `Foo` vs `Foo<T>`) carry
+// `arch-fence-allow: degenerate-case-fast-path` markers.
 //
 // The split here is documented mechanism, not the compiler-law
 // violation the original course-correct entry flagged. The cosmetic

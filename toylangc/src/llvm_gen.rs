@@ -2029,16 +2029,19 @@ pub fn generate_with_tcx<'tcx>(
             //
             // Phase 1 D Case 1b: the resolved_func may come from either
             // `state.toylang_instances` (already-walked, populated by
-            // walk_and_stash_internal_callees for non-generics + transitively)
+            // populate_toylang_instances_from_cgus's entry-point walk + the
+            // transitive callee surfacing inside walk_and_stash_internal_callees)
             // OR, for generic consumer fns instantiated only via Rust
             // call sites (`__lang_stubs::identity::<i32>(42)` from a
             // `rust_caller` source), be synthesized here from the registry
-            // entry + the concrete Instance args. The synthesis is what
-            // makes Case 1b possible — without it, generic toylang fns
-            // never get codegenned at the user-bin compile because the
-            // registry-driven discovery in `populate_toylang_instances_from_cgus`
-            // intentionally skips generics (no caller-args to substitute
-            // with from registry alone).
+            // entry + the concrete Instance args. The synthesis is the
+            // load-bearing piece for Case 1b/4/6: cross-language generic
+            // monomorphization (architecture §20.8.5) requires rustc's
+            // mono collector to surface the concrete Instance, since Sky's
+            // frontend has no way to enumerate what Rust source will
+            // instantiate. Generic exports stay non-roots in the entry-
+            // point walk by design; this codepath is where they enter the
+            // codegen queue.
             let name = tcx.item_name(def_id).to_string();
             let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main".to_string() } else { name.clone() };
             let Some(toy_fn) = registry.functions.get(&registry_name) else { continue; };
