@@ -753,7 +753,7 @@ The upstream effort is *not* on Sky's critical path. Sky ships with the fork, ma
 
 The empirical baseline for fork maintenance is erw's pre-stage-3 experience: ~2-3 days per nightly bump for a 5-patch fork. Sky's fork is 3 patches (smaller), but the patches touch the mono collector (a churn-prone area). The realistic estimate:
 
-- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the three patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent.
+- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the three patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent. (Optionally a 4th patch — the debuginfo walker clamp, §10.4.5 / §25 B8 — if not yet upstream-landed. ~10 LOC defensive change in `rustc_codegen_llvm`; mechanically simple to rebase. Toylang carries this as commit `e67de69ef35` on its `per-instance-mir` branch as the reference implementation.)
 - **Per-bump cost: ~1 week for MIR construction churn.** This is independent of the fork — it's the cost of Sky's per_instance_mir provider building synthetic MIR bodies, which uses rustc-internal MIR construction APIs that drift. The empirical erw data point: 15 months of MIR drift was ~1 hour for erw's 6 sites. Sky's count is higher (every generic Sky function exported produces per_instance_mir output containing ReifyFnPointer casts), so the per-bump cost is larger, but the per-site cost is similar.
 - **Per-bump cost: ~1-2 days for ABI helpers drift.** PassMode variants, BackendRepr changes, layout-data shape shifts. Sky inherits erw's ABI helpers wholesale; the drift surface is identical.
 - **Per-bump cost: ~0.5-1 day for everything else.** Driver entry-point changes, Callbacks trait additions, layout query key shape, providers struct restructuring. All small, all mechanical.
@@ -909,6 +909,8 @@ The marker-based detection is per-crate. Every Sky stub rlib has the marker, reg
 **Caching the marker check.** Within a single Sky `rustc` invocation, the marker check fires once at startup. Across multiple cargo-invoked rustc subprocesses (one per crate in the build graph), each subprocess does its own marker check; the check is per-crate-load cheap (a single `module_children` walk).
 
 For checking *upstream* crates' markers (when loading rlib metadata), Sky maintains a `HashSet<CrateNum>` of "known Sky stub rlibs" populated lazily on first item-from-crate query. Subsequent queries about the same crate are O(1). The detection mechanism scales to large dep graphs.
+
+**Gotcha: glob re-exports across Sky deps.** The marker check must verify the marker DefId's parent crate (`def_id.krate`) matches the crate being inspected — not just that a symbol named `__SKY_STUBS_MARKER` is visible from the crate's `module_children`. The reason: a downstream Sky crate that does `use sky_lib::*;` (or any glob re-export from a Sky lib) inadvertently re-exports `__SKY_STUBS_MARKER` into its own crate root. A naive `module_children` walk that just looks for the symbol name would falsely flag the downstream crate as a Sky stub rlib. The consequences are immediate and bad: Sky's partitioner override would try to filter the downstream's own items out of the CGU list, the binary's `fn main` would disappear from codegen, and the link would fail with an undefined `_main` symbol. The fix is a one-line DefId-parentage check (`def_id.krate == crate_num`). Toylang's empirical hit on this trap (Session 11, during the marker-detection migration) is recorded here so future implementers don't skip the check. The trap also extends to other marker conventions Sky might add later — anything name-based that's matched via cross-crate item iteration should include the parentage check.
 
 ### 4.6 Cross-references
 
@@ -1340,6 +1342,8 @@ impl ::std::clone::Clone for Widget {
 ```
 
 The Clone impl is in Sky's stub rlib because Sky owns the Widget type (orphan rule satisfied; Section 6.6). The body is `unreachable!()` — Sky's `per_instance_mir` provider intercepts when rustc tries to use it, returning Sky's substituted body. Sky's codegen backend emits the real body into the binary's `.o`.
+
+**Sky-emitted symbols do not need forward declarations in the stub rlib.** A natural temptation when adding a new emission shape is to also add an `extern "C" { pub fn __sky_<thing>(...); }` block to the stub rlib so that "rustc knows the symbol exists." Don't. Sky's `symbol_name` query override (§5.3, §26.1) is the load-bearing bridge between Rust-source references and Sky-emitted symbols: rustc resolves a Rust-source call `sky_lib::clone_widget(...)` to the stub rlib's `pub fn clone_widget` DefId; Sky's `symbol_name` provider rewrites the linker name from rustc's default Rust-mangled form to whatever Sky's codegen emitted (`__sky_impl_clone_widget`, or a Sky-mangled internal name, or anything else); the linker resolves cross-translation-unit. The forward declaration adds nothing — it doesn't influence the symbol resolution, doesn't affect rustc's codegen for the stub crate (the stub fn's body is `unreachable!()`), and doesn't satisfy any Sky-side typing requirement. Toylang carried such forward declarations as vestigial scaffolding from a pre-`symbol_name`-override era; removing them eliminated a generic-vs-non-generic asymmetry (extern "C" blocks can't contain generic items) without affecting any visible behavior. Sky should not emit them in the first place. (Body-less Sky source declarations of *real* Rust functions — the analog of toylang's `fn println_int(x: i32);` syntax for binding to existing Rust functions — do still produce extern decls in the stub rlib, because those describe symbols the linker resolves to a Rust-defined body. That's an unrelated use case.)
 
 ### 6.3 `__SKY_STUBS_MARKER` for activation
 
@@ -1970,6 +1974,39 @@ The LayoutData returned by Sky's override has the following critical properties:
 - **`uninhabited: false`** — Sky types are inhabited by default (they have at least one value). Sky doesn't surface uninhabited types to rustc via this override; if a future feature requires it, the design will be extended.
 
 The combination of these properties is what "opaque sized blob" means in rustc's terms. Rustc allocates the type's space, can pass references to it, can sret-return it. Rustc cannot inspect it. Sky's codegen knows the type's internal structure; rustc doesn't.
+
+### 10.4.5 Debuginfo walker's source-vs-layout-field-count assumption
+
+The opaque-with-size shape collides with an implicit assumption inside rustc's debuginfo emitter. `rustc_codegen_llvm::debuginfo::metadata::build_struct_type_di_node` and `build_union_type_di_node` iterate an ADT's source-level `FieldDef`s and query `layout.field(cx, i)` / `layout.fields.offset(i)` per source field:
+
+```rust
+variant_def.fields.iter().enumerate().map(|(i, f)| {
+    let field_layout = struct_type_and_layout.field(cx, i);
+    build_field_di_node(..., struct_type_and_layout.fields.offset(i), ...)
+})
+```
+
+Under rustc's normal model, `variant_def.fields.len() == struct_type_and_layout.fields.count()` always holds. Under Sky's `layout_of` override returning `FieldsShape::Arbitrary { offsets: [], memory_index: [] }` (zero layout fields, per §10.4) for a source struct that has at least one `FieldDef` (e.g., the `PhantomData` wrapper needed to satisfy "all generics must be used"), the assumption breaks — the walker calls `offset(0)` on an empty offsets vec and panics in `rustc_abi/src/lib.rs::FieldsShape::offset` with `index out of bounds: the len is 0 but the index is 0`. ICEs the debuginfo walker.
+
+The crash only surfaces when the Sky ADT appears inside a Rust generic (e.g., `Vec<MySkyType>`), because the outer Rust type's `build_generic_type_param_di_nodes` recurses into each type-param's DI node. Sky ADTs that don't cross into Rust-generic-debuginfo contexts dodge it accidentally. Toylang surfaced the bug empirically via `r_t_r_vec_of_ship` (a `Vec<ToyShip>` test); the original toylang workaround was to emit `pub struct Foo;` (a unit struct with zero `FieldDef`s) for the non-generic case while keeping `pub struct Foo<T>(PhantomData<T>);` for generics — a forced asymmetry that violated the compiler law "non-generic is the degenerate case of generic."
+
+Two mitigation paths, both architecturally compatible with §10.4's opaque-with-size shape:
+
+1. **Defensive clamp upstream.** Patch both `build_struct_type_di_node` and `build_union_type_di_node` to clamp the source iter to `min(variant_def.fields.len(), layout.fields.count())`:
+
+    ```rust
+    let visible_field_count = std::cmp::min(
+        variant_def.fields.len(),
+        struct_type_and_layout.fields.count(),
+    );
+    variant_def.fields.iter().take(visible_field_count).enumerate()...
+    ```
+
+   ~5–10 LOC, no-op on unoverridden layouts, defensive for any plugin overriding `layout_of` (cranelift, miri, Sky). Sibling sites worth auditing: the enum variant walker (`build_enum_variant_struct_type_di_node` in `metadata/enums/mod.rs`) iterates `0..variant_layout.fields.count()` first then indexes source — the inverse direction, so the underreport case doesn't reach a panic there. Toylang shipped this clamp as a fourth fork patch (commit `e67de69ef35`) and verified it eliminates the ICE on rustc 1.95.0-dev. Recommended Sky-side path while pursuing upstream landing — Sky's fork can carry the patch indefinitely; the upstream PR is the long-term cleanup.
+
+2. **`SkyOpaqueType<typeid>` wrapper for every Sky struct.** §10.6 already defines this wrapper for non-export and comptime types; extending it to every Sky struct would mean the source ADT has zero `FieldDef`s of its own — the wrapper IS the single source field, and the wrapper's own source has zero fields, so the walker iterates zero times and never queries `offset(0)`. Side-steps the issue without touching rustc. Costs: multi-day refactor (touches stub_gen, layout_of, oracle, mir_shims, symbol_name); the SkyOpaqueType machinery has to be built anyway for §13's comptime types, so the migration amortizes. Recommended long-term direction; defer until the comptime machinery is in flight.
+
+Either path is locked-design-compatible. Pre-1.0 Sky should ship path 1 as a fork patch while pursuing upstream landing; the SkyOpaqueType migration is a follow-up that arrives with comptime types.
 
 ### 10.5 Layouts computed at per_instance_mir / layout_of time, memoized per invocation
 
@@ -4031,6 +4068,8 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 **B6 (Sky-specific). Slab/comptime interaction with incremental cache.** Probability: ~30% over 5 years. Sky's per-invocation slab plus query-cache interactions may produce non-determinism if the slab is touched in incremental-cache-skippable code paths. Erw's B6 pattern applies here: query-provider side-effect fragility. Canary: tests fail deterministically on warm runs but pass on cold. Reaction: move side-effects to up-front walks (Sky's analog of erw's `populate_toylang_instances_from_cgus`). Pre-emptively designed in Sky's pipeline (Section 20).
 
 **B7 (Sky-specific). Comptime evaluator nondeterminism.** Probability: ~20% over 5 years. Sky's comptime evaluator must be deterministic; if a regression introduces nondeterminism (HashMap iteration order leaking into comptime output), the reproducible-build invariant breaks. Canary: byte-comparison CI catches it. Reaction: identify the nondeterministic source, fix.
+
+**B8 (Sky-specific). Debuginfo walker's source-vs-layout-field-count assumption.** Probability: 100% per nightly bump *until* the upstream defensive clamp lands (see §10.4.5). Rustc's `build_struct_type_di_node` and `build_union_type_di_node` iterate source-level `FieldDef`s and query `layout.field(cx, i)` / `layout.fields.offset(i)` per source field, relying on `source.len() == layout.fields.count()`. Sky's opaque-with-size `layout_of` override (§10.4) violates the assumption: source has N (PhantomData wrapper), layout reports 0 — `offset(0)` on an empty vec panics, ICEs the debuginfo walker. Surfaces when a Sky ADT appears inside a Rust generic (e.g., `Vec<MySkyType>`). Canary: integration tests that put a Sky ADT inside any Rust stdlib generic fail with `index out of bounds: the len is 0 but the index is 0` in `rustc_abi/src/lib.rs::FieldsShape::offset`. Reaction: carry the defensive clamp as a fork patch (~10 LOC; toylang's fork commit `e67de69ef35` is the working reference). The clamp is a no-op on unoverridden layouts so it never affects pure-Rust pass-through. Pursue upstream landing in parallel; the patch is general enough that any plugin layout-override (cranelift, miri) benefits, which strengthens the case. Alternate Sky-side mitigation: the `SkyOpaqueType<typeid>` wrapper migration (§10.4.5 path 2) sidesteps the assumption entirely. See §10.4.5 for the full analysis.
 
 ### 25.3 Category C: operational invariants
 

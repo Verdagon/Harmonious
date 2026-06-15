@@ -25,7 +25,7 @@ Phase 2 C landed `impl rust_trait for toylang_type` end-to-end.
 **Eleven course-correct items are done** (#1, #2, #4, #5, #6, #11,
 #14, #15, #16, #17, #18) and #10 is partial.
 
-**Session 11 layered the generic-vs-non-generic uniformity sweep on top**: four phases (A rename, B drop typecheck skip, C entry-point walk replacing the registry walk, F grep-based CI fence) closed all sites that branched on `type_params.is_empty()` in discovery + typecheck paths. Phase E (struct-shape ICE) was investigated — reproduced live on rustc 1.95.0-dev; concrete two-path recommendation in `phase-e-investigation.md`. **253/253 tests passing.**
+**Session 11 layered the generic-vs-non-generic uniformity sweep on top**: phases A (rename) + B (drop typecheck skip) + C (entry-point walk replacing the registry walk) + F (grep-based CI fence) closed all discovery+typecheck sites; Phase E (struct-shape ICE) was reproduced and fixed by **fork patch 4** (`e67de69ef35`, a debuginfo clamp upstream-ready as `phase-e-rustc-pr-draft.md`), then the struct-shape divergence in stub_gen was retired via the universal `pub struct Foo<P...>(PhantomData<(P...)>);` form. A follow-up investigation prompted by "why do we need extern "C" for anything?" found two of the three `extern "C"` decl sites in stub_gen were vestigial (`__toylang_impl_*` and `__toylang_accessor_*`); removing them eliminated the last generic-vs-non-generic asymmetry in toylang's emission. **The CLAUDE.md compiler-law violation count is now zero. 253/253 tests passing.**
 
 ---
 
@@ -452,11 +452,14 @@ Per the focused plan at `tmp/claude-plan-2026-06-15-ccc8939f.md`, Phases A → B
 
 - **Phase A** (commit `8faca57`): added `ToyFunction::has_abstract_args()` helper to `registry.rs`. Four call sites in `callbacks_impl.rs` renamed. Cosmetic, no behavior change.
 - **Phase B** (commit `5a1e7d0`): generalized `DeferredTypeParam` from `{trait_name, method}` to a single `query: String` description. Added `contains_type_param` guards at the top of four ungated oracle entry points (`rust_free_fn_return_type`, `rust_free_fn_param_types`, `rust_method_return_type`, `rust_method_param_types`). Added a receiver-TypeParam short-circuit in `type_resolve.rs`'s `Expr::MethodCall` arm so `fn foo<T>(x: T) { x.clone() }` defers cleanly. Dropped the `has_abstract_args()` skip at Check 5 + Check 6 — generic toylang bodies now type-resolve at `after_rust_analysis` with deferred Rust queries silently skipped via `TypeResolveError::RustTypeDeferred`. Sharper diagnostics: Sky-side typecheck errors in generic bodies surface earlier.
-- **Phase C** (uncommitted): replaced the registry walk in `populate_toylang_instances_from_cgus` with the §20.4 entry-point walk. Roots = local main (implicitly `is_export` per `parser.rs:382`) + local export free fns + local `is_export` impl-block methods + same for upstream registries loaded by S.4. Each root pushes a `ToylangInstance` and calls `walk_and_stash_internal_callees` for transitive non-export discovery. Generic exports stay non-roots (no concrete args at root); they reach codegen via Channel A (the CGU walk in `llvm_gen.rs:1995`), driven by caller-site Instances. **Net behavior change**: dead non-export non-generic local code is no longer emitted (aligned with §9.3). No fixture relied on it. The 5 `test_generic_*` fixtures that were expected to fail still do — the plan flagged this as unchanged.
-- **Phase F** (uncommitted): new file `toylangc/tests/architecture_fence.rs` grep-scans `callbacks_impl.rs` + `type_resolve.rs` for unmarked `type_params.is_empty()` branches. The four remaining sites (`monomorphize_type`'s ty-subst fast path, the two `resolve_caller_from_*` substituted-args fast paths, `type_resolve.rs`'s FnCall arity check) carry inline `// arch-fence-allow: <reason>` markers so the test passes. Validated by stash-and-rerun — removing the markers makes the test fail loudly with line numbers. Same role A.5 plays for byte-identical pass-through and `non_export_body_bearing_fn_gets_no_stub_shell` plays for §9.
-- **Phase E** (investigation, uncommitted scope note in `phase-e-investigation.md`): reproduced the documented ICE under current rustc by temporarily switching to `pub struct Foo(())` for non-generic types. Crash is `rustc_abi/src/lib.rs:1676:66` — `FieldsShape::offset(i)` index-out-of-bounds, called from `build_struct_type_di_node`'s closure that enumerates source `FieldDef`s, called from `build_generic_type_param_di_nodes` (because we're inside `Vec<ToyShip>`). The root cause: Sky's `layout_of` override returns `FieldsShape::Arbitrary { offsets: [] }` (len 0) but the source tuple-struct has 1 source field; the walker iterates with `.enumerate()` and panics. Two paths recommended: (1) a ~5-10 LOC upstream `rustc_codegen_llvm` patch clamping the loop to `min(source.len(), layout.fields.count())` — general defensive fix benefiting any plugin layout-override (cranelift, miri, future Sky); ~1 day to write + weeks of PR review; (2) migrate every Sky struct to `pub struct Widget(SkyOpaqueData<TYPEID>)` per §10.6 — substantial 5-10 day refactor touching stub_gen + layout + oracle + mir_shims + symbol_name. Recommendation: do (1) first; defer (2) until §13's comptime-type machinery is built anyway.
+- **Phase C** (commit `d87638d`): replaced the registry walk in `populate_toylang_instances_from_cgus` with the §20.4 entry-point walk. Roots = local main (implicitly `is_export` per `parser.rs:382`) + local export free fns + local `is_export` impl-block methods + same for upstream registries loaded by S.4. Each root pushes a `ToylangInstance` and calls `walk_and_stash_internal_callees` for transitive non-export discovery. Generic exports stay non-roots (no concrete args at root); they reach codegen via the CGU walk in `llvm_gen.rs:1995`, driven by caller-site Instances. **Net behavior change**: dead non-export non-generic local code is no longer emitted (aligned with §9.3).
+- **Phase F** (commit `d87638d`): new `toylangc/tests/architecture_fence.rs` grep-scans `callbacks_impl.rs` + `type_resolve.rs` + `stub_gen.rs` for unmarked `type_params.is_empty()` and `type_args.is_empty()` branches. Substituted-args fast paths + arity check + degenerate-case helpers carry inline `// arch-fence-allow: <reason>` markers. Same role A.5 plays for byte-identical pass-through and `non_export_body_bearing_fn_gets_no_stub_shell` plays for §9.
+- **Phase E investigation** (commit `a43569c`): reproduced the documented ICE under current rustc. Crash is `rustc_abi/src/lib.rs:1676:66` — `FieldsShape::offset(i)` index-out-of-bounds, called from `build_struct_type_di_node`'s closure that enumerates source `FieldDef`s, called from `build_generic_type_param_di_nodes` (because we're inside `Vec<ToyShip>`). Root cause: Sky's `layout_of` override reports 0 layout fields but the source tuple-struct has 1 source field.
+- **Phase E Path 1 — fork patch** (commit `e67de69ef35` on `per-instance-mir`; erw side `8a9adc8`): defensive clamp `.take(min(variant_def.fields.len(), struct_type_and_layout.fields.count()))` at both `build_struct_type_di_node` and `build_union_type_di_node`. Audited enum walker — iterates layout first then indexes source, so Sky's underreport case can't reach a panic there. Verified by reproducing the previously-ICE'ing `pub struct Foo(())` shape; passes 253/253 under the patched rustc. PR draft at `phase-e-rustc-pr-draft.md`.
+- **Phase E completion — struct-shape unification** (commit `c17cf7e`): with the fork patch in place, retired the struct-shape `is_generic` branch in stub_gen. Universal shape `pub struct Foo<P...>(PhantomData<(P...)>);` at every N. The fence test now also scans stub_gen.rs.
+- **Vestigial-extern-decl cleanup** (commit `ed4e07e`): prompted by the question "why do we need extern "C" for anything if we always talk directly to Rust functions?" Investigation found two of three `extern "C"` decl sites in stub_gen were vestigial. The `__toylang_impl_*` decls were leftover from before the `symbol_name` query override existed — Rust callers reach Sky-emitted symbols via the override rewriting `__lang_stubs::<name>::h...` → `__toylang_impl_<name>` at link time; no forward decl needed. The `__toylang_accessor_*` decls had no consumer at all. Removing both eliminated the last `extern "C"`-gated `is_generic` branches. What remains in the block is only body-less toylang fn decls — toylang's actual "talk to existing Rust fn" syntax (e.g., `fn println_int(x: i32);` → `extern "C" { pub fn println_int(...); }`); these can't take toylang-source generics by nature.
 
-Test counts after Session 11: **253/253 passing** (98 unit + 1 fence + 138 integration + 16 standalone). Phases A and B are on `main`; Phase C edits + Phase F new test file + Phase E scope note are uncommitted at user request pending review.
+Test counts after Session 11: **253/253 passing** (98 unit + 1 fence + 138 integration + 16 standalone). All Session 11 work is on `main` (commits `8faca57`, `5a1e7d0`, `d87638d`, `a43569c`, `4c19bec`, `8a9adc8`, `70e3069`, `c17cf7e`, `747d0e6`, `ed4e07e`, `a3a7c94`) plus fork commit `e67de69ef35`.
 
 ## How the uniformity sweep was structured (now mostly landed)
 
@@ -472,11 +475,10 @@ Test counts after Session 11: **253/253 passing** (98 unit + 1 fence + 138 integ
 session (~1 week total). D follows whenever #4 lands. E is a
 research thread that can run independently in the background.
 
-**Architectural-property fence:** the moment Phase C lands, add a
-test that mirrors Session 10's commit pattern: walk
-`registry.functions` + `registry.trait_impls`, assert there is NO
-branch on `type_params.is_empty()` left in the discovery + typecheck
-paths (grep-based in CI). Same role A.5 plays for the byte-
+**Architectural-property fence** (landed as Phase F in Session 11):
+`toylangc/tests/architecture_fence.rs` grep-scans `callbacks_impl.rs`,
+`type_resolve.rs`, and `stub_gen.rs` for unmarked `type_params.is_empty()`
+and `type_args.is_empty()` branches. Same role A.5 plays for the byte-
 identical invariant and `non_export_body_bearing_fn_gets_no_stub_shell`
 plays for §9.
 
@@ -977,15 +979,19 @@ standalone) when run with `integration-projects-cache` wiped.
 #16, #17, #18 (11/18). #10 partial. #3 audited and deferred (bundled
 with #7/#9, not a mechanical cleanup).
 
-**Generic/non-generic uniformity sweep**: Phases A/B/C/F landed (Session
-11). The four `type_params.is_empty()` discovery+typecheck sites the
-plan flagged as implementation pragmas are gone; the four remaining
-sites (substituted-args fast paths + FnCall arity check) carry
-`arch-fence-allow` markers and are fenced by
-`tests/architecture_fence.rs`. The two externally-constrained sites
-(struct shape + extern decls in `stub_gen.rs`) stay until rustc patch /
-inline-codegen rewrite lands respectively. Phase E investigation in
-`phase-e-investigation.md`.
+**Generic/non-generic uniformity sweep**: Phases A/B/C/F + Phase E
+completion + vestigial-extern-decl cleanup landed (Session 11). Every
+discovery+typecheck site that branched on `type_params.is_empty()` is
+gone; struct shape unified via fork patch 4 (`e67de69ef35`); the
+vestigial `__toylang_impl_*` and `__toylang_accessor_*` extern decls in
+stub_gen were removed (Sky's `symbol_name` override is the bridge —
+no forward decl needed for Sky-emitted symbols). The remaining
+`extern "C" { ... }` content is only body-less toylang fn decls (the
+"talk to existing Rust fn" syntax), orthogonal to toylang generics.
+Substituted-args fast paths + arity check + degenerate-case helpers
+carry `arch-fence-allow` markers and are fenced by
+`tests/architecture_fence.rs`. **The CLAUDE.md compiler-law violation
+count is zero.** See `phase-e-investigation.md` and `phase-e-rustc-pr-draft.md`.
 
 **Sidecars produced**: yes, ~120 files materialize during a full test run.
 The format is bincode + BLAKE3 truncated checksum with a 64-byte fixed
