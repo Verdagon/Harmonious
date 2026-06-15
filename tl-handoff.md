@@ -811,14 +811,15 @@ the previously-ICE'ing `pub struct Foo(())` shape on the patched rustc —
 253/253 tests pass. PR draft at `phase-e-rustc-pr-draft.md` ready for
 upstream submission.
 
+**Phase E completion landed** (Session 11): stub_gen's struct shape is
+now universal — `pub struct Foo<P...>(PhantomData<(P...)>);` at every N
+— via the fork patch. The architecture fence was extended to scan
+stub_gen.rs; the only remaining `is_generic` branches there are the two
+`extern "C"` decl sites, properly marked
+`arch-fence-allow: extern-C-cannot-be-generic`.
+
 Remaining options:
 
-- **Phase E completion** (~1 hour): with the clamp now in place locally,
-  remove the struct-shape `is_generic` branch from stub_gen and update
-  the architecture_fence to allow the now-unified shape. This adds a
-  hard local dependency on the fork patch — anyone building against
-  vanilla nightly crashes. Trade-off: closes the asymmetry; widens the
-  fork-vs-vanilla gap. Could be deferred until the upstream PR lands.
 - **Phase E Path 2 — `SkyOpaqueType<typeid>` migration** (5-10 days):
   the §10.6 locked Sky design. Substantial — every Sky struct's stub
   shape becomes a wrapper, and every Sky→rustc type-identity site
