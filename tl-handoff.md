@@ -25,6 +25,8 @@ Phase 2 C landed `impl rust_trait for toylang_type` end-to-end.
 **Eleven course-correct items are done** (#1, #2, #4, #5, #6, #11,
 #14, #15, #16, #17, #18) and #10 is partial.
 
+**Session 11 layered the generic-vs-non-generic uniformity sweep on top**: four phases (A rename, B drop typecheck skip, C entry-point walk replacing the registry walk, F grep-based CI fence) closed all sites that branched on `type_params.is_empty()` in discovery + typecheck paths. Phase E (struct-shape ICE) was investigated — reproduced live on rustc 1.95.0-dev; concrete two-path recommendation in `phase-e-investigation.md`. **253/253 tests passing.**
+
 ---
 
 ## 2. The story so far (sessions before yours)
@@ -444,7 +446,19 @@ constraints lift — site 3 via course-correct #4's inline-codegen
 rewrite, site 4 via a rustc bug fix or a different opaque-stub
 mechanism.
 
-## How we fix all of it (planned, not yet started)
+### Session 11 — uniformity sweep landed
+
+Per the focused plan at `tmp/claude-plan-2026-06-15-ccc8939f.md`, Phases A → B → C → F landed in one session. Sites 1 and 2 are gone; sites 3 and 4 remain (forced, as expected). Plus Phase E investigation answered the struct-shape ICE question with reproduction + recommendation.
+
+- **Phase A** (commit `8faca57`): added `ToyFunction::has_abstract_args()` helper to `registry.rs`. Four call sites in `callbacks_impl.rs` renamed. Cosmetic, no behavior change.
+- **Phase B** (commit `5a1e7d0`): generalized `DeferredTypeParam` from `{trait_name, method}` to a single `query: String` description. Added `contains_type_param` guards at the top of four ungated oracle entry points (`rust_free_fn_return_type`, `rust_free_fn_param_types`, `rust_method_return_type`, `rust_method_param_types`). Added a receiver-TypeParam short-circuit in `type_resolve.rs`'s `Expr::MethodCall` arm so `fn foo<T>(x: T) { x.clone() }` defers cleanly. Dropped the `has_abstract_args()` skip at Check 5 + Check 6 — generic toylang bodies now type-resolve at `after_rust_analysis` with deferred Rust queries silently skipped via `TypeResolveError::RustTypeDeferred`. Sharper diagnostics: Sky-side typecheck errors in generic bodies surface earlier.
+- **Phase C** (uncommitted): replaced the registry walk in `populate_toylang_instances_from_cgus` with the §20.4 entry-point walk. Roots = local main (implicitly `is_export` per `parser.rs:382`) + local export free fns + local `is_export` impl-block methods + same for upstream registries loaded by S.4. Each root pushes a `ToylangInstance` and calls `walk_and_stash_internal_callees` for transitive non-export discovery. Generic exports stay non-roots (no concrete args at root); they reach codegen via Channel A (the CGU walk in `llvm_gen.rs:1995`), driven by caller-site Instances. **Net behavior change**: dead non-export non-generic local code is no longer emitted (aligned with §9.3). No fixture relied on it. The 5 `test_generic_*` fixtures that were expected to fail still do — the plan flagged this as unchanged.
+- **Phase F** (uncommitted): new file `toylangc/tests/architecture_fence.rs` grep-scans `callbacks_impl.rs` + `type_resolve.rs` for unmarked `type_params.is_empty()` branches. The four remaining sites (`monomorphize_type`'s ty-subst fast path, the two `resolve_caller_from_*` substituted-args fast paths, `type_resolve.rs`'s FnCall arity check) carry inline `// arch-fence-allow: <reason>` markers so the test passes. Validated by stash-and-rerun — removing the markers makes the test fail loudly with line numbers. Same role A.5 plays for byte-identical pass-through and `non_export_body_bearing_fn_gets_no_stub_shell` plays for §9.
+- **Phase E** (investigation, uncommitted scope note in `phase-e-investigation.md`): reproduced the documented ICE under current rustc by temporarily switching to `pub struct Foo(())` for non-generic types. Crash is `rustc_abi/src/lib.rs:1676:66` — `FieldsShape::offset(i)` index-out-of-bounds, called from `build_struct_type_di_node`'s closure that enumerates source `FieldDef`s, called from `build_generic_type_param_di_nodes` (because we're inside `Vec<ToyShip>`). The root cause: Sky's `layout_of` override returns `FieldsShape::Arbitrary { offsets: [] }` (len 0) but the source tuple-struct has 1 source field; the walker iterates with `.enumerate()` and panics. Two paths recommended: (1) a ~5-10 LOC upstream `rustc_codegen_llvm` patch clamping the loop to `min(source.len(), layout.fields.count())` — general defensive fix benefiting any plugin layout-override (cranelift, miri, future Sky); ~1 day to write + weeks of PR review; (2) migrate every Sky struct to `pub struct Widget(SkyOpaqueData<TYPEID>)` per §10.6 — substantial 5-10 day refactor touching stub_gen + layout + oracle + mir_shims + symbol_name. Recommendation: do (1) first; defer (2) until §13's comptime-type machinery is built anyway.
+
+Test counts after Session 11: **253/253 passing** (98 unit + 1 fence + 138 integration + 16 standalone). Phases A and B are on `main`; Phase C edits + Phase F new test file + Phase E scope note are uncommitted at user request pending review.
+
+## How the uniformity sweep was structured (now mostly landed)
 
 | Phase | Site(s) | Approach | Estimate |
 |---|---|---|---|
@@ -788,6 +802,25 @@ where the language gets a feature that exercises a fundamentally new
 Sky interop pattern. Tier 3 is a quarter-of-work each; don't start
 without budgeting properly.
 
+**Update after Session 11**: Tier 1 + Tier 2 done; the uniformity sweep
+(Phases A/B/C/F) closed every site that branched on
+`type_params.is_empty()` in discovery + typecheck paths. Two compact
+options remain before committing to a Tier 3 quarter-of-work piece:
+
+- **Phase E Path 1 — upstream rustc patch** (~1 day in our control + PR
+  review): write the ~5-10 LOC clamp in `build_struct_type_di_node`,
+  write a minimal Sky-free reproducer (cranelift layout-override test
+  would work), file the bug, submit. If it lands or we ship it as a
+  fourth fork patch, the struct-shape `is_generic` divergence in
+  `stub_gen.rs` can be removed in another 5-LOC change. See
+  `phase-e-investigation.md` for the precise diagnosis.
+- **Phase E Path 2 — `SkyOpaqueType<typeid>` migration** (5-10 days):
+  the §10.6 locked Sky design. Substantial — every Sky struct's stub
+  shape becomes a wrapper, and every Sky→rustc type-identity site
+  needs to decode the const-generic typeid. High blast radius.
+  Recommendation: defer until §13's comptime-type machinery lands and
+  this work amortizes.
+
 ### Cross-references for the next person
 
 - `workstream-a-scope-notes.md` — Workstream A completion notes,
@@ -920,15 +953,25 @@ convention is "patches as working tree state"). See the diff with
 
 ## 12. Status snapshot (where you start)
 
-**Tests passing**: **251/251** (97 unit + 138 integration + 16
+**Tests passing**: **253/253** (98 unit + 1 fence + 138 integration + 16
 standalone) when run with `integration-projects-cache` wiped.
 
-**Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, **4 ✅
-(NEW)**, 5 ✅, 6 ✅. All seven cases tested.
+**Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, 4 ✅,
+5 ✅, 6 ✅. All seven cases tested.
 
 **Course-correct.md items done**: #1, #2, #4, #5, #6, #11, #14, #15,
 #16, #17, #18 (11/18). #10 partial. #3 audited and deferred (bundled
 with #7/#9, not a mechanical cleanup).
+
+**Generic/non-generic uniformity sweep**: Phases A/B/C/F landed (Session
+11). The four `type_params.is_empty()` discovery+typecheck sites the
+plan flagged as implementation pragmas are gone; the four remaining
+sites (substituted-args fast paths + FnCall arity check) carry
+`arch-fence-allow` markers and are fenced by
+`tests/architecture_fence.rs`. The two externally-constrained sites
+(struct shape + extern decls in `stub_gen.rs`) stay until rustc patch /
+inline-codegen rewrite lands respectively. Phase E investigation in
+`phase-e-investigation.md`.
 
 **Sidecars produced**: yes, ~120 files materialize during a full test run.
 The format is bincode + BLAKE3 truncated checksum with a 64-byte fixed
@@ -979,6 +1022,16 @@ time — see `workstream-a-scope-notes.md` for the why).
 | `d65ef81` | Session 9 sharpening (case4/5/6 now architecturally correct) |
 | `a7683fc` | Session-9 doc refresh |
 | `1b738e6` | Session 10: `export` keyword + non-export items invisible to rustc |
+| `0d728f9` | Session-10 doc refresh |
+| `0b40d98` | Honest accounting: generic-vs-non-generic uniformity audit + fix plan |
+| `8faca57` | Phase A: rename `type_params.is_empty()` to `has_abstract_args()` |
+| `5a1e7d0` | Phase B: generic bodies type-resolve eagerly, defer on TypeParam |
+
+**Uncommitted as of Session 11 end (user-fenced pending review):**
+Phase C populate rewrite in `callbacks_impl.rs` (+ 3 arch-fence-allow
+markers), Phase F new file `toylangc/tests/architecture_fence.rs` (+ 1
+marker in `type_resolve.rs`), Phase E new file `phase-e-investigation.md`,
+this Session 11 doc refresh.
 
 Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
 baseline.
@@ -1038,8 +1091,11 @@ helpers work cross-crate, Workstream A's codegen-at-binary architecture
 runs every Sky body at the user-bin compile from the AST in the
 sidecar, the multi-crate plumbing works (case6 builds), the seven-case
 taxonomy has fixtures for six of seven cases (1a/1b/2/3/5/6), and the
-§4.4 byte-identical pass-through invariant is guarded by CI (A.5).
-**243/243 tests pass.**
+§4.4 byte-identical pass-through invariant is guarded by CI (A.5),
+the §9 export commitment is guarded by `non_export_body_bearing_fn_gets_no_stub_shell`,
+and the CLAUDE.md compiler-law's generic/non-generic uniformity is
+guarded by `architecture_fence.rs`.
+**253/253 tests pass.**
 
 Architecturally the prototype is now **LITERAL** Sky shape for
 multi-toylang-crate projects, no longer just rehearsal. Single-file
@@ -1051,11 +1107,11 @@ with their own sidecars, consumed by independent toylang binaries
 that codegen the libs' bodies at the binary compile from the sidecar's
 AST.
 
-The biggest remaining architectural piece is **Phase 2 C** (toylang
-`impl rust_trait for toylang_type`) — the gating language feature for
-Case 4 and the most architecturally interesting remaining piece.
-Estimate 3–5 weeks of focused work. After that the Tier 3 facade-level
-shifts (#7, #8, #12, #13) are each their own multi-week sub-project.
+Phase 2 C is done (Session 8) and the generic/non-generic uniformity
+sweep is done (Session 11). The biggest remaining architectural pieces
+are the **Tier 3 facade-level shifts** (#7, #8, #12, #13) and **Phase E
+Path 1's upstream rustc patch** (~1 day in our control to write +
+weeks of PR review; the cheapest remaining unification win). See §7.
 
 Read the architecture doc. Read course-correct.md (status table at the
 top). Read `workstream-a-scope-notes.md` and `phase3-e6-scope-notes.md`
