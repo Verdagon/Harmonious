@@ -1,1177 +1,889 @@
-# Handoff: erw → Sky Quarter Of Work
+# Handoff: erw → Sky / Tier 3 facade rebuilds
 
-Hi, future-you / junior engineer. You're picking up a multi-week project. This
-document is your full briefing — read it end to end before you touch any code.
-Sections are ordered "context first, action last."
+Hi, future-you. You're picking up after Session 12. Phases 1 and 2 of the
+quarter-of-work plan are done; the seven-case interop taxonomy is fully
+tested; the Sky-architectural `__ToylangOpaque<HASH>` wrapper migration
+landed; fork patch 4 was retired. **262/262 tests passing** against
+unpatched-aside-from-`per_instance_mir`-trio rustc.
 
-If you only read one thing, read **§7 Where to start**.
+The remaining work is **Tier 3** — five course-correct items that rebuild
+facade-level assumptions toylang inherited from the early Approach-B era.
+Each is its own multi-week piece; see §6 for the plan.
 
----
-
-## 1. The project in one paragraph
-
-`erw` is a Rust-interop prototype currently embodied by two crates:
-`rustc-lang-facade` (a reusable library that hooks into rustc via query
-overrides) and `toylangc` (a toy consumer language that uses the facade to
-prove out interop mechanics). The **architectural target** is **Sky**, a
-memory-safe systems language whose compiler will use the same facade pattern.
-The master design doc is `rust-interop-architecture.md` (5,148 lines). The
-catalog of places where erw currently diverges from Sky is `course-correct.md`
-(18 items). This project — driven by the plan at
-`/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md` — adds
-tests that exercise the "hard cases" (1b, 3, 4, 5, 6) from the
-architecture doc's seven-case taxonomy. **As of Session 8, all seven cases are tested** (1a, 1b, 2, 3, 4, 5, 6).
-Phase 2 C landed `impl rust_trait for toylang_type` end-to-end.
-**Eleven course-correct items are done** (#1, #2, #4, #5, #6, #11,
-#14, #15, #16, #17, #18) and #10 is partial.
-
-**Session 11 layered the generic-vs-non-generic uniformity sweep on top**: phases A (rename) + B (drop typecheck skip) + C (entry-point walk replacing the registry walk) + F (grep-based CI fence) closed all discovery+typecheck sites; Phase E (struct-shape ICE) was reproduced and fixed by **fork patch 4** (`e67de69ef35`, a debuginfo clamp upstream-ready as `phase-e-rustc-pr-draft.md`), then the struct-shape divergence in stub_gen was retired via the universal `pub struct Foo<P...>(PhantomData<(P...)>);` form. A follow-up investigation prompted by "why do we need extern "C" for anything?" found two of the three `extern "C"` decl sites in stub_gen were vestigial (`__toylang_impl_*` and `__toylang_accessor_*`); removing them eliminated the last generic-vs-non-generic asymmetry in toylang's emission. **The CLAUDE.md compiler-law violation count is zero.**
-
-**Session 12 then landed Phase E Path 2 — the wrapper-as-field migration**. Sky structs now emit as newtypes around `__ToylangOpaque<HASH>` (a content-addressed typeid carrier, architecture §10.4.5 path 2 / §10.6). `layout_of` reports source-matching field counts so the rustc debuginfo walker's assumption holds structurally. Fork patch 4 was retired — Path 2 eliminates the violation at its source. Only the 3 per_instance_mir patches remain in the fork. **262/262 tests passing.**
+If you only read one thing, read **§6 Where to start now**.
 
 ---
 
-## 2. The story so far (sessions before yours)
-
-You should know the recent history because file names and concepts in your
-work descend from it.
-
-**Session 1 (course-correct.md authoring).** Read the architecture doc end
-to end. Produced `course-correct.md` — 18 places in the prototype that
-diverge from Sky's locked decisions.
-
-**Session 2 (Approach A restoration — course-correct item #1).** The biggest
-divergence: erw's "stage 3" migration replaced an Instance-keyed forked
-`per_instance_mir` query with a DefId-keyed `optimized_mir` override
-(Approach A → Approach B), and "stage 4" went further by retiring all rustc
-fork patches to zero-fork. Sky **requires** Approach A because Sky's
-arbitrary-typed comptime arguments cannot be substituted by rustc's
-collector — only Sky's frontend understands Sky-typed values.
-
-This session restored Approach A end-to-end. Three workstreams:
-- **W1**: Rebuilt the 3-patch rustc fork (declare query, collector hook,
-  default-None provider). `~/rust` checkout bumped from rustc 1.86 (Jan 2025)
-  to rustc 1.95.0-dev / commit `d940e568` (matching `nightly-2026-01-20`).
-  Build took 14:43 with `download-ci-llvm = true`. Installed as toolchain
-  `rustc-fork` at `$HOME/rust/build/host/stage2`.
-- **W2**: Facade switched from `optimized_mir.rs` to `per_instance.rs`.
-  Trait method `collect_generic_rust_deps` now takes `ty::Instance<'tcx>`
-  instead of `LocalDefId`.
-- **W3**: Toylang substitutes `instance.args` concretely Sky-side. Retired
-  `oracle::ActiveParamMap` thread-local. `debug_assert!(!instance.args.has_param())`
-  added in `build_dependency_body`. `ResolvedType::TypeParam` arm in
-  `try_resolved_to_rustc_ty` (oracle.rs:292) now panics unconditionally
-  ("Sky-side substitution should have replaced it").
-
-After W3: 210/210 tests pass. Plus a positive-evidence probe test
-`test_approach_a_callback_log_shape` was added — asserts the
-`CollectGenericRustDeps` log entries carry an `args_fingerprint` field, which
-is sharp regression protection for the trait-signature shape.
-
-**Session 3 (quarter-of-work Phase 1 Workstream S start).** Wrote this plan.
-Started Phase 1. Landed three sub-commits:
-- **S.1**: Sidecar format spec doc + `SidecarHeader` types.
-- **S.2**: Bincode serialization + BLAKE3 checksum + serde derives + `BTreeMap` promotion.
-- **S.3**: Sidecar written at end of rlib compile's `after_rust_analysis`.
-
-Test counts after Session 3: 225/225 (81 unit + 129 integration + 15
-standalone). 121 `.sky-meta` sidecar files materialize during the test run.
-
-**Session 4 (this session — finished Workstream S, oracle sweep, Workstream A).**
-Three major pieces landed plus one attempted+rolled-back, then re-tried after
-removing the blocker:
-
-- **S.4** (sidecar load): Facade walks `tcx.crates(())`, finds Sky-marked rlibs
-  via `is_from_lang_stubs`, reads adjacent `.sky-meta` files (with cargo's `lib`
-  prefix strip), fires new `LangCallbacks::on_sky_lib_loaded(tcx, crate_name,
-  bytes)` trait method (Option B per §7.3 — facade doesn't know consumer payload
-  shape). Toylang's impl deserializes via `sidecar::deserialize_sidecar`, stores
-  in new `ToylangState.upstream_registries: BTreeMap<String, ToylangRegistry>`.
-  New `CallbackLog::OnSkyLibLoaded` variant + `test_s4_sidecar_load_smoke`.
-- **S.5** (sidecar determinism CI invariant): `test_s5_sidecar_determinism`
-  builds the `arithmetic` fixture twice with isolated per-run `CARGO_TARGET_DIR`s
-  and byte-compares the two `.sky-meta` files. Panic on mismatch points at
-  common causes (HashMap-leak, bincode-cfg drift, timestamp leak).
-- **Workstream A first attempt — REVERTED.** A.1+A.2+A.4 prototype compiled
-  but tripped a deeper blocker: `oracle::find_extern_fn_def_id` walks only
-  LOCAL HIR items. At user-bin compile every `extern "C" { fn ... }` decl is
-  in the upstream `__lang_stubs` rlib, not local. Lookup panics. Reverted A
-  edits, documented findings in `workstream-a-scope-notes.md`.
-- **Oracle cross-crate sweep** (the blocker fix): completed stage-5a's
-  half-done refactor. Added cross-crate fallbacks to `find_extern_fn_def_id`
-  + new `find_extern_fn_in_stub_rlib` + `find_stub_fn_in_stub_rlib` +
-  `find_wrapper_fn_def_id`. Same pattern stage 5a applied to
-  `resolve_rust_path`. New `CallbackLog::OracleCrossCrateProbe` variant +
-  isolated `oracle_probe/` fixture + `test_oracle_cross_crate_extern_fn_lookup`
-  asserting the fallback fires at user-bin compile.
-- **Workstream A re-attempted — LANDED.** With oracle blocker gone, A.1+A.2+A.4
-  shipped. Rlib compile produces no toylang `.o` (`llvm_paths = None`). User-bin
-  compile is the codegen site. Discovery shifted from upstream-CGU walk (finds
-  zero items at user-bin) to **registry-driven**: iterate `registry.functions`,
-  push `ToylangInstance` per non-generic body-bearing fn, look up `pub fn` shell
-  DefId in `__lang_stubs`, transitively `walk_and_stash_internal_callees` to
-  surface generic monomorphizations like `wrap<i32>`. New `stub_def_id` field
-  on `ToylangInstance` lets codegen build `Instance::new_raw(def_id, empty_args)`
-  for extern wrapper emission. See `workstream-a-scope-notes.md` for the
-  detailed completion notes including the two key unlocks.
-
-Test counts after Session 4: **228/228** (81 unit + 132 integration + 15
-standalone). Course-correct items #11 and #15 are done. Sky-aligned shape
-at the SHAPE level for single-file programs; literal Sky shape (per-library
-publishing) lands in Phase 3.
-
-**Session 5 (Phase 3 multi-crate + Phase 1 D + cleanups + A.5).** Four
-distinct pieces of work, all landed and committed:
-
-- **Phase 3 (E.1–E.6) — multi-toylang-crate end-to-end.** E.1 (marker-based
-  `__SKY_STUBS_MARKER` detection — course-correct #6); E.2 (`[toylang-dependencies]`
-  manifest schema); E.3 (build orchestration fan-out per Sky lib); E.4
-  (oracle multi-crate iteration); E.5 (typecheck cross-crate name
-  resolution via effective_registry merge); E.6 (codegen-side upstream
-  iteration + new `test_case6_basic_multi_crate` — the first test
-  exhibiting architecture §5.5 literally: library compile produces rlib +
-  sidecar only; binary compile codegens every reachable Sky item across
-  all libs from the AST in the sidecar). Hard-won: a 0%-CPU hang at the
-  user-bin compile diagnosed via `sample` as @GCMLZ re-entrance —
-  `lang_symbol_name` calls `call_notify_concrete_entry_point` from
-  inside `generate_and_compile`, which already holds MUTABLE_STATE;
-  std::sync::Mutex isn't reentrant. Fixed with a thread-local
-  fat-pointer state-bypass in the facade (`lib.rs`). Course-correct
-  items #6 and #16 done.
-
-- **Phase 1 D — rust_caller manifest field + Cases 1a/1b/3/5.**
-  `[project.rust_caller]` optional path to a Rust source file that
-  supplies the binary's `fn main`. `write_main_shim` prepends the
-  standard extern-crate preamble and appends the rust_caller's content,
-  replacing the default `__toylang_main` shim. Four new integration
-  tests: case1a (Rust calls non-generic Sky), case1b (Rust calls
-  generic Sky with rustc-known T — FIRST test exercising Approach A with
-  non-empty `instance.args`; required extending the CGU walk in
-  `generate_with_tcx` to synthesize `FnItem` from registry + instance.args
-  for upstream generics), case5 (Rust → Sky → different Rust lib via
-  Vec stdlib), case3 (Rust → Sky → trait dispatch back to Rust top's
-  Clone impl; required a small fix in `codegen_extern_wrapper`'s
-  `rust_ret_type` arm for direct-coerced RustType returns).
-
-- **Course-correct cleanups #14 + #2.** #14: retire CARGO_PRIMARY_PACKAGE
-  env-var gate at the top of `run_wrapper_mode`; the manifest-vicinity
-  lookup below already does the right thing. #2: retire the
-  `(Linkage::External, Visibility::Default)` post-partition mutation in
-  `partition.rs` — Workstream A's binary-codegen model means the
-  Phase-6 wrappers and the toylang code that calls them live in the
-  same final binary at link time, so default Hidden linkage works. The
-  §B2 timing risk dissolves.
-
-- **A.5 byte-identical pass-through invariant** (architecture §4.4).
-  New `test_a5_byte_identical_pass_through` standalone test compiles a
-  small Rust corpus (add, struct, generic, trait_impl) with both
-  `+nightly-2026-01-20` (vanilla) and `+rustc-fork`, emits LLVM IR,
-  normalizes the disambiguator hash + module ID + LLVM-version
-  metadata, asserts byte-equality. Hard CI guard against
-  Sky's-machinery-leaks-into-pure-Rust-compiles regressions. Skips
-  gracefully when vanilla toolchain isn't installed.
-
-Test counts after Session 5: **243/243 passing** (90 unit + 137
-integration + 16 standalone).
-
-**Session 6 (Tier 1 sweep — #4, B, #5).** All three Tier 1 items landed
-in one session as mechanical refactors:
-
-- **#4 codegen-wrapper emission channel** (commit `6c19e53`). Wrapped
-  rustc's own ongoing-codegen `Box<dyn Any>` in
-  `LangOngoingCodegen { inner, lang_obj_path }`; `codegen_crate`
-  returns the wrapper, `join_codegen` downcasts and extracts both.
-  Retired `FacadeMutableState.lang_obj_path` +
-  `set_lang_obj_path` / `get_lang_obj_path`. The inline-Inkwell
-  rewrite the architecture eventually wants is deferred (Sky's full
-  codegen still goes through the consumer's `generate_and_compile`
-  callback); the cross-phase channel itself is gone.
-
-- **Workstream B oracle TypeParam tolerance** (commit `01d98fd`).
-  `oracle::rust_trait_method_return_type` /
-  `rust_trait_method_param_types` now detect TypeParam in Self or
-  any type arg and return a structured "deferred" error instead of
-  panicking via `try_resolved_to_rustc_ty`. New
-  `RustTypeLookupContext::DeferredTypeParam` +
-  `UnresolvedRustType::is_deferred`; the `TypeResolveError` enum
-  gained a `RustTypeDeferred` variant; the Check 5 typecheck loop
-  silently skips deferred entries. ~80 LOC + 3 unit tests for the
-  new `contains_type_param` helper.
-
-- **#5 hook point: after_expansion not after_analysis**
-  (commit `e81cf6d`). One-line driver.rs swap. Toylang's oracle
-  queries (fn_sig / adt_def / module_children) are all available at
-  expansion-time. The handoff's 3–5-day estimate budgeted for a
-  worst-case split (Sky-side parse at after_expansion, rustc cross-
-  check at after_analysis); in practice it was a hook-point swap
-  with a comment refresh.
-
-Test counts after Session 6: **246/246 passing** (93 unit + 137
-integration + 16 standalone).
-
-**Session 7 (Tier 1 mechanical cleanups — #17, #18, #3 audit).** Two
-mechanical items closed; #3 deferred after an audit revealed it's
-deeper than the docs estimated.
-
-- **#18 build.rs comment refresh** (commit `1c27b09`). The stale
-  rationale ("toylang's emitted `.o` (bundled into the rlib) calls
-  into rust_dependencies symbols at the OBJECT-FILE level") died with
-  Workstream A. Rewrote it to explain the actual current load-bearing
-  reason: Phase 1 D's `rust_caller.rs` lives inside user_bin and names
-  rust_dependencies directly (`use serde::...`), so cargo must pass
-  `--extern serde=...` to user_bin's rustc — which requires the
-  direct re-listing. Without it, the compile fails at "unresolved
-  import" before linking.
-
-- **#17 stub_gen `is_generic` special-casing** (commit `4f5cc8a`).
-  Two of the four `!is_generic` branches were purely cosmetic
-  (the impl-block header `impl Foo` vs `impl<T> Foo<T>`, the wrapper-
-  fn header `pub fn foo(…)` vs `pub fn foo<T>(…)`) — unified via new
-  `generics_for_impl_block` + `fn_generics_clause` helpers that return
-  empty token streams for the zero-param case. Two divergences stay
-  and are now explicitly documented as gated by external constraints:
-  struct shape (rustc debuginfo-walker ICE on opaque non-generic
-  ADTs with any source field) and extern decls (`extern "C"` doesn't
-  permit generics; Sky retires this whole mechanism when #4's inline-
-  codegen rewrite lands).
-
-- **#3 `cgu_stash.rs` retirement — AUDITED, NOT LANDED.** The audit
-  found `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for
-  two paths that don't go through Workstream A's registry-driven
-  discovery: (1) accessor-method discovery via `opt_associated_item`,
-  and (2) Case-1b generic consumer fns instantiated from Rust call
-  sites (`__lang_stubs::wrap::<i32>(42)` from a `rust_caller.rs`,
-  where the registry walk intentionally skips generics because it has
-  no caller args). Retiring the stash requires moving both discovery
-  paths to the `after_expansion` queue the architecture wants —
-  that's bundled with #7 (sidecar-loaded universe) and #9 (symbol_name
-  discovery retirement), not a mechanical cleanup. #3 stays paired
-  with that deeper rebuild.
-
-Test counts after Session 7: **246/246 passing** (no test count
-change — both refactors are byte-equivalent to the old emission).
-
-**Session 8 (Phase 2 C — Case 4 end-to-end).** The toylang language
-feature `impl rust_trait for toylang_type` landed across seven
-sub-steps, closing the seven-case interop taxonomy.
-
-- **C.1 parser** (commit `6e9e7a8`): top-level `impl <Path> for
-  <Ident> { fn … }` recognised; `&self` elevated to an explicit
-  `self: &Struct` parameter (CLAUDE.md "prefer self as another
-  parameter"); 3 new parser unit tests.
-
-- **C.2 registry** (same commit): `ToyImpl { trait_name,
-  self_type_name, methods: Vec<ToyImplMethod> }`,
-  `ToylangRegistry.trait_impls: Vec<ToyImpl>` (deterministic by
-  source order).
-
-- **C.3 type resolver + C.4 stub_gen** (commit `5b1babd`):
-  Check 6 type-resolves each method body via the existing
-  `resolve_fn_body` path (no method-specific code path needed);
-  stub_gen emits one `impl <Trait> for <SelfType> { fn name(&self,
-  …) -> Ret { unreachable!() } }` block per `ToyImpl`. 1 new
-  stub_gen unit test.
-
-- **C.5 llvm_gen + C.6 symbol_name + C.7 fixture** (commit
-  `b56cf4c`):
-  - New facade helper `is_consumer_trait_impl_method` walks
-    `opt_associated_item` + `impl_opt_trait_ref` to discriminate
-    trait-impl methods on consumer types.
-  - `is_consumer_accessor_safe` now excludes them (early return when
-    `impl_opt_trait_ref` is Some) so accessor and trait-impl callback
-    names don't collide.
-  - symbol_name routes trait-impl methods to a new callback shape
-    `__impl_method__<Self>__<Trait>__<m>` → consumer mangles to
-    `__toylang_impl__<Self>__<Trait>__<m>`.
-  - New oracle helper `find_trait_impl_method_def_id` walks
-    `tcx.all_impls(trait_def_id)` to find the impl method's DefId
-    for Instance construction.
-  - `populate_toylang_instances_from_cgus` iterates
-    `registry.trait_impls`, pushes `ToylangInstance` per method so
-    the existing codegen pass emits both internal and Rust-ABI
-    extern wrapper.
-  - Auto-deref bug fix in type_resolve + llvm_gen: `Ref { Struct }`
-    receiver auto-derefs for `self.field` access. The codegen path
-    loads the receiver pointer before GEPing the field — earlier the
-    GEP indexed into the receiver's stack slot itself and printed
-    garbage (1835707572 instead of 42 the first time the fixture
-    ran).
-  - `case4_sky_impl_rust_trait/` fixture: Widget + impl Clone + Sky
-    accessors; rust_caller calls `Clone::clone(&w)` via trait
-    dispatch, prints id via Sky `id_of`.
-
-Test counts after Session 8: **251/251 passing** (97 unit + 138
-integration + 16 standalone).
-
-**Session 9 (honest fixture audit + sharpening).** Re-reading the case
-fixtures against the architecture doc's worked examples revealed that
-several of them are *partial* tests of the architectural case rather
-than the sharp version. The seven-case taxonomy fixtures were meant
-to make drift toward Approach B "fail loudly"; a weak fixture for the
-hardest case doesn't do that.
-
-Audit findings (pre-Session-9 state):
-
-| Case | Architectural shape | Pre-9 fixture | Sharp? |
-|---|---|---|---|
-| 1a | Rust → Sky non-generic | non-generic call | ✅ |
-| 1b | Rust → Sky generic w/ **Rust-defined** T | `identity::<i32>(42)` — stdlib type | ⚠️ exercises Approach-A mechanism (non-empty `instance.args`) but with a stdlib type, not a user-struct (the architectural distinguishing case). case3 below covers the user-struct path. |
-| 2 | Sky → Rust generic | existing fixtures (`Vec::new<i32, Global>()`) | ✅ |
-| 3 | Rust → Sky generic → trait dispatch back to Rust | `clone_it::<MyCounter>` with MyCounter Clone-derived in rust_caller | ✅ — the genuinely sharp test |
-| 4 | **Sky top** → Rust **generic** intermediary → Sky impl of Rust trait | **Rust** top → direct `Clone::clone(&w)`, no Rust generic middle, Sky top inverted to Rust top | ❌ wrong shape — closer to case1a+trait-dispatch than to architectural Case 4 |
-| 5 | Rust → Sky **generic** middle → different Rust | Sky middle is non-generic `count_three()` | ⚠️ structurally case-1a-layered-over-case-2; the "1b-layered-over-2" hardness isn't exercised |
-| 6 | Sky → Rust **generic** middle → different Sky | both Sky pieces non-generic, no Rust middle | ⚠️ tests "Sky lib depends on Sky lib" but not the architectural difficulty (rustc walking a Rust generic body and dispatching to the other Sky's trait impl) |
-
-What's actually exercised at the mechanism level pre-Session-9:
-
-- ✅ Approach A with non-empty `instance.args` — case1b (i32), case3 (MyCounter).
-- ✅ Sky → Rust trait dispatch with substituted Self — case3.
-- ✅ Sky stub rlib impl block compiles + rustc dispatches to it — case4 (pre-9).
-- ❌ **Rustc walks an extern Rust generic body, sees a trait method
-  call, dispatches to a Sky-defined impl.** Load-bearing for Case 4
-  *and* Case 6 architecturally; **no pre-9 fixture exercised it.**
-
-Session 9's sharpening work:
-
-- New `some_rust_lib/` test crate ships a true Rust generic
-  intermediary (`pub fn duplicate<T: Clone>(x: &T) -> T { x.clone() }`)
-  with no `extern "C"` decoration — the architecturally important
-  shape that `test_helpers` cannot carry because its surface is
-  C-ABI-only.
-- case4 rewritten with the correct shape: Sky top, Rust generic middle
-  (`duplicate::<Widget>(&w)`), Sky impl of `Clone for Widget`. Now
-  exercises rustc walking `duplicate<Widget>`'s body, queueing
-  `<Widget as Clone>::clone`, and firing Sky's emission path.
-- case5 rewritten with a generic Sky middle (`store_in_vec<T>(x: T) ->
-  usize` — 1b layered over 2).
-- case6 rewritten with a Rust generic intermediary between the two
-  Sky crates — Sky-app calls Rust `duplicate::<Pair>` which dispatches
-  to Sky-lib's `Clone for Pair`.
-
-Test counts after Session 9: **251/251 passing** (97 unit + 138
-integration + 16 standalone) — the sharpening is byte-equivalent at
-the test-count level because the existing case4/5/6 tests were
-already counted; what changed is *what they actually test*.
-
-Honest follow-ups deferred from Session 9 (small, real, documented):
-
-1. **8-byte two-field struct return type via Rust ABI through Sky's
-   extern wrapper.** When case6 first ran with `Pair { first: i32,
-   second: i32 }` (8 bytes), the extern wrapper for
-   `__toylang_impl__Pair__Clone__clone` came back with signature
-   `define { i8, i8 } @… (ptr)` — only 2 bytes of return data.
-   abi_helpers' coerced-return computation treats the 8-byte
-   opaque-with-size layout as if it were 2 bytes somewhere along the
-   pipeline. case6 was simplified to a single-i32-field `Box` to
-   unblock; the two-field-struct gap stands. Not specific to Phase
-   2 C — touches the generic small-struct return path that should
-   also affect non-trait-method consumer fns. Investigate next.
-
-2. **case1b user-struct variant.** case1b still uses `identity::<i32>`
-   (stdlib type). A sharper variant would mirror case3's MyCounter
-   pattern. case3 already covers the user-struct-as-T path mechanism,
-   so case1b's weakness is mild; add a `case1b_user_struct` variant
-   if/when defending against drift in this specific direction.
-
-**Session 10 (export keyword — Sky §9 architectural property
-enforced).** Until Session 9 toylang emitted `pub fn name(...) {
-unreachable!() }` for every body-bearing fn in the stub rlib, so
-rustc DID have DefIds for non-export items even though it never
-walked their bodies. Session 10 closes that gap.
-
-- New `export` keyword in front of fn / impl decls; parser sets
-  `is_export: bool` on `ToyFunction` and `ToyImpl`. `main` is
-  implicitly export (the Rust shim names `__toylang_main`). Structs
-  are deliberately NOT gated — §10 needs opaque-with-size ADT
-  presence for layout composition.
-- stub_gen skips the `pub fn` shell for non-export body-bearing fns
-  and the entire `impl` block for non-export impls. Check 2 in
-  `after_rust_analysis` (stub-presence guard) restricted to export
-  items.
-- New `stub_gen::tests::non_export_body_bearing_fn_gets_no_stub_shell`
-  is the CI fence: builds a registry with one export + one
-  non-export fn, runs `generate`, asserts the non-export name never
-  appears as a `fn` declaration. Mirror of A.5's spirit — a CI-
-  enforceable fence against drift away from Sky §9's commitment.
-- Fixtures migrated: case1a/1b/3/5 added `export` on the Sky fn the
-  rust_caller calls; case4 marked `export impl Clone for Widget`;
-  case6_lib exported make_box/box_value/impl Clone; two layout-probe
-  fixtures (tg_of_*_layout) marked `export fn make_wrapper` because
-  they assert the layout query fires at rlib-compile time, which
-  needs the rustc-visible signature.
-
-Test counts after Session 10: **252/252 passing** (98 unit + 138
-integration + 16 standalone). All seven taxonomy cases continue to
-pass under the stricter semantics — proves the discovery + codegen
-path was already Sky-aligned at the mechanism level; what changed is
-whether rustc can name non-export items at all (it can't, which is
-the locked architectural claim).
-
-**Session 10 post-audit: the generic-vs-non-generic uniformity
-claim.** A natural follow-up question: are generic and non-generic
-toylang fns handled exactly the same way? Honest answer:
-**mostly, but not entirely.** Auditing the codebase, four sites
-still branch on `type_params.is_empty()`:
-
-| # | Site | Reason | Forced? |
-|---|---|---|---|
-| 1 | `populate_toylang_instances_from_cgus` registry walk | Skips generic fns at the top level — "no concrete args to substitute at the top level." Transitive generic discovery via `walk_and_stash_internal_callees` still works. | Implementation pragma |
-| 2 | Check 5 eager typecheck (`after_rust_analysis`) | Skips generic fn bodies because resolving them needs concrete T. Generic bodies get typechecked lazily inside `codegen_internal_function`. | Implementation pragma |
-| 3 | stub_gen `extern "C" { pub fn ... }` block | Rust's `extern "C"` syntactically doesn't permit generics. The non-generic case emits the extern decl; generic case omits it. | External (Rust syntax) |
-| 4 | stub_gen `pub struct` shape | Rustc's debuginfo walker ICEs on opaque non-generic ADTs with any source field. Non-generic emits `pub struct Foo;`; generic uses `pub struct Foo<T>(PhantomData<T>)`. | External (rustc ICE) |
-
-What's already uniform:
-
-- **Approach A substitution mechanism**: `resolve_caller_from_instance`
-  has a fast-path return for empty type_params but is otherwise
-  identical — `instance.args` is just empty for non-generics.
-- **Body codegen** once the body is resolved: `codegen_internal_function`
-  operates on a resolved body with concrete types; doesn't care about
-  genericity.
-- **Symbol mangling**: generics get type-arg suffixes
-  (`__toylang_internal_wrap__i32`); non-generics get no suffix —
-  same code path, the suffix loop just iterates zero items.
-- **Impl-block + wrapper-fn headers in stub_gen** (Session 7's #17
-  work): unified via `generics_for_impl_block` /
-  `fn_generics_clause` helpers that return empty token streams for
-  zero params.
-
-The honest framing of sites 1 + 2: they branch on `type_params.is_empty()`
-as a *degenerate-case shortcut* for the semantically-correct
-condition "skip items whose args are still abstract." For non-generics
-the condition is never true; for generics at the top level it's
-always true. Same outcome, but the code does the cheap check
-instead of expressing the intent.
-
-Sites 3 + 4 are forced by external constraints and stay until those
-constraints lift — site 3 via course-correct #4's inline-codegen
-rewrite, site 4 via a rustc bug fix or a different opaque-stub
-mechanism.
-
-### Session 11 — uniformity sweep landed
-
-Per the focused plan at `tmp/claude-plan-2026-06-15-ccc8939f.md`, Phases A → B → C → F landed in one session. Sites 1 and 2 are gone; sites 3 and 4 remain (forced, as expected). Plus Phase E investigation answered the struct-shape ICE question with reproduction + recommendation.
-
-- **Phase A** (commit `8faca57`): added `ToyFunction::has_abstract_args()` helper to `registry.rs`. Four call sites in `callbacks_impl.rs` renamed. Cosmetic, no behavior change.
-- **Phase B** (commit `5a1e7d0`): generalized `DeferredTypeParam` from `{trait_name, method}` to a single `query: String` description. Added `contains_type_param` guards at the top of four ungated oracle entry points (`rust_free_fn_return_type`, `rust_free_fn_param_types`, `rust_method_return_type`, `rust_method_param_types`). Added a receiver-TypeParam short-circuit in `type_resolve.rs`'s `Expr::MethodCall` arm so `fn foo<T>(x: T) { x.clone() }` defers cleanly. Dropped the `has_abstract_args()` skip at Check 5 + Check 6 — generic toylang bodies now type-resolve at `after_rust_analysis` with deferred Rust queries silently skipped via `TypeResolveError::RustTypeDeferred`. Sharper diagnostics: Sky-side typecheck errors in generic bodies surface earlier.
-- **Phase C** (commit `d87638d`): replaced the registry walk in `populate_toylang_instances_from_cgus` with the §20.4 entry-point walk. Roots = local main (implicitly `is_export` per `parser.rs:382`) + local export free fns + local `is_export` impl-block methods + same for upstream registries loaded by S.4. Each root pushes a `ToylangInstance` and calls `walk_and_stash_internal_callees` for transitive non-export discovery. Generic exports stay non-roots (no concrete args at root); they reach codegen via the CGU walk in `llvm_gen.rs:1995`, driven by caller-site Instances. **Net behavior change**: dead non-export non-generic local code is no longer emitted (aligned with §9.3).
-- **Phase F** (commit `d87638d`): new `toylangc/tests/architecture_fence.rs` grep-scans `callbacks_impl.rs` + `type_resolve.rs` + `stub_gen.rs` for unmarked `type_params.is_empty()` and `type_args.is_empty()` branches. Substituted-args fast paths + arity check + degenerate-case helpers carry inline `// arch-fence-allow: <reason>` markers. Same role A.5 plays for byte-identical pass-through and `non_export_body_bearing_fn_gets_no_stub_shell` plays for §9.
-- **Phase E investigation** (commit `a43569c`): reproduced the documented ICE under current rustc. Crash is `rustc_abi/src/lib.rs:1676:66` — `FieldsShape::offset(i)` index-out-of-bounds, called from `build_struct_type_di_node`'s closure that enumerates source `FieldDef`s, called from `build_generic_type_param_di_nodes` (because we're inside `Vec<ToyShip>`). Root cause: Sky's `layout_of` override reports 0 layout fields but the source tuple-struct has 1 source field.
-- **Phase E Path 1 — fork patch** (commit `e67de69ef35` on `per-instance-mir`; erw side `8a9adc8`): defensive clamp `.take(min(variant_def.fields.len(), struct_type_and_layout.fields.count()))` at both `build_struct_type_di_node` and `build_union_type_di_node`. Audited enum walker — iterates layout first then indexes source, so Sky's underreport case can't reach a panic there. Verified by reproducing the previously-ICE'ing `pub struct Foo(())` shape; passes 253/253 under the patched rustc. PR draft at `phase-e-rustc-pr-draft.md`.
-- **Phase E completion — struct-shape unification** (commit `c17cf7e`): with the fork patch in place, retired the struct-shape `is_generic` branch in stub_gen. Universal shape `pub struct Foo<P...>(PhantomData<(P...)>);` at every N. The fence test now also scans stub_gen.rs.
-- **Vestigial-extern-decl cleanup** (commit `ed4e07e`): prompted by the question "why do we need extern "C" for anything if we always talk directly to Rust functions?" Investigation found two of three `extern "C"` decl sites in stub_gen were vestigial. The `__toylang_impl_*` decls were leftover from before the `symbol_name` query override existed — Rust callers reach Sky-emitted symbols via the override rewriting `__lang_stubs::<name>::h...` → `__toylang_impl_<name>` at link time; no forward decl needed. The `__toylang_accessor_*` decls had no consumer at all. Removing both eliminated the last `extern "C"`-gated `is_generic` branches. What remains in the block is only body-less toylang fn decls — toylang's actual "talk to existing Rust fn" syntax (e.g., `fn println_int(x: i32);` → `extern "C" { pub fn println_int(...); }`); these can't take toylang-source generics by nature.
-
-Test counts after Session 11: **253/253 passing** (98 unit + 1 fence + 138 integration + 16 standalone). All Session 11 work is on `main` (commits `8faca57`, `5a1e7d0`, `d87638d`, `a43569c`, `4c19bec`, `8a9adc8`, `70e3069`, `c17cf7e`, `747d0e6`, `ed4e07e`, `a3a7c94`) plus fork commit `e67de69ef35`.
-
-### Session 12 — Phase E Path 2 landed (wrapper-as-field migration + fork patch 4 retired)
-
-Per the focused plan at `~/.claude/plans/parsed-singing-globe.md`, Phase E Path 2 (architecture §10.4.5 path 2 / §10.6) landed in three substantive commits + supporting reconnaissance. Sky struct stubs now emit as newtypes around a content-addressed-typeid wrapper; the rustc debuginfo walker's source-vs-layout-field-count assumption holds structurally; fork patch 4 (`e67de69ef35`) was retired. Net: only the 3 per_instance_mir patches remain in the rustc fork.
-
-- **Phase 1 — scaffolding** (commit `72a929e`): new `toylangc/src/typeid.rs` with BLAKE3-truncated-u64 hash over a bincode-serialized `(name, type_args)` pre-image (6 unit tests including a hard-pinned Widget typeid `0x48723b0bb65d86f7` as a drift anchor). `stub_gen` emits `pub struct __ToylangOpaque<const T: u64>;` at every stub rlib's crate root. New `typeid_table: BTreeMap<u64, (String, Vec<ResolvedType>)>` on `ToylangRegistry` plus `populate_typeid_table()` called before sidecar serialization, so downstream compiles can decode upstream typeids per architecture §10.8.
-- **Phase 2 — const-generic-u64 plumbing** (commit `41423cf`): new `find_toylang_opaque_def_id`, `is_toylang_opaque`, `extract_typeid_from_args`, `build_opaque_args` helpers in `oracle.rs`. The find helper walks LOCAL_CRATE first then `tcx.crates(())` with the §4.5 parentage check (handles both rlib-compile and user-bin-compile cases plus glob re-export traps). The encode side uses `ty::Const::from_bits(tcx, typeid as u128, fully_monomorphized(), u64)`; the decode side reads `args.const_at(0).try_to_leaf().map(|s| s.to_u64())` (greenfield against the valtree-era API — no in-tree precedent). New `CallbackLog::Phase2RoundTripProbe` variant + probe firing at `after_rust_analysis`'s rlib-compile branch + integration test `test_phase2_const_u64_round_trip` verifies the end-to-end round-trip on the pinned rustc-fork.
-- **Phase 3 — Sky struct stub shape migration** (commit `90599cf`): replaced `pub struct Foo<P...>(PhantomData<(P...)>);` with the wrapper-as-field newtype shape: `pub struct Foo(__ToylangOpaque<HASH>);` for non-generics, `pub struct Foo<P...>(__ToylangOpaque<HASH>, PhantomData<(P...)>);` for generics. `queries/layout.rs::build_layout` now reports a matching layout-field count derived from `adt_def.non_enum_variant().fields.len()` (1 for non-generic, 2 for generic) with the wrapper at offset 0 of size `total_size` and the PhantomData ZST tail (when present) at offset = `total_size`. `BackendRepr::Memory { sized: true }` still applies — keeps rustc from decomposing into scalars; the wrapper is itself opaque-with-size. Sky structs keep their own DefIds so all existing `impl Trait for Foo` blocks work unchanged. The new `is_empty()` branch in stub_gen carries an `arch-fence-allow: phantomdata-only-when-generics-present` marker so the architecture fence passes.
-- **Phase 4 — collapsed**: the planned `__ToylangOpaque<HASH>` layout intercept turned out unnecessary for toylang because the wrapper is `pub struct __ToylangOpaque<const T: u64>;` (unit struct, 0 source fields) — default `layout_of` returns a 0-field ZST layout that matches its source, so the debuginfo walker iterates zero times when recursing in. Phase 4's intercept was anticipating §10.7 Cases 2/3 (`Vec<__ToylangOpaque<HASH>>` direct references for non-export / comptime types), which toylang doesn't emit. Punted to that day.
-- **Phase 5 — fork patch 4 retirement + docs**: reverted `e67de69ef35` in `~/rust`, rebuilt rustc, ran the full suite against unpatched rustc. 262/262 passing — Path 2 eliminates the assumption violation structurally without any fork patch. Updated architecture doc §10.4.5 path 2 (now the recommended path; path 1 retained as transitional measure for plugins that can't migrate), §25.2 B8 (probability "negligible" under wrapper-as-field shape), course-correct.md, `phase-e-investigation.md` (status banner: Path 2 LANDED), this handoff.
-
-Test counts after Session 12: **262/262 passing** (106 unit + 1 fence + 139 integration + 16 standalone). Commits on `main`: `72a929e`, `41423cf`, `90599cf` plus this session's doc-refresh commit. The fork's `per-instance-mir` branch contains the revert as a commit on top of `e67de69ef35`.
-
-The PR draft at `phase-e-rustc-pr-draft.md` is preserved — it remains the right upstream submission for plugin authors who don't migrate to the wrapper-as-field shape (cranelift, miri, future plugins). The clamp is genuinely useful as defense-in-depth for any layout-overriding plugin; Sky-side it's no longer needed.
-
-## How the uniformity sweep was structured (now mostly landed)
-
-| Phase | Site(s) | Approach | Estimate |
-|---|---|---|---|
-| **A** | 1, 2 (cosmetic) | Rename the predicate to `has_abstract_args()` so the call sites document the architectural intent rather than the shortcut. Body unchanged. Establishes the vocabulary for B. | ~2 hours |
-| **B** | 2 (semantic) | Drop the type-params skip in Check 5. Call `resolve_fn_body` on generic bodies; reuse Workstream B's `RustTypeDeferred` error variant to silently skip queries the body can't answer until substitution. Net effect: generic toylang fns get Sky-side type errors earlier (at after_rust_analysis instead of at codegen). | ~1 day |
-| **C** | 1 (architectural) | Rebuild discovery around Sky's after_expansion entry-point walk (§20.4). Start from main + exports + impl methods, transitively enumerate every call site's substituted Instance, push to the queue. Generic and non-generic items both arrive via the same channel for the Sky→Sky path. Rust→Sky generic instantiations (Case 1b/4/6) still flow through rustc's CGU walk — that's a separate, architecturally-justified discovery channel. | ~3–5 days |
-| **D** | 3 (forced — coupled with #4) | When course-correct #4's deeper rewrite lands (Sky's `codegen_crate` walks the queue and emits via Inkwell inline), the extern-decl pattern dies entirely. stub_gen no longer needs to emit `extern "C" { pub fn ... }` blocks at all. Site 3 vanishes by becoming dead code. | bundled with #4 |
-| **E** | 4 (forced — external) | Two options: (1) file a rustc bug + patch the debuginfo walker upstream so opaque non-generic ADTs with source fields don't ICE — then unify struct shape on `pub struct Foo(PhantomData<()>)`. (2) Investigate whether a different opaque-stub pattern dodges the ICE (the architecture mentions `SkyOpaqueType<const T: u64>` as the universal wrapper; a non-generic could be `SkyOpaqueType<typeid>` with empty type args). | ~1 day investigation, then either a rustc patch (~1 week) or the wrapper-migration (~3–5 days) |
-
-**Recommended sequencing:** A → B → C in one Phase-A/B/C focused
-session (~1 week total). D follows whenever #4 lands. E is a
-research thread that can run independently in the background.
-
-**Architectural-property fence** (landed as Phase F in Session 11):
-`toylangc/tests/architecture_fence.rs` grep-scans `callbacks_impl.rs`,
-`type_resolve.rs`, and `stub_gen.rs` for unmarked `type_params.is_empty()`
-and `type_args.is_empty()` branches. Same role A.5 plays for the byte-
-identical invariant and `non_export_body_bearing_fn_gets_no_stub_shell`
-plays for §9.
+## 1. Current state (one paragraph)
+
+`erw` is a two-crate workspace: `rustc-lang-facade` (a reusable library
+that hooks into rustc via query overrides) and `toylangc` (a toy consumer
+language exercising the facade). Architecturally we're aiming at **Sky**,
+the design locked in `rust-interop-architecture.md` (5,148 lines). The
+divergence catalog is `course-correct.md` (18 items, **11 done**: #1, #2,
+#4, #5, #6, #11, #14, #15, #16, #17, #18; #10 partial; #3, #7, #8, #9,
+#12, #13 remaining). The seven-case interop taxonomy (1a/1b/2/3/4/5/6) has
+been fully tested since Session 8; the architecturally-hard cases
+(rustc-walking-a-Rust-generic-body-dispatching-to-a-Sky-impl) all have
+fixtures. Toylang now uses **Approach A** (Instance-keyed
+`per_instance_mir`), **per-library stub rlibs** with `__SKY_STUBS_MARKER`,
+**sidecar-driven** (`.sky-meta` carries Temputs), **codegen-at-binary**
+(no per-rlib `.o`), **`export`-gated** stub generation (Sky §9), and
+**wrapper-as-field** Sky struct stubs (`__ToylangOpaque<HASH>` per §10.6).
+Three rustc fork patches remain — the `per_instance_mir` trio only.
 
 ---
 
-## 3. The plan you're executing
+## 2. Session history (compressed)
 
-Master plan: `/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md`.
-Read it. It's the authoritative scope; this handoff document is the
-narrative version.
+| Session | Commits | What landed |
+|---|---|---|
+| 1 | (none, doc) | `course-correct.md` — 18 wrong-track items |
+| 2 | (pre-`411c2f5`-era) | Approach A restored: 3-patch rustc fork rebuilt, facade switched from `optimized_mir` to `per_instance_mir`, toylang substitutes Sky-side from `instance.args`. |
+| 3 | (Session 4 batch) | Sidecar S.1–S.3: format spec doc + `SidecarHeader` types, bincode serialization + BLAKE3 checksum, sidecar written at rlib-compile `after_rust_analysis`. |
+| 4 | `671f002` | S.4 (facade reads upstream `.sky-meta` via new `on_sky_lib_loaded` callback); S.5 (sidecar determinism test); **oracle cross-crate sweep** (finishes stage-5a — `find_extern_fn_def_id` falls back to walking upstream `__lang_stubs`); **Workstream A** (codegen moves from rlib compile to user-bin compile — registry-driven discovery + `walk_and_stash_internal_callees`). |
+| 5 | `671f002`, `1a72a64`, `7278f4a`, `88b56d2`, `dc52833` | Phase 3 E.1–E.6 (multi-toylang-crate end-to-end including `case6_basic`; @GCMLZ deadlock fixed via thread-local fat-pointer bypass diagnosed by `sample <pid>`); Phase 1 D rust_caller + Cases 1a/1b/3/5; #14 (CARGO_PRIMARY_PACKAGE retired); #2 (B2 linkage mutation retired); A.5 byte-identical pass-through CI. |
+| 6 | `6c19e53`, `01d98fd`, `e81cf6d`, `7c23f63` | Tier 1 sweep: #4 (codegen-wrapper channel via `LangOngoingCodegen`), Workstream B (oracle TypeParam tolerance via `RustTypeDeferred`), #5 (`after_expansion` hook — turned out trivial). |
+| 7 | `1c27b09`, `4f5cc8a`, `7a203b0` | #18 (build.rs comment refresh); #17 (cosmetic `is_generic` branches unified via `generics_for_impl_block` / `fn_generics_clause`); #3 audited — deferred (bundled with #7/#9). |
+| 8 | `6e9e7a8`, `5b1babd`, `b56cf4c`, `22a1390` | Phase 2 C (Case 4): toylang `impl rust_trait for toylang_type` parser/AST/registry, type-resolver, stub_gen impl emission, facade discriminator (`is_consumer_trait_impl_method`), symbol_name routing, llvm_gen impl method bodies, auto-deref bug fix. Seven-case taxonomy now 7/7. |
+| 9 | `d65ef81`, `a7683fc` | Honest audit of case fixtures → sharpened case4/5/6 with new `some_rust_lib/` (true Rust generic intermediary, `pub fn duplicate<T: Clone>(&T) -> T`). |
+| 10 | `1b738e6`, `0d728f9` | `export` keyword: non-export body-bearing fns get NO `pub fn` shell in stub rlib (Sky §9). CI fence `non_export_body_bearing_fn_gets_no_stub_shell`. |
+| 11 | `8faca57`, `5a1e7d0`, `d87638d`, `a43569c`, `4c19bec`, `8a9adc8`, `70e3069`, `c17cf7e`, `747d0e6`, `ed4e07e`, `a3a7c94`, `09d50bb` + fork `e67de69ef35` | Generic/non-generic uniformity sweep (Phases A/B/C/F); Phase E investigation; fork patch 4 (debuginfo clamp) shipped; struct shape unified to `pub struct Foo<P...>(PhantomData<(P...)>);`; vestigial `__toylang_impl_*` + `__toylang_accessor_*` extern decls retired. **CLAUDE.md compiler-law violation count: zero.** |
+| 12 | `72a929e`, `41423cf`, `90599cf`, `7f6bf97` + fork `003f91e4df9` | **Phase E Path 2**: `__ToylangOpaque<const T: u64>` wrapper-as-field migration (architecture §10.4.5 path 2 / §10.6). typeid helper + wrapper emission + typeid table (Phase 1), const-generic-u64 encode/decode (Phase 2), Sky struct stub shape migration + layout-field-count match (Phase 3), fork patch 4 reverted (Phase 5). **262/262 against unpatched rustc.** |
 
-Three phases, ~15 weeks total:
-
-| Phase | Weeks | Scope | Cases unlocked |
-|---|---|---|---|
-| 1 | 1-7 | Sidecar (S) + binary-compile codegen (A) + typeresolver fix (B) + rust_caller fixtures (D) | 1b, 3, 5 |
-| 2 | 8-12 | Toylang `impl rust_trait for toylang_type` language feature (C) | 4 |
-| 3 | 13-15 | Multi-toylang-crate workspace + marker-based detection (E) | 6 |
-
-**All three phases complete.** Phase 1: S.1–S.5 done, oracle cross-
-crate sweep done, Workstream A done, Workstream B done (oracle
-TypeParam tolerance, Session 6), Workstream D (rust_caller fixtures
-for Cases 1a/1b/3/5) done, A.5 done. Phase 2: C.1–C.7 done (Case 4
-via `impl rust_trait for toylang_type`, Session 8). Phase 3: E.1–E.6
-done. The seven-case taxonomy is fully tested.
-
-Detailed commit-by-commit schedule is in the master plan's "Sequencing
-recommendation" table at the end.
+Anchor commits worth knowing: `c38d7e0` is the doc cleanup right before
+Session 12 started; `ce437ae` is the last commit with full Approach A
+before the Approach B "stage 3" detour (don't go there). The fork lives
+at `~/rust` on `per-instance-mir`. Its tip is the revert of patch 4 on
+top of patch 4 itself — three patches in effect.
 
 ---
 
-## 4. Critical context you need
+## 3. Critical context (the load-bearing pieces)
 
-### 4.1 Approach A: why per_instance_mir matters
+### 3.1 Approach A: why `per_instance_mir` matters
 
-Read `rust-interop-architecture.md` §3.1 + §19.1 carefully. The
-one-paragraph version: rustc's mono collector substitutes generic args
-inline as it walks. For toylang's currently-supported generics (rustc-
-representable types), Approach B works fine. For Sky's comptime args
-(arbitrary Sky-typed values), rustc literally cannot represent them, so
-substitution MUST happen Sky-side before MIR construction. Sky's only
-viable path is Instance-keyed `per_instance_mir` where the consumer's
-provider receives the concrete `Instance` and returns a fully-substituted
-body.
-
-`docs/historical/approach-a-reference/` has the historical Approach A
-implementation extracted from before stage 3 retirement. Read its README;
-it's a structural template for any future change to the substitution
-direction.
-
-The `debug_assert!(!instance.args.has_param())` in
+`rust-interop-architecture.md` §3.1 + §19.1. One paragraph: rustc's mono
+collector substitutes generic args inline as it walks. For toylang's
+generics (rustc-representable types), Approach B would work. For Sky's
+comptime args (arbitrary Sky-typed values), rustc literally cannot
+represent them, so substitution MUST happen Sky-side before MIR
+construction. The Instance-keyed `per_instance_mir` query is the only
+viable mechanism. `docs/historical/approach-a-reference/` has the
+structural template from the pre-B-detour era. The
+`debug_assert!(!instance.args.has_param())` in
 `rustc-lang-facade/src/queries/per_instance.rs::build_dependency_body` is
-load-bearing — if it fires during a test run, Approach B behavior has
-regressed somewhere upstream.
+load-bearing — if it fires, Approach B has snuck back in somewhere.
 
-### 4.2 The sidecar architecture (your current workstream)
+### 3.2 Sidecar architecture
 
-Read `rust-interop-architecture.md` §7 + §8, then `docs/architecture/sidecar-format.md`
-(I wrote it in S.1, it's the implementer-facing reference).
-
-Picture: Sky libraries compile to **rlib + sidecar only** — no Sky `.o`.
-The rlib contains Rust stub source (compiled by rustc) with
-`unreachable!()` bodies. The sidecar (`.sky-meta`) is a binary blob
-carrying the typed AST for every item in the library — exports AND
+`rust-interop-architecture.md` §7 + §8 + `docs/architecture/sidecar-format.md`.
+Sky libraries compile to **rlib + sidecar only** — no Sky `.o`. The rlib
+contains Rust stub source with `unreachable!()` bodies. The sidecar
+(`.sky-meta`) is a binary blob (bincode + BLAKE3 checksum + 64-byte
+versioned header) carrying the typed AST for every item — exports AND
 non-exports. The binary compile reads sidecars from every Sky-marked rlib
-it loads, then codegens **every reachable Sky item across all libs** into
-one consolidated `.o`.
+and codegens **every reachable Sky item across all libs** into one `.o`.
 
-This is course-correct items #11 + #15 in their locked end states. Phase 1
-Workstream A is what actually moves toylang to this emission model.
-Workstream S is the foundation it depends on.
+This is course-correct items #11 + #15 in their locked end state. Done.
 
-### 4.3 The two-symbol architecture (Sessions ago, still relevant)
+### 3.3 The two-symbol architecture
 
-Toylang emits three layers of symbols for any item:
+Toylang emits three layers of symbols per item:
 1. `__toylang_internal_<name>__<mangled_targs>` — toylang↔toylang ABI.
-   Used by toylang's own codegen for toylang→toylang calls.
 2. `__toylang_impl_<name>__<mangled_targs>` — Rust-ABI-coerced extern
-   wrapper. Used when Rust code calls into toylang.
+   wrapper. What Rust callers actually invoke.
 3. The rustc-mangled name (`__lang_stubs::wrap::<i32>`) — what Rust
-   source sees. The facade's `symbol_name` override at
-   `rustc-lang-facade/src/queries/symbol_name.rs:31-80` reroutes this to
-   `__toylang_impl_*`.
+   source sees. `rustc-lang-facade/src/queries/symbol_name.rs:31-80`
+   rewrites this to `__toylang_impl_*`.
 
-Important for your work: **Sessions before you had a wrong mental model**
-that called this a "symbol mismatch." It's not. The override at
-`queries/symbol_name.rs` already makes Rust call sites resolve to the
-right symbol. The REAL blocker is **cross-crate generic instantiation**:
-toylang's `.o` is emitted at the rlib compile, before Rust call sites for
-`wrap::<LocalThing>` exist at the user_bin compile. Workstream A's job is
-to fix this by moving codegen to the binary compile.
+Important pre-existing-mental-model correction: this is **not** a "symbol
+mismatch" needing reconciliation. The symbol_name override IS the bridge.
+There's a load-bearing implication for Tier 3 #9 (retiring the
+`symbol_name` side-effect channel): the OVERRIDE stays — what goes is the
+`notify_concrete_entry_point` call inside it that discovers Instances for
+internal-callee stashing.
 
-### 4.4 The two compiles per build
+### 3.4 Two compiles per build
 
-When you run `toylangc build` on a project, cargo invokes rustc TWICE:
-- **rlib compile**: compiles the `__lang_stubs` rlib. Crate name starts
-  with `lang_stubs_`. Marker `is_downstream_of_stubs = false`.
-- **user_bin compile**: compiles the binary that depends on
-  `__lang_stubs`. Crate name is the user's project name. Marker
-  `is_downstream_of_stubs = true`.
+`toylangc build` invokes rustc twice per project:
+- **rlib compile**: `__lang_stubs_<project>` crate. Produces rlib +
+  sidecar, no Sky `.o`. `is_user_bin_compile = false`.
+- **user-bin compile**: user's binary crate. Reads upstream sidecars,
+  codegens every reachable Sky body, produces the binary.
+  `is_user_bin_compile = true`.
 
-Each invocation is its own process — independent state, no cross-process
-sharing. The callback log file `.toylang-build/callback.log` gets written
-by whichever compile fires `generate_and_compile`. Today: rlib compile
-writes it (llvm_paths = Some), user_bin compile doesn't (llvm_paths = None,
-returns early at `callbacks_impl.rs:584`).
+Independent processes; no in-memory shared state across them. The callback
+log file is shared on disk. The gate variable lives in
+`callbacks_impl.rs` and `main.rs:145-195`.
 
-Phase 1 Workstream A INVERTS this. After A, the rlib compile produces NO
-`.o` (and stops writing the log) and the user_bin compile produces ALL
-`.o` (and writes the log).
+### 3.5 The `@`-arcana invariants
 
-The gate variable `is_downstream_of_stubs` appears at
-`callbacks_impl.rs:75, 191, 214, 387` and `main.rs:145-195`. Workstream A
-renames it `is_user_bin_compile` and inverts its semantics throughout.
+`docs/architecture/rust-interop-guide.md` Part 8 has the index;
+`rust-interop-architecture.md` §26 lists Sky's 14 cross-cutting
+invariants. The ones most likely to bite during Tier 3 work:
 
----
-
-## 5. Files you'll touch (organized by area)
-
-### 5.1 Facade (`rustc-lang-facade/src/`)
-
-- **`lib.rs`** — trait `LangCallbacks`, vtables, trampolines, `OnceLock`
-  defaults, the `is_from_lang_stubs` / `is_consumer_codegen_target` /
-  `is_consumer_accessor_safe` predicates. This is the integration boundary
-  between facade and consumer (toylang).
-  - For Phase 1 S.4: you'll add sidecar-loading machinery here.
-  - For Phase 3 E.1: you'll replace `is_from_lang_stubs` with marker-based
-    detection.
-  - For Phase 2 C.6: you'll extend `is_consumer_accessor_safe` to handle
-    trait-impl methods (`tcx.impl_trait_ref`).
-- **`queries/per_instance.rs`** — Approach A's `per_instance_mir` provider.
-  The `debug_assert!(!instance.args.has_param())` is here. Don't touch
-  unless you really mean to.
-- **`queries/optimized_mir.rs`** — DOES NOT EXIST. It was deleted in W2 of
-  the previous session. Don't bring it back. (If you grep for
-  "optimized_mir" you'll find historical references in comments — that's
-  fine.)
-- **`queries/symbol_name.rs`** — the Rust-mangled-name → `__toylang_impl_*`
-  redirect. For Phase 2 C.6 you'll add trait-impl method handling here.
-- **`queries/layout.rs`** — `layout_of` override for consumer types. The
-  layout-probe tests grep its `[toylang] layout_of intercepted for: ...`
-  stderr line. Don't add new eprintlns nearby without thinking about it.
-- **`queries/partition.rs`** — CGU filter. Should be largely untouched in
-  Phase 1; Phase 3 E.1's marker-based predicate will simplify it.
-
-### 5.2 Toylang (`toylangc/src/`)
-
-- **`sidecar.rs`** — Phase 1 S.1 + S.2 (already written). Read it.
-  Contains `SidecarHeader`, `serialize_sidecar`, `deserialize_sidecar`,
-  14 unit tests.
-- **`toylang/callbacks_impl.rs`** — toylang's implementation of the facade
-  trait. This is where most of Phase 1 Workstream A's work lands.
-  Specifically: invert `is_downstream_of_stubs`, change `after_rust_analysis`
-  to read upstream sidecars + populate registry from union, change
-  `generate_and_compile` gating.
-- **`toylang/registry.rs`** — `ToylangRegistry` + `ToyStruct` + `ToyFunction`
-  etc. Phase 1 S.2 already promoted `HashMap` → `BTreeMap` for determinism;
-  any new types you add here must derive `Serialize, Deserialize`.
-- **`toylang/parser.rs`** — Phase 2 C.1's main work site (`impl` block
-  parsing).
-- **`toylang/ast.rs`, `toylang/typed_ast.rs`** — Phase 2 C.2's main work
-  site (`ToyImpl` AST node, threading `ResolvedType::TypeParam` and friends
-  through).
-- **`oracle.rs`** — the rustc-querying helpers. Phase 1 B's site is
-  `rust_trait_method_return_type` / `_param_types` at lines 665-768.
-  Phase 3 E.4's site is `resolve_rust_path` at lines 117-124.
-- **`build.rs`** — the orchestration that generates `.toylang-build/`.
-  Phase 1 D.2 will add a `rust_caller.rs` copy step here. Phase 3 E.3 will
-  add the multi-crate fan-out.
-- **`manifest.rs`** — toylang.toml schema. Phase 1 D.1 adds
-  `project.rust_caller`. Phase 3 E.2 adds `[[dependencies]]`.
-- **`stub_gen.rs`** — generates the Rust stub source for `__lang_stubs/src/lib.rs`.
-  Phase 2 C.4 adds `impl ::std::clone::Clone for #ident` block emission.
-  Phase 3 E.1 will add the `pub const __SKY_STUBS_MARKER` (if not already).
-- **`main.rs`** — entry point with two modes: orchestration (`toylangc build`)
-  and wrapper-mode (rustc-driver). Phase 1 A.1 / A.2 touches
-  `run_toylang_compile` here.
-- **`llvm_gen.rs`** — large file. Toylang's LLVM IR emission. Phase 2 C.5
-  adds trait-impl method codegen.
-
-### 5.3 Reference materials
-
-- **`rust-interop-architecture.md`** (repo root) — Sky's architecture doc,
-  5,148 lines. The master reference for "what are we building toward?"
-- **`course-correct.md`** (repo root) — the 18-item catalog of erw → Sky
-  divergences. Items #6, #11, #15, #16 are the ones this plan touches.
-- **`docs/architecture/sidecar-format.md`** — the spec for the file format
-  you're implementing.
-- **`docs/architecture/rust-interop-guide.md`** — erw's current architecture
-  guide. Outdated in some places (still describes Approach B in spots),
-  but the cross-cutting invariants section (@SyMINCZ, @ELASZ, @GCMLZ,
-  @ACRTFDZ, @TCHAPZ, @RTMEIZ, @UTAIRZ, @MBMRVZ, @IVTDBTZ, @TVIMDGAZ,
-  @ETASTZ, @DPSFDOZ) is still load-bearing. Read those — they're traps.
-- **`docs/historical/handoff-optimized-mir-migration.md`** — the
-  forward-direction (A→B) handoff. Read it in reverse to understand what
-  the W1-W3 work undid.
-- **`docs/historical/approach-a-reference/`** — extracted snapshots of
-  Approach A's implementation before stage 3 retired it.
-- **`docs/historical/rebuilding-rustc-fork.md`** — procedure for rebuilding
-  `~/rust`'s fork. If you need to bump nightly, read this.
+- **@SyMINCZ** — computing a symbol name does NOT drive codegen.
+  Only `ReifyFnPointer` casts in the `per_instance_mir` body do that.
+  Critical for #9 — you cannot replace the side-effect with an
+  innocent-looking `tcx.symbol_name(instance)` and expect codegen to
+  follow.
+- **@GCMLZ** — Sky's `MUTABLE_STATE` mutex is held during
+  `generate_and_compile`. Query providers must NOT lock it. Session 5's
+  thread-local fat-pointer bypass handles re-entrant `symbol_name` calls;
+  #12 retires the whole mutex.
+- **@DPSFDOZ** — `tcx.def_path_str()` ICEs outside diagnostic contexts.
+  Use `tcx.def_path(def_id).data` walks or `tcx.crate_name(def_id.krate)`
+  checks instead.
+- **@ELASZ** — every `GenericArgs` Sky builds for a Rust item fills
+  lifetime slots with `tcx.lifetimes.re_erased`.
 
 ---
 
-## 6. Discipline and conventions
+## 4. File map
 
-Read `CLAUDE.md` (both user-global and project) in full. The
-non-negotiable rules:
+### 4.1 Facade — `rustc-lang-facade/src/`
+
+| File | Role | Tier 3 relevance |
+|---|---|---|
+| `lib.rs` | Trait `LangCallbacks`, `LangPredicates`, two vtables (`PredicateVtable`/`StatefulVtable`), trampolines, `MUTABLE_STATE` mutex, `is_from_lang_stubs` marker walk | **#7 #9 #12** all touch this heavily |
+| `queries/per_instance.rs` | Approach A's provider. `debug_assert!(!instance.args.has_param())` is load-bearing. | Mostly stable |
+| `queries/layout.rs` | `layout_of` override. Today calls `monomorphize_type` callback. | **#8** rewrites this |
+| `queries/symbol_name.rs` | Rust-mangled-name → `__toylang_impl_*` redirect. Today fires `notify_concrete_entry_point` side effect. | **#9** retires the side effect |
+| `queries/drop_glue.rs` | `mir_shims` override for consumer types. Calls back for type name. | Touched by #7 |
+| `queries/partition.rs` | CGU filter — strips consumer items from rustc's mono partition. | Mostly stable; #2 already retired the linkage mutation |
+| `queries/upstream_monomorphization.rs` | Forces consumer types to local mono. | Stable |
+| `cgu_stash.rs` | 87-line LIFETIME-ERASED-`'tcx`-to-`'static` stash of upstream CGU references for codegen-time walk. | **#3** deletes this |
+| `mir_helpers.rs`, `abi_helpers.rs` | Inherited wholesale per arch §26.5–26.6. | Don't touch |
+| `driver.rs` | `Callbacks::after_expansion` hook + sidecar load loop. | **#7** populates the universe here |
+
+### 4.2 Toylang — `toylangc/src/`
+
+| File | Role | Tier 3 relevance |
+|---|---|---|
+| `toylang/callbacks_impl.rs` | Trait impl, registry state, validation checks, sidecar write, oracle cross-crate probe, Phase 2 round-trip probe, populate-from-CGUs entry-point walk | **#7 #8 #9** all heavily |
+| `toylang/registry.rs` | `ToylangRegistry`, `ToyStruct`, `ToyFunction`, `ToyImpl`, `typeid_table` (Phase 1.3). `BTreeMap` for sidecar determinism. | #7's "universe" is structurally the registry |
+| `oracle.rs` | rustc-querying helpers. `find_extern_fn_def_id` cross-crate, `is_toylang_opaque`/`extract_typeid_from_args`/`build_opaque_args` (Phase 2), trait/impl resolution. | Stable; touched by #8 (Sky-side layout) |
+| `llvm_gen.rs` | LLVM IR emission via Inkwell. Reads `state.toylang_instances` populated by `populate_toylang_instances_from_cgus`. Walks `upstream_cgus(tcx)` at user-bin compile for accessors + Case-1b generics from Rust callers. | **#3** kills the CGU walk once #7+#9 land |
+| `stub_gen.rs` | Emits stub rlib's `lib.rs`. Phase E Path 2 — Sky structs are wrapper-as-field newtypes. | Stable |
+| `typeid.rs` | BLAKE3-truncated-to-u64 hash over `(name, type_args)`. `Widget` typeid hard-pinned at `0x48723b0bb65d86f7`. | Stable |
+| `sidecar.rs` | Sidecar serialization. `SidecarHeader`, `serialize_sidecar`, `deserialize_sidecar`, 15 unit tests. | Stable |
+| `main.rs` | Two-mode entry point (orchestrator + rustc-wrapper). `is_user_bin_compile` gating. | Stable |
+| `build.rs` | Generates `.toylang-build/` workspace, fans out per-Sky-lib stub crates, wires rust_caller. | Stable |
+| `manifest.rs` | `toylang.toml` schema + multi-crate dep graph resolver. | Stable |
+| `cgu_stash.rs` (DOES NOT EXIST in toylangc — it's facade-side) | — | — |
+
+### 4.3 Reference materials
+
+- **`rust-interop-architecture.md`** (repo root, 5187 lines) — locked Sky design.
+- **`course-correct.md`** (repo root) — 18-item divergence catalog with status table.
+- **`docs/architecture/sidecar-format.md`** — sidecar binary format.
+- **`docs/architecture/rust-interop-guide.md`** Part 8 — `@`-arcana index.
+- **`docs/historical/approach-a-reference/`** — pre-stage-3 Approach A code snapshots.
+- **`docs/historical/rebuilding-rustc-fork.md`** — 5-step fork rebuild procedure.
+- **`phase-e-investigation.md`**, **`phase-e-rustc-pr-draft.md`** — Path 1 patch + PR draft, preserved for upstream submission (Sky-side no longer needed).
+- **`workstream-a-scope-notes.md`**, **`phase3-e6-scope-notes.md`** — Sessions 4 + 5 completion notes; @GCMLZ deadlock + thread-local-fat-pointer pattern documented in the latter.
+
+---
+
+## 5. Discipline (the non-negotiable rules)
+
+From CLAUDE.md (both project + user-global):
 
 - **No `cd && cargo`.** Use `cargo --manifest-path /absolute/path/Cargo.toml`.
   `cd` is OK only when the user explicitly asks.
-- **Don't pivot unilaterally.** If you discover the plan won't work as
-  written, STOP and ask the user before changing direction.
-- **Don't make temporary debug programs.** If you need a probe, add a test
-  case. The probe pattern I used in this session: add an `eprintln!` with
-  `[PROBE]` prefix, run, remove. NEVER write a `tmp_debug.rs`.
-- **Don't use `git checkout -- file` to revert.** Use `git diff` then apply
-  the diff in reverse manually.
-- **Always pipe build/test output to a fixed tmp file per session.** This
-  session used `./tmp/quarter-of-work.txt`. Don't rotate file names. Don't
-  chain `cargo test | tail`. Run the test, then grep the file separately.
-- **Use relative paths in `cargo` commands.** Not `/Volumes/V/...` or
+- **Don't pivot unilaterally.** If you discover the plan won't work, STOP
+  and ask before changing direction. Session 5's "don't revert before
+  diagnosing" lesson — `sample <pid>` a hanging process before writing
+  scope notes speculating about cause.
+- **Don't make temporary debug programs.** Use probe patterns (`eprintln!`
+  with `[PROBE]` prefix → remove) or add as a test.
+- **No `git checkout -- file` to revert.** Use `git diff` and apply
+  manually in reverse.
+- **Always pipe to a fixed tmp file per session.** This session used
+  `./tmp/quarter-of-work.txt` — same name for the whole session, never
+  rotate, never chain `cargo test | tail`.
+- **Relative paths in `cargo` commands.** No `/Volumes/V/...` or
   `/Users/verdagon/...`.
 
-The non-obvious rule from this session:
-- **`integration-projects-cache` stale-cache gotcha.** When integration
-  tests fail in seemingly random ways (callback log empty, expected
-  callbacks missing, etc.), wipe the shared cargo cache first:
-  `rm -rf /Users/verdagon/erw/toylangc/target/integration-projects-cache`.
-  Then re-run. This is a real source of false negatives and ate me ~30
-  minutes in Session 3.
+### Real traps you will hit
+
+1. **Stale `integration-projects-cache`.** When tests fail in seemingly
+   random ways: `rm -rf /Users/verdagon/erw/toylangc/target/integration-projects-cache`.
+   Bit prior sessions multiple times.
+2. **Wrapper-vs-build mode.** `toylangc` is BOTH the orchestrator AND the
+   rustc wrapper. Same binary, different argv. See `main.rs::run_wrapper_mode`
+   vs `build::build_project`. Debugging "why isn't my callback firing"
+   starts with determining WHICH MODE the failing invocation was in.
+2. **`tcx.crates(())` excludes the local crate.** At rlib-compile time the
+   wrapper / Sky items live in LOCAL_CRATE; at user-bin-compile time they
+   live in extern crates. The `find_toylang_opaque_def_id` pattern
+   (oracle.rs Phase 2) is the template: walk LOCAL first, then
+   `tcx.crates(())`.
+3. **`tcx.output_filenames(())`** — key is `()`, not a CrateNum. Easy to
+   get wrong.
+4. **@SyMINCZ.** Computing a symbol name doesn't drive codegen. A new call
+   to `tcx.symbol_name(instance)` registers nothing; only `ReifyFnPointer`
+   casts in the `per_instance_mir` body do.
+5. **@TVIMDGAZ.** When building an Instance for `<MyType as Trait>::method`,
+   use the trait def's method DefId with `[Self=MyType, …]` args; let
+   `Instance::expect_resolve` map to the impl method.
+6. **`instantiate_identity()` needs a comment.** Per CLAUDE.md compiler
+   law. Only valid for structural inspection. Every call site explains why
+   we're not substituting.
+7. **bincode v2 ≠ v1.** Use `bincode::serde::encode_to_vec` /
+   `decode_from_slice` (NOT `bincode::serialize` / `bincode::deserialize`).
+8. **§4.5 marker-parentage check.** Glob re-exports (`use __lang_stubs::*;`)
+   can lift `__SKY_STUBS_MARKER` into a downstream crate's
+   `module_children`. The parentage check (`def_id.krate == cnum`) protects
+   against this. `find_toylang_opaque_def_id` already does it; replicate
+   for any new universe lookup.
+9. **The `[toylang] layout_of intercepted for: ...` stderr line.** Layout
+   probe integration tests grep this. If #8 changes the format, fix the
+   tests too — search for `layout_of intercepted` in
+   `toylangc/tests/integration_projects.rs`.
+10. **The `arch-fence-allow` markers.** `tests/architecture_fence.rs`
+    scans `callbacks_impl.rs`, `type_resolve.rs`, and `stub_gen.rs` for
+    `type_params.is_empty()` / `type_args.is_empty()` branches.
+    Substituted-args fast paths + degenerate-case helpers carry inline
+    `// arch-fence-allow: <reason>` markers (on the same line OR the
+    immediately-preceding line — not further back).
 
 ---
 
-## 7. Where to start
+## 6. Where to start now — Tier 3 plan
 
-Phase 1 (Workstream S/A/B/D + A.5), Phase 2 C (Case 4 language
-feature), Phase 3 (multi-crate E.1–E.6), **all seven taxonomy cases**
-(1a/1b/2/3/4/5/6), and **eleven of eighteen course-correct items**
-(#1, #2, #4, #5, #6, #11, #14, #15, #16, #17, #18) are all done.
+The remaining course-correct items are five facade-level rebuilds. They
+have real dependencies on each other. **#13 (wrapper-mode `@MRRIWMZ`
+retirement) is explicitly out of scope here** — it's a separate ~4–6
+week piece touching install/distribution and should be sequenced much
+later (probably with Sky's own toolchain shipping).
 
-Session 8 closed Case 4 via the Phase 2 C feature. The seven-case
-taxonomy is now fully tested — there is no longer a "main remaining
-piece" with concrete scope; what's left is the deep facade-rebuild
-trio (#7/#8/#12 + #9 + #3, bundled) plus the wrapper-mode retirement
-(#13).
+### 6.1 Dependency graph
 
-### Tier 2 — DONE (Session 8)
+```
+       #7 LangPredicates → SkyUniverse
+         |       |       |
+         v       v       v
+        #9      #8       |
+         |       |       |
+         v       |       |
+        #3       v       |
+                #4-deeper (inline codegen) ──┐
+                 |                            |
+                 +────────────────────────────v
+                                     #12 retire MUTABLE_STATE
+```
 
-Phase 2 C (toylang `impl rust_trait for toylang_type`) landed in
-seven sub-steps across three commits (see §2 Session 8). Case 4 is
-tested via `case4_sky_impl_rust_trait/`. Nothing remains in Tier 2.
+- **#7** is the foundation. It introduces a facade-owned `SkyUniverse`
+  data structure (basically owning what's today `ToylangRegistry +
+  upstream_registries`) and retires every `is_consumer_type(name)` /
+  `is_consumer_fn(name)` vtable call. Without #7, the rest don't have a
+  place to put what they're moving.
+- **#8** is mostly orthogonal — Sky-side layout walker replacing the
+  `monomorphize_type` callback. Benefits from #7's universe but can be
+  done first if you want.
+- **#9** depends on #7 (somewhere to register Instances at after_expansion
+  instead of via `symbol_name` side effect).
+- **#3** falls out of #9 (once `symbol_name` isn't driving discovery, the
+  remaining CGU walk is just for accessors + Case-1b, which can be
+  rewritten directly during codegen without a `'static`-stashing dance).
+- **#12** falls out of #7 + #9 + the deeper half of #4 (the
+  `codegen_crate` rewrite to walk the queue inline via Inkwell). Today
+  Session 6 only landed #4's *channel* part; the *emission* part is still
+  outstanding.
 
-The original wording follows for posterity (this is the architecturally
-interesting pattern that's now exercised):
+**Recommended sequencing:** #7 first (foundation), then #8 in parallel
+with #9, then #3 as cleanup, then the deeper #4 + #12 together. Total:
+~8–10 weeks sequential, ~6–8 with parallelism.
 
-> Phase 2 C — toylang `impl rust_trait for toylang_type`. Unlocks
-> Case 4 (Sky type implementing a Rust trait, consumed via a Rust
-> generic intermediary — "Sky exposes a trait impl that satisfies a
-> Rust generic's bound"). Real toylang language-feature work: parser,
-> AST, type-resolver, stub_gen impl-block emission, llvm_gen for
-> trait-impl method codegen, symbol_name override extension for impl
-> DefIds.
->
-> This is the most architecturally interesting remaining piece because
-> it's the pattern Sky must support: a Sky-defined type implementing
-> a Rust trait, where the Rust generic that bounds the trait gets
-> instantiated by either Rust or Sky code. The Phase 2 C work touches
-> real language design (how does toylang write `impl Clone for Widget`?
-> toylang's existing syntax is `impl rust.std.clone.Clone for Widget {
-> fn clone(&self) -> Widget { ... } }` per architecture §6.2's worked
-> example).
+### 6.2 Item #7 — replace `LangPredicates` with sidecar-loaded universe
 
-### Tier 3 — larger architectural shifts (multi-week)
+**Effort:** ~2 weeks.
 
-These rebuild facade-level assumptions that today's tests don't
-exercise sharply. Each is its own multi-week sub-project.
+**The problem today.** The facade asks the consumer "is `Foo` a consumer
+type?" via vtable. `rustc-lang-facade/src/lib.rs:89` declares the trait:
 
-- **#7 — replace `LangPredicates` with sidecar-loaded universe.**
-  Today: facade calls `is_consumer_type(name)` / `is_consumer_fn(name)`
-  via vtable. Sky wants content-addressed typeids in the sidecar. ~2
-  weeks; touches many call sites.
+```rust
+pub trait LangPredicates: Send + Sync + Any {
+    fn is_consumer_type(&self, name: &str) -> bool;
+    fn is_consumer_fn(&self, name: &str) -> bool;
+}
+```
 
-- **#8 — `layout_of` walks Sky-side.** Today: facade calls
-  `monomorphize_type` callback for field types and lets rustc compose.
-  Sky wants `layout_of` to walk Sky's universe recursively itself.
-  ~1–2 weeks.
+Call sites (the ones that need to change):
+- `rustc-lang-facade/src/lib.rs:346` `is_consumer_type` helper
+- `rustc-lang-facade/src/lib.rs:492` `is_consumer_accessor_safe`
+- `rustc-lang-facade/src/lib.rs:519` `is_consumer_trait_impl_method`
+- `rustc-lang-facade/src/lib.rs:530` `is_consumer_fn` helper
+- `rustc-lang-facade/src/queries/layout.rs:65`
+- `rustc-lang-facade/src/queries/drop_glue.rs:53`
+- `rustc-lang-facade/src/queries/symbol_name.rs:42`
+- `rustc-lang-facade/src/queries/per_instance.rs:62`
 
-- **#9 — retire `symbol_name` side-effect channel.** Today: rustc's
-  `symbol_name` query firing on a consumer Instance triggers
-  `notify_concrete_entry_point` which stashes the Instance for
-  internal-callee discovery (`@SyMINCZ` trap-fence). Sky's discovery
-  moves to the `after_expansion` queue (§20.4); `symbol_name`
-  becomes a pure read. Bundled with #3 (the CGU stash retirement —
-  see §2's Session 7 audit). ~1–2 weeks.
+Plus the trampoline `trampoline_is_consumer_type` at `lib.rs:682` and the
+predicate-vtable plumbing at `lib.rs:230-237, 821`.
 
-- **#12 — retire `MUTABLE_STATE` + two-vtable split.** Today: facade
-  holds a Mutex around consumer state; the @GCMLZ bypass uses a
-  thread-local fat pointer (Phase 3 E.6). Once #4's deeper inline-
-  codegen rewrite and #9's symbol_name retirement land, the locking
-  story fundamentally simplifies. ~1–2 weeks.
+Sky's locked design (architecture §7, §8, §9, §10.8): a content-addressed
+**Sky universe** owned by the facade, populated at sidecar-load time
+(`Callbacks::after_expansion` — the hook is already at the right place).
+Predicates are O(1) lookups against the universe with no vtable hop.
 
-- **#3 — retire `cgu_stash.rs`.** Session 7 audit (§2) showed this
-  is bundled with #7 + #9: the consumer's accessor-method discovery
-  and Case-1b generic-from-Rust discovery both still rely on rustc's
-  CGU walk; moving both to the after_expansion queue is the same
-  architectural shift those items name. Order-of-operations: land
-  the sidecar-loaded universe (#7) so the queue exists, retire the
-  symbol_name discovery channel (#9), then delete the stash (#3).
-  ~comes free with the above.
+**The migration.**
 
-- **#13 — retire wrapper-mode `@MRRIWMZ`.** Largest. Today: toylangc
-  IS the rustc-via-`RUSTC_WORKSPACE_WRAPPER` wrapper, re-parsing the
-  toylang.toml in the child process. Sky wants the forked rustc binary
-  statically linked with the codegen backend. This is the "ship a Sky
-  toolchain" piece. Architecture §4.1–§4.5. ~4–6 weeks; touches
-  install, distribution, and the entire startup model.
+1. **Define the universe.** In `rustc-lang-facade/src/lib.rs`, introduce:
 
-### My recommendation
+   ```rust
+   pub struct SkyUniverse {
+       pub typeids: HashSet<u64>,
+       pub fn_names: HashSet<String>,      // for is_consumer_fn
+       pub type_names: HashSet<String>,    // for is_consumer_type
+       // Future: full Temputs entries for #8's Sky-side layout walk.
+   }
+   ```
 
-**Tier 1, in #4 → Workstream B → #5 order.** Each is a discrete win.
-Then Tier 2 (Phase 2 C) is the biggest forward-progress piece — it's
-where the language gets a feature that exercises a fundamentally new
-Sky interop pattern. Tier 3 is a quarter-of-work each; don't start
-without budgeting properly.
+   Stored in an `OnceLock<RwLock<SkyUniverse>>` (replacing what
+   `MUTABLE_STATE` partially does). Note: #12 eventually retires
+   `MUTABLE_STATE`; #7 introduces the lock-free read path that #12 will
+   inherit.
 
-**Update after Session 11**: Tier 1 + Tier 2 done; the uniformity sweep
-(Phases A/B/C/F) closed every site that branched on
-`type_params.is_empty()` in discovery + typecheck paths. **Phase E Path 1
-also landed**: the rustc debuginfo clamp was written and verified as fork
-patch 4 (`e67de69ef35` on `per-instance-mir`). Verified by reproducing
-the previously-ICE'ing `pub struct Foo(())` shape on the patched rustc —
-253/253 tests pass. PR draft at `phase-e-rustc-pr-draft.md` ready for
-upstream submission.
+2. **Populate at sidecar load.** Today's `LangCallbacks::on_sky_lib_loaded`
+   takes raw bytes and lets the consumer deserialize. Add a parallel
+   facade-side path that extracts the universe-relevant subset from each
+   sidecar's `ToylangRegistry` (or whatever the consumer's typed AST type
+   is) — alternatively, change `on_sky_lib_loaded`'s signature to return
+   the relevant subset. Plus a `before_main_pass` hook that populates the
+   universe with the LOCAL crate's items (since the local sidecar isn't
+   written yet at this point).
 
-**Phase E completion + vestigial-extern cleanup landed** (Session 11):
-stub_gen's struct shape is now universal —
-`pub struct Foo<P...>(PhantomData<(P...)>);` at every N — via fork
-patch 4 (the debuginfo clamp). Additionally, the
-`__toylang_impl_*` and `__toylang_accessor_*` extern "C" decls in
-stub_gen were investigated and found vestigial (Sky's `symbol_name`
-override routes Rust callers without needing forward decls; Sky's
-codegen emits accessor symbols directly). Removing both eliminated
-every generic-vs-non-generic asymmetry in stub_gen — the previously-
-flagged "Phase D" sites turned out to be independently fixable. The
-architecture fence now scans for both `type_params.is_empty()` and
-`type_args.is_empty()`.
+3. **Migrate call sites.** Each `crate::is_consumer_type(&name)` becomes
+   `crate::sky_universe().contains_type(&name)`. Lock-free reads
+   (`RwLock::read()`).
 
-Remaining options:
+4. **Retire the vtable slot.** Once all call sites use the universe,
+   `LangPredicates::is_consumer_type` becomes an empty trait or is
+   removed entirely. Toylang's
+   `callbacks_impl::is_consumer_type/is_consumer_fn` impls go away.
 
-- **Phase E Path 2 — `SkyOpaqueType<typeid>` migration** (5-10 days):
-  the §10.6 locked Sky design. Substantial — every Sky struct's stub
-  shape becomes a wrapper, and every Sky→rustc type-identity site
-  needs to decode the const-generic typeid. High blast radius.
-  Recommendation: defer until §13's comptime-type machinery lands and
-  this work amortizes.
-- **Tier 3 facade-level shifts** (#7, #8, #12, #13): each is its own
-  multi-week sub-project. Don't start without explicit agreement.
+5. **Toylang side.** `ToylangState.upstream_type_names` and
+   `upstream_structs` (Phase 3 E.5 mirrors) can stay or be replaced by
+   reading directly from the facade's universe via a `get_universe()`
+   accessor — minor cleanup.
 
-### Cross-references for the next person
+**Verification.**
+- Suite passes 262/262 throughout. Each migration step is one PR; tests
+  green between steps.
+- Add a unit test that asserts `SkyUniverse::contains_type("Widget")`
+  returns true after loading a fixture sidecar.
+- Smoke test: temporarily replace one `is_consumer_type` call site with
+  a sentinel that panics if reached → verify the universe path fires
+  instead, then remove the sentinel.
 
-- `workstream-a-scope-notes.md` — Workstream A completion notes,
-  including the two key unlocks (oracle sweep, transitive callee walk).
-- `phase3-e6-scope-notes.md` — Phase 3 E.6 completion notes, including
-  the @GCMLZ re-entrance root cause and the thread-local bypass fix
-  pattern.
-- `rust-interop-architecture.md` §§4.5, 6.1, 6.3, 6.5 — marker-based
-  detection (E.1) reference. §5.3 — codegen backend method sketches
-  (#4 reference). §20.3 — pipeline ordering (#5 reference). §6.2 +
-  Appendix A.3 — `impl rust_trait for sky_type` worked example
-  (Phase 2 C reference).
-- `course-correct.md` — top-of-file status table shows what's done.
+**Pitfalls.**
+- The universe needs to be populated BEFORE the first query that consults
+  it. `Callbacks::after_expansion` fires once per rustc invocation; the
+  sidecar loader runs there too (driver.rs:130). For local-crate items,
+  populate from the consumer's just-built registry; that happens later in
+  `after_rust_analysis`. So queries between `after_expansion` and
+  `after_rust_analysis` (Rust-source typecheck) need the universe
+  pre-populated, but won't yet have local items — handle this gracefully
+  (queries about local items can't fire before the local registry is
+  built; queries about upstream items can).
+- The cross-crate parentage check from #4.5 (def_id.krate match) is still
+  needed when registering items into the universe — don't accept items
+  from re-exports.
+
+**Architecture refs:** §7.1–7.5, §8, §9.4, §10.8, §10.9.
+
+### 6.3 Item #8 — `layout_of` walks Sky-side
+
+**Effort:** ~1–2 weeks.
+
+**The problem today.** `rustc-lang-facade/src/queries/layout.rs:70`
+calls back to the consumer:
+
+```rust
+let result = crate::call_monomorphize_type(&name, tcx, ty);
+let layout = build_layout(tcx, ty, &result.field_types, query.typing_env);
+```
+
+`call_monomorphize_type` (lib.rs:545) dispatches through `StatefulVtable`
+to the consumer's `LangCallbacks::monomorphize_type`. The consumer
+(toylang) looks up `name` in its registry, substitutes type params with
+concrete args from `ty`, returns `MonomorphizeResult { field_types:
+Vec<Ty<'tcx>> }`. The facade then queries `tcx.layout_of` on each field.
+
+Sky's locked design (architecture §10.3–10.5, §8.8): `layout_of` walks
+Sky's universe **recursively itself**, no callback. Sky owns the layout
+machinery end-to-end.
+
+**The migration.**
+
+1. **Make the universe (from #7) carry full Temputs.** Each entry needs
+   `Vec<Field { name, ResolvedType }>` and `type_params` — enough to do
+   the substitution Sky-side.
+
+2. **Add a Sky-side layout walker.** Most of toylang's
+   `monomorphize_type` impl (callbacks_impl.rs around line 790) becomes a
+   facade-side fn: takes `Ty<'tcx>`, extracts `(name, args)`, looks up
+   the universe entry, substitutes its `field_types` per `args`,
+   recursively converts each substituted `ResolvedType` back to
+   `Ty<'tcx>` (the inverse of `rustc_ty_to_resolved_type`), then composes
+   layout.
+
+3. **The `ResolvedType → Ty<'tcx>` conversion** is the part that needs
+   the most care. Toylang's `oracle::try_resolved_to_rustc_ty` already
+   does this. Either move it facade-side (via universe), or keep it
+   toylang-side but expose a single conversion callback to the facade
+   (lighter touch).
+
+4. **Retire `monomorphize_type` callback.** `LangCallbacks::monomorphize_type`
+   trait method removed; `StatefulVtable.monomorphize_type` slot removed.
+   The consumer no longer needs to deal with layouts at all.
+
+**Verification.**
+- All layout-probe integration tests pass (search
+  `toylangc/tests/integration_projects.rs` for `layout_of intercepted`).
+- The `[toylang] layout_of intercepted for: <ty> size=N align=M` log
+  line stays at the same format (probe tests assert on it).
+- Cross-check: `r_t_r_vec_of_ship` continues to work (the wrapper-as-field
+  shape, layout-field-count match — Phase E Path 2).
+
+**Pitfalls.**
+- The `ResolvedType` representation has Sky-specific kinds (`TypeParam`,
+  `RustType`, `StructRef`, etc.). Moving it facade-side requires either
+  the facade depending on the consumer's typed-AST type, or generalizing
+  it to a small lingua franca. Recommend keeping consumer-defined Temputs
+  facade-stored as `Box<dyn Any>` + a registered conversion callback —
+  not a perfect retirement of the callback but a strict simplification.
+- Recursive layout queries can re-enter Sky's `layout_of` override.
+  Currently safe because `monomorphize_type` is stateless (@GCMLZ note in
+  layout.rs:43–52 documents this). Maintain statelessness in the new
+  walker.
+
+**Architecture refs:** §8.8 "no pre-computed layouts," §10.3–10.5, §13.7
+(comptime adds work but is out of scope here).
+
+### 6.4 Item #9 — retire `symbol_name` side-effect channel
+
+**Effort:** ~1–2 weeks. Depends on #7.
+
+**The problem today.** `rustc-lang-facade/src/queries/symbol_name.rs`
+overrides `tcx.symbol_name(instance)`. For consumer Instances it
+synthesizes the `__toylang_impl_*` symbol name (which is fine — that's
+the architectural bridge per §3.3 above). BUT it also fires
+`call_notify_concrete_entry_point` (symbol_name.rs:96) as a side effect.
+This is how toylang discovers internal-callee Instances for stashing —
+when rustc's mono walk queries the symbol name of a Sky item, toylang
+records the Instance so its later codegen pass can emit it.
+
+The Session 5 thread-local fat-pointer bypass exists because
+`generate_and_compile` holds `MUTABLE_STATE` and the symbol_name override
+re-enters trying to lock it.
+
+Sky's locked design (architecture §19, §20.4, §26.1 SyMINCZ): discovery
+happens at `Callbacks::after_expansion` via universe walk; the codegen
+queue is populated there, not via `symbol_name` side effects.
+`symbol_name` becomes a pure read.
+
+**The migration.**
+
+1. **Move the discovery to after_expansion.** Today's
+   `populate_toylang_instances_from_cgus` (callbacks_impl.rs) is an
+   entry-point walk that already does most of this — Phase C (Session 11)
+   migrated to §20.4 shape. Extend it to also enumerate the items that
+   `symbol_name`'s side effect was discovering: anything reachable from
+   exports + main + trait-impl methods, traversing toylang→toylang calls.
+
+2. **Remove the side effect from `symbol_name`.**
+   `rustc-lang-facade/src/queries/symbol_name.rs:96` — delete the
+   `call_notify_concrete_entry_point` call. The override becomes:
+   "rewrite the symbol name, return it, no state mutation."
+
+3. **Retire the callback trait method.**
+   `LangCallbacks::notify_concrete_entry_point` (lib.rs:172) goes away.
+   `StatefulVtable.notify_concrete_entry_point` slot too. The thread-local
+   fat-pointer bypass becomes obsolete (no re-entrance because no
+   side-effecting call).
+
+4. **Consumer state cleanup.** Toylang's `walked_entry_points` set
+   (callbacks_impl.rs) shrinks — no longer needs to dedupe against
+   symbol_name firings.
+
+**Verification.**
+- Suite passes 262/262.
+- The Phase 2 round-trip probe (`test_phase2_const_u64_round_trip`) still
+  fires.
+- Smoke test: temporarily add an `eprintln!("FIRED")` where
+  `call_notify_concrete_entry_point` was, run the suite, observe it
+  doesn't fire anymore.
+
+**Pitfalls.**
+- **@SyMINCZ is a real trap, not just an arcanum.** If you move discovery
+  somewhere that uses `tcx.symbol_name` as a "now register this Instance
+  please" hint, you'll silently miss Instances rustc never queries for.
+  Only `ReifyFnPointer` casts inside `per_instance_mir` bodies drive
+  rustc's mono collector.
+- Don't accidentally break the `__toylang_impl_*` symbol rewrite. The
+  override needs to STAY (that's the architectural bridge). What goes is
+  ONLY the `call_notify_concrete_entry_point` call within it.
+- The thread-local fat-pointer bypass (`phase3-e6-scope-notes.md`)
+  exists specifically for symbol_name re-entrance during
+  `generate_and_compile`. Once #9 lands, that bypass is dead code — but
+  don't remove it in the same PR as #9; do it in a follow-up so you can
+  bisect if anything's left.
+
+**Architecture refs:** §19, §20.4, §26.1 (SyMINCZ), §26.2 (GCMLZ).
+
+### 6.5 Item #3 — retire `cgu_stash.rs`
+
+**Effort:** ~3–5 days. Depends on #7 + #9.
+
+**The problem today.** `rustc-lang-facade/src/cgu_stash.rs` (87 lines)
+holds CGU references with their `'tcx` lifetime erased to `'static`. The
+consumer's codegen path (`toylangc/src/llvm_gen.rs:1994`) calls
+`upstream_cgus(tcx)` to walk them and discover items rustc surfaced via
+mono — specifically:
+
+1. **Accessor methods** discovered via `opt_associated_item`.
+2. **Case-1b generic toylang fns** instantiated from Rust callers
+   (`__lang_stubs::wrap::<LocalThing>` in a `rust_caller.rs`). The
+   registry walk skips these (no concrete args at root); the CGU walk is
+   the only discovery path.
+
+Sky's locked design (architecture §19, §20.4): the codegen queue is
+populated at after_expansion. Cross-language generic instantiation (Case
+1b) still flows through rustc's mono collector — that's architecturally
+correct — but the discovery happens DURING `codegen_crate`'s queue walk,
+not via a separately-stashed list.
+
+**The migration.**
+
+1. **Move accessor discovery to after_expansion.** Every Sky struct's
+   fields are known from the universe (#7). Each `(struct, field)` pair
+   becomes an entry point. No more `opt_associated_item` walk needed.
+
+2. **Move Case-1b discovery into `codegen_crate`.** The user-bin
+   compile's codegen path already iterates the CGU list (via the partition
+   override at lib.rs / `collect_and_partition_mono_items`). Replace the
+   `upstream_cgus(tcx)` stash dance with a direct iteration during
+   codegen — pick up consumer Instances from the filtered CGU list while
+   we still have the live `'tcx` (no need to stash, no lifetime erasure).
+
+3. **Delete `cgu_stash.rs`.** And `upstream_cgus(tcx)`. And the
+   corresponding `stash_cgus` call in `partition.rs`.
+
+**Verification.**
+- All `case1b*`, `case4*`, `case6*` fixtures still pass (those exercise
+  Case 1b / Rust-walks-Sky-impl paths).
+- Suite passes 262/262.
+- Probe: temporarily replace `upstream_cgus(tcx)` with `panic!("stash
+  consulted")` and verify nothing calls it.
+
+**Pitfalls.**
+- Accessor methods are weird — they exist as Sky-emitted symbols
+  (`Foo::field` accessors), called from Rust source via the stub rlib's
+  `impl Foo { pub fn field(&self) -> &T { unreachable!() } }`. The
+  discovery channel today is "rustc's mono collector queues them; CGU
+  stash holds them; toylang's codegen picks them up." Under #3, the queue
+  must enumerate every accessor of every Sky struct as a potential entry
+  point. They're cheap (one per field) so over-enumeration is fine.
+- The `'tcx`-to-`'static` erasure in cgu_stash.rs is a controlled unsafe
+  block. The codegen-time walk in #3 doesn't need it (we have live
+  `tcx`). Don't add a new lifetime-erased path just because the old one
+  existed.
+
+**Architecture refs:** §19, §20.4, §20.8.5 (cross-crate Sky generic mono).
+
+### 6.6 Item #12 — retire `MUTABLE_STATE` + two-vtable split
+
+**Effort:** ~1–2 weeks. Depends on #7 + #9 + the deeper half of #4.
+
+**The problem today.** `rustc-lang-facade/src/lib.rs:342` holds
+`static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>>`.
+This mutex wraps:
+- A pointer to the consumer's state object (`Box<dyn Any>`).
+- The two vtables: `PredicateVtable` (lock-free reads) and
+  `StatefulVtable` (mutating ops).
+- The current session's config.
+
+The mutex is held during `generate_and_compile` (lib.rs:571). Query
+providers that fire during codegen (re-entrant `layout_of` /
+`symbol_name`) must NOT lock it. `@GCMLZ` is the trap-fence; the
+two-vtable split exists to enforce lock-free reads for predicates while
+allowing mutating callbacks to lock. Session 5's thread-local
+fat-pointer bypass handles the @GCMLZ re-entrance via `symbol_name`.
+
+Sky's locked design: the universe (from #7) is the shared state, accessed
+via `RwLock` (lock-free reads). Codegen walks the queue inline (#4
+deeper) without crossing the consumer boundary mid-call. So there's no
+re-entrance to manage, no two-vtable split needed.
+
+**Pre-req: the deeper half of #4** (architecture §5.3). Session 6's #4
+work landed only the channel piece (the `Box<dyn Any>`-injecting wrapper).
+The architecture-locked design is that Sky's `codegen_crate` itself walks
+the queue and emits via Inkwell inline — no `generate_and_compile`
+callback to the consumer at all. The consumer registers its items into
+the universe at after_expansion; Sky's codegen does the rest. This is
+~1–2 weeks of work on its own and bundles naturally with #12.
+
+**The migration (once #4 deeper is done).**
+
+1. **Replace `Mutex` with `RwLock`.** The universe is read-mostly; only
+   sidecar-load + local-registry-load are writes, both rare and
+   serialized by the rustc-invocation lifecycle.
+
+2. **Collapse the two vtables.** `PredicateVtable` and `StatefulVtable`
+   merge into a single registration API. After #7 and #9, there are very
+   few callback methods left:
+   - `on_sky_lib_loaded` (sidecar load — #7 may rewrite to be
+     facade-driven)
+   - Possibly a "convert ResolvedType to Ty<'tcx>" callback if #8 left
+     that consumer-side
+   - The `per_instance_mir` provider (Approach A — stays)
+
+3. **Retire the thread-local fat-pointer bypass.** Once #9 retires the
+   symbol_name side effect and #4 deeper retires `generate_and_compile`,
+   the re-entrance scenario doesn't exist. Delete the bypass.
+
+**Verification.**
+- Suite passes 262/262.
+- @GCMLZ is verifiably dead: temporarily add `panic!("MUTABLE_STATE
+  accessed")` everywhere the mutex was locked → suite still passes (the
+  universe-RwLock path is exclusive).
+
+**Pitfalls.**
+- This is THE most invasive Tier 3 item structurally. Don't try to land
+  it before #7, #9, and the deeper #4 are in. Each prerequisite removes
+  a reason MUTABLE_STATE exists; until all three are gone, the mutex is
+  still load-bearing.
+- The Session 5 deadlock (@GCMLZ via symbol_name re-entrance) is a real
+  failure mode. If you remove the thread-local bypass before #9 lands,
+  you'll deadlock at the user-bin compile of any multi-crate fixture
+  (`case6_basic` is the canary).
+
+**Architecture refs:** §5.3 (CodegenBackend.codegen_crate inline
+emission), §26.2 (GCMLZ).
+
+### 6.7 What's NOT in this plan
+
+- **#13** (wrapper-mode `@MRRIWMZ` retirement). Architecture §4.1–§4.5.
+  ~4–6 weeks; touches install, distribution, the whole startup model.
+  Sequence with Sky's own toolchain shipping, not as part of this rebuild
+  series.
+- **#10** (partially done; `collect_generic_rust_deps` Instance-keyed via
+  Approach A landed in Session 2). The remaining "Instance-keyed" surface
+  for Sky's full design needs `per_instance_mir` to be Instance-keyed at
+  the rustc query layer — which IS the existing fork patch. Done in
+  effect.
+
+### 6.8 If something goes sideways
+
+Per Session 5's lesson: **diagnose before reverting.** A 0%-CPU hang is
+`sample <pid>`; a panic is `RUST_BACKTRACE=full`; a silent miss is a
+probe. The thread-local fat-pointer pattern in
+`phase3-e6-scope-notes.md` is the reference for re-entrance issues.
+
+Per Session 4's lesson: **half-done refactors compound.** If a Tier 3
+item feels MUCH harder than estimated, check whether an EARLIER refactor
+(stage 5a's oracle cross-crate sweep was a real example) is half-done in
+the area you're touching. Finish it first, then return to the planned
+work.
 
 ---
 
-## 9. Operational tips
+## 7. Operational tips
 
-### 9.1 Running tests
+### 7.1 Running tests
 
 ```bash
 # Full suite (run with cache wiped):
 rm -rf /Users/verdagon/erw/toylangc/target/integration-projects-cache
-cargo test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml > /Users/verdagon/erw/tmp/quarter-of-work.txt 2>&1
-grep -aE "^test result|FAILED|^running" /Users/verdagon/erw/tmp/quarter-of-work.txt | tail -8
+cargo +rustc-fork test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml > /Users/verdagon/erw/tmp/quarter-of-work.txt 2>&1
+grep -aE "^test result|FAILED" /Users/verdagon/erw/tmp/quarter-of-work.txt
 
-# Just sidecar unit tests:
-cargo test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml --bin toylangc sidecar:: > /Users/verdagon/erw/tmp/quarter-of-work.txt 2>&1
+# Just unit tests (toylangc bin):
+cargo +rustc-fork test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml --bin toylangc <pattern>
 
 # Just one integration test:
-cargo test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml --test integration_projects test_diamond_call_pattern > /Users/verdagon/erw/tmp/quarter-of-work.txt 2>&1
+cargo +rustc-fork test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml --test integration_projects <name>
 ```
 
-The session log file `./tmp/quarter-of-work.txt` is fixed — re-use it for
-every command in your session per CLAUDE.md's "build & run convention."
+Re-use `tmp/quarter-of-work.txt` for every command in your session.
 
-### 9.2 Direct toylangc invocation (for probing)
+### 7.2 Direct toylangc invocation (for probing)
 
 ```bash
-cargo run --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml --quiet -- \
-    build /Users/verdagon/erw/toylangc/tests/integration_projects/diamond_call_pattern/toylang.toml \
+cargo +rustc-fork run --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml --quiet -- \
+    build /Users/verdagon/erw/toylangc/tests/integration_projects/<fixture>/toylang.toml \
     > /Users/verdagon/erw/tmp/quarter-of-work.txt 2>&1
 ```
 
-This bypasses cargo test and runs the binary directly, capturing all
-stderr. Useful when you need to see eprintln output that cargo test
-swallows.
+Bypasses cargo test, captures all stderr. Useful for seeing eprintln
+output cargo test swallows.
 
-### 9.3 Rebuilding the rustc fork
+### 7.3 Rebuilding the rustc fork
 
-If you need to make changes to `~/rust` (the forked rustc), see
-`docs/historical/rebuilding-rustc-fork.md`. Five steps; the install
-step needs `bash install.sh --prefix=$HOME/rust/build/host/stage2`.
-Full rebuild from clean state with CI LLVM = ~15 min.
+When you change `~/rust/compiler/`, see
+`docs/historical/rebuilding-rustc-fork.md`. Five steps:
 
-### 9.4 Sidecar inspection
+1. `cd ~/rust && python3 x.py dist rustc-dev` (~10 min)
+2. `cd /tmp && tar xzf ~/rust/build/dist/rustc-dev-1.95.0-dev-aarch64-apple-darwin.tar.gz && cd rustc-dev-* && bash install.sh --prefix=$HOME/rust/build/host/stage2` (~3 min — see note below)
+3. `rm -rf $HOME/rust/build/host/stage2/lib/rustlib/rustc-src` (REQUIRED — without this step 2 takes 30+ min on subsequent rebuilds because of `.old.old.old.old.old.old.old.old` backup cascades)
+4. `cd ~/rust && python3 x.py build library --stage 2` (~5 min)
+5. **REINSTALL rustc-dev** (steps 2 again) — step 4 wipes
+   `lib/rustlib/<target>/lib/librustc_*.rmeta`. Without this you get 50+
+   "can't find crate for `rustc_abi`" errors.
 
-You don't have a `skyc inspect` tool (deferred per architecture doc
-§8.9). If you need to inspect a sidecar's contents during debugging,
-write a temporary test in `sidecar.rs::tests` that calls
-`deserialize_sidecar` on a known file path and prints the registry.
-Don't write a freestanding tool.
+Total: ~20 min for a clean rebuild. Cached LLVM is enabled in
+`config.toml`.
 
----
+### 7.4 Sidecar inspection
 
-## 10. Things that will probably bite you
-
-These are real traps. Read them.
-
-1. **Stale incremental cache.** Already covered in §6. Wipe
-   `integration-projects-cache` when tests act weird.
-2. **Wrapper mode vs build mode.** `toylangc` is BOTH the orchestrator
-   AND the rustc wrapper. The same binary runs in both modes. See
-   `main.rs::run_wrapper_mode` and `build::build_project`. If you're
-   debugging "why isn't my callback firing", first determine WHICH MODE
-   the failing invocation is in.
-3. **Two rustc invocations per build.** rlib + user_bin. Independent
-   processes. State doesn't carry across. The callback log file is shared
-   but whoever writes last wins.
-4. **`is_downstream_of_stubs` semantics.** TRUE means "this is the
-   user_bin compile (not the rlib)". The variable name is awkward.
-   Phase 1 A.2 renames it.
-5. **Cargo's `.cargo` directory.** Doesn't exist in the workspace; `cargo`
-   uses `$CARGO_HOME` (typically `~/.cargo/`) for the registry cache.
-   When toylang fixtures depend on path-based test_helpers, watch that
-   the `path = "../test_helpers"` works in the generated `.toylang-build/`
-   workspace.
-6. **`tcx.output_filenames(())` vs `tcx.output_filenames(LOCAL_CRATE.into())`.**
-   The query key is `()`, not a CrateNum. Easy to get wrong.
-7. **`@-arcana` invariants.** The `docs/architecture/rust-interop-guide.md`
-   has a section on cross-cutting invariants (@SyMINCZ, @ELASZ, etc.).
-   The @SyMINCZ one specifically — "computing a symbol name doesn't force
-   codegen" — has caught me. If you add a new call to `tcx.symbol_name`
-   thinking it'll register the Instance for codegen, that's wrong; only
-   `ReifyFnPointer` casts in the per_instance_mir body do that.
-8. **Trait-method dispatch keys on trait DefId, not impl DefId.** Per
-   @TVIMDGAZ. When you build an Instance for `<MyType as Trait>::method`,
-   you use the trait def's method DefId with `[Self=MyType, …]` args, then
-   `Instance::expect_resolve` maps to the impl method at runtime.
-9. **`instantiate_identity()` requires a comment.** Per the project's
-   CLAUDE.md compiler law. `EarlyBinder::instantiate_identity()` is only
-   valid for structural inspection. Every call site needs a comment
-   explaining why we're not substituting.
-10. **The bincode crate version.** This project uses bincode v2, not v1.
-    The APIs differ. Use `bincode::serde::encode_to_vec` and
-    `bincode::serde::decode_from_slice`, NOT `bincode::serialize` /
-    `bincode::deserialize` (those are v1).
+No `skyc inspect` tool (deferred per arch §8.9). To inspect a sidecar
+during debugging, add a temporary test in `sidecar.rs::tests` that calls
+`deserialize_sidecar` on a known path and prints. Don't write a
+freestanding tool.
 
 ---
 
-## 11. Useful git references
+## 8. Status snapshot (where you start)
 
-```bash
-# Last commit before Approach B migration (clean Approach A state):
-git show ce437ae
-
-# The A→B cutover (read in reverse to undo):
-git show bf770ae
-
-# Previous handoff doc (the A→B forward direction):
-docs/historical/handoff-optimized-mir-migration.md
-```
-
-The fork lives at `~/rust` on branch `per-instance-mir`. Three patches
-currently applied (uncommitted in the working tree — the project
-convention is "patches as working tree state"). See the diff with
-`cd ~/rust && git diff --stat`.
-
----
-
-## 12. Status snapshot (where you start)
-
-**Tests passing**: **262/262** (106 unit + 1 fence + 139 integration + 16
+**Tests**: **262/262** (106 unit + 1 fence + 139 integration + 16
 standalone) when run with `integration-projects-cache` wiped.
 
-**Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, 4 ✅,
-5 ✅, 6 ✅. All seven cases tested.
+**Seven-case taxonomy**: 7/7 tested (1a/1b/2/3/4/5/6).
 
-**Course-correct.md items done**: #1, #2, #4, #5, #6, #11, #14, #15,
-#16, #17, #18 (11/18). #10 partial. #3 audited and deferred (bundled
-with #7/#9, not a mechanical cleanup).
+**Course-correct.md items done**: 11/18 (#1, #2, #4, #5, #6, #11, #14,
+#15, #16, #17, #18). #10 partial. #3, #7, #8, #9, #12 remaining (this
+plan). #13 explicitly out of scope.
 
-**Generic/non-generic uniformity sweep**: Phases A/B/C/F + Phase E
-completion + vestigial-extern-decl cleanup landed (Session 11). Every
-discovery+typecheck site that branched on `type_params.is_empty()` is
-gone; struct shape unified via fork patch 4 (`e67de69ef35`); the
-vestigial `__toylang_impl_*` and `__toylang_accessor_*` extern decls in
-stub_gen were removed (Sky's `symbol_name` override is the bridge —
-no forward decl needed for Sky-emitted symbols). The remaining
-`extern "C" { ... }` content is only body-less toylang fn decls (the
-"talk to existing Rust fn" syntax), orthogonal to toylang generics.
-Substituted-args fast paths + arity check + degenerate-case helpers
-carry `arch-fence-allow` markers and are fenced by
-`tests/architecture_fence.rs`. **The CLAUDE.md compiler-law violation
-count is zero.** See `phase-e-investigation.md` and `phase-e-rustc-pr-draft.md`.
-
-**Sidecars produced**: yes, ~120 files materialize during a full test run.
-The format is bincode + BLAKE3 truncated checksum with a 64-byte fixed
-header. S.4's facade-side loader reads them at user-bin compile time;
-S.5's determinism test byte-compares two builds.
-
-**Byte-identical pass-through**: guarded by `test_a5_byte_identical_pass_through`
-(standalone test). Compiles a 4-entry Rust corpus with both vanilla
-nightly + rustc-fork, normalizes the disambiguator-derived bits, asserts
-LLVM IR byte-equality. Skips gracefully if vanilla isn't installed.
-
-**Fork state**: `~/rust` on `per-instance-mir` branch, **4 patches**
-applied: query declaration, collector hook, default-None provider, and
-debuginfo struct+union field clamp (Session 11's Phase E Path 1,
-commit `e67de69ef35`). Rebuilt for nightly-2026-01-20 / rustc 1.95.0-dev
-/ commit `d940e568`. Installed as toolchain `rustc-fork`.
+**Fork state**: `~/rust` on `per-instance-mir`, 3 patches in effect
+(query decl, collector hook, default-None provider). Patch 4 (debuginfo
+clamp `e67de69ef35`) was reverted (`003f91e4df9`) — Session 12 made it
+unnecessary. Built for nightly-2026-01-20 / rustc 1.95.0-dev / commit
+`d940e568`. Installed as toolchain `rustc-fork`.
 
 **Toolchain pin**: `rust-toolchain.toml` channel = `"rustc-fork"`. Four
-sites stay in sync (the toolchain file + `TOYLANG_NIGHTLY` in main.rs +
-two test files).
+sites stay in sync (toolchain file + `TOYLANG_NIGHTLY` in main.rs + two
+test files).
 
-**Codegen architecture**: post-Workstream A — rlib compile produces
-rlib + sidecar only (no toylang `.o`). User-bin compile is the
-codegen site, driven by registry-driven discovery + transitive callee
-walk (NOT the upstream CGU walk, which finds zero stub items at user-bin
-time — see `workstream-a-scope-notes.md` for the why).
+**Codegen architecture**: post-Workstream-A — rlib compile produces rlib
++ sidecar only (no toylang `.o`). User-bin compile is the codegen site,
+driven by §20.4-aligned entry-point walk + transitive callee walking +
+upstream-CGU iteration for Case-1b/accessors.
 
-**Working tree is clean** as of Session 8. Sessions 2–8's work is on
-`main` across fourteen commits:
+**Sky struct stub shape**: Phase E Path 2 wrapper-as-field newtype.
+Non-generic: `pub struct Foo(__ToylangOpaque<HASH>);`. Generic:
+`pub struct Foo<P...>(__ToylangOpaque<HASH>, PhantomData<(P...)>);`.
+
+**§9 export commitment**: fenced by stub_gen unit test
+`non_export_body_bearing_fn_gets_no_stub_shell`.
+
+**§4.4 byte-identical pass-through**: fenced by
+`test_a5_byte_identical_pass_through`.
+
+**Compiler-law generic/non-generic uniformity**: fenced by
+`tests/architecture_fence.rs` (scans `callbacks_impl.rs` +
+`type_resolve.rs` + `stub_gen.rs` for unmarked
+`type_params.is_empty()`/`type_args.is_empty()` branches).
+
+**Working tree**: clean.
+
+**Recent commits worth knowing** (newest first):
 
 | Commit | What |
 |---|---|
-| `671f002` | Approach A restoration + Sidecar (S.1–S.5) + Workstream A + Phase 3 multi-crate (E.1–E.6) |
-| `1a72a64` | Phase 1 D: rust_caller manifest field + Cases 1a/1b/3/5 fixtures + tests |
-| `7278f4a` | Course-correct #14 (CARGO_PRIMARY_PACKAGE) + #2 (B2 linkage mutation) retirement |
-| `88b56d2` | A.5: byte-identical pass-through invariant CI test (§4.4) |
-| `dc52833` | Session-5 doc refresh (course-correct table, tl-handoff §7 tiered options) |
-| `6c19e53` | Course-correct #4 (codegen-wrapper emission channel) |
-| `01d98fd` | Workstream B (oracle TypeParam tolerance in trait queries) |
-| `e81cf6d` | Course-correct #5 (after_expansion hook point) |
-| `7c23f63` | Session-6 doc refresh (course-correct status + tl-handoff Session 6) |
-| `1c27b09` | Course-correct #18 (build.rs rust_deps re-listing comment) |
-| `4f5cc8a` | Course-correct #17 (cosmetic is_generic branches in stub_gen) |
-| `7a203b0` | Session-7 doc refresh (Tier 1 closure + #3 audit) |
-| `6e9e7a8` | Phase 2 C.1 + C.2 (parser + ToyImpl registry) |
-| `5b1babd` | Phase 2 C.3 + C.4 (typecheck + stub-rlib emission) |
-| `b56cf4c` | Phase 2 C.5 + C.6 + C.7 (Case 4 end-to-end; 7/7 cases tested) |
-| `22a1390` | Session-8 doc refresh |
-| `d65ef81` | Session 9 sharpening (case4/5/6 now architecturally correct) |
-| `a7683fc` | Session-9 doc refresh |
-| `1b738e6` | Session 10: `export` keyword + non-export items invisible to rustc |
-| `0d728f9` | Session-10 doc refresh |
-| `0b40d98` | Honest accounting: generic-vs-non-generic uniformity audit + fix plan |
-| `8faca57` | Phase A: rename `type_params.is_empty()` to `has_abstract_args()` |
-| `5a1e7d0` | Phase B: generic bodies type-resolve eagerly, defer on TypeParam |
-| `d87638d` | Phase C + F: entry-point walk + architectural-property fence |
-| `a43569c` | Phase E investigation: rustc debuginfo ICE reproduces; recommend upstream patch |
-| `4c19bec` | Doc refresh: Session 11 uniformity sweep + Phase E investigation |
-| `8a9adc8` | Phase E patch landed in fork; verified clamp eliminates the ICE |
-| `70e3069` | Doc refresh (Path 1 landed) |
-| `c17cf7e` | Phase E completion (struct shape unification) |
-| `747d0e6` | Doc refresh (E closed) |
-| `ed4e07e` | Remove vestigial extern decls; close last gen/non-gen asymmetry in stub_gen |
+| `7f6bf97` | Phase E Path 2 Phase 5 — fork patch 4 retired, docs refreshed |
+| `90599cf` | Phase E Path 2 Phase 3 — Sky struct stubs migrated to wrapper-as-field |
+| `41423cf` | Phase E Path 2 Phase 2 — const-generic-u64 plumbing |
+| `72a929e` | Phase E Path 2 Phase 1 — wrapper decl + typeid helper + table |
+| `c38d7e0` | Pre-Session-12 stale comment cleanup |
+| `09d50bb` | Session 11 doc refresh |
+| `ed4e07e` | Vestigial `__toylang_impl_*` / `__toylang_accessor_*` extern decls retired |
+| `c17cf7e` | Phase E Path 1 completion — struct shape unified (under fork patch 4) |
+| `1b738e6` | Session 10 — `export` keyword |
+| `b56cf4c` | Phase 2 C — Case 4 end-to-end |
+| `671f002` | Approach A + Sidecar + Workstream A + Phase 3 multi-crate (big bang) |
 
-Plus fork commit `e67de69ef35` (in `~/rust` on `per-instance-mir`):
-debuginfo: clamp struct + union field walk to layout's field count.
-
-Use `git log 411c2f5..HEAD` to walk forward from the pre-Session-2
-baseline.
-
-**The plan file**: `/Users/verdagon/.claude/plans/now-please-plan-out-dynamic-island.md`.
-Already approved.
+Use `git log <commit>..HEAD` to walk forward.
 
 ---
 
-## 13. When to escalate
+## 9. When to escalate
 
 Ping the user (don't pivot unilaterally) if:
 
-- The rustc fork needs more patches beyond the existing 3.
-- You hit a test failure you can't explain after wiping the cache and
-  trying twice.
-- Phase 2 C's toylang `impl` parser turns out > 8 weeks (the plan
-  budgets 3–5).
-- You're tempted to revert Workstream A, the @GCMLZ thread-local
-  bypass, or any of the Phase 3 multi-crate plumbing. These are
-  delicate; any revert is a major architectural regression. Talk to
-  the user first.
-- A Tier 3 item (#7, #8, #12, #13) is being started without an
-  explicit "yes, we're committing to a multi-week piece" agreement.
+- The rustc fork needs more patches beyond the 3 in effect.
+- You hit a test failure you can't explain after wiping cache twice.
+- A Tier 3 item's estimate slips past 1.5× the planned weeks. The plan
+  is conservative; significant overrun signals a half-done earlier
+  refactor or a design mismatch.
+- You're tempted to revert Workstream A (Session 4), the @GCMLZ
+  thread-local bypass (Session 5), Phase 2 C's symbol_name routing
+  (Session 8), or Phase E Path 2's wrapper-as-field shape (Session 12).
+  These are load-bearing; any revert is an architectural regression.
+- A Tier 3 item is being started without an explicit "yes, multi-week"
+  agreement.
 
-For routine "this took longer than I estimated" — just keep going.
+For routine "this took longer than I estimated" — keep going.
 
 **Lessons from prior sessions worth re-reading:**
 
 - **Session 4 — the half-done refactor pattern.** Workstream A's
   original ~2–3 week sizing didn't account for the oracle cross-crate
   sweep being half-done from stage 5a. Once finished, A landed in ~2
-  hours. If a future workstream feels MUCH harder than estimated,
-  look for half-done stage refactors blocking the obvious path.
+  hours. If a future workstream feels MUCH harder than estimated, look
+  for half-done stage refactors blocking the obvious path.
 
 - **Session 5 — diagnose before reverting.** A 0%-CPU hang at the
   user-bin compile was initially attributed to a panic + @GCMLZ unwind
-  interaction. That was wrong. `sample <pid>` on the hung process
-  showed the real cause: std::sync::Mutex same-thread re-entrance at
-  MUTABLE_STATE during `lang_symbol_name → call_notify_concrete_entry_point`
-  from inside `generate_and_compile`. Fixed in ~30 minutes once the
-  stack trace was in hand. Lesson: when a process hangs at 0% CPU
-  with no error, run `sample` BEFORE reverting and writing scope
-  notes that speculate about the cause.
+  interaction. That was wrong. `sample <pid>` showed the real cause:
+  std::sync::Mutex same-thread re-entrance at MUTABLE_STATE via
+  `lang_symbol_name → call_notify_concrete_entry_point` from inside
+  `generate_and_compile`. Fixed in ~30 minutes once the stack trace was
+  in hand.
+
+- **Session 12 — verify before assuming.** Phase 4's "wrapper layout
+  intercept" turned out unnecessary because the wrapper's default ZST
+  layout was already structurally safe. Confirmed empirically by running
+  the suite with the wrapper's default layout in effect. Sometimes a
+  planned phase collapses; trust the test corpus over the original
+  prediction.
 
 ---
 
-## 14. Closing notes
+## 10. Closing notes
 
 You're inheriting a working baseline at a **major checkpoint**, with the
-architecturally interesting interop machinery proven end-to-end. The
-mechanism is alive: Approach A fires per-Instance with concrete args
-(Case 1b exercises this directly), the rustc fork is built and pinned
-at `~/rust` (3 patches), the sidecar format is specified and types
-ship + roundtrip + deserialize at upstream-rlib-load, the oracle
-helpers work cross-crate, Workstream A's codegen-at-binary architecture
-runs every Sky body at the user-bin compile from the AST in the
-sidecar, the multi-crate plumbing works (case6 builds), the seven-case
-taxonomy has fixtures for six of seven cases (1a/1b/2/3/5/6), and the
-§4.4 byte-identical pass-through invariant is guarded by CI (A.5),
-the §9 export commitment is guarded by `non_export_body_bearing_fn_gets_no_stub_shell`,
-and the CLAUDE.md compiler-law's generic/non-generic uniformity is
-guarded by `architecture_fence.rs`.
-**262/262 tests pass.** Session 12 landed Phase E Path 2 — the
-`__ToylangOpaque<const T: u64>` wrapper-as-field migration. Sky struct
-stubs now emit as newtypes around a content-addressed-typeid wrapper
-(architecture §10.4.5 path 2 / §10.6) with source/layout field counts
-matching, so the rustc debuginfo walker's bound check passes
-structurally. Fork patch 4 (`e67de69ef35`) was reverted — the assumption
-violation it patched is gone at its source, not just masked. Toylang now
-runs against unpatched rustc for the debuginfo walker; only the 3
-per_instance_mir patches remain.
+architecturally interesting interop machinery proven end-to-end:
 
-Architecturally the prototype is now **LITERAL** Sky shape for
-multi-toylang-crate projects, no longer just rehearsal. Single-file
-toylang programs still use the 2-cargo-crate split (lang_stubs_crate +
-user_bin), which is rehearsal-shape only because the "library" half is
-a derived artifact of the binary's own source. Multi-crate fixtures
-exercise the real Sky shape: independent toylang libraries published
-with their own sidecars, consumed by independent toylang binaries
-that codegen the libs' bodies at the binary compile from the sidecar's
-AST.
+- Approach A fires per-Instance with concrete args (`case1b` exercises
+  this directly).
+- The rustc fork is 3 patches against nightly-2026-01-20, installed as
+  `rustc-fork`.
+- Per-library stub rlibs with `__SKY_STUBS_MARKER` + adjacent
+  `.sky-meta` sidecars work end-to-end.
+- Multi-toylang-crate projects build (case6_basic + sharpened
+  case4/5/6).
+- The seven-case taxonomy is fully tested (7/7).
+- Sky §9 export commitment is fenced; §4.4 byte-identical pass-through is
+  fenced; generic/non-generic uniformity is fenced; Sky struct stub
+  shape is wrapper-as-field per §10.6.
+- 262/262 tests pass against an unpatched-aside-from-the-Approach-A-trio
+  rustc.
 
-Phase 2 C is done (Session 8) and the generic/non-generic uniformity
-sweep is done (Session 11). The biggest remaining architectural pieces
-are the **Tier 3 facade-level shifts** (#7, #8, #12, #13) and **Phase E
-Path 1's upstream rustc patch** (~1 day in our control to write +
-weeks of PR review; the cheapest remaining unification win). See §7.
+Tier 3 is the **last architectural rebuild before #13's toolchain ship**.
+After Tier 3 lands, the facade looks like Sky's locked design: an owned
+universe populated at after_expansion, lock-free reads everywhere,
+codegen walking the queue inline via Inkwell, no MUTABLE_STATE, no
+two-vtable split, no CGU stash, no `symbol_name` side effect. The only
+remaining gap to a real Sky toolchain is #13 (the wrapper-mode
+retirement), which is its own multi-week piece sequenced with shipping.
 
 Read the architecture doc. Read course-correct.md (status table at the
-top). Read `workstream-a-scope-notes.md` and `phase3-e6-scope-notes.md`
-for the load-bearing context on the current codegen path and the
-@GCMLZ bypass. Then start with §7 of this document.
+top). Then start with §6 of this document.
 
-Good luck. The architectural goal — making tests for the seven-case
-taxonomy's hard cases EXIST so future drift back toward Approach B
-fails loudly — is mostly met. Five hard cases (1b, 3, 4, 5, 6) were
-the original target; four of those are now tested (1b, 3, 5, 6).
-Adding Case 4 closes the taxonomy.
+Good luck.
 
-— previous engineer
+— previous engineer (Session 12 end)
