@@ -20,8 +20,8 @@ If you only read one thing, read **§6 Where to start now**.
 that hooks into rustc via query overrides) and `toylangc` (a toy consumer
 language exercising the facade). Architecturally we're aiming at **Sky**,
 the design locked in `rust-interop-architecture.md` (5,148 lines). The
-divergence catalog is `course-correct.md` (18 items, **11 done**: #1, #2,
-#4, #5, #6, #11, #14, #15, #16, #17, #18; #10 partial; #3, #7, #8, #9,
+divergence catalog is `course-correct.md` (18 items, **12 done**: #1, #2,
+#4, #5, #6, #7, #11, #14, #15, #16, #17, #18; #10 partial; #3, #8, #9,
 #12, #13 remaining). The seven-case interop taxonomy (1a/1b/2/3/4/5/6) has
 been fully tested since Session 8; the architecturally-hard cases
 (rustc-walking-a-Rust-generic-body-dispatching-to-a-Sky-impl) all have
@@ -50,6 +50,7 @@ Three rustc fork patches remain — the `per_instance_mir` trio only.
 | 10 | `1b738e6`, `0d728f9` | `export` keyword: non-export body-bearing fns get NO `pub fn` shell in stub rlib (Sky §9). CI fence `non_export_body_bearing_fn_gets_no_stub_shell`. |
 | 11 | `8faca57`, `5a1e7d0`, `d87638d`, `a43569c`, `4c19bec`, `8a9adc8`, `70e3069`, `c17cf7e`, `747d0e6`, `ed4e07e`, `a3a7c94`, `09d50bb` + fork `e67de69ef35` | Generic/non-generic uniformity sweep (Phases A/B/C/F); Phase E investigation; fork patch 4 (debuginfo clamp) shipped; struct shape unified to `pub struct Foo<P...>(PhantomData<(P...)>);`; vestigial `__toylang_impl_*` + `__toylang_accessor_*` extern decls retired. **CLAUDE.md compiler-law violation count: zero.** |
 | 12 | `72a929e`, `41423cf`, `90599cf`, `7f6bf97` + fork `003f91e4df9` | **Phase E Path 2**: `__ToylangOpaque<const T: u64>` wrapper-as-field migration (architecture §10.4.5 path 2 / §10.6). typeid helper + wrapper emission + typeid table (Phase 1), const-generic-u64 encode/decode (Phase 2), Sky struct stub shape migration + layout-field-count match (Phase 3), fork patch 4 reverted (Phase 5). **262/262 against unpatched rustc.** |
+| 13 | `c801638` | **Tier 3 #7**: `LangPredicates` → `SkyUniverse`. Facade-owned in-process universe (`HashSet`-backed, `RwLock`-protected); populated at sidecar load (`on_sky_lib_loaded`) + local registry build (`after_rust_analysis`). Predicates `is_consumer_type` / `is_consumer_fn` migrated to universe lookups; `LangPredicates` trait + `PredicateVtable` + trampolines + toylang's `upstream_fn_names`/`upstream_type_names` mirrors all retired. +2 facade unit tests; 138 integration suite is the end-to-end fence. Landed in ~45 min vs handoff's ~2-week estimate — the predicate bodies were a single chokepoint, so all 6 downstream call sites migrated transparently. **264/264 passing.** |
 
 Anchor commits worth knowing: `c38d7e0` is the doc cleanup right before
 Session 12 started; `ce437ae` is the last commit with full Approach A
@@ -749,13 +750,14 @@ freestanding tool.
 
 ## 8. Status snapshot (where you start)
 
-**Tests**: **262/262** (106 unit + 1 fence + 139 integration + 16
-standalone) when run with `integration-projects-cache` wiped.
+**Tests**: **264/264** (106 toylangc unit + 2 facade unit + 1 fence + 139
+integration + 16 standalone) when run with `integration-projects-cache`
+wiped.
 
 **Seven-case taxonomy**: 7/7 tested (1a/1b/2/3/4/5/6).
 
-**Course-correct.md items done**: 11/18 (#1, #2, #4, #5, #6, #11, #14,
-#15, #16, #17, #18). #10 partial. #3, #7, #8, #9, #12 remaining (this
+**Course-correct.md items done**: 12/18 (#1, #2, #4, #5, #6, #7, #11,
+#14, #15, #16, #17, #18). #10 partial. #3, #8, #9, #12 remaining (this
 plan). #13 explicitly out of scope.
 
 **Fork state**: `~/rust` on `per-instance-mir`, 3 patches in effect

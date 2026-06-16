@@ -6,11 +6,11 @@ This document catalogs the places in the current erw prototype that are on the *
 
 | Status | Items |
 |---|---|
-| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #4 (codegen channel), #5 (after_expansion hook), #6 (`__SKY_STUBS_MARKER`), #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs), #17 (cosmetic is_generic branches unified in stub_gen), #18 (build.rs comment refreshed) |
+| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #4 (codegen channel), #5 (after_expansion hook), #6 (`__SKY_STUBS_MARKER`), **#7 (LangPredicates → SkyUniverse)**, #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs), #17 (cosmetic is_generic branches unified in stub_gen), #18 (build.rs comment refreshed) |
 | 🟡 Partial | #10 (Instance-keyed collect_generic_rust_deps — landed; the rest needs E.5-style threading) |
-| ⏳ Remaining | #3, #7, #8, #9, #12, #13 |
+| ⏳ Remaining | #3, #8, #9, #12, #13 |
 
-11 of 18 items done. **Session 8** closed Phase 2 C (Case 4 via `impl rust_trait for toylang_type`), bringing the seven-case interop taxonomy to full coverage. Pure-cleanup work is depleted. #3 audit (Session 7) found `cgu_stash` is NOT retire-ready: `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for accessor-method discovery and Case-1b generic consumer fns instantiated from Rust call sites — paths Workstream A's registry-driven walk doesn't cover. #3 stays bundled with the deeper rebuild.
+12 of 18 items done. **Session 8** closed Phase 2 C (Case 4 via `impl rust_trait for toylang_type`), bringing the seven-case interop taxonomy to full coverage. Pure-cleanup work is depleted. #3 audit (Session 7) found `cgu_stash` is NOT retire-ready: `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for accessor-method discovery and Case-1b generic consumer fns instantiated from Rust call sites — paths Workstream A's registry-driven walk doesn't cover. #3 stays bundled with the deeper rebuild.
 
 The remaining items: wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend (#13), and the deep facade-rebuild trio (#7/#8/#12 + #9 + #3, the sidecar-loaded universe replacing `LangPredicates`).
 
@@ -113,7 +113,7 @@ Lines 156 / 195 (`notify_concrete_entry_point_inner` "stashing"), the `toylang_i
 | 4 | ✅ | `codegen_wrapper.rs:96–108` + `lib.rs:500–509` | Callback returns `.o` path; `join_codegen` injects via `OnceLock` channel | Sky's `codegen_crate` walks queue inline and emits via Inkwell directly — landed as a `LangOngoingCodegen { inner, lang_obj_path }` wrapper around rustc's own ongoing-codegen `Box<dyn Any>`; the OnceLock channel + `FacadeMutableState.lang_obj_path` are retired. The inline-Inkwell rewrite is deferred (still calls consumer's `generate_and_compile`), but the cross-phase channel is gone. |
 | 5 | ✅ | `driver.rs:76` | Hook at `after_analysis` | Hook at `after_expansion` (§20.3) — landed as a hook-point swap; toylang's oracle queries (fn_sig, adt_def, module_children) are all available at expansion-time. |
 | 6 | ✅ | `lib.rs:325–327` (`is_from_lang_stubs`) | Crate-name match against `"__lang_stubs"` | Marker-based: walk `module_children` for `__SKY_STUBS_MARKER` |
-| 7 | ⏳ | `lib.rs:86–104, 308–311, 386–389` | Name-list-based `is_consumer_type/fn` | Sidecar-loaded universe + content-addressed typeids |
+| 7 | ✅ | `lib.rs:86–104, 308–311, 386–389` | Name-list-based `is_consumer_type/fn` | **Done in commit `c801638`** — `SkyUniverse { typeids, fn_names, type_names }` populated at sidecar load + local registry build; predicates are O(1) RwLock reads. `LangPredicates` trait, `PredicateVtable`, trampolines, and toylang's per-callbacks mirrors all retired. +2 facade unit tests. |
 | 8 | ⏳ | `lib.rs:131–136` (`monomorphize_type`) | "Give me field types so rustc composes layout" | Sky's `layout_of` walks Sky's universe recursively itself |
 | 9 | ⏳ | `lib.rs:170–176` + `queries/symbol_name.rs:80–82` + `callbacks_impl.rs:156,195` | `symbol_name` query as side-effect channel for internal-callee discovery | Discovery moves to frontend's after_expansion walk; symbol_name becomes pure read |
 | 10 | 🟡 | `lib.rs:154–160` | `collect_generic_rust_deps(LocalDefId) → Vec<(DefId, args-with-Params)>` | Instance-keyed body production (pre-substituted) — landed for the primary path; cross-crate effective-registry merging followed in E.5 |
