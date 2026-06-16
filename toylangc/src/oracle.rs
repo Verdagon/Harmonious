@@ -1015,6 +1015,161 @@ pub fn rust_trait_method_return_type<'tcx>(
     Ok(rustc_ty_to_resolved_type(tcx, sig.output()))
 }
 
+// ---------------------------------------------------------------------------
+// Phase E Path 2 — `__ToylangOpaque<const T: u64>` const-generic plumbing
+// ---------------------------------------------------------------------------
+//
+// Phase 2 ships these helpers with no in-tree consumers. Phase 3 (stub_gen
+// Sky-struct emission) starts using `find_toylang_opaque_def_id` +
+// `build_opaque_args`; Phase 4 (`layout_of` wrapper intercept) starts using
+// `is_toylang_opaque` + `extract_typeid_from_args`. Each helper carries
+// `#[allow(dead_code)]` until its consumer lands; remove when that consumer
+// merges. The tests below exercise the encoders/decoders end-to-end so
+// they aren't truly dead — just not yet wired into the build pipeline.
+//
+// Architecture: `rust-interop-architecture.md` §10.6. The wrapper carries a
+// content-addressed u64 typeid as its only generic parameter. Phase 3 will
+// start emitting `__ToylangOpaque<HASH>` references inside Sky struct stubs;
+// Phase 4 will intercept `layout_of(__ToylangOpaque<HASH>)` and decode the
+// const arg to look up the Sky type. The helpers below are the
+// encode/decode/predicate triple they need.
+//
+// Naming: `__ToylangOpaque` is the toylang-specific name for what Sky's
+// architecture calls `SkyOpaqueType` (§10.6). Toylang's stub_gen emits it at
+// every stub rlib's crate root (Phase 1.2).
+
+/// The crate-root item name of toylang's opaque wrapper. Match against this
+/// at `tcx.item_name(adt_def.did())` time when intercepting wrapper layouts /
+/// symbols / drop glue.
+#[allow(dead_code)]
+pub const TOYLANG_OPAQUE: &str = "__ToylangOpaque";
+
+/// Locate the wrapper's DefId at the stub rlib's crate root. Models the
+/// existing `find_stub_fn_in_stub_rlib` pattern: walk every marker-bearing
+/// crate (handles multi-toylang-crate projects per E.1/E.6) and look for a
+/// struct named `__ToylangOpaque` whose def_id's crate is THIS crate (the
+/// §4.5 parentage check that protects against `use __lang_stubs::*;` glob
+/// re-exports inadvertently lifting the wrapper into a downstream's
+/// `module_children`).
+///
+/// Returns `None` when no stub rlib is loaded or none of the loaded stub
+/// rlibs carry the wrapper — both impossible in any toylang build that ran
+/// Phase 1.2's stub_gen but worth surfacing as `None` rather than panicking
+/// so the caller can fall through to its default `layout_of` path.
+#[allow(dead_code)]
+pub fn find_toylang_opaque_def_id(tcx: TyCtxt<'_>) -> Option<DefId> {
+    use rustc_hir::def::Res;
+    // At the rlib compile the wrapper lives in the LOCAL crate (being
+    // built); at the user-bin compile it lives in an extern stub rlib.
+    // Walk LOCAL_CRATE first so the rlib compile resolves it immediately
+    // without a redundant extern-crate iteration. Modelled on
+    // `crate_has_sky_marker`'s local-vs-extern split (facade lib.rs).
+    let local_cnum = rustc_hir::def_id::LOCAL_CRATE;
+    if rustc_lang_facade::is_from_lang_stubs(tcx, local_cnum.as_def_id()) {
+        for child in tcx.module_children_local(rustc_hir::def_id::CRATE_DEF_ID) {
+            if child.ident.as_str() != TOYLANG_OPAQUE { continue; }
+            if let Res::Def(DefKind::Struct, def_id) = child.res.expect_non_local::<rustc_hir::def_id::DefId>() {
+                if def_id.krate == local_cnum {
+                    return Some(def_id);
+                }
+            }
+        }
+    }
+    for c in tcx.crates(()).iter().copied() {
+        if !rustc_lang_facade::is_from_lang_stubs(tcx, c.as_def_id()) {
+            continue;
+        }
+        let stubs_root = c.as_def_id();
+        for child in tcx.module_children(stubs_root) {
+            if child.ident.as_str() != TOYLANG_OPAQUE { continue; }
+            if let Res::Def(DefKind::Struct, def_id) = child.res {
+                // §4.5 parentage check — reject any re-export of the wrapper
+                // into a different crate's `module_children` (would surface
+                // here if a downstream did `use __lang_stubs::*;` and the
+                // glob lifted `__ToylangOpaque` into its crate root).
+                if def_id.krate == c {
+                    return Some(def_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True iff `def_id` is the toylang opaque wrapper struct.
+///
+/// Phase 4's `layout_of` intercept gates on this before extracting the
+/// typeid. The check is name-and-parentage based: name equals
+/// `__ToylangOpaque` AND the defining crate carries the Sky stubs marker
+/// (which excludes user-defined `__ToylangOpaque` imports and glob
+/// re-exports). Caches across calls would be a future-trivial addition; for
+/// now we walk on every call because the walk visits at most one item per
+/// marker-bearing crate (the wrapper is the only such item at the crate
+/// root) and the producer count is small.
+#[allow(dead_code)]
+pub fn is_toylang_opaque(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if tcx.item_name(def_id).as_str() != TOYLANG_OPAQUE { return false; }
+    rustc_lang_facade::is_from_lang_stubs(tcx, def_id)
+}
+
+/// Decode the typeid from the const-u64 generic argument at slot 0 of a
+/// `__ToylangOpaque<HASH>` instantiation.
+///
+/// The caller is responsible for first confirming via `is_toylang_opaque`
+/// that the ADT is the wrapper; this helper just reads the const at index 0
+/// and converts to `u64`. Returns `None` when the const slot is empty
+/// (impossible for a well-typed wrapper instantiation but treated
+/// defensively) or the const is non-leaf (e.g., still a `ConstKind::Param`
+/// from `instantiate_identity()` — a structural inspection rather than a
+/// monomorphized instance).
+///
+/// Architecture §10.8: the typeid is content-addressed, so the decoded u64
+/// is identical to whatever the original `crate::typeid::compute(name, &[])`
+/// computed at stub-emission time.
+#[allow(dead_code)]
+pub fn extract_typeid_from_args<'tcx>(
+    args: ty::GenericArgsRef<'tcx>,
+) -> Option<u64> {
+    let ct = args.const_at(0);
+    ct.try_to_leaf().map(|scalar| scalar.to_u64())
+}
+
+/// Build a `GenericArgs` for `__ToylangOpaque<HASH>` with the typeid as the
+/// single const-u64 argument. The const is interned via `ty::Const::from_bits`
+/// against the target's `u64` type. The wrapper has exactly one generic
+/// parameter slot (the const u64) by construction (Phase 1.2 emission), so
+/// the `for_item` walk produces exactly this one entry.
+///
+/// Phase 3 calls this when stub_gen emits Sky structs as
+/// `Foo(__ToylangOpaque<HASH>);` — the field type's GenericArgs need the
+/// concrete HASH.
+#[allow(dead_code)]
+pub fn build_opaque_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    opaque_def_id: DefId,
+    typeid: u64,
+) -> ty::GenericArgsRef<'tcx> {
+    let u64_ty = tcx.types.u64;
+    let typeid_const = ty::Const::from_bits(
+        tcx,
+        typeid as u128,
+        ty::TypingEnv::fully_monomorphized(),
+        u64_ty,
+    );
+    let const_arg: ty::GenericArg<'tcx> = typeid_const.into();
+    let args = ty::GenericArgs::for_item(tcx, opaque_def_id, |param, _| {
+        match param.kind {
+            ty::GenericParamDefKind::Const { .. } => const_arg,
+            ty::GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+            ty::GenericParamDefKind::Type { .. } => panic!(
+                "build_opaque_args: __ToylangOpaque must have only const params, got Type at {:?}",
+                param.name,
+            ),
+        }
+    });
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

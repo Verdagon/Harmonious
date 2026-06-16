@@ -1203,6 +1203,108 @@ fn test_oracle_cross_crate_extern_fn_lookup() {
 }
 
 // ============================================================================
+// Phase E Path 2 / Phase 2 — const-generic-u64 plumbing end-to-end test
+//
+// Verifies the encode/decode round-trip against a real `TyCtxt`. The probe
+// in `callbacks_impl::after_rust_analysis`'s rlib-compile branch:
+//   1. Calls `find_toylang_opaque_def_id` to locate `__ToylangOpaque` in the
+//      stub rlib (Phase 1.2 emission).
+//   2. Calls `build_opaque_args(tcx, opaque_def_id, encoded_typeid)` with a
+//      sentinel typeid (`Widget`'s hard-pinned hash from Phase 1.1).
+//   3. Calls `extract_typeid_from_args` on the result.
+//   4. Logs `Phase2RoundTripProbe { opaque_def_id_found, encoded_typeid,
+//      decoded_typeid }`.
+//
+// What this test catches:
+//   - Drift in rustc's `ty::Const::from_bits` / `try_to_leaf` / `to_u64` API
+//     surfaces as `decoded_typeid != encoded_typeid` or a panic during the
+//     probe.
+//   - Drift in `find_toylang_opaque_def_id`'s module-children walk surfaces
+//     as `opaque_def_id_found == false`.
+//   - A regression that stops `stub_gen` from emitting the wrapper surfaces
+//     as `opaque_def_id_found == false`.
+// ============================================================================
+
+#[test]
+fn test_phase2_const_u64_round_trip() {
+    // Same fixture as the oracle-probe test — small, dedicated, no race with
+    // shared-fixture tests.
+    let project = projects_dir().join("oracle_probe");
+    assert!(project.is_dir(), "fixture not found: {}", project.display());
+    let build_dir = project.join(".toylang-build");
+    let cargo_target = shared_cargo_target_dir();
+    let log_path = build_dir.join("callback.log");
+
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            .env("TOYLANG_LOG_PATH", &log_path)
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
+    assert!(
+        build_out.status.success(),
+        "oracle_probe toylangc build failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("callback log not written at {}: {}", log_path.display(), e));
+
+    // Find the Phase2RoundTripProbe entry. Debug format includes
+    // `opaque_def_id_found: <bool>`, `encoded_typeid: <int>`,
+    // `decoded_typeid: <Option<u64>>`.
+    let entry = log.lines().map(str::trim).find(|line| {
+        line.starts_with("Phase2RoundTripProbe ")
+    }).unwrap_or_else(|| {
+        panic!(
+            "expected Phase2RoundTripProbe entry in callback log — did Phase 1's stub_gen \
+             stop emitting __ToylangOpaque, or did Phase 2's probe disappear from \
+             after_rust_analysis? Full log:\n{}",
+            log,
+        )
+    });
+
+    assert!(
+        entry.contains("opaque_def_id_found: true"),
+        "Phase2RoundTripProbe couldn't find __ToylangOpaque in the stub rlib. \
+         Likely causes: stub_gen no longer emits the wrapper (check \
+         `toylang_opaque_wrapper_emitted_at_crate_root`), or \
+         `find_toylang_opaque_def_id`'s module-children walk drifted. Entry: {:?}",
+        entry,
+    );
+
+    // Hardcoded sentinel matches the encoder in `after_rust_analysis`'s probe.
+    // It's the same value as Phase 1.1's `widget_typeid_is_stable` anchor —
+    // any drift in bincode or blake3 would surface in both places.
+    let encoded_sentinel = 0x48723b0bb65d86f7u64;
+    let encoded_str = format!("encoded_typeid: {}", encoded_sentinel);
+    assert!(
+        entry.contains(&encoded_str),
+        "Phase2RoundTripProbe encoded_typeid changed away from the pinned \
+         sentinel {:#018x}. Update the probe + this test together if \
+         intentional. Entry: {:?}",
+        encoded_sentinel, entry,
+    );
+
+    let decoded_str = format!("decoded_typeid: Some({})", encoded_sentinel);
+    assert!(
+        entry.contains(&decoded_str),
+        "Phase 2 const-u64 round-trip failed — encoder and decoder disagree, or \
+         the wrapper was found but its args couldn't be decoded. Expected \
+         `{}` somewhere in:\n{}",
+        decoded_str, entry,
+    );
+}
+
+// ============================================================================
 // S.5 sidecar determinism CI invariant (course-correct.md quarter-of-work
 // plan, Workstream S final).
 //

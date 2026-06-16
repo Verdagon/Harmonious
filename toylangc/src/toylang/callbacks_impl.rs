@@ -56,6 +56,20 @@ pub enum CallbackLog {
     /// the fallback (e.g. someone reverts it to local-only) trips the
     /// smoke test by surfacing a mismatch.
     OracleCrossCrateProbe { resolved: usize, total: usize },
+    /// Phase E Path 2 / Phase 2 — verifies the const-generic-u64 round-trip
+    /// against a real `TyCtxt`. The rlib compile builds an opaque-args
+    /// instance with a sentinel typeid via `build_opaque_args`, then decodes
+    /// it back via `extract_typeid_from_args`. Equal values mean the encoder
+    /// and decoder agree on representation; mismatch (or wrapper-not-found)
+    /// surfaces as `opaque_def_id_found = false` so the integration test can
+    /// assert end-to-end Phase 2 correctness. Fires at the rlib compile only
+    /// (where `is_user_bin_compile == false`) since that's the first compile
+    /// to load the stub rlib with the wrapper available.
+    Phase2RoundTripProbe {
+        opaque_def_id_found: bool,
+        encoded_typeid: u64,
+        decoded_typeid: Option<u64>,
+    },
     GenerateAndCompile,
 }
 
@@ -679,6 +693,24 @@ impl LangCallbacks for ToylangCallbacks {
             }
             panic!("[toylang] aborting due to validation errors");
         }
+
+        // Phase E Path 2 / Phase 2 — round-trip probe. With Phase 1's wrapper
+        // emission in stub_gen and Phase 2's encode/decode helpers in oracle,
+        // verify the const-u64 plumbing works against the actual rustc Const
+        // API on the pinned nightly. Sentinel typeid is the same one Phase 1
+        // pinned for `Widget` so a regression in either the helper layer or
+        // the rustc API surface surfaces consistently across both tests.
+        let encoded_typeid: u64 = 0x48723b0bb65d86f7;
+        let opaque_def_id_opt = crate::oracle::find_toylang_opaque_def_id(tcx);
+        let decoded_typeid = opaque_def_id_opt.map(|opaque_def_id| {
+            let args = crate::oracle::build_opaque_args(tcx, opaque_def_id, encoded_typeid);
+            crate::oracle::extract_typeid_from_args(args)
+        }).flatten();
+        state(s).log.push(CallbackLog::Phase2RoundTripProbe {
+            opaque_def_id_found: opaque_def_id_opt.is_some(),
+            encoded_typeid,
+            decoded_typeid,
+        });
 
         // S.3 (course-correct quarter-of-work plan): write the `.sky-meta`
         // sidecar adjacent to the rlib that rustc is about to emit. The
