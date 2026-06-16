@@ -206,6 +206,29 @@ pub trait LangCallbacks: Send + Sync {
 
     /// Compile the consumer's function bodies and return the path to the .o file.
     fn generate_and_compile<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)>;
+
+    /// Phase 2 (inline-codegen plan): emit the consumer's function bodies as
+    /// LLVM bitcode buffers. Each returned `(module_name, bitcode_bytes)`
+    /// pair becomes a `ModuleCodegen<ModuleLlvm>` via
+    /// `rustc_codegen_llvm::ModuleLlvm::parse_from_tcx` and rides rustc's
+    /// optimize → ThinLTO → emission pipeline alongside Rust CGUs.
+    ///
+    /// Sidesteps the separate `.o` emission path: instead of writing IR
+    /// to disk and shelling to `llc`, the consumer hands rustc the
+    /// bitcode and lets rustc's pipeline finish it.
+    ///
+    /// Default returns empty — phased rollout. Override to opt into the
+    /// inline-codegen path. While both this and `generate_and_compile`
+    /// emit non-empty output simultaneously, the resulting binary will
+    /// have duplicate symbols; toylang's intermediate gate (an env var)
+    /// ensures only one path is active per build.
+    fn consumer_emit_modules<'tcx>(
+        &self,
+        _state: &mut dyn Any,
+        _tcx: TyCtxt<'tcx>,
+    ) -> Vec<(String, Vec<u8>)> {
+        Vec::new()
+    }
 }
 
 // ============================================================================
@@ -281,6 +304,12 @@ struct StatefulVtable {
         &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
     ) -> Option<(PathBuf, Vec<String>)>,
+
+    consumer_emit_modules: for<'tcx> fn(
+        &(dyn Any + Send + Sync),
+        &mut (dyn Any + Send + Sync),
+        TyCtxt<'tcx>,
+    ) -> Vec<(String, Vec<u8>)>,
 }
 
 // ============================================================================
@@ -717,6 +746,20 @@ pub(crate) fn call_generate_and_compile<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
+/// Call the consumer's consumer_emit_modules. Holds MUTABLE_STATE for the
+/// duration; same re-entrance discipline as `call_generate_and_compile`.
+/// Called from the `extra_modules` hook (Phase 2 inline-codegen plan).
+pub(crate) fn call_consumer_emit_modules<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Vec<(String, Vec<u8>)> {
+    let c = CONFIG.get().expect("config not installed");
+    let func = c.stateful_vtable.consumer_emit_modules;
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
+    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
+}
+
 /// Read saved default query providers. Per @GCMLZ, no locking — stored in
 /// OnceLock so they're safe to call during generate_and_compile.
 pub(crate) fn default_layout_of() -> queries::layout::LayoutOfFn {
@@ -807,6 +850,14 @@ fn trampoline_on_sky_lib_loaded<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().on_sky_lib_loaded(state, tcx, crate_name, sidecar_bytes)
 }
 
+fn trampoline_consumer_emit_modules<'tcx, C: LangCallbacks + 'static>(
+    data: &(dyn Any + Send + Sync),
+    state: &mut (dyn Any + Send + Sync),
+    tcx: TyCtxt<'tcx>,
+) -> Vec<(String, Vec<u8>)> {
+    data.downcast_ref::<C>().unwrap().consumer_emit_modules(state, tcx)
+}
+
 fn trampoline_generate_and_compile<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     state: &mut (dyn Any + Send + Sync),
@@ -836,6 +887,7 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
             on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
             generate_and_compile: trampoline_generate_and_compile::<C>,
+            consumer_emit_modules: trampoline_consumer_emit_modules::<C>,
         },
     });
     let _ = MUTABLE_STATE.set(std::sync::Mutex::new(FacadeMutableState {

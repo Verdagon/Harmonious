@@ -71,10 +71,11 @@ impl rustc_driver::Callbacks for LangDriver {
         config.make_codegen_backend = Some(Box::new(|_opts, _target| {
             crate::codegen_wrapper::LangCodegenBackend::new()
         }));
-        // Phase 1 (inline-codegen plan): install the smoke-test hook so the
-        // rustc fork patch's `extra_modules` seam is exercised end-to-end.
-        // Phase 2 replaces this with toylang's real ModuleCodegen emission.
-        crate::extra_modules_hook::install_phase1_smoke_hook();
+        // Phase 2 (inline-codegen plan): install the hook that submits
+        // consumer-emitted bitcode modules into rustc's optimize → ThinLTO
+        // → emission pipeline. Hook is a no-op until the consumer overrides
+        // `LangCallbacks::consumer_emit_modules` (default returns empty).
+        crate::extra_modules_hook::install_consumer_modules_hook();
     }
 
     fn after_expansion<'tcx>(
