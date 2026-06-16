@@ -99,11 +99,14 @@ fn build_layout<'tcx>(
     field_types: &[Ty<'tcx>],
     typing_env: TypingEnv<'tcx>,
 ) -> TyAndLayout<'tcx> {
+    use rustc_abi::FieldIdx;
     use rustc_index::IndexVec;
 
-    // Compute field offsets from the consumer-provided field types.
+    // Compute the struct's total size and align from the consumer's
+    // user-visible field types. These come from `monomorphize_type`'s
+    // substitution — they are the Sky-level fields, not the stub rlib's
+    // PhantomData / opaque-wrapper carrier fields.
     let mut offset = 0u64;
-    let mut field_offsets_vec: Vec<u64> = Vec::new();
     let mut max_align = 1u64;
     for &field_ty in field_types {
         let layout = tcx.layout_of(PseudoCanonicalInput {
@@ -114,7 +117,6 @@ fn build_layout<'tcx>(
         let falign = layout.align.abi.bytes();
         max_align = max_align.max(falign);
         offset = align_up(offset, falign);
-        field_offsets_vec.push(offset);
         offset += fsz;
     }
     let total_size = align_up(offset, max_align);
@@ -122,15 +124,61 @@ fn build_layout<'tcx>(
     let align = Align::from_bytes(max_align).unwrap();
     let abi_align = AbiAlign::new(align);
 
-    // Report 0 fields to rustc — the struct is fully opaque. Rustc only needs
-    // the total size and alignment for ABI decisions with BackendRepr::Memory.
-    // Exposing per-field info caused crashes when rustc's ABI code tried to
-    // index into the ADT's fields (which are dummy stubs, not real fields).
+    // Phase E Path 2 / Phase 3 — report one layout field per source
+    // FieldDef so rustc's debuginfo walker's source-vs-layout-field-count
+    // assumption holds (architecture §10.4.5). Sky's `stub_gen` emits one
+    // of two shapes:
+    //   Non-generic: `pub struct Foo(__ToylangOpaque<HASH>);` (1 field).
+    //   Generic:    `pub struct Foo<P...>(__ToylangOpaque<HASH>, PhantomData<(P...)>);` (2 fields).
+    //
+    // Both shapes are wrapper-as-field newtypes — the Sky data lives in the
+    // wrapper at offset 0; the PhantomData tail (when present) is a ZST
+    // carrier at offset = total_size. Layout reports matching offsets so
+    // the walker's recursive `layout.fields.offset(i)` queries always
+    // succeed. `BackendRepr::Memory { sized: true }` keeps rustc from
+    // decomposing the struct into scalars — same protection that made
+    // the previous 0-field layout safe; the wrapper field is itself
+    // opaque-with-size, so even with per-field exposure rustc can't
+    // unpack it.
+    //
+    // Source field count comes from `adt_def.non_enum_variant().fields`
+    // rather than from `field_types` because the latter holds Sky
+    // user-visible fields (e.g. `Pair<i32,i64>` has 2 Sky fields) while
+    // the former mirrors what stub_gen emitted (1 wrapper field or
+    // wrapper+PhantomData). Pre-Phase-3 we reported 0 layout fields and
+    // relied on fork patch 4's defensive clamp; Path 2 makes the patch
+    // unnecessary.
+    let source_field_count = if let TyKind::Adt(adt_def, _) = ty.kind() {
+        adt_def.non_enum_variant().fields.len()
+    } else {
+        0
+    };
+    let (offsets, in_memory_order): (IndexVec<FieldIdx, Size>, IndexVec<u32, FieldIdx>) =
+        match source_field_count {
+            0 => (IndexVec::new(), IndexVec::new()),
+            1 => (
+                IndexVec::from_iter([Size::ZERO]),
+                IndexVec::from_iter([FieldIdx::from_u32(0)]),
+            ),
+            // 2 fields: wrapper at offset 0 occupying the whole size;
+            // PhantomData ZST at offset = total_size (i.e. just past the
+            // payload). Memory order matches declaration order.
+            2 => (
+                IndexVec::from_iter([Size::ZERO, Size::from_bytes(total_size)]),
+                IndexVec::from_iter([FieldIdx::from_u32(0), FieldIdx::from_u32(1)]),
+            ),
+            // 3+ would mean stub_gen emitted a shape we don't recognize —
+            // panic so the regression surfaces loudly rather than
+            // silently producing wrong debuginfo.
+            other => panic!(
+                "Sky struct {:?} has {} source FieldDefs; stub_gen only emits \
+                 1 (non-generic) or 2 (generic) under Phase E Path 2",
+                ty, other,
+            ),
+        };
+
     let layout_data = LayoutData {
-        fields: FieldsShape::Arbitrary {
-            offsets: IndexVec::new(),
-            in_memory_order: IndexVec::new(),
-        },
+        fields: FieldsShape::Arbitrary { offsets, in_memory_order },
         variants: Variants::Single { index: VariantIdx::from_u32(0) },
         backend_repr: BackendRepr::Memory { sized: true },
         largest_niche: None,

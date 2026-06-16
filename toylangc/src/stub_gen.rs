@@ -144,31 +144,47 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     for (name, toy_struct) in &registry.structs {
         let ident = format_ident!("{}", name);
 
-        // Phase E completion: universal struct shape, non-generic is the
-        // degenerate case of generic (CLAUDE.md compiler law).
+        // Phase E Path 2 (Phase 3) — wrapper-as-field newtype shape
+        // (architecture §10.4.5 path 2 / §10.6). Each Sky struct's stub
+        // representation contains a `__ToylangOpaque<HASH>` field carrying
+        // the struct's content-addressed typeid, plus (for generics) a
+        // `PhantomData<(P1, P2, ...)>` carrier so the generic params are
+        // "used" per rustc's E0392 rule:
         //
-        //   0 type params: `pub struct Foo(PhantomData<()>);`
-        //   1 type param:  `pub struct Foo<T>(PhantomData<(T)>);`
-        //   N type params: `pub struct Foo<A, B, ...>(PhantomData<(A, B, ...)>);`
+        //   0 type params: `pub struct Foo(__ToylangOpaque<HASH>);`
+        //   1+ type params: `pub struct Foo<P...>(__ToylangOpaque<HASH>, PhantomData<(P...)>);`
         //
-        // Single PhantomData<(P1, P2, ...)> source field at every N. The
-        // empty-tuple `()` case is what previously ICE'd on rustc's
-        // debuginfo walker (build_struct_type_di_node iterated source
-        // FieldDefs and queried fields.offset(i) for i out of bounds when
-        // layout_of reports 0 fields). Fork patch 4 (`e67de69ef35` on
-        // per-instance-mir) clamps that walk to min(source.len(),
-        // layout.fields.count()), making the universal shape safe.
+        // Layout matches source — `queries/layout.rs` reports 1 field
+        // (non-generic) or 2 (generic), so the debuginfo walker's source-
+        // vs-layout-field-count assumption (§10.4.5) holds without fork
+        // patch 4. The wrapper itself has zero source fields; when the
+        // walker recurses into it (Phase 4's intercept supplies the layout)
+        // it iterates zero times, also safely.
         //
-        // PhantomData was already the chosen wrapper for the generic case
-        // because of rustc's "all generics must be used" rule (E0392). At
-        // N=0 the rule is vacuously satisfied; PhantomData<()> still works
-        // and keeps the shape uniform.
+        // The Sky struct keeps its own DefId, so all existing
+        // `impl Trait for Foo` blocks below work unchanged.
         let generics_clause = fn_generics_clause(&toy_struct.type_params);
         let type_params_idents: Vec<syn::Ident> = toy_struct.type_params.iter()
             .map(|p| format_ident!("{}", p))
             .collect();
-        let item: syn::ItemStruct = parse_quote! {
-            pub struct #ident #generics_clause (std::marker::PhantomData<(#(#type_params_idents),*)>);
+        let typeid = crate::typeid::compute(name, &[]);
+        let typeid_lit = syn::LitInt::new(&format!("{}u64", typeid), proc_macro2::Span::call_site());
+        // Non-generic structs omit the PhantomData carrier because there
+        // are no type params for it to "use" per rustc's E0392. Generic
+        // and non-generic structs share the wrapper field; the PhantomData
+        // tail is the per-N degenerate diverger forced by rustc syntax.
+        // arch-fence-allow: phantomdata-only-when-generics-present
+        let item: syn::ItemStruct = if toy_struct.type_params.is_empty() {
+            parse_quote! {
+                pub struct #ident (__ToylangOpaque<#typeid_lit>);
+            }
+        } else {
+            parse_quote! {
+                pub struct #ident #generics_clause (
+                    __ToylangOpaque<#typeid_lit>,
+                    std::marker::PhantomData<(#(#type_params_idents),*)>,
+                );
+            }
         };
         items.push(syn::Item::Struct(item));
 
