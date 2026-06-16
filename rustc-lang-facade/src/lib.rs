@@ -29,6 +29,7 @@ extern crate rustc_target;
 pub mod abi_helpers;
 pub mod codegen_wrapper;
 pub mod driver;
+pub mod extra_modules_hook;
 pub mod mir_helpers;
 pub mod queries;
 
