@@ -37,8 +37,6 @@ mod cgu_stash;
 pub use cgu_stash::upstream_cgus;
 pub(crate) use cgu_stash::{clear_upstream_cgus, stash_upstream_cgus};
 
-use std::path::PathBuf;
-
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
 
@@ -204,9 +202,6 @@ pub trait LangCallbacks: Send + Sync {
         sidecar_bytes: &[u8],
     );
 
-    /// Compile the consumer's function bodies and return the path to the .o file.
-    fn generate_and_compile<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)>;
-
     /// Phase 2 (inline-codegen plan): emit the consumer's function bodies as
     /// LLVM bitcode buffers. Each returned `(module_name, bitcode_bytes)`
     /// pair becomes a `ModuleCodegen<ModuleLlvm>` via
@@ -217,11 +212,9 @@ pub trait LangCallbacks: Send + Sync {
     /// to disk and shelling to `llc`, the consumer hands rustc the
     /// bitcode and lets rustc's pipeline finish it.
     ///
-    /// Default returns empty — phased rollout. Override to opt into the
-    /// inline-codegen path. While both this and `generate_and_compile`
-    /// emit non-empty output simultaneously, the resulting binary will
-    /// have duplicate symbols; toylang's intermediate gate (an env var)
-    /// ensures only one path is active per build.
+    /// Default returns empty. Override to participate in inline codegen.
+    /// (Phase 2 step 3 made this the canonical codegen path; the legacy
+    /// `generate_and_compile` trait method was retired.)
     fn consumer_emit_modules<'tcx>(
         &self,
         _state: &mut dyn Any,
@@ -298,12 +291,6 @@ struct StatefulVtable {
         &str,
         &[u8],
     ),
-
-    generate_and_compile: for<'tcx> fn(
-        &(dyn Any + Send + Sync),
-        &mut (dyn Any + Send + Sync),
-        TyCtxt<'tcx>,
-    ) -> Option<(PathBuf, Vec<String>)>,
 
     consumer_emit_modules: for<'tcx> fn(
         &(dyn Any + Send + Sync),
@@ -732,20 +719,6 @@ pub(crate) fn call_on_sky_lib_loaded<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx, crate_name, sidecar_bytes)
 }
 
-/// Call the consumer's generate_and_compile. Per @GCMLZ, holds MUTABLE_STATE
-/// for the entire call. Query providers triggered during codegen read only from
-/// CONFIG and DEFAULT_* OnceLocks (no lock), so no deadlock.
-pub(crate) fn call_generate_and_compile<'tcx>(
-    tcx: TyCtxt<'tcx>,
-) -> Option<(PathBuf, Vec<String>)> {
-    let c = CONFIG.get().expect("config not installed");
-    let func = c.stateful_vtable.generate_and_compile;
-    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
-    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
-}
-
 /// Call the consumer's consumer_emit_modules. Holds MUTABLE_STATE for the
 /// duration; same re-entrance discipline as `call_generate_and_compile`.
 /// Called from the `extra_modules` hook (Phase 2 inline-codegen plan).
@@ -858,21 +831,6 @@ fn trampoline_consumer_emit_modules<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().consumer_emit_modules(state, tcx)
 }
 
-fn trampoline_generate_and_compile<'tcx, C: LangCallbacks + 'static>(
-    data: &(dyn Any + Send + Sync),
-    state: &mut (dyn Any + Send + Sync),
-    tcx: TyCtxt<'tcx>,
-) -> Option<(PathBuf, Vec<String>)> {
-    // Tier 3 #9 retired the @GCMLZ thread-local fat-pointer bypass that
-    // used to wrap this body. It existed because `lang_symbol_name`'s
-    // override re-entered `call_notify_concrete_entry_point`, which tried
-    // to lock `MUTABLE_STATE` already held by this thread. With #9 the
-    // symbol_name override is stateless (calls
-    // `call_consumer_symbol_for_callback_name` — no lock), so the
-    // re-entrance scenario disappears and the bypass is dead code.
-    data.downcast_ref::<C>().unwrap().generate_and_compile(state, tcx)
-}
-
 /// Install callbacks for use by query overrides. Phase 1 of globals init.
 pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     callbacks: C,
@@ -886,7 +844,6 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
             consumer_symbol_for_callback_name: trampoline_consumer_symbol_for_callback_name::<C>,
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
             on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
-            generate_and_compile: trampoline_generate_and_compile::<C>,
             consumer_emit_modules: trampoline_consumer_emit_modules::<C>,
         },
     });

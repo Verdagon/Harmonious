@@ -1,16 +1,23 @@
 # Handoff: erw → Sky / Tier 3 facade rebuilds
 
-Hi, future-you. You're picking up after Session 12. Phases 1 and 2 of the
+Hi, future-you. You're picking up after Session 14. Phases 1 and 2 of the
 quarter-of-work plan are done; the seven-case interop taxonomy is fully
 tested; the Sky-architectural `__ToylangOpaque<HASH>` wrapper migration
-landed; fork patch 4 was retired. **262/262 tests passing** against
+landed; fork patch 4 (debuginfo clamp) was retired in Session 12; Tier 3
+#7 (`SkyUniverse` foundation) + #9 (`symbol_name` side-effect retired)
+landed in Session 13. **264/264 tests passing** against
 unpatched-aside-from-`per_instance_mir`-trio rustc.
 
-The remaining work is **Tier 3** — five course-correct items that rebuild
-facade-level assumptions toylang inherited from the early Approach-B era.
-Each is its own multi-week piece; see §6 for the plan.
+Session 14 (today) was a deep investigation + planning session, no commits.
+The team decided to pursue **inline-codegen via a new rustc fork patch (c)**
+as the next major workstream. It folds three Tier 3 items (#3, #4-deeper,
+#12) into one architectural change AND empirically validates Sky's load-
+bearing cross-language ThinLTO inlining claim. The detailed implementation
+plan is at **`/Users/verdagon/.claude/plans/parsed-singing-globe.md`** —
+read that file first.
 
-If you only read one thing, read **§6 Where to start now**.
+**If you only read one thing, read the plan file. After that, read §6.0
+Latest direction below for the rationale.**
 
 ---
 
@@ -50,7 +57,8 @@ Three rustc fork patches remain — the `per_instance_mir` trio only.
 | 10 | `1b738e6`, `0d728f9` | `export` keyword: non-export body-bearing fns get NO `pub fn` shell in stub rlib (Sky §9). CI fence `non_export_body_bearing_fn_gets_no_stub_shell`. |
 | 11 | `8faca57`, `5a1e7d0`, `d87638d`, `a43569c`, `4c19bec`, `8a9adc8`, `70e3069`, `c17cf7e`, `747d0e6`, `ed4e07e`, `a3a7c94`, `09d50bb` + fork `e67de69ef35` | Generic/non-generic uniformity sweep (Phases A/B/C/F); Phase E investigation; fork patch 4 (debuginfo clamp) shipped; struct shape unified to `pub struct Foo<P...>(PhantomData<(P...)>);`; vestigial `__toylang_impl_*` + `__toylang_accessor_*` extern decls retired. **CLAUDE.md compiler-law violation count: zero.** |
 | 12 | `72a929e`, `41423cf`, `90599cf`, `7f6bf97` + fork `003f91e4df9` | **Phase E Path 2**: `__ToylangOpaque<const T: u64>` wrapper-as-field migration (architecture §10.4.5 path 2 / §10.6). typeid helper + wrapper emission + typeid table (Phase 1), const-generic-u64 encode/decode (Phase 2), Sky struct stub shape migration + layout-field-count match (Phase 3), fork patch 4 reverted (Phase 5). **262/262 against unpatched rustc.** |
-| 13 | `c801638`, `fa3fdd3` | **Tier 3 #7 + #9**: `LangPredicates` → `SkyUniverse`, then symbol_name side-effect channel retired. `SkyUniverse { typeids, fn_names, type_names }` populated at sidecar load + local registry build; predicates are O(1) RwLock reads. `LangPredicates` trait + `PredicateVtable` + trampolines + toylang's per-callbacks name mirrors all gone. Then: `notify_concrete_entry_point` callback replaced by stateless `consumer_symbol_for_callback_name`; the @GCMLZ thread-local fat-pointer bypass (Session 5) retired with it. **264/264 passing.** Both landed in ~1.5h vs the handoff's ~4-week sum estimate — the chokepoint pattern repeats. |
+| 13 | `c801638`, `fa3fdd3`, `45e903b`, `c4fc74a` | **Tier 3 #7 + #9**: `LangPredicates` → `SkyUniverse`, then symbol_name side-effect channel retired. `SkyUniverse { typeids, fn_names, type_names }` populated at sidecar load + local registry build; predicates are O(1) RwLock reads. `LangPredicates` trait + `PredicateVtable` + trampolines + toylang's per-callbacks name mirrors all gone. Then: `notify_concrete_entry_point` callback replaced by stateless `consumer_symbol_for_callback_name`; the @GCMLZ thread-local fat-pointer bypass (Session 5) retired with it. **264/264 passing.** Both landed in ~1.5h vs the handoff's ~4-week sum estimate — the chokepoint pattern repeats. |
+| 14 | (no code commits — planning session) | **Strategic pivot**: deep investigation into Sky's cross-language inlining design. Five agents traced: (a) rustc post-`codegen_crate` lifecycle teardown, (b) ThinLTO cross-module inlining mechanism, (c) LLVM IR type interop requirements at link level, (d) rustc function attributes for ThinLTO compatibility (`rustc_codegen_llvm/src/attributes.rs:376-583`), (e) `LangCodegenBackend` wrapper integration surface. Two prior-investigation errors corrected: (i) "share LLVMContext with rustc" was overstated as a constraint — rustc itself runs one context per CGU and patch (c) just adds Sky's module as another, (ii) "std stays uninlineable" was wrong — rustc's own LTO bitcode-extraction handles `.llvmbc` rlibs natively, so std inlining works once Sky's module rides rustc's pipeline. **Plan written:** `/Users/verdagon/.claude/plans/parsed-singing-globe.md`. Folds Tier 3 #3 + #4-deeper + #12 into one workstream; adds new fork patch 4 (`extra_modules` hook on `ExtraBackendMethods`); empirically validates cross-language ThinLTO inlining including std. Est ~6–8 days. |
 
 Anchor commits worth knowing: `c38d7e0` is the doc cleanup right before
 Session 12 started; `ce437ae` is the last commit with full Approach A
@@ -254,13 +262,55 @@ From CLAUDE.md (both project + user-global):
 
 ## 6. Where to start now — Tier 3 plan
 
-The remaining course-correct items are five facade-level rebuilds. They
-have real dependencies on each other. **#13 (wrapper-mode `@MRRIWMZ`
-retirement) is explicitly out of scope here** — it's a separate ~4–6
-week piece touching install/distribution and should be sequenced much
-later (probably with Sky's own toolchain shipping).
+### 6.0 Latest direction (Session 14) — read this first
 
-### 6.1 Dependency graph
+**Execute the plan at `/Users/verdagon/.claude/plans/parsed-singing-globe.md`.**
+It supersedes the original §6.1 sequencing below for items #3, #4-deeper,
+and #12.
+
+What changed: Session 14's deep investigation found that the architecturally
+right way to retire `cgu_stash`, finish #4's inline-codegen rewrite, and
+retire `MUTABLE_STATE` is to land all three as a single inline-codegen
+prototype that **also empirically validates cross-language ThinLTO inlining**
+— Sky's load-bearing perf claim. The pieces fall together because:
+
+- A new fork patch (~15 lines + visibility upgrades on `ExtraBackendMethods`)
+  exposes a `extra_modules` hook between rustc's CGU loop and
+  `codegen_finished`.
+- Toylang's `consumer_emit_modules` returns its IR as a `ModuleCodegen<ModuleLlvm>`
+  via Inkwell→bitcode→`ModuleLlvm::parse` round-trip.
+- Sky's module rides rustc's normal optimize → ThinLTO-summary → emission
+  pipeline as just another CGU. Cross-language inlining (including std)
+  happens via rustc's existing LTO machinery — no LLD plugin needed.
+- `generate_and_compile` retires → `cgu_stash` retires → `MUTABLE_STATE`
+  retires. Three Tier 3 items in one ~6–8 day workstream.
+
+Plan structure (per the plan file): Phase 0 fork patch, Phase 1 smoke test
+(hard-coded extra module), Phase 2 toylang as `ModuleCodegen<ModuleLlvm>`,
+Phase 3 attribute matching (mirror `rustc_codegen_llvm/src/attributes.rs:376-583`),
+Phase 4 cross-language inlining fixtures + benchmark, Phase 5 Tier 3 cleanups
+(retire `MUTABLE_STATE` + `cgu_stash`).
+
+**Decisions confirmed by the user before plan was finalized:**
+- IR transport: bitcode round-trip (safe; avoids LLVMContext sharing).
+- Old `.o` path removed once patch (c) works (no dual-path maintenance).
+- Net fork patch count goes from 3 to 4. Upstream PR for the hook is on
+  the deferred list; the patch is forward-portable and would benefit
+  cranelift/gcc-rs/spirv etc.
+
+**Tier 3 item status after Session 14 plan is executed:**
+- #3 (retire `cgu_stash`) — falls out of Phase 5.
+- #4-deeper (inline-codegen rewrite) — IS the plan.
+- #12 (retire `MUTABLE_STATE` + two-vtable) — falls out of Phase 5.
+- #8 (`layout_of` walks Sky-side) — **still its own item**, not in scope for
+  this plan; do it after. ~1–2 days under the chokepoint pattern.
+- #13 (wrapper-mode retirement) — still explicitly deferred.
+
+The §6.1–6.6 detailed sub-plans below are kept as **historical reference**
+for items #7 (done) and #9 (done). For #3, #8, #12 the new plan file is
+authoritative.
+
+### 6.1 Dependency graph (historical; for #7/#9 reference)
 
 ```
        #7 LangPredicates → SkyUniverse
@@ -757,14 +807,22 @@ wiped.
 **Seven-case taxonomy**: 7/7 tested (1a/1b/2/3/4/5/6).
 
 **Course-correct.md items done**: 13/18 (#1, #2, #4, #5, #6, #7, #9,
-#11, #14, #15, #16, #17, #18). #10 partial. #3, #8, #12 remaining (this
-plan). #13 explicitly out of scope.
+#11, #14, #15, #16, #17, #18). #10 partial. #3, #8, #12 remaining.
+#3 + #4-deeper + #12 are folded into the next-session plan at
+`/Users/verdagon/.claude/plans/parsed-singing-globe.md`. #8 is a separate
+~1–2 day item to land after. #13 explicitly out of scope.
+
+**Active plan**: `/Users/verdagon/.claude/plans/parsed-singing-globe.md` —
+inline-codegen prototype via new rustc fork patch (c). Est ~6–8 days.
+Validates cross-language ThinLTO inlining empirically.
 
 **Fork state**: `~/rust` on `per-instance-mir`, 3 patches in effect
 (query decl, collector hook, default-None provider). Patch 4 (debuginfo
 clamp `e67de69ef35`) was reverted (`003f91e4df9`) — Session 12 made it
-unnecessary. Built for nightly-2026-01-20 / rustc 1.95.0-dev / commit
-`d940e568`. Installed as toolchain `rustc-fork`.
+unnecessary. **The plan will add a new patch 4** (the `extra_modules`
+hook on `ExtraBackendMethods` + ~3 visibility upgrades) — net count will
+go to 4 in Phase 0 of the plan. Built for nightly-2026-01-20 / rustc
+1.95.0-dev / commit `d940e568`. Installed as toolchain `rustc-fork`.
 
 **Toolchain pin**: `rust-toolchain.toml` channel = `"rustc-fork"`. Four
 sites stay in sync (toolchain file + `TOYLANG_NIGHTLY` in main.rs + two
@@ -796,6 +854,10 @@ Non-generic: `pub struct Foo(__ToylangOpaque<HASH>);`. Generic:
 
 | Commit | What |
 |---|---|
+| `c4fc74a` | Session 13 doc refresh (#7 + #9 marked done in course-correct.md + handoff) |
+| `45e903b` | Session 13 doc refresh (#7 landed) |
+| `fa3fdd3` | **Tier 3 #9** — `symbol_name` side-effect retired; stateless `consumer_symbol_for_callback_name`; @GCMLZ thread-local bypass gone |
+| `c801638` | **Tier 3 #7** — `LangPredicates` → `SkyUniverse`; predicates are now O(1) RwLock reads |
 | `7f6bf97` | Phase E Path 2 Phase 5 — fork patch 4 retired, docs refreshed |
 | `90599cf` | Phase E Path 2 Phase 3 — Sky struct stubs migrated to wrapper-as-field |
 | `41423cf` | Phase E Path 2 Phase 2 — const-generic-u64 plumbing |
@@ -816,17 +878,25 @@ Use `git log <commit>..HEAD` to walk forward.
 
 Ping the user (don't pivot unilaterally) if:
 
-- The rustc fork needs more patches beyond the 3 in effect.
+- The rustc fork needs MORE patches beyond what the active plan calls for
+  (the plan adds one — the `extra_modules` hook).
 - You hit a test failure you can't explain after wiping cache twice.
-- A Tier 3 item's estimate slips past 1.5× the planned weeks. The plan
-  is conservative; significant overrun signals a half-done earlier
-  refactor or a design mismatch.
-- You're tempted to revert Workstream A (Session 4), the @GCMLZ
-  thread-local bypass (Session 5), Phase 2 C's symbol_name routing
-  (Session 8), or Phase E Path 2's wrapper-as-field shape (Session 12).
+- A plan phase's estimate slips past 1.5× the planned days. The plan is
+  conservative; significant overrun signals a half-done earlier refactor
+  or a design mismatch.
+- You're tempted to revert Workstream A (Session 4), Phase 2 C's
+  symbol_name routing (Session 8), Phase E Path 2's wrapper-as-field
+  shape (Session 12), or the Tier 3 #7+#9 retirements (Session 13).
   These are load-bearing; any revert is an architectural regression.
-- A Tier 3 item is being started without an explicit "yes, multi-week"
-  agreement.
+- The plan's bitcode round-trip cost dominates (>100ms per build) —
+  alternative IR transports were ranked-and-rejected but are on the table
+  if cost is real.
+- The plan's std-inlining fixture (Phase 4.2) doesn't pass — investigate,
+  then either document `build-std` as opt-in or escalate. First-party
+  inlining (Phase 4.1) passing is the minimum-acceptable outcome; std
+  inlining is the stretch goal.
+- Anything past the plan's Phase 5 is being started without an explicit
+  "yes, do this next" agreement (e.g., #8 is not in the plan).
 
 For routine "this took longer than I estimated" — keep going.
 
@@ -872,20 +942,34 @@ architecturally interesting interop machinery proven end-to-end:
 - Sky §9 export commitment is fenced; §4.4 byte-identical pass-through is
   fenced; generic/non-generic uniformity is fenced; Sky struct stub
   shape is wrapper-as-field per §10.6.
-- 262/262 tests pass against an unpatched-aside-from-the-Approach-A-trio
+- 264/264 tests pass against an unpatched-aside-from-the-Approach-A-trio
   rustc.
+- Tier 3 #7 (`SkyUniverse` foundation) + #9 (`symbol_name` side-effect
+  retirement) landed in Session 13. Predicates are O(1) RwLock reads;
+  the @GCMLZ thread-local fat-pointer bypass (Session 5) is dead code.
 
-Tier 3 is the **last architectural rebuild before #13's toolchain ship**.
-After Tier 3 lands, the facade looks like Sky's locked design: an owned
-universe populated at after_expansion, lock-free reads everywhere,
-codegen walking the queue inline via Inkwell, no MUTABLE_STATE, no
-two-vtable split, no CGU stash, no `symbol_name` side effect. The only
-remaining gap to a real Sky toolchain is #13 (the wrapper-mode
-retirement), which is its own multi-week piece sequenced with shipping.
+**The next workstream — the active plan at
+`/Users/verdagon/.claude/plans/parsed-singing-globe.md`** — is the most
+architecturally ambitious yet. It validates Sky's cross-language ThinLTO
+inlining claim empirically by reshaping toylang's codegen to ride rustc's
+own optimization + LTO pipeline via a new fork patch. The patch is small
+(~15 lines + visibility upgrades), the integration is well-scoped (~6–8
+days), and the deliverable is both a Sky-aligned facade AND empirical
+proof that the perf story works. Along the way it retires three Tier 3
+items (#3, #4-deeper, #12) as natural side effects.
+
+After the plan lands: only #8 (`layout_of` walks Sky-side, ~1–2 days
+under the chokepoint pattern) and #13 (wrapper-mode retirement, deferred
+with Sky's toolchain shipping) remain. The facade will then look like
+Sky's locked design: owned universe populated at after_expansion,
+lock-free reads everywhere, codegen walking the queue inline, no
+MUTABLE_STATE, no two-vtable split, no CGU stash, no `symbol_name` side
+effect, AND empirical verification of cross-language inlining.
 
 Read the architecture doc. Read course-correct.md (status table at the
-top). Then start with §6 of this document.
+top). Read the active plan file. Then start with the plan's Phase 0
+(rustc fork patch).
 
 Good luck.
 
-— previous engineer (Session 12 end)
+— previous engineer (Session 14 end)

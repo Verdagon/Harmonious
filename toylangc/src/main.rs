@@ -189,28 +189,14 @@ fn run_toylang_compile(
     mut args: Vec<String>,
     is_user_bin_compile: bool,
 ) {
-    let unique_id = std::process::id();
-    let ll_path = std::env::temp_dir().join(format!("toylang_output_{}.ll", unique_id));
-    let obj_path = std::env::temp_dir().join(format!("toylang_output_{}.o", unique_id));
-
     let has_functions = registry.functions.values().any(|f| f.body.is_some());
     if has_functions {
         args.push("-C".to_string());
         args.push("codegen-units=16".to_string());
     }
 
-    // Workstream A inversion (A.1): allocate `llvm_paths` only at the
-    // user-bin compile. The rlib compile under A produces no toylang
-    // `.o`; the user-bin compile is the codegen site.
-    let llvm_paths = if has_functions && is_user_bin_compile {
-        Some((ll_path, obj_path))
-    } else {
-        None
-    };
-
     let toylang_callbacks = toylang::callbacks_impl::ToylangCallbacks {
         registry: Arc::new(registry),
-        llvm_paths,
         is_user_bin_compile,
         // Tier 3 #7.4 retired `upstream_fn_names` + `upstream_type_names`
         // — the facade's `SkyUniverse` carries those now.
@@ -259,16 +245,3 @@ pub fn find_sysroot_tool(tool_name: &str) -> PathBuf {
         .join(tool_name)
 }
 
-/// Compile LLVM IR text (.ll) to native object code (.o).
-pub fn compile_llvm_ir(ll_path: &Path, obj_path: &Path) {
-    let llc = find_sysroot_tool("llc");
-    eprintln!("[toylang] compiling LLVM IR: {} → {}", ll_path.display(), obj_path.display());
-    let status = std::process::Command::new(&llc)
-        .arg("-filetype=obj")
-        .arg("-o")
-        .arg(obj_path)
-        .arg(ll_path)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run llc at {}: {}", llc.display(), e));
-    assert!(status.success(), "llc failed with status {}", status);
-}

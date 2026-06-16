@@ -7,7 +7,6 @@ extern crate rustc_span;
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
@@ -153,8 +152,9 @@ pub struct ToylangState {
 
 pub struct ToylangCallbacks {
     pub registry: Arc<ToylangRegistry>,
-    /// (ll_path, obj_path) for LLVM compilation. None if no external codegen.
-    pub llvm_paths: Option<(PathBuf, PathBuf)>,
+    // Phase 2 step 3 retired `llvm_paths`: the new inline-codegen path
+    // (consumer_emit_modules → patch-(c) extra_modules hook) emits bitcode
+    // bytes in-memory; no per-build .ll/.o temp paths needed.
     // Tier 3 #7.4 retired `upstream_fn_names` + `upstream_type_names`.
     // Their sole purpose was backing the `LangPredicates` impl's
     // `is_consumer_fn` / `is_consumer_type` methods. Those predicates now
@@ -934,106 +934,10 @@ impl LangCallbacks for ToylangCallbacks {
         self.compute_consumer_symbol(name, tcx, instance)
     }
 
-    fn generate_and_compile<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)> {
-        // Phase 2 inline-codegen gate: when LANG_FACADE_INLINE_CODEGEN=1,
-        // `consumer_emit_modules` submits Sky's CGU into rustc's pipeline.
-        // The old `.o` path would produce duplicate symbols, so skip it.
-        // Once Phase 2 step 3 flips the default, this gate inverts.
-        if std::env::var("LANG_FACADE_INLINE_CODEGEN").is_ok() {
-            return None;
-        }
-
-        let ts = state(s);
-        ts.log.push(CallbackLog::GenerateAndCompile);
-
-        // B6 fix: populate state.toylang_instances from the CGU list + a
-        // transitive internal-callee walk, up front and deterministically.
-        // Prior art accumulated state as a side effect of the per-item
-        // `notify_concrete_entry_point` query firing — which rustc's
-        // incremental cache could skip on cache hit, leaving state empty
-        // and the emitted `.o` symbol-less. See risks.md §B6 for the
-        // full diagnosis and risks.md §B6 RESOLVED marker for this fix.
-        // Workstream A inverted the gate: short-circuits on the RLIB
-        // compile (produces only stubs + sidecar); runs on USER-BIN
-        // (the codegen site).
-        self.populate_toylang_instances_from_cgus(ts, tcx);
-
-        // S.4: dump the log BEFORE the `llvm_paths` early-return so
-        // user-bin compiles (where `llvm_paths` is None) also surface
-        // their entries (specifically `OnSkyLibLoaded` from the S.4
-        // sidecar load). Append mode rather than overwrite so the rlib
-        // compile's earlier entries (CollectGenericRustDeps for main,
-        // NotifyConcreteEntryPoint, etc.) survive when the user-bin
-        // compile runs second within the same `toylangc build`. Each
-        // test wipes the build dir before invoking toylangc so the
-        // append never inherits cross-test bleed-over.
-        if let Ok(path) = std::env::var("TOYLANG_LOG_PATH") {
-            use std::fs::OpenOptions;
-            use std::io::Write;
-            let lines: Vec<String> = ts.log.iter().map(|entry| format!("{:?}", entry)).collect();
-            let mut blob = lines.join("\n");
-            blob.push('\n');
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .expect("failed to open callback log for append");
-            f.write_all(blob.as_bytes()).expect("failed to write callback log");
-        }
-
-        let (ref ll_path, ref obj_path) = self.llvm_paths.as_ref()?;
-
-        // Phase 3 E.6: build an effective registry merging local + upstream
-        // so codegen treats upstream consumer fns (e.g. case6_lib's double_it
-        // when compiling case6_app's user-bin) as toylang fns rather than
-        // Rust extern decls. Without this, the FnCall codegen path at
-        // `llvm_gen.rs:1161` sees `double_it` missing from the local
-        // registry and emits a `declare i32 @__toylang_impl_double_it(i32)`
-        // alongside the populate-iteration loop's `define i32 @__toylang_impl_double_it(...)`,
-        // and LLVM disambiguates the latter to `.1` — leaving the
-        // unmangled symbol undefined at link time.
-        let effective_registry = {
-            let mut effective = (*self.registry).clone();
-            for upstream in ts.upstream_registries.values() {
-                for (name, func) in &upstream.functions {
-                    effective.functions
-                        .entry(name.clone())
-                        .or_insert_with(|| func.clone());
-                }
-                for (name, st) in &upstream.structs {
-                    effective.structs
-                        .entry(name.clone())
-                        .or_insert_with(|| st.clone());
-                }
-            }
-            effective
-        };
-
-        // Walk MonoItems and codegen each consumer instance inline (same 'tcx scope).
-        // Bitcode bytes are discarded here (only the new consumer_emit_modules
-        // path uses them); we still write the .ll text + shell to llc to keep
-        // the existing path functional until Phase 2 step 3 retires it.
-        let (llvm_ir, _bitcode, rust_symbols) = crate::llvm_gen::generate_with_tcx(
-            tcx, &effective_registry, self, ts,
-        );
-        std::fs::write(ll_path, &llvm_ir)
-            .expect("toylang: failed to write .ll file");
-        eprintln!("[toylang] compiling LLVM IR: {} → {}", ll_path.display(), obj_path.display());
-        crate::compile_llvm_ir(ll_path, obj_path);
-
-        Some((obj_path.clone(), rust_symbols))
-    }
-
     fn consumer_emit_modules<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Vec<(String, Vec<u8>)> {
-        // Phase 2 inline-codegen path. Disabled by default; flip
-        // LANG_FACADE_INLINE_CODEGEN=1 to opt in. With the gate off, returns
-        // empty (the old generate_and_compile path keeps emitting the .o).
-        // With it on, returns one bitcode module per Sky CGU. Both paths
-        // active simultaneously produce duplicate symbols, so callers must
-        // also disable generate_and_compile (Phase 2 step 3).
-        if std::env::var("LANG_FACADE_INLINE_CODEGEN").is_err() {
-            return Vec::new();
-        }
+        // Phase 2 inline-codegen path (Phase 2 step 3 made this the default;
+        // the env-gate was retired). Sky's CGU rides rustc's optimize →
+        // ThinLTO → emission pipeline via the patch-(c) `extra_modules` hook.
 
         let ts = state(s);
         ts.log.push(CallbackLog::GenerateAndCompile);
