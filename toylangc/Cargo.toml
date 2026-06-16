@@ -15,7 +15,7 @@ proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "2.0", features = ["full", "parsing", "printing"] }
 prettyplease = "0.2"
-inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "ffc9d5b", features = ["llvm19-1"] }
+inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "39f778f", features = ["llvm21-1"] }
 toml = "0.8"
 bincode = { version = "2", features = ["serde"] }
 blake3 = "1"

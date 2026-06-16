@@ -230,7 +230,7 @@ fn run_plain_rustc(args: &[String]) {
     rustc_driver::run_compiler(args, &mut cb);
 }
 
-fn find_sysroot_tool(tool_name: &str) -> PathBuf {
+pub fn find_sysroot_tool(tool_name: &str) -> PathBuf {
     let plus_pin = format!("+{}", TOYLANG_NIGHTLY);
     let sysroot = std::process::Command::new("rustc")
         .arg(&plus_pin)

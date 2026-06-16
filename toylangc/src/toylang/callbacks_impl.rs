@@ -935,6 +935,14 @@ impl LangCallbacks for ToylangCallbacks {
     }
 
     fn generate_and_compile<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)> {
+        // Phase 2 inline-codegen gate: when LANG_FACADE_INLINE_CODEGEN=1,
+        // `consumer_emit_modules` submits Sky's CGU into rustc's pipeline.
+        // The old `.o` path would produce duplicate symbols, so skip it.
+        // Once Phase 2 step 3 flips the default, this gate inverts.
+        if std::env::var("LANG_FACADE_INLINE_CODEGEN").is_ok() {
+            return None;
+        }
+
         let ts = state(s);
         ts.log.push(CallbackLog::GenerateAndCompile);
 
@@ -1002,7 +1010,10 @@ impl LangCallbacks for ToylangCallbacks {
         };
 
         // Walk MonoItems and codegen each consumer instance inline (same 'tcx scope).
-        let (llvm_ir, rust_symbols) = crate::llvm_gen::generate_with_tcx(
+        // Bitcode bytes are discarded here (only the new consumer_emit_modules
+        // path uses them); we still write the .ll text + shell to llc to keep
+        // the existing path functional until Phase 2 step 3 retires it.
+        let (llvm_ir, _bitcode, rust_symbols) = crate::llvm_gen::generate_with_tcx(
             tcx, &effective_registry, self, ts,
         );
         std::fs::write(ll_path, &llvm_ir)
@@ -1012,6 +1023,116 @@ impl LangCallbacks for ToylangCallbacks {
 
         Some((obj_path.clone(), rust_symbols))
     }
+
+    fn consumer_emit_modules<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Vec<(String, Vec<u8>)> {
+        // Phase 2 inline-codegen path. Disabled by default; flip
+        // LANG_FACADE_INLINE_CODEGEN=1 to opt in. With the gate off, returns
+        // empty (the old generate_and_compile path keeps emitting the .o).
+        // With it on, returns one bitcode module per Sky CGU. Both paths
+        // active simultaneously produce duplicate symbols, so callers must
+        // also disable generate_and_compile (Phase 2 step 3).
+        if std::env::var("LANG_FACADE_INLINE_CODEGEN").is_err() {
+            return Vec::new();
+        }
+
+        let ts = state(s);
+        ts.log.push(CallbackLog::GenerateAndCompile);
+
+        // S.4: dump the callback log so user-bin entries (OnSkyLibLoaded etc.)
+        // reach disk. Mirrors generate_and_compile's behavior. Runs in BOTH
+        // user-bin and rlib compile (rlib has no Sky body codegen but still
+        // emits log entries).
+        if let Ok(path) = std::env::var("TOYLANG_LOG_PATH") {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            let lines: Vec<String> = ts.log.iter().map(|entry| format!("{:?}", entry)).collect();
+            let mut blob = lines.join("\n");
+            blob.push('\n');
+            let mut f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("failed to open callback log for append");
+            f.write_all(blob.as_bytes()).expect("failed to write callback log");
+        }
+
+        if !self.is_user_bin_compile {
+            // Rlib compile produces no Sky `.o` (Workstream A).
+            return Vec::new();
+        }
+
+        self.populate_toylang_instances_from_cgus(ts, tcx);
+
+        // Same effective-registry construction as generate_and_compile.
+        let effective_registry = {
+            let mut effective = (*self.registry).clone();
+            for upstream in ts.upstream_registries.values() {
+                for (name, func) in &upstream.functions {
+                    effective.functions
+                        .entry(name.clone())
+                        .or_insert_with(|| func.clone());
+                }
+                for (name, st) in &upstream.structs {
+                    effective.structs
+                        .entry(name.clone())
+                        .or_insert_with(|| st.clone());
+                }
+            }
+            effective
+        };
+
+        let (_ir_text, bitcode, _rust_symbols) = crate::llvm_gen::generate_with_tcx(
+            tcx, &effective_registry, self, ts,
+        );
+
+        // Inkwell's `write_bitcode_to_memory` wraps the bitcode in a 20-byte
+        // Mach-O bitcode wrapper (magic `0xDEC0170B` + offset/size/cputype).
+        // Rustc's `LLVMRustParseBitcodeForLTO` expects raw bitcode starting
+        // with `BC C0 DE`. Strip the wrapper if present.
+        let bitcode = strip_macho_wrapper(bitcode);
+
+        // PROBE: dump bitcode + IR for inspection
+        if std::env::var("LANG_FACADE_INLINE_CODEGEN_PROBE").is_ok() {
+            let _ = std::fs::write("/tmp/sky_probe.bc", &bitcode);
+            let _ = std::fs::write("/tmp/sky_probe.ll", &_ir_text);
+            eprintln!("[probe] wrote /tmp/sky_probe.bc ({} bytes) and /tmp/sky_probe.ll ({} bytes)",
+                bitcode.len(), _ir_text.len());
+        }
+
+        // One CGU per Sky module, named per CodegenUnitNameBuilder so it
+        // doesn't clash with rustc's own CGUs.
+        let cgu_name = build_sky_cgu_name(tcx);
+        vec![(cgu_name, bitcode)]
+    }
+}
+
+/// Strip Mach-O bitcode wrapper (20-byte header) if present, returning the
+/// raw bitcode that rustc's `LLVMRustParseBitcodeForLTO` accepts.
+/// Wrapper magic is 0x0B17C0DE little-endian (`DE C0 17 0B`); offset of raw
+/// bitcode is at bytes 8-11 little-endian.
+fn strip_macho_wrapper(bitcode: Vec<u8>) -> Vec<u8> {
+    const WRAPPER_MAGIC: [u8; 4] = [0xDE, 0xC0, 0x17, 0x0B];
+    if bitcode.len() < 20 || bitcode[0..4] != WRAPPER_MAGIC {
+        return bitcode;
+    }
+    let offset = u32::from_le_bytes([bitcode[8], bitcode[9], bitcode[10], bitcode[11]]) as usize;
+    let size = u32::from_le_bytes([bitcode[12], bitcode[13], bitcode[14], bitcode[15]]) as usize;
+    if offset + size > bitcode.len() {
+        return bitcode;
+    }
+    bitcode[offset..offset + size].to_vec()
+}
+
+/// Build a deterministic Sky CGU name that won't clash with rustc's own CGUs.
+fn build_sky_cgu_name<'tcx>(tcx: TyCtxt<'tcx>) -> String {
+    let mut builder = rustc_middle::mir::mono::CodegenUnitNameBuilder::new(tcx);
+    builder
+        .build_cgu_name(
+            rustc_hir::def_id::LOCAL_CRATE,
+            &[rustc_span::Symbol::intern("sky")],
+            Some(rustc_span::Symbol::intern("0")),
+        )
+        .to_string()
 }
 
 

@@ -1969,7 +1969,7 @@ pub fn generate_with_tcx<'tcx>(
     registry: &ToylangRegistry,
     callbacks: &crate::toylang::callbacks_impl::ToylangCallbacks,
     state: &mut crate::toylang::callbacks_impl::ToylangState,
-) -> (String, Vec<String>) {
+) -> (String, Vec<u8>, Vec<String>) {
     let context = Context::create();
     let mut ctx = CodegenCtx::new(&context, tcx, registry);
     let mut seen_symbols = std::collections::HashSet::new();
@@ -2105,7 +2105,37 @@ pub fn generate_with_tcx<'tcx>(
 
     let rust_symbols = ctx.rust_symbols.clone();
     let ir = ctx.module.print_to_string().to_string();
-    (ir, rust_symbols)
+    // Phase 2 inline-codegen path: bitcode bytes for `consumer_emit_modules`
+    // → `ModuleLlvm::parse_from_tcx`. Always emitted; the old
+    // generate_and_compile path discards the bytes and writes `ir` via llc.
+    //
+    // Inkwell's `write_bitcode_to_{memory,path}` produces records LLVM 21's
+    // own llvm-dis rejects ("Invalid record"). Suspected Inkwell-side bug
+    // (only manifests on non-trivial modules). Workaround: write the IR
+    // text and assemble via llvm-as, which produces valid bitcode that both
+    // llvm-dis and rustc's LTO parser accept.
+    let bitcode = assemble_text_to_bitcode(&ir);
+    (ir, bitcode, rust_symbols)
+}
+
+/// Workaround for Inkwell's bitcode-emission bug under LLVM 21: write the IR
+/// text to a temp file, shell to llvm-as, read the bitcode bytes back.
+fn assemble_text_to_bitcode(ir: &str) -> Vec<u8> {
+    let pid = std::process::id();
+    let ll_path = std::env::temp_dir().join(format!("toylang_sky_{}.ll", pid));
+    let bc_path = std::env::temp_dir().join(format!("toylang_sky_{}.bc", pid));
+    std::fs::write(&ll_path, ir).expect("write .ll");
+    let llvm_as = crate::find_sysroot_tool("llvm-as");
+    let status = std::process::Command::new(&llvm_as)
+        .arg(&ll_path)
+        .arg("-o").arg(&bc_path)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run llvm-as at {}: {}", llvm_as.display(), e));
+    assert!(status.success(), "llvm-as failed with status {}", status);
+    let bytes = std::fs::read(&bc_path).expect("read bitcode");
+    let _ = std::fs::remove_file(&ll_path);
+    let _ = std::fs::remove_file(&bc_path);
+    bytes
 }
 
 /// Codegen an accessor function inline (GEP to field offset, return pointer).
