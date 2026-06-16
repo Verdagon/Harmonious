@@ -1,5 +1,22 @@
 # Phase E — debuginfo ICE investigation
 
+**Status (Session 12 update): Path 2 LANDED.** Sky structs now emit as
+wrapper-as-field newtypes around `__ToylangOpaque<HASH>`; source and layout
+field counts match; the ICE doesn't reproduce. Fork patch 4 was reverted —
+the assumption violation it patched is now structurally impossible, not
+just masked. 262/262 tests pass under unpatched rustc. See `tl-handoff.md`
+§12 and commits `72a929e` / `41423cf` / `90599cf` for the migration.
+
+The investigation notes below are preserved for the architectural reasoning
+trail. The PR draft at `phase-e-rustc-pr-draft.md` is also preserved — it
+remains the right upstream submission for plugin authors who don't migrate
+to the wrapper-as-field shape (cranelift, miri, future plugins). Sky-side
+the patch is no longer needed.
+
+---
+
+## Original investigation (Session 11)
+
 Status: investigation complete; recommendation made; no code change yet.
 
 ## TL;DR

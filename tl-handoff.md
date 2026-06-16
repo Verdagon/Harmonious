@@ -25,7 +25,9 @@ Phase 2 C landed `impl rust_trait for toylang_type` end-to-end.
 **Eleven course-correct items are done** (#1, #2, #4, #5, #6, #11,
 #14, #15, #16, #17, #18) and #10 is partial.
 
-**Session 11 layered the generic-vs-non-generic uniformity sweep on top**: phases A (rename) + B (drop typecheck skip) + C (entry-point walk replacing the registry walk) + F (grep-based CI fence) closed all discovery+typecheck sites; Phase E (struct-shape ICE) was reproduced and fixed by **fork patch 4** (`e67de69ef35`, a debuginfo clamp upstream-ready as `phase-e-rustc-pr-draft.md`), then the struct-shape divergence in stub_gen was retired via the universal `pub struct Foo<P...>(PhantomData<(P...)>);` form. A follow-up investigation prompted by "why do we need extern "C" for anything?" found two of the three `extern "C"` decl sites in stub_gen were vestigial (`__toylang_impl_*` and `__toylang_accessor_*`); removing them eliminated the last generic-vs-non-generic asymmetry in toylang's emission. **The CLAUDE.md compiler-law violation count is now zero. 253/253 tests passing.**
+**Session 11 layered the generic-vs-non-generic uniformity sweep on top**: phases A (rename) + B (drop typecheck skip) + C (entry-point walk replacing the registry walk) + F (grep-based CI fence) closed all discovery+typecheck sites; Phase E (struct-shape ICE) was reproduced and fixed by **fork patch 4** (`e67de69ef35`, a debuginfo clamp upstream-ready as `phase-e-rustc-pr-draft.md`), then the struct-shape divergence in stub_gen was retired via the universal `pub struct Foo<P...>(PhantomData<(P...)>);` form. A follow-up investigation prompted by "why do we need extern "C" for anything?" found two of the three `extern "C"` decl sites in stub_gen were vestigial (`__toylang_impl_*` and `__toylang_accessor_*`); removing them eliminated the last generic-vs-non-generic asymmetry in toylang's emission. **The CLAUDE.md compiler-law violation count is zero.**
+
+**Session 12 then landed Phase E Path 2 — the wrapper-as-field migration**. Sky structs now emit as newtypes around `__ToylangOpaque<HASH>` (a content-addressed typeid carrier, architecture §10.4.5 path 2 / §10.6). `layout_of` reports source-matching field counts so the rustc debuginfo walker's assumption holds structurally. Fork patch 4 was retired — Path 2 eliminates the violation at its source. Only the 3 per_instance_mir patches remain in the fork. **262/262 tests passing.**
 
 ---
 
@@ -460,6 +462,20 @@ Per the focused plan at `tmp/claude-plan-2026-06-15-ccc8939f.md`, Phases A → B
 - **Vestigial-extern-decl cleanup** (commit `ed4e07e`): prompted by the question "why do we need extern "C" for anything if we always talk directly to Rust functions?" Investigation found two of three `extern "C"` decl sites in stub_gen were vestigial. The `__toylang_impl_*` decls were leftover from before the `symbol_name` query override existed — Rust callers reach Sky-emitted symbols via the override rewriting `__lang_stubs::<name>::h...` → `__toylang_impl_<name>` at link time; no forward decl needed. The `__toylang_accessor_*` decls had no consumer at all. Removing both eliminated the last `extern "C"`-gated `is_generic` branches. What remains in the block is only body-less toylang fn decls — toylang's actual "talk to existing Rust fn" syntax (e.g., `fn println_int(x: i32);` → `extern "C" { pub fn println_int(...); }`); these can't take toylang-source generics by nature.
 
 Test counts after Session 11: **253/253 passing** (98 unit + 1 fence + 138 integration + 16 standalone). All Session 11 work is on `main` (commits `8faca57`, `5a1e7d0`, `d87638d`, `a43569c`, `4c19bec`, `8a9adc8`, `70e3069`, `c17cf7e`, `747d0e6`, `ed4e07e`, `a3a7c94`) plus fork commit `e67de69ef35`.
+
+### Session 12 — Phase E Path 2 landed (wrapper-as-field migration + fork patch 4 retired)
+
+Per the focused plan at `~/.claude/plans/parsed-singing-globe.md`, Phase E Path 2 (architecture §10.4.5 path 2 / §10.6) landed in three substantive commits + supporting reconnaissance. Sky struct stubs now emit as newtypes around a content-addressed-typeid wrapper; the rustc debuginfo walker's source-vs-layout-field-count assumption holds structurally; fork patch 4 (`e67de69ef35`) was retired. Net: only the 3 per_instance_mir patches remain in the rustc fork.
+
+- **Phase 1 — scaffolding** (commit `72a929e`): new `toylangc/src/typeid.rs` with BLAKE3-truncated-u64 hash over a bincode-serialized `(name, type_args)` pre-image (6 unit tests including a hard-pinned Widget typeid `0x48723b0bb65d86f7` as a drift anchor). `stub_gen` emits `pub struct __ToylangOpaque<const T: u64>;` at every stub rlib's crate root. New `typeid_table: BTreeMap<u64, (String, Vec<ResolvedType>)>` on `ToylangRegistry` plus `populate_typeid_table()` called before sidecar serialization, so downstream compiles can decode upstream typeids per architecture §10.8.
+- **Phase 2 — const-generic-u64 plumbing** (commit `41423cf`): new `find_toylang_opaque_def_id`, `is_toylang_opaque`, `extract_typeid_from_args`, `build_opaque_args` helpers in `oracle.rs`. The find helper walks LOCAL_CRATE first then `tcx.crates(())` with the §4.5 parentage check (handles both rlib-compile and user-bin-compile cases plus glob re-export traps). The encode side uses `ty::Const::from_bits(tcx, typeid as u128, fully_monomorphized(), u64)`; the decode side reads `args.const_at(0).try_to_leaf().map(|s| s.to_u64())` (greenfield against the valtree-era API — no in-tree precedent). New `CallbackLog::Phase2RoundTripProbe` variant + probe firing at `after_rust_analysis`'s rlib-compile branch + integration test `test_phase2_const_u64_round_trip` verifies the end-to-end round-trip on the pinned rustc-fork.
+- **Phase 3 — Sky struct stub shape migration** (commit `90599cf`): replaced `pub struct Foo<P...>(PhantomData<(P...)>);` with the wrapper-as-field newtype shape: `pub struct Foo(__ToylangOpaque<HASH>);` for non-generics, `pub struct Foo<P...>(__ToylangOpaque<HASH>, PhantomData<(P...)>);` for generics. `queries/layout.rs::build_layout` now reports a matching layout-field count derived from `adt_def.non_enum_variant().fields.len()` (1 for non-generic, 2 for generic) with the wrapper at offset 0 of size `total_size` and the PhantomData ZST tail (when present) at offset = `total_size`. `BackendRepr::Memory { sized: true }` still applies — keeps rustc from decomposing into scalars; the wrapper is itself opaque-with-size. Sky structs keep their own DefIds so all existing `impl Trait for Foo` blocks work unchanged. The new `is_empty()` branch in stub_gen carries an `arch-fence-allow: phantomdata-only-when-generics-present` marker so the architecture fence passes.
+- **Phase 4 — collapsed**: the planned `__ToylangOpaque<HASH>` layout intercept turned out unnecessary for toylang because the wrapper is `pub struct __ToylangOpaque<const T: u64>;` (unit struct, 0 source fields) — default `layout_of` returns a 0-field ZST layout that matches its source, so the debuginfo walker iterates zero times when recursing in. Phase 4's intercept was anticipating §10.7 Cases 2/3 (`Vec<__ToylangOpaque<HASH>>` direct references for non-export / comptime types), which toylang doesn't emit. Punted to that day.
+- **Phase 5 — fork patch 4 retirement + docs**: reverted `e67de69ef35` in `~/rust`, rebuilt rustc, ran the full suite against unpatched rustc. 262/262 passing — Path 2 eliminates the assumption violation structurally without any fork patch. Updated architecture doc §10.4.5 path 2 (now the recommended path; path 1 retained as transitional measure for plugins that can't migrate), §25.2 B8 (probability "negligible" under wrapper-as-field shape), course-correct.md, `phase-e-investigation.md` (status banner: Path 2 LANDED), this handoff.
+
+Test counts after Session 12: **262/262 passing** (106 unit + 1 fence + 139 integration + 16 standalone). Commits on `main`: `72a929e`, `41423cf`, `90599cf` plus this session's doc-refresh commit. The fork's `per-instance-mir` branch contains the revert as a commit on top of `e67de69ef35`.
+
+The PR draft at `phase-e-rustc-pr-draft.md` is preserved — it remains the right upstream submission for plugin authors who don't migrate to the wrapper-as-field shape (cranelift, miri, future plugins). The clamp is genuinely useful as defense-in-depth for any layout-overriding plugin; Sky-side it's no longer needed.
 
 ## How the uniformity sweep was structured (now mostly landed)
 
@@ -969,7 +985,7 @@ convention is "patches as working tree state"). See the diff with
 
 ## 12. Status snapshot (where you start)
 
-**Tests passing**: **253/253** (98 unit + 1 fence + 138 integration + 16
+**Tests passing**: **262/262** (106 unit + 1 fence + 139 integration + 16
 standalone) when run with `integration-projects-cache` wiped.
 
 **Seven-case taxonomy coverage**: 1a ✅, 1b ✅, 2 ✅, 3 ✅, 4 ✅,
@@ -1121,7 +1137,15 @@ taxonomy has fixtures for six of seven cases (1a/1b/2/3/5/6), and the
 the §9 export commitment is guarded by `non_export_body_bearing_fn_gets_no_stub_shell`,
 and the CLAUDE.md compiler-law's generic/non-generic uniformity is
 guarded by `architecture_fence.rs`.
-**253/253 tests pass.**
+**262/262 tests pass.** Session 12 landed Phase E Path 2 — the
+`__ToylangOpaque<const T: u64>` wrapper-as-field migration. Sky struct
+stubs now emit as newtypes around a content-addressed-typeid wrapper
+(architecture §10.4.5 path 2 / §10.6) with source/layout field counts
+matching, so the rustc debuginfo walker's bound check passes
+structurally. Fork patch 4 (`e67de69ef35`) was reverted — the assumption
+violation it patched is gone at its source, not just masked. Toylang now
+runs against unpatched rustc for the debuginfo walker; only the 3
+per_instance_mir patches remain.
 
 Architecturally the prototype is now **LITERAL** Sky shape for
 multi-toylang-crate projects, no longer just rehearsal. Single-file

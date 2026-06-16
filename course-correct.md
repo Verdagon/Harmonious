@@ -16,6 +16,8 @@ The remaining items: wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-
 
 **Session 11 (separate from course-correct numbering)**: the generic-vs-non-generic uniformity audit landed Phases A → B → C → F per a focused plan (`tmp/claude-plan-2026-06-15-ccc8939f.md`). `ToyFunction::has_abstract_args()` helper rename (A), generalized `DeferredTypeParam.query` + TypeParam guards on 4 ungated oracle entry points + Check 5/6 skip drop (B), §20.4 entry-point walk replacing the registry walk in `populate_toylang_instances_from_cgus` (C), grep-based CI fence `tests/architecture_fence.rs` (F). Phase E (struct-shape ICE) was investigated — see `phase-e-investigation.md`; the documented rustc debuginfo ICE still reproduces on rustc 1.95.0-dev, recommendation is to file the upstream patch first. 253/253 tests passing.
 
+**Session 12 (separate from course-correct numbering)**: Phase E Path 2 — the `__ToylangOpaque<const T: u64>` wrapper-as-field migration (architecture §10.4.5 path 2 / §10.6) — landed in three commits (`72a929e`/`41423cf`/`90599cf`). Sky struct stubs now emit as newtypes around a content-addressed-typeid wrapper, with `layout_of` reporting source-matching field counts. Fork patch 4 (`e67de69ef35`) reverted; the debuginfo walker's source-vs-layout-field-count assumption holds structurally without a defensive clamp. 262/262 tests passing under unpatched rustc (only the 3 per_instance_mir patches remain in the fork).
+
 See `tl-handoff.md` for the narrative summary and recommended next directions.
 
 ---
