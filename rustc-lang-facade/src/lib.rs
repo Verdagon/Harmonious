@@ -144,14 +144,30 @@ pub trait LangCallbacks: Send + Sync {
     /// consumer entry-point Instance. Returns the extern symbol the consumer
     /// has chosen for this Instance.
     ///
-    /// May mutate state — specifically, this is the hook that drives internal
-    /// consumer→consumer transitive discovery and stashing into codegen state.
-    /// Implementations must dedup across calls so shared internal callees are
-    /// stashed exactly once per compilation.
-    fn notify_concrete_entry_point<'tcx>(
+    /// **Tier 3 #9 (stateless).** Pre-#9 this method was named
+    /// `notify_concrete_entry_point` and held `&mut dyn Any state`; it
+    /// served as a discovery side-channel that stashed Instances into
+    /// codegen state. Phase C (Session 11) migrated discovery to the
+    /// `after_expansion` entry-point walk, and #9 retires the side
+    /// effect. The method now returns a symbol name as a pure function
+    /// of `(self, callback_name, tcx, instance)` — no consumer state
+    /// mutation. This is what unlocks dropping the @GCMLZ thread-local
+    /// fat-pointer bypass (Session 5): without re-entrant state
+    /// mutation through `symbol_name`, the trampoline never re-locks.
+    ///
+    /// The `callback_name` is a routing prefix the facade chose based on
+    /// the Instance's kind:
+    /// - `__impl_method__<Self>__<Trait>__<m>` for trait-impl methods
+    /// - `<Self>.<field>` for accessor methods
+    /// - `<fn_name>` for free fns
+    ///
+    /// The consumer mangles to its own symbol scheme. Toylang's
+    /// `consumer_symbol_for_callback_name` defers to its existing
+    /// `notify_concrete_entry_point_inner` helper (minus the log push)
+    /// which already had the mangling logic.
+    fn consumer_symbol_for_callback_name<'tcx>(
         &self,
-        state: &mut dyn Any,
-        name: &str,
+        callback_name: &str,
         tcx: TyCtxt<'tcx>,
         instance: ty::Instance<'tcx>,
     ) -> String;
@@ -233,9 +249,13 @@ struct StatefulVtable {
         ty::Instance<'tcx>,
     ) -> Vec<(DefId, GenericArgsRef<'tcx>)>,
 
-    notify_concrete_entry_point: for<'tcx> fn(
+    // Tier 3 #9: stateless successor to `notify_concrete_entry_point`. No
+    // `&mut state` parameter; dispatched without locking `MUTABLE_STATE`,
+    // matching the `monomorphize_type` pattern. The thread-local fat-pointer
+    // bypass (Session 5) becomes obsolete because no consumer state is
+    // mutated via the `symbol_name` re-entrance path.
+    consumer_symbol_for_callback_name: for<'tcx> fn(
         &(dyn Any + Send + Sync),
-        &mut (dyn Any + Send + Sync),
         &str,
         TyCtxt<'tcx>,
         ty::Instance<'tcx>,
@@ -639,30 +659,21 @@ pub(crate) fn call_collect_generic_rust_deps<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance)
 }
 
-/// Call the consumer's notify_concrete_entry_point. Holds the mutable state
-/// mutex for the entire call.
-pub(crate) fn call_notify_concrete_entry_point<'tcx>(
+/// Call the consumer's `consumer_symbol_for_callback_name`. **Tier 3 #9
+/// (stateless).** No `MUTABLE_STATE` lock; mirrors `call_monomorphize_type`.
+/// The previous `call_notify_concrete_entry_point` held the mutex (with a
+/// thread-local fat-pointer bypass for re-entrance via @GCMLZ) — both are
+/// gone. The override is now a pure read.
+pub(crate) fn call_consumer_symbol_for_callback_name<'tcx>(
     name: &str,
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
 ) -> String {
     let c = CONFIG.get().expect("config not installed");
-    let func = c.stateful_vtable.notify_concrete_entry_point;
+    let func = c.stateful_vtable.consumer_symbol_for_callback_name;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
-    // @GCMLZ + Phase 3 E.6: if this call is reentering from inside
-    // `trampoline_generate_and_compile` (i.e. via a query provider like
-    // `lang_symbol_name`), MUTABLE_STATE is already held by this same
-    // thread. Re-locking on std's Mutex would deadlock. Use the
-    // trampoline-stashed state pointer instead. The pointer is only
-    // dereferenced within the trampoline's stack frame so aliasing is
-    // not a soundness issue — Rust query execution is single-threaded
-    // per session.
-    if let Some(state_ptr) = try_get_generate_and_compile_state() {
-        return (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance);
-    }
-    let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance)
+    // Safety: callbacks is immutable (from CONFIG, no lock needed).
+    (func)(unsafe { &*callbacks_ptr }, name, tcx, instance)
 }
 
 /// Call the consumer's after_rust_analysis. Holds the mutable state mutex for the entire call.
@@ -768,14 +779,13 @@ fn trampoline_collect_generic_rust_deps<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().collect_generic_rust_deps(state, name, tcx, instance)
 }
 
-fn trampoline_notify_concrete_entry_point<'tcx, C: LangCallbacks + 'static>(
+fn trampoline_consumer_symbol_for_callback_name<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
-    state: &mut (dyn Any + Send + Sync),
     name: &str,
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
 ) -> String {
-    data.downcast_ref::<C>().unwrap().notify_concrete_entry_point(state, name, tcx, instance)
+    data.downcast_ref::<C>().unwrap().consumer_symbol_for_callback_name(name, tcx, instance)
 }
 
 fn trampoline_after_rust_analysis<'tcx, C: LangCallbacks + 'static>(
@@ -801,69 +811,14 @@ fn trampoline_generate_and_compile<'tcx, C: LangCallbacks + 'static>(
     state: &mut (dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
 ) -> Option<(PathBuf, Vec<String>)> {
-    // Phase 3 E.6 / @GCMLZ: expose the held state pointer via a thread-local
-    // so that query providers (e.g. `lang_symbol_name`) which re-enter the
-    // facade during `generate_and_compile` can reach the consumer state
-    // WITHOUT re-locking MUTABLE_STATE.
-    //
-    // The deadlock this prevents: at the user-bin compile, when toylang's
-    // codegen calls `tcx.symbol_name(instance)` for an upstream consumer
-    // function (Case 6, an item from a Sky library), rustc fires
-    // `lang_symbol_name`, which calls `call_notify_concrete_entry_point`,
-    // which (without this bypass) tries to lock MUTABLE_STATE — already
-    // held by THIS thread from the outer `call_generate_and_compile`. std's
-    // Mutex isn't reentrant, so the same thread blocks waiting on itself.
-    // (Single-project tests don't hit this because their symbol_name
-    // queries get cached by rustc during the earlier mono walk, before
-    // generate_and_compile starts.)
-    let state_ptr: *mut (dyn Any + Send + Sync) = state;
-    set_generate_and_compile_state(state_ptr);
-    let result = data.downcast_ref::<C>().unwrap().generate_and_compile(state, tcx);
-    clear_generate_and_compile_state();
-    result
-}
-
-/// Width-erased fat-pointer storage for the trampoline's held state. The
-/// thread-local stores both halves of `*mut dyn Trait`; the read site
-/// transmutes back. The pointer is only valid while the trampoline's
-/// stack frame is alive.
-#[derive(Copy, Clone)]
-struct GcState {
-    data: *mut (),
-    vtable: *mut (),
-}
-
-std::thread_local! {
-    static GENERATE_AND_COMPILE_FAT_STATE: std::cell::Cell<Option<GcState>> = const {
-        std::cell::Cell::new(None)
-    };
-}
-
-fn set_generate_and_compile_state(s: *mut (dyn Any + Send + Sync)) {
-    // SAFETY: `*mut dyn Trait` is `(*mut (), *mut ())` per Rust's current
-    // ABI. We split via transmute, recombine on read. Pointer is only
-    // dereferenced while the trampoline's stack frame is alive.
-    let raw: [*mut (); 2] = unsafe { std::mem::transmute(s) };
-    GENERATE_AND_COMPILE_FAT_STATE.with(|c| {
-        c.set(Some(GcState { data: raw[0], vtable: raw[1] }))
-    });
-}
-
-fn clear_generate_and_compile_state() {
-    GENERATE_AND_COMPILE_FAT_STATE.with(|c| c.set(None));
-}
-
-/// If we're inside `generate_and_compile`'s trampoline (which already holds
-/// MUTABLE_STATE), return the held state pointer so re-entrant callbacks
-/// can mutate state without re-locking.
-fn try_get_generate_and_compile_state() -> Option<*mut (dyn Any + Send + Sync)> {
-    GENERATE_AND_COMPILE_FAT_STATE.with(|c| {
-        c.get().map(|gc| {
-            let raw: [*mut (); 2] = [gc.data, gc.vtable];
-            // SAFETY: reverses the split in `set_generate_and_compile_state`.
-            unsafe { std::mem::transmute::<[*mut (); 2], *mut (dyn Any + Send + Sync)>(raw) }
-        })
-    })
+    // Tier 3 #9 retired the @GCMLZ thread-local fat-pointer bypass that
+    // used to wrap this body. It existed because `lang_symbol_name`'s
+    // override re-entered `call_notify_concrete_entry_point`, which tried
+    // to lock `MUTABLE_STATE` already held by this thread. With #9 the
+    // symbol_name override is stateless (calls
+    // `call_consumer_symbol_for_callback_name` — no lock), so the
+    // re-entrance scenario disappears and the bypass is dead code.
+    data.downcast_ref::<C>().unwrap().generate_and_compile(state, tcx)
 }
 
 /// Install callbacks for use by query overrides. Phase 1 of globals init.
@@ -876,7 +831,7 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         stateful_vtable: StatefulVtable {
             monomorphize_type: trampoline_monomorphize_type::<C>,
             collect_generic_rust_deps: trampoline_collect_generic_rust_deps::<C>,
-            notify_concrete_entry_point: trampoline_notify_concrete_entry_point::<C>,
+            consumer_symbol_for_callback_name: trampoline_consumer_symbol_for_callback_name::<C>,
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
             on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
             generate_and_compile: trampoline_generate_and_compile::<C>,

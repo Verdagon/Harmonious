@@ -6,15 +6,15 @@
 //! in other functions emit calls to the consumer's extern symbol, which
 //! the consumer's .o provides.
 //!
-//! Per @GCMLZ, this provider may fire during generate_and_compile. For
-//! non-consumer items, it only reads CONFIG and DEFAULT_SYMBOL_NAME (no lock).
-//! For consumer items, it calls `call_notify_concrete_entry_point`, which
-//! locks `MUTABLE_STATE`. Before the B6 fix this was the side-effect that
-//! populated `state.toylang_instances`; post-B6 the populate step moved to
-//! an up-front CGU walk in `generate_and_compile` and
-//! `notify_concrete_entry_point_inner` is pure (aside from the log push).
-//! See `docs/architecture/risks.md` §B6 and `@GCMLZ` for the full story,
-//! including the `_inner` bypass used during codegen to avoid re-locking.
+//! Per @GCMLZ, this provider may fire during generate_and_compile. **Tier
+//! 3 #9 (this commit): pure read in both branches.** For non-consumer
+//! items it reads CONFIG + DEFAULT_SYMBOL_NAME (no lock). For consumer
+//! items it calls `call_consumer_symbol_for_callback_name`, which is
+//! stateless (no `MUTABLE_STATE` lock either). The previous
+//! `call_notify_concrete_entry_point` held the mutex; the @GCMLZ
+//! thread-local fat-pointer bypass (Session 5) was the workaround for
+//! its re-entrance via `generate_and_compile`. Both are gone now —
+//! @SyMINCZ stays as the invariant document.
 //!
 //! @SyMINCZ — computing a symbol name here does NOT force rustc to codegen
 //! the `Instance`. It is a pure read. Codegen for consumer-referenced Rust
@@ -93,7 +93,7 @@ pub fn lang_symbol_name<'tcx>(
                 // sees these DefIds here too and must rewrite so its call sites
                 // target the consumer-chosen symbol (`__toylang_impl_*`) that
                 // the rlib's `.o` defines.
-                let symbol = crate::call_notify_concrete_entry_point(
+                let symbol = crate::call_consumer_symbol_for_callback_name(
                     &callback_name, tcx, instance,
                 );
                 return ty::SymbolName::new(tcx, &symbol);

@@ -272,7 +272,25 @@ impl ToylangCallbacks {
         instance: ty::Instance<'tcx>,
     ) -> String {
         state.log.push(CallbackLog::NotifyConcreteEntryPoint { name: name.to_string() });
+        // Tier 3 #9: the mangling moved to the stateless
+        // `compute_consumer_symbol`; this wrapper retains the log push
+        // for the direct codegen-side caller (`llvm_gen.rs`'s accessor
+        // emission), which has state in hand and benefits from the
+        // observability record.
+        self.compute_consumer_symbol(name, tcx, instance)
+    }
 
+    /// Tier 3 #9 (stateless): compute the consumer's chosen extern symbol
+    /// for the given callback-name + Instance. Pure function of
+    /// `(self.registry, callback_name, tcx, instance)`. The facade's
+    /// `consumer_symbol_for_callback_name` trait method delegates here;
+    /// so does `notify_concrete_entry_point_inner` (plus a log push).
+    pub fn compute_consumer_symbol<'tcx>(
+        &self,
+        name: &str,
+        tcx: TyCtxt<'tcx>,
+        instance: ty::Instance<'tcx>,
+    ) -> String {
         // Phase 2 C.6 — trait-impl method shape from the facade is
         //   `__impl_method__<Self>__<Trait>__<m>`
         // Mangle to a concrete consumer symbol distinct from both the
@@ -903,14 +921,17 @@ impl LangCallbacks for ToylangCallbacks {
         self.collect_generic_rust_deps_inner(state(s), name, tcx, instance)
     }
 
-    fn notify_concrete_entry_point<'tcx>(
+    fn consumer_symbol_for_callback_name<'tcx>(
         &self,
-        s: &mut dyn Any,
         name: &str,
         tcx: TyCtxt<'tcx>,
         instance: ty::Instance<'tcx>,
     ) -> String {
-        self.notify_concrete_entry_point_inner(state(s), name, tcx, instance.def_id(), instance)
+        // Tier 3 #9: stateless. Pure function of (self.registry, name,
+        // tcx, instance). No `&mut dyn Any state`; no `MUTABLE_STATE`
+        // lock at the facade level. The trampoline takes no `state`
+        // either (mirrors `monomorphize_type`).
+        self.compute_consumer_symbol(name, tcx, instance)
     }
 
     fn generate_and_compile<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) -> Option<(PathBuf, Vec<String>)> {
