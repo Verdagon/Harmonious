@@ -62,50 +62,29 @@ pub struct MonomorphizeTypeResult<'tcx> {
 use std::any::Any;
 
 // ============================================================================
-// Two callback families.
+// Consumer callback trait.
 //
-// `LangPredicates` — pure callbacks that are functions of `(self, tcx, ...)`
-// only. The facade dispatches them through `PredicateVtable`; their bridge
-// fns and trampolines NEVER touch `MUTABLE_STATE`. Adding a hook here means
-// "this hook must not need consumer state, and must not lock."
+// Tier 3 #7.4 (this commit): retired the previous `LangPredicates` super-
+// trait. Its two methods (`is_consumer_type`, `is_consumer_fn`) used to
+// dispatch through `PredicateVtable` to the consumer's vtable; #7.3 migrated
+// the callers to read from the facade-owned `SkyUniverse` directly, leaving
+// the trait and its vtable as dead code. They are deleted here.
 //
-// `LangCallbacks: LangPredicates` — stateful callbacks that mutate consumer
-// state. Each takes `&mut dyn Any state`. The facade dispatches them through
-// `StatefulVtable`; their helpers lock `MUTABLE_STATE` for the duration of
-// the call.
+// What remains: `LangCallbacks`, the stateful callback family. Each method
+// takes `&mut dyn Any state` (downcast to your concrete state type). The
+// facade dispatches them through `StatefulVtable`; their helpers lock
+// `MUTABLE_STATE` for the duration of the call. Locking story is unchanged
+// from before #7 (will change when #12 retires `MUTABLE_STATE`).
 //
-// The split exists so the type system enforces the locking story: a hook in
-// the predicate family literally cannot lock, because its signature has no
-// `state` to mutate. New override-style hooks (visibility, layout overrides,
-// etc.) go on `LangPredicates`. New monomorphization or codegen hooks that
-// need state go on `LangCallbacks`. See `docs/architecture/rust-interop-guide.md`
-// Part 2 for the family taxonomy and @GCMLZ for the locking history.
+// See `docs/architecture/rust-interop-guide.md` Part 2 for the family
+// taxonomy and @GCMLZ for the locking history. The two-vtable split is now
+// a one-vtable design.
 // ============================================================================
-
-/// Pure callbacks: functions of `(self, tcx, ...)` only, no consumer state.
-/// Bridge fns for these MUST NOT lock `MUTABLE_STATE`.
-pub trait LangPredicates: Send + Sync {
-    /// Check if a type name belongs to the consumer's language.
-    fn is_consumer_type(&self, name: &str) -> bool;
-
-    /// Check if a function name belongs to the consumer's language.
-    fn is_consumer_fn(&self, name: &str) -> bool;
-
-    // Stage 4c retired `visibility_override`: the partitioner override in
-    // `queries::partition` now forces `(External, Default)` on
-    // `__lang_stubs` items directly. No trait method needed.
-    //
-    // Stage 5c.4 retired `generate_stubs`: under the two-crate architecture
-    // the stub rlib's `src/lib.rs` is written by the consumer's build-mode
-    // path (e.g. `toylangc build`'s `write_stub_crate`), not injected into
-    // rustc at compile time. The facade no longer needs to know how to
-    // generate stubs.
-}
 
 /// Stateful callbacks: each takes `&mut dyn Any state` (downcast to your
 /// concrete state type). Bridge fns for these lock `MUTABLE_STATE` for the
 /// duration of the call.
-pub trait LangCallbacks: LangPredicates {
+pub trait LangCallbacks: Send + Sync {
     /// Create the consumer's mutable state. Called once at startup.
     /// The facade stores this in its global and passes `&mut dyn Any` to every
     /// stateful callback. The consumer downcasts to its concrete state type.
@@ -226,12 +205,10 @@ pub trait LangCallbacks: LangPredicates {
 
 use std::sync::OnceLock;
 
-/// Vtable for the pure (`LangPredicates`) callback family. Bridge fns and
-/// helpers reading from this vtable NEVER lock `MUTABLE_STATE`.
-struct PredicateVtable {
-    is_consumer_type: fn(&(dyn Any + Send + Sync), &str) -> bool,
-    is_consumer_fn: fn(&(dyn Any + Send + Sync), &str) -> bool,
-}
+// Tier 3 #7.4: `PredicateVtable` retired. Predicates (`is_consumer_type`,
+// `is_consumer_fn`) now read from the facade-owned `SkyUniverse` (see the
+// SKY_UNIVERSE block above). The consumer no longer supplies a predicate
+// vtable; #7.2's sidecar-load populate writes the universe instead.
 
 /// Vtable for the stateful (`LangCallbacks`) callback family. Helpers
 /// dispatching through this vtable lock `MUTABLE_STATE` for the duration of
@@ -302,12 +279,12 @@ struct StatefulVtable {
 // See docs/arcana/GenerateCompileMutexLock-GCMLZ.md for the full analysis.
 // ============================================================================
 
-/// Immutable config: callbacks + the two vtables. Set once by `install_callbacks`.
-/// `predicate_vtable` is dispatched lock-free; `stateful_vtable` is dispatched
-/// while holding `MUTABLE_STATE`.
+/// Immutable config: callbacks + the stateful vtable. Set once by
+/// `install_callbacks`. Dispatched while holding `MUTABLE_STATE`. Tier 3
+/// #7.4 retired the previous `predicate_vtable` field (predicates now
+/// read from `SkyUniverse`); a future #12 retires `MUTABLE_STATE` itself.
 pub(crate) struct FacadeConfig {
     callbacks: Box<dyn Any + Send + Sync>,
-    predicate_vtable: PredicateVtable,
     stateful_vtable: StatefulVtable,
 }
 
@@ -341,11 +318,98 @@ static DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR:
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock::new();
 
+// ============================================================================
+// SkyUniverse — content-addressed Sky-item registry owned by the facade.
+//
+// Per architecture §7.1–7.5, §8, §9.4, §10.8, §10.9 and course-correct #7:
+// the facade owns a content-addressed registry of every Sky item visible to
+// the current rustc invocation (typeids of Sky types, names of Sky fns +
+// types). It is populated at sidecar-load time from each upstream Sky-marked
+// rlib's `.sky-meta` payload, plus from the LOCAL crate's just-built
+// registry once Sky's frontend has typechecked it.
+//
+// Predicates like "is `Widget` a Sky type?" become O(1) lock-free reads of
+// this structure — no vtable hop, no consumer callback. This is the
+// foundation Tier 3 #9 (retire symbol_name side-effect channel), #3 (retire
+// cgu_stash), and #12 (retire MUTABLE_STATE + two-vtable split) all build
+// on.
+//
+// Sky-locked design has read-mostly access: sidecar loads + local-registry
+// build are the only writes, both serialized by the rustc-invocation
+// lifecycle (each happens at a known pipeline phase before queries fire).
+// `RwLock` gives us lock-free reads; the lock is uncontended during
+// `generate_and_compile` (consistent with @GCMLZ's "no consumer-callback
+// lock during codegen" rule).
+//
+// #7.1 (this commit): structure + accessors only. Call sites still go
+// through the vtable predicates. #7.2 populates; #7.3 migrates call sites;
+// #7.4 retires the vtable.
+// ============================================================================
+
+use std::collections::HashSet;
+use std::sync::RwLock;
+
+/// Content-addressed registry of every Sky item visible to this rustc
+/// invocation. See module-level comment above `SKY_UNIVERSE`.
+#[derive(Default, Debug)]
+pub struct SkyUniverse {
+    /// Typeids (BLAKE3-truncated-to-u64 per `toylangc/src/typeid.rs`).
+    /// Identifies Sky types by content, not by source name. Future-proof for
+    /// Sky's comptime-derived types whose source name may collide with
+    /// rustc-known types.
+    pub typeids: HashSet<u64>,
+    /// Source-level names of Sky fns (for `is_consumer_fn`-style lookups
+    /// against rustc DefId names).
+    pub fn_names: HashSet<String>,
+    /// Source-level names of Sky types (for `is_consumer_type`-style lookups).
+    pub type_names: HashSet<String>,
+}
+
+impl SkyUniverse {
+    pub fn contains_type(&self, name: &str) -> bool {
+        self.type_names.contains(name)
+    }
+    pub fn contains_fn(&self, name: &str) -> bool {
+        self.fn_names.contains(name)
+    }
+    pub fn contains_typeid(&self, typeid: u64) -> bool {
+        self.typeids.contains(&typeid)
+    }
+}
+
+static SKY_UNIVERSE: OnceLock<RwLock<SkyUniverse>> = OnceLock::new();
+
+/// Read-only access to the Sky universe. Lock-free in the common case
+/// (RwLock read guard). Initialises an empty universe on first use so
+/// callers can read safely before populate has happened (returns "not
+/// present" for everything, which is the right answer).
+pub fn sky_universe() -> std::sync::RwLockReadGuard<'static, SkyUniverse> {
+    SKY_UNIVERSE
+        .get_or_init(|| RwLock::new(SkyUniverse::default()))
+        .read()
+        .expect("SkyUniverse RwLock poisoned")
+}
+
+/// Mutating access for populate paths only (sidecar load, local registry
+/// build). The caller's closure receives an exclusive lock.
+pub fn with_sky_universe_mut<R>(f: impl FnOnce(&mut SkyUniverse) -> R) -> R {
+    let lock = SKY_UNIVERSE.get_or_init(|| RwLock::new(SkyUniverse::default()));
+    let mut guard = lock.write().expect("SkyUniverse RwLock poisoned");
+    f(&mut guard)
+}
+
 /// Check if a type name belongs to the consumer's language.
-/// Per @GCMLZ, reads from CONFIG (no lock) — safe during generate_and_compile.
+///
+/// **Tier 3 #7.3 (migrated to SkyUniverse).** Reads from the facade-owned
+/// universe via `sky_universe()` — lock-free in the common case (read
+/// guard on `SKY_UNIVERSE`'s RwLock). The previous predicate-vtable hop
+/// is retired; #7.4 will delete the vtable slot itself.
+///
+/// Per @GCMLZ, this is still safe during `generate_and_compile`: the
+/// universe is written only at sidecar-load + local-registry populate
+/// (both before codegen starts); reads during codegen never block.
 pub(crate) fn is_consumer_type(name: &str) -> bool {
-    let c = CONFIG.get().expect("config not installed");
-    (c.predicate_vtable.is_consumer_type)(&*c.callbacks, name)
+    sky_universe().contains_type(name)
 }
 
 /// Check if a DefId is from a Sky stub rlib (i.e., its containing crate
@@ -526,10 +590,12 @@ pub fn is_consumer_trait_impl_method<'tcx>(
 }
 
 /// Check if a function name belongs to the consumer's language.
-/// Per @GCMLZ, reads from CONFIG (no lock) — safe during generate_and_compile.
+///
+/// **Tier 3 #7.3 (migrated to SkyUniverse).** Reads from the facade-owned
+/// universe via `sky_universe()` — lock-free in the common case.  Mirrors
+/// `is_consumer_type` exactly. See its doc for the migration rationale.
 pub(crate) fn is_consumer_fn(name: &str) -> bool {
-    let c = CONFIG.get().expect("config not installed");
-    (c.predicate_vtable.is_consumer_fn)(&*c.callbacks, name)
+    sky_universe().contains_fn(name)
 }
 
 /// Call the consumer's monomorphize_type. Lock-free — reads only from
@@ -679,19 +745,9 @@ pub(crate) fn default_upstream_monomorphizations_for()
 // (LangCallbacks) take `&mut (dyn Any + Send + Sync)`. The two-family split is
 // expressed by signature: predicate trampolines literally cannot touch state.
 
-fn trampoline_is_consumer_type<C: LangCallbacks + 'static>(
-    data: &(dyn Any + Send + Sync),
-    name: &str,
-) -> bool {
-    data.downcast_ref::<C>().unwrap().is_consumer_type(name)
-}
-
-fn trampoline_is_consumer_fn<C: LangCallbacks + 'static>(
-    data: &(dyn Any + Send + Sync),
-    name: &str,
-) -> bool {
-    data.downcast_ref::<C>().unwrap().is_consumer_fn(name)
-}
+// Tier 3 #7.4 retired `trampoline_is_consumer_type` and
+// `trampoline_is_consumer_fn`. Predicates now read from `SkyUniverse`; no
+// vtable dispatch needed.
 
 fn trampoline_monomorphize_type<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
@@ -817,10 +873,6 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     let consumer_state = callbacks.create_state();
     let _ = CONFIG.set(FacadeConfig {
         callbacks: Box::new(callbacks),
-        predicate_vtable: PredicateVtable {
-            is_consumer_type: trampoline_is_consumer_type::<C>,
-            is_consumer_fn: trampoline_is_consumer_fn::<C>,
-        },
         stateful_vtable: StatefulVtable {
             monomorphize_type: trampoline_monomorphize_type::<C>,
             collect_generic_rust_deps: trampoline_collect_generic_rust_deps::<C>,
@@ -864,4 +916,46 @@ pub(crate) fn install_query_defaults(
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
     let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
     let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR.set(upstream_monomorphizations_for);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tier 3 #7.5: the universe correctly answers `contains_*` after
+    /// items are inserted. Exercises the pure data structure — no rustc,
+    /// no static. The end-to-end "universe populated from a real sidecar
+    /// lights up the predicates" path is covered by the 138-fixture
+    /// integration suite, which depends on the universe at every consumer
+    /// codegen site since #7.3.
+    #[test]
+    fn sky_universe_populate_and_query() {
+        let mut u = SkyUniverse::default();
+        u.type_names.insert("Widget".to_string());
+        u.fn_names.insert("clone_widget".to_string());
+        u.typeids.insert(0x48723b0bb65d86f7);
+
+        assert!(u.contains_type("Widget"));
+        assert!(u.contains_fn("clone_widget"));
+        assert!(u.contains_typeid(0x48723b0bb65d86f7));
+
+        // Misses return false (not panic / not unwrap).
+        assert!(!u.contains_type("Unknown"));
+        assert!(!u.contains_fn("unknown"));
+        assert!(!u.contains_typeid(0));
+    }
+
+    /// The static accessor returns a default-empty universe when nothing
+    /// has been written. Guards against the OnceLock initialiser regressing
+    /// to a panic/expect.
+    #[test]
+    fn sky_universe_static_starts_empty() {
+        // Note: this test reads the global. Because the static is shared
+        // across all tests in this binary, other tests must not write to
+        // it before this test runs. The facade has no other tests today;
+        // future writers should use a dedicated test crate or `serial_test`.
+        let u = sky_universe();
+        assert!(!u.contains_type("Widget"));
+        assert!(!u.contains_fn("anything"));
+    }
 }

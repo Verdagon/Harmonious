@@ -12,8 +12,42 @@ use std::sync::Arc;
 
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 
-use rustc_lang_facade::{LangCallbacks, LangPredicates, MonomorphizeTypeResult};
+use rustc_lang_facade::{LangCallbacks, MonomorphizeTypeResult};
 use crate::toylang::registry::ToylangRegistry;
+
+/// Tier 3 #7.2: populate the facade's `SkyUniverse` from a `ToylangRegistry`.
+/// Called from both the upstream-sidecar load path (`on_sky_lib_loaded`) and
+/// the local-crate validation path (`after_rust_analysis` rlib-compile
+/// branch) so the universe sees every Sky item visible to this rustc
+/// invocation. Idempotent: re-inserting an existing entry is a no-op.
+fn populate_sky_universe_from_registry(registry: &ToylangRegistry) {
+    rustc_lang_facade::with_sky_universe_mut(|u| {
+        for name in registry.structs.keys() {
+            u.type_names.insert(name.clone());
+        }
+        for (name, func) in &registry.functions {
+            // Only body-bearing fns are "consumer fns" — body-less ones are
+            // extern Rust fn declarations toylang binds to. The vtable
+            // predicate `is_consumer_fn` enforces this; mirror the rule here
+            // so universe-driven lookups agree.
+            if func.body.is_some() {
+                u.fn_names.insert(name.clone());
+                // Toylang-specific: `main` is exposed to rustc via the stub
+                // rlib as `__toylang_main` (the symbol the user-bin shim
+                // calls). The universe must know the stub-side name because
+                // facade predicates fire on `tcx.item_name(def_id)`-derived
+                // strings, which see the stub name. Mirrors the special
+                // case the vtable predicate (`is_consumer_fn`) used pre-#7.3.
+                if name == "main" {
+                    u.fn_names.insert(crate::oracle::TOYLANG_MAIN.to_string());
+                }
+            }
+        }
+        for &typeid in registry.typeid_table.keys() {
+            u.typeids.insert(typeid);
+        }
+    });
+}
 
 /// A structured log entry for each callback rustc makes into toylang.
 /// The `name` fields are consumed via `{:?}` formatting when
@@ -121,20 +155,18 @@ pub struct ToylangCallbacks {
     pub registry: Arc<ToylangRegistry>,
     /// (ll_path, obj_path) for LLVM compilation. None if no external codegen.
     pub llvm_paths: Option<(PathBuf, PathBuf)>,
-    /// Phase 3 E.6: names of body-bearing functions defined in UPSTREAM
-    /// Sky-marked rlibs (loaded via S.4's `on_sky_lib_loaded`). The
-    /// `is_consumer_fn` / `is_consumer_type` predicates are called from
-    /// `symbol_name` and other queries that only see `&self` (no access
-    /// to `ToylangState`), so we mirror the relevant subset of upstream
-    /// state into this set as upstreams arrive.
-    pub upstream_fn_names: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Same as `upstream_fn_names` but for consumer types (struct names).
-    pub upstream_type_names: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    // Tier 3 #7.4 retired `upstream_fn_names` + `upstream_type_names`.
+    // Their sole purpose was backing the `LangPredicates` impl's
+    // `is_consumer_fn` / `is_consumer_type` methods. Those predicates now
+    // read from the facade's `SkyUniverse` (populated in `on_sky_lib_loaded`
+    // via `populate_sky_universe_from_registry`), so the per-callbacks
+    // mirror is redundant.
     /// Session 9 — full ToyStruct definitions from upstream Sky libs, keyed
-    /// by struct name. Mirrors what's in `ToylangState.upstream_registries`
-    /// but accessible from `&self` predicates (e.g. `monomorphize_type`)
-    /// that don't get state access. Populated alongside `upstream_type_names`
-    /// in `on_sky_lib_loaded`.
+    /// by struct name. Used by `monomorphize_type` to look up an upstream
+    /// struct's field types when rustc queries its layout during the
+    /// binary's Rust-generic walk (Case 6). Not part of the universe — the
+    /// facade's `SkyUniverse` carries names + typeids only; the full Temputs
+    /// will move facade-side under Tier 3 #8.
     pub upstream_structs: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::toylang::registry::ToyStruct>>>,
     /// True at the user-bin compile under two-crate wrapper mode (course-
     /// correct.md items #11 + #15, Workstream A). The renaming + semantic
@@ -420,33 +452,18 @@ impl ToylangCallbacks {
 // option is to construct an Instance per registry item and walk its
 // signature — but it's not currently needed.
 
-impl LangPredicates for ToylangCallbacks {
-    fn is_consumer_type(&self, name: &str) -> bool {
-        if self.registry.structs.contains_key(name) { return true; }
-        // Phase 3 E.6: also accept types defined in upstream Sky libs.
-        self.upstream_type_names.lock().unwrap().contains(name)
-    }
-
-    fn is_consumer_fn(&self, name: &str) -> bool {
-        if name == crate::oracle::TOYLANG_MAIN {
-            return self.registry.functions.get("main").map_or(false, |f| f.body.is_some());
-        }
-        if self.registry.functions.get(name).map_or(false, |f| f.body.is_some()) {
-            return true;
-        }
-        // Phase 3 E.6: also accept body-bearing fns from upstream Sky libs.
-        self.upstream_fn_names.lock().unwrap().contains(name)
-    }
-
-    // Stage 4c retired the `visibility_override` trait method: the
-    // facade's partitioner override now forces `(External, Default)` on
-    // `__lang_stubs` items directly in the CGU slice. No consumer-side
-    // predicate needed.
-    //
-    // Stage 5c.4 retired the `generate_stubs` trait method: wrapper mode's
-    // `build::write_stub_crate` calls `stub_gen::generate` directly when
-    // writing the stub rlib's `src/lib.rs`. No facade-level callback.
-}
+// Tier 3 #7.4 retired `impl LangPredicates for ToylangCallbacks`. The two
+// methods (`is_consumer_type`, `is_consumer_fn`) used to feed the facade's
+// predicate vtable; the universe-based `is_consumer_type` /
+// `is_consumer_fn` in the facade now reads from `SkyUniverse` directly.
+// Population happens in `on_sky_lib_loaded` (upstream) and
+// `after_rust_analysis` (local) via `populate_sky_universe_from_registry`.
+//
+// Stage 4c retired the `visibility_override` trait method: the facade's
+// partitioner override now forces `(External, Default)` on `__lang_stubs`
+// items directly in the CGU slice. Stage 5c.4 retired the `generate_stubs`
+// trait method: wrapper mode's `build::write_stub_crate` calls
+// `stub_gen::generate` directly.
 
 impl LangCallbacks for ToylangCallbacks {
     fn create_state(&self) -> Box<dyn Any + Send + Sync> {
@@ -455,6 +472,14 @@ impl LangCallbacks for ToylangCallbacks {
 
     fn after_rust_analysis<'tcx>(&self, s: &mut dyn Any, tcx: TyCtxt<'tcx>) {
         state(s).log.push(CallbackLog::AfterRustAnalysis);
+
+        // Tier 3 #7.2: mirror the LOCAL registry into the facade's
+        // `SkyUniverse`. Done unconditionally (both rlib + user-bin compiles)
+        // so query predicates fired downstream see the local items. Upstream
+        // items were populated earlier in `on_sky_lib_loaded`.
+        //
+        // Idempotent + cheap; called at most once per rustc invocation.
+        populate_sky_universe_from_registry(&self.registry);
 
         // Workstream A: validation lives at the rlib compile only. The
         // user-bin compile trusts the rlib-compile's validation as the
@@ -794,23 +819,22 @@ impl LangCallbacks for ToylangCallbacks {
         // consumer-fn calls (e.g. the user-bin's main calling case6_lib::double_it)
         // to the consumer emitter's `__toylang_impl_*` symbol that codegen
         // produces from the populate-upstream iteration.
-        {
-            let mut fns = self.upstream_fn_names.lock().unwrap();
-            for (name, func) in &registry.functions {
-                if func.body.is_some() { fns.insert(name.clone()); }
-            }
-        }
-        {
-            let mut tys = self.upstream_type_names.lock().unwrap();
-            for name in registry.structs.keys() { tys.insert(name.clone()); }
-        }
-        // Session 9 — mirror full ToyStruct definitions for upstream-aware
-        // `monomorphize_type` (Case 6: rustc queries layout of
-        // `case6_lib::Pair` during the binary's Rust-generic walk).
+        //
+        // Tier 3 #7.4: the `upstream_fn_names` + `upstream_type_names`
+        // mirrors are gone — the facade's `SkyUniverse` carries the
+        // body-bearing fn names + type names instead (populated below).
+        // The `upstream_structs` mirror stays: it carries full ToyStruct
+        // field info for `monomorphize_type`'s Case-6 layout query, which
+        // the universe doesn't track (yet — Tier 3 #8's facade-side layout
+        // walk will absorb it).
         {
             let mut structs = self.upstream_structs.lock().unwrap();
             for (name, ts) in &registry.structs { structs.insert(name.clone(), ts.clone()); }
         }
+        // Tier 3 #7.2: mirror the loaded registry into the facade's
+        // `SkyUniverse`. After #7.4 retired the predicate vtable, this is
+        // the *only* path that surfaces upstream items to the predicates.
+        populate_sky_universe_from_registry(&registry);
         ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
 

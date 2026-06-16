@@ -212,8 +212,8 @@ fn run_toylang_compile(
         registry: Arc::new(registry),
         llvm_paths,
         is_user_bin_compile,
-        upstream_fn_names: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        upstream_type_names: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        // Tier 3 #7.4 retired `upstream_fn_names` + `upstream_type_names`
+        // — the facade's `SkyUniverse` carries those now.
         upstream_structs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
