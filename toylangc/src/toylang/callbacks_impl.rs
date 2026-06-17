@@ -21,8 +21,13 @@ use crate::toylang::registry::ToylangRegistry;
 /// invocation. Idempotent: re-inserting an existing entry is a no-op.
 fn populate_sky_universe_from_registry(registry: &ToylangRegistry) {
     rustc_lang_facade::with_sky_universe_mut(|u| {
-        for name in registry.structs.keys() {
+        // Tier 3 #8: also stash the full ToyStruct so `monomorphize_type`
+        // can serve cross-Sky-crate layout queries (Case 6 / case6_lib's
+        // `Box`) from the universe instead of a consumer-side mutex-
+        // protected mirror.
+        for (name, toy_struct) in &registry.structs {
             u.type_names.insert(name.clone());
+            u.insert_struct_info(name.clone(), std::sync::Arc::new(toy_struct.clone()));
         }
         for (name, func) in &registry.functions {
             // Only body-bearing fns are "consumer fns" — body-less ones are
@@ -175,13 +180,11 @@ pub struct ToylangCallbacks {
     // read from the facade's `SkyUniverse` (populated in `on_sky_lib_loaded`
     // via `populate_sky_universe_from_registry`), so the per-callbacks
     // mirror is redundant.
-    /// Session 9 — full ToyStruct definitions from upstream Sky libs, keyed
-    /// by struct name. Used by `monomorphize_type` to look up an upstream
-    /// struct's field types when rustc queries its layout during the
-    /// binary's Rust-generic walk (Case 6). Not part of the universe — the
-    /// facade's `SkyUniverse` carries names + typeids only; the full Temputs
-    /// will move facade-side under Tier 3 #8.
-    pub upstream_structs: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::toylang::registry::ToyStruct>>>,
+    // Tier 3 #8 retired `upstream_structs`. Full ToyStruct field info now
+    // lives in the facade's `SkyUniverse.struct_infos` (type-erased
+    // `Arc<dyn Any + Send + Sync>`); `monomorphize_type` downcasts on read.
+    // The Case 6 cross-Sky-crate layout path Session 9 patched goes through
+    // the same single source of truth as local layouts.
     /// True at the user-bin compile under two-crate wrapper mode (course-
     /// correct.md items #11 + #15, Workstream A). The renaming + semantic
     /// flip from the prior `is_downstream_of_stubs` is part of A's
@@ -882,20 +885,12 @@ impl LangCallbacks for ToylangCallbacks {
         // to the consumer emitter's `__toylang_impl_*` symbol that codegen
         // produces from the populate-upstream iteration.
         //
-        // Tier 3 #7.4: the `upstream_fn_names` + `upstream_type_names`
-        // mirrors are gone — the facade's `SkyUniverse` carries the
-        // body-bearing fn names + type names instead (populated below).
-        // The `upstream_structs` mirror stays: it carries full ToyStruct
-        // field info for `monomorphize_type`'s Case-6 layout query, which
-        // the universe doesn't track (yet — Tier 3 #8's facade-side layout
-        // walk will absorb it).
-        {
-            let mut structs = self.upstream_structs.lock().unwrap();
-            for (name, ts) in &registry.structs { structs.insert(name.clone(), ts.clone()); }
-        }
-        // Tier 3 #7.2: mirror the loaded registry into the facade's
-        // `SkyUniverse`. After #7.4 retired the predicate vtable, this is
-        // the *only* path that surfaces upstream items to the predicates.
+        // Tier 3 #7.4 + #8: all mirrors retired. The facade's `SkyUniverse`
+        // carries (a) body-bearing fn names + type names for predicates,
+        // (b) full ToyStruct field info via the type-erased `struct_infos`
+        // map for `monomorphize_type`'s Case-6 cross-Sky-crate layout
+        // queries. `populate_sky_universe_from_registry` writes both in
+        // one pass.
         populate_sky_universe_from_registry(&registry);
         ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
@@ -911,24 +906,24 @@ impl LangCallbacks for ToylangCallbacks {
         // without deadlocking. Former `CallbackLog::MonomorphizeType`
         // log push retired — wasn't consumed by any test.
         //
-        // Session 9 — Case 6 sharpening: when the app's binary compile
-        // queries `layout_of` for a struct defined in an upstream Sky
-        // library (Pair lives in case6_lib, queried from case6_app), the
-        // struct isn't in the local registry. Fall back to the upstream
-        // registries S.4 deposited so cross-Sky-crate layouts work. The
-        // local registry takes precedence to preserve shadowing semantics
-        // when names collide.
-        let toy_struct_local = self.registry.structs.get(name).cloned();
-        let toy_struct: crate::toylang::registry::ToyStruct = if let Some(ts) = toy_struct_local {
-            ts
-        } else {
-            self.upstream_structs.lock().unwrap().get(name).cloned()
-                .unwrap_or_else(|| panic!(
-                    "[toylang] monomorphize_type: struct '{}' not in local or upstream registries",
-                    name,
-                ))
-        };
-        let toy_struct = &toy_struct;
+        // Tier 3 #8: single source of truth via the facade's `SkyUniverse`.
+        // `populate_sky_universe_from_registry` (called both at local-
+        // registry build and at upstream sidecar load) deposits every Sky
+        // struct's `ToyStruct` here type-erased. Downcast to recover the
+        // typed metadata. The previous dual-source dance (local registry +
+        // mutex-protected `upstream_structs` mirror) retires; Case 6 cross-
+        // Sky-crate layouts still resolve because case6_lib's structs were
+        // populated into the universe at `on_sky_lib_loaded` time.
+        let info = rustc_lang_facade::sky_universe()
+            .get_struct_info(name)
+            .unwrap_or_else(|| panic!(
+                "[toylang] monomorphize_type: struct '{}' not in SkyUniverse \
+                 (likely a populate-ordering bug or a missing sidecar load)",
+                name,
+            ));
+        let toy_struct: &crate::toylang::registry::ToyStruct = info
+            .downcast_ref()
+            .expect("SkyUniverse.struct_infos entry is not a ToyStruct");
 
         // Build type-param substitution at the rustc Ty level (no round-trip through ResolvedType).
         // arch-fence-allow: substituted-args-fast-path (no substitution needed when zero type params).

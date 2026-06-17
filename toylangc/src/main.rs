@@ -199,9 +199,10 @@ fn run_toylang_compile(
     let toylang_callbacks = toylang::callbacks_impl::ToylangCallbacks {
         registry: Arc::new(registry),
         is_user_bin_compile,
-        // Tier 3 #7.4 retired `upstream_fn_names` + `upstream_type_names`
-        // — the facade's `SkyUniverse` carries those now.
-        upstream_structs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        // Tier 3 #7.4 + #8 retired `upstream_fn_names` / `upstream_type_names`
+        // / `upstream_structs` — all three live in the facade's `SkyUniverse`
+        // now (names + typeids in dedicated fields, full ToyStruct info as
+        // type-erased `Arc<dyn Any>` in `struct_infos`).
     };
 
     rustc_lang_facade::driver::run_compiler(toylang_callbacks, &args);

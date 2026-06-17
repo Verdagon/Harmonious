@@ -383,7 +383,7 @@ static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock:
 // #7.4 retires the vtable.
 // ============================================================================
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 /// Content-addressed registry of every Sky item visible to this rustc
@@ -400,6 +400,15 @@ pub struct SkyUniverse {
     pub fn_names: HashSet<String>,
     /// Source-level names of Sky types (for `is_consumer_type`-style lookups).
     pub type_names: HashSet<String>,
+    /// Tier 3 #8: consumer-defined struct metadata, type-erased so the
+    /// facade stays consumer-agnostic. The consumer (toylang or future Sky)
+    /// inserts an `Arc<ToyStruct>` (or its `ResolvedType`-bearing analog) via
+    /// `insert_struct_info`; `monomorphize_type` reads via
+    /// `get_struct_info` + downcast. Retires the prior consumer-side
+    /// `upstream_structs: HashMap<String, ToyStruct>` mutex-mirror that
+    /// duplicated this surface to handle cross-Sky-crate layouts (Case 6
+    /// sharpening).
+    pub struct_infos: HashMap<String, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl SkyUniverse {
@@ -411,6 +420,25 @@ impl SkyUniverse {
     }
     pub fn contains_typeid(&self, typeid: u64) -> bool {
         self.typeids.contains(&typeid)
+    }
+    /// Tier 3 #8: register consumer-side metadata for a Sky struct. Stored
+    /// type-erased so the facade has no compile-time dependency on the
+    /// consumer's typed-AST type. The consumer downcasts on read.
+    pub fn insert_struct_info(
+        &mut self,
+        name: String,
+        info: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        self.struct_infos.insert(name, info);
+    }
+    /// Tier 3 #8: retrieve the consumer-side struct metadata previously
+    /// inserted via `insert_struct_info`. Returns a clone of the `Arc` so
+    /// the read can outlive the `SkyUniverse` read guard.
+    pub fn get_struct_info(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.struct_infos.get(name).cloned()
     }
 }
 
@@ -915,6 +943,35 @@ mod tests {
         assert!(!u.contains_type("Unknown"));
         assert!(!u.contains_fn("unknown"));
         assert!(!u.contains_typeid(0));
+    }
+
+    /// Tier 3 #8: type-erased `struct_infos` round-trip — insert a typed
+    /// value as `Arc<dyn Any>`, retrieve it, downcast back. Confirms the
+    /// pattern `monomorphize_type` uses to recover consumer-side metadata
+    /// without the facade needing the consumer's typed-AST type.
+    #[test]
+    fn sky_universe_struct_info_round_trip() {
+        use std::sync::Arc;
+        #[derive(Debug, PartialEq)]
+        struct FakeToyStruct {
+            field_count: usize,
+            payload: &'static str,
+        }
+        let original = FakeToyStruct { field_count: 3, payload: "hello" };
+        let mut u = SkyUniverse::default();
+        u.insert_struct_info("FakeStruct".to_string(), Arc::new(original));
+
+        let retrieved = u
+            .get_struct_info("FakeStruct")
+            .expect("just inserted, must be present");
+        let downcast: &FakeToyStruct = retrieved
+            .downcast_ref()
+            .expect("inserted as FakeToyStruct, must downcast back");
+        assert_eq!(downcast.field_count, 3);
+        assert_eq!(downcast.payload, "hello");
+
+        // Misses return None (not panic).
+        assert!(u.get_struct_info("Unknown").is_none());
     }
 
     /// The static accessor returns a default-empty universe when nothing
