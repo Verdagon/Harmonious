@@ -708,7 +708,109 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 /// LTO-exclusion (745aed3) Sky's body is the sole definition of the
 /// rustc-mangled consumer symbols at LTO time, so the binary runs and
 /// prints `50` like the non-LTO sibling.
-#[test] fn test_lto_smoke() { run_integration_project("lto_smoke"); }
+#[test] fn test_lto_smoke() {
+    run_integration_project("lto_smoke");
+    // Tier 3 close-out: tighten the smoke test from "doesn't panic" to
+    // "cross-language inlining empirically verified." Disassemble the
+    // built binary's `lto_smoke::main` (the Rust user_bin entry point)
+    // and assert it contains NO `bl` instruction targeting a symbol
+    // whose name contains `__toylang_main` or `__toylang_internal`.
+    // Under `lto = "thin"` + `opt-level = 3`, ThinLTO inlines Sky's
+    // body across the user_bin → __lang_stubs crate boundary; the
+    // entire compute chain (Sky's `compute() -> 10 + 20*2`) constant-
+    // folds into `mov w8, #50` baked inside the Rust main. If the
+    // inlining ever regresses (e.g. function attributes drift, the
+    // single-symbol scheme breaks, `#![no_builtins]` stops excluding
+    // the stub rlib), this assertion fires with the actual `bl`
+    // instructions listed.
+    assert_sky_inlined_into_main("lto_smoke");
+}
+
+/// Disassemble `<binary>` with `llvm-objdump` and assert that the user_bin's
+/// Rust `main` function contains no `bl` instruction targeting a Sky symbol
+/// (`__toylang_main` or `__toylang_internal`). The presence of such a
+/// branch under `lto = "thin"` + `opt-level >= 1` means cross-language
+/// inlining failed — the build is correct but Sky's perf claim regressed.
+///
+/// `llvm-objdump` location: `$LLVM_SYS_211_PREFIX/bin/llvm-objdump`.
+/// `LLVM_SYS_211_PREFIX` is set by the test harness env already. If the
+/// tool is missing the test fails loudly rather than skipping, because
+/// silent skips defeat the architectural assertion.
+fn assert_sky_inlined_into_main(project_name: &str) {
+    let bin = shared_cargo_target_dir().join("debug").join(project_name);
+    assert!(bin.exists(), "binary not found at {}", bin.display());
+
+    let llvm_prefix = std::env::var("LLVM_SYS_211_PREFIX")
+        .expect("LLVM_SYS_211_PREFIX env not set — the test harness sets it; \
+                 if running cross-language inlining tests manually you must too");
+    let objdump = std::path::PathBuf::from(&llvm_prefix).join("bin").join("llvm-objdump");
+    assert!(
+        objdump.exists(),
+        "llvm-objdump not found at {} (expected from LLVM_SYS_211_PREFIX)",
+        objdump.display(),
+    );
+
+    let dump = Command::new(&objdump)
+        .args(["-d", "--no-show-raw-insn"])
+        .arg(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run llvm-objdump: {}", e));
+    assert!(
+        dump.status.success(),
+        "llvm-objdump failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&dump.stdout),
+        String::from_utf8_lossy(&dump.stderr),
+    );
+    let asm = String::from_utf8_lossy(&dump.stdout);
+
+    // Find the user_bin's `<...lto_smoke<hash>4main>:` block in the
+    // disassembly. The function-header pattern in llvm-objdump's output
+    // is `<addr> <symbol>:` at column 0. Once inside, walk lines until
+    // we hit the next function header. The rustc-mangled name embeds
+    // `<crate-name-len><crate-name>` and ends with `4main` (length of
+    // "main" = 4) for the binary's own `fn main()`.
+    let main_marker = format!("{}{}4main>:", project_name.len(), project_name);
+    let mut in_main = false;
+    let mut bl_violations: Vec<String> = Vec::new();
+    for line in asm.lines() {
+        if line.ends_with(":") && line.contains('<') {
+            // Function header. Entered or exited a function body.
+            if line.contains(&main_marker) {
+                in_main = true;
+                continue;
+            }
+            if in_main {
+                break;
+            }
+            continue;
+        }
+        if !in_main { continue; }
+        // Look for branch-link instructions targeting Sky symbols.
+        // Disassembly lines look like:
+        //   100002744:     	bl	0x100002bb4 <__RNvCsxxx_12___lang_stubs14___toylang_main>
+        let trimmed = line.trim_start();
+        if (trimmed.contains("bl\t") || trimmed.contains("bl ") || trimmed.contains(" b\t"))
+            && (line.contains("___toylang_main") || line.contains("__toylang_internal"))
+        {
+            bl_violations.push(line.to_string());
+        }
+    }
+    assert!(
+        in_main,
+        "{}: could not find `{}::main` function in disassembly — \
+         symbol-naming convention drift?",
+        project_name, project_name,
+    );
+    assert!(
+        bl_violations.is_empty(),
+        "{}: cross-language inlining regressed — \
+         `{}::main` still calls Sky symbols instead of having them inlined.\n\
+         Found:\n{}",
+        project_name,
+        project_name,
+        bl_violations.join("\n"),
+    );
+}
 /// Phase 3 E.6: the first multi-toylang-crate integration test. case6_app
 /// (the binary) depends on case6_lib (a toylang library that exports
 /// `double_it`). The build exercises:

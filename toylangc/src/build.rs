@@ -84,7 +84,12 @@ pub fn build_project(manifest_path: &Path) -> i32 {
     let root_lto = graph
         .last()
         .and_then(|p| p.manifest.project.lto.clone());
-    if let Err(e) = write_workspace_toml(&build_dir, &stub_dir_names, root_lto.as_deref()) {
+    let root_opt_level = graph
+        .last()
+        .and_then(|p| p.manifest.project.opt_level.clone());
+    if let Err(e) = write_workspace_toml(
+        &build_dir, &stub_dir_names, root_lto.as_deref(), root_opt_level.as_deref(),
+    ) {
         eprintln!("toylangc: {}", e);
         return 1;
     }
@@ -147,6 +152,7 @@ fn write_workspace_toml(
     build_dir: &Path,
     stub_dir_names: &[String],
     lto: Option<&str>,
+    opt_level: Option<&str>,
 ) -> Result<(), String> {
     let mut members: Vec<&str> = stub_dir_names.iter().map(|s| s.as_str()).collect();
     members.push("user_bin");
@@ -161,10 +167,25 @@ fn write_workspace_toml(
     s.push_str("resolver = \"2\"\n");
     // Phase 4.5 touch point 6: workspace-root `[profile.dev]` override.
     // Cargo silently ignores member-level profile blocks (tl-handoff.md §5
-    // trap #12), so the only place LTO actually takes effect is here.
-    if let Some(lto_value) = lto.filter(|v| !v.is_empty()) {
+    // trap #12), so the only place LTO + opt-level actually take effect is
+    // here.
+    let lto_value = lto.filter(|v| !v.is_empty());
+    let opt_value = opt_level.filter(|v| !v.is_empty());
+    if lto_value.is_some() || opt_value.is_some() {
         s.push_str("\n[profile.dev]\n");
-        s.push_str(&format!("lto = \"{}\"\n", lto_value));
+        if let Some(v) = lto_value {
+            s.push_str(&format!("lto = \"{}\"\n", v));
+        }
+        if let Some(v) = opt_value {
+            // Numeric opt-levels stay as integers; string names ("z", "s")
+            // need quoting. Simple heuristic: parse as integer first; if
+            // it parses, emit unquoted.
+            if v.parse::<u32>().is_ok() {
+                s.push_str(&format!("opt-level = {}\n", v));
+            } else {
+                s.push_str(&format!("opt-level = \"{}\"\n", v));
+            }
+        }
     }
     fs::write(build_dir.join("Cargo.toml"), s)
         .map_err(|e| format!("cannot write workspace Cargo.toml: {}", e))

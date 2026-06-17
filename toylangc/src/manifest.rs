@@ -58,6 +58,16 @@ pub struct Project {
     /// LTO off (the default toylang build target shape).
     #[serde(default)]
     pub lto: Option<String>,
+    /// Optional `opt-level` for the generated workspace's `[profile.dev]`.
+    /// Default-empty: profile inherits cargo's dev default (0). Required
+    /// alongside `lto = "thin"` if the fixture needs to verify cross-
+    /// language *inlining* (not just linking) — LLVM's inliner is
+    /// effectively disabled at opt-level 0, so an LTO-inlining assertion
+    /// fixture must set this to at least `"1"` (typically `"3"`). Stored
+    /// as a string to mirror cargo's TOML format (`opt-level = "z"`,
+    /// `opt-level = 3`, etc.); the field carries the literal text.
+    #[serde(default, rename = "opt-level")]
+    pub opt_level: Option<String>,
 }
 
 fn default_edition() -> String {

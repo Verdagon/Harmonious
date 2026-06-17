@@ -2,6 +2,7 @@
 name = "lto_smoke"
 source = "main.toylang"
 lto = "thin"
+opt-level = "3"
 
 [rust-dependencies]
 test_helpers = { path = "../test_helpers" }
