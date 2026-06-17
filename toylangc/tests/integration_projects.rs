@@ -696,6 +696,19 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 #[test] fn test_large_struct() { run_integration_project("large_struct"); }
 #[test] fn test_generic_with_i64() { run_integration_project("generic_with_i64"); }
 #[test] fn test_arithmetic() { run_integration_project("arithmetic"); }
+/// Phase 4.5 touch point 6: empirical proof that Path B's single-symbol
+/// architecture + `#![no_builtins]` exclusion of stub rlibs from ThinLTO
+/// composes correctly end-to-end. The fixture mirrors `arithmetic` but
+/// sets `lto = "thin"` in its `[project]` block; build.rs translates that
+/// into `[profile.dev] lto = "thin"` at the workspace-root Cargo.toml
+/// (cargo silently ignores member-level profile blocks; see tl-handoff.md
+/// §5 trap #12). Under the pre-Path-B two-symbol scheme this would have
+/// linked but panicked with `unreachable!()` because ThinLTO's IR linker
+/// would have picked the stub rlib's body. Under Path B (8fbd928) + the
+/// LTO-exclusion (745aed3) Sky's body is the sole definition of the
+/// rustc-mangled consumer symbols at LTO time, so the binary runs and
+/// prints `50` like the non-LTO sibling.
+#[test] fn test_lto_smoke() { run_integration_project("lto_smoke"); }
 /// Phase 3 E.6: the first multi-toylang-crate integration test. case6_app
 /// (the binary) depends on case6_lib (a toylang library that exports
 /// `double_it`). The build exercises:

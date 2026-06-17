@@ -48,6 +48,16 @@ pub struct Project {
     /// top-level is Rust source rather than toylang's `main`.
     #[serde(default)]
     pub rust_caller: Option<String>,
+    /// Phase 4.5 touch point 6: optional LTO setting for the generated
+    /// cargo workspace's `[profile.dev]`. When set, the workspace's
+    /// top-level `Cargo.toml` carries `[profile.dev] lto = "<value>"`
+    /// (typically `"thin"` to validate cross-language ThinLTO inlining
+    /// end-to-end). Must live at the WORKSPACE root, not in a member —
+    /// cargo silently ignores member-level `[profile.dev]` overrides
+    /// (see tl-handoff.md §5 trap #12). Empty string or absent leaves
+    /// LTO off (the default toylang build target shape).
+    #[serde(default)]
+    pub lto: Option<String>,
 }
 
 fn default_edition() -> String {

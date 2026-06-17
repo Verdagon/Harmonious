@@ -1,0 +1,7 @@
+[project]
+name = "lto_smoke"
+source = "main.toylang"
+lto = "thin"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }

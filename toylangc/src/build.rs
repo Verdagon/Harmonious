@@ -81,7 +81,10 @@ pub fn build_project(manifest_path: &Path) -> i32 {
         .map(|(i, p)| (p.manifest.project.name.clone(), i))
         .collect();
 
-    if let Err(e) = write_workspace_toml(&build_dir, &stub_dir_names) {
+    let root_lto = graph
+        .last()
+        .and_then(|p| p.manifest.project.lto.clone());
+    if let Err(e) = write_workspace_toml(&build_dir, &stub_dir_names, root_lto.as_deref()) {
         eprintln!("toylangc: {}", e);
         return 1;
     }
@@ -140,7 +143,11 @@ pub fn build_project(manifest_path: &Path) -> i32 {
 /// `n_projects` is the count of projects in the resolved dep graph (incl.
 /// the root). The root's stub crate is at `lang_stubs_crate`, each dep's
 /// at `lang_stubs_<dep_name>` — see `build_project` for the mapping.
-fn write_workspace_toml(build_dir: &Path, stub_dir_names: &[String]) -> Result<(), String> {
+fn write_workspace_toml(
+    build_dir: &Path,
+    stub_dir_names: &[String],
+    lto: Option<&str>,
+) -> Result<(), String> {
     let mut members: Vec<&str> = stub_dir_names.iter().map(|s| s.as_str()).collect();
     members.push("user_bin");
     let mut s = String::new();
@@ -152,6 +159,13 @@ fn write_workspace_toml(build_dir: &Path, stub_dir_names: &[String]) -> Result<(
     }
     s.push_str("]\n");
     s.push_str("resolver = \"2\"\n");
+    // Phase 4.5 touch point 6: workspace-root `[profile.dev]` override.
+    // Cargo silently ignores member-level profile blocks (tl-handoff.md §5
+    // trap #12), so the only place LTO actually takes effect is here.
+    if let Some(lto_value) = lto.filter(|v| !v.is_empty()) {
+        s.push_str("\n[profile.dev]\n");
+        s.push_str(&format!("lto = \"{}\"\n", lto_value));
+    }
     fs::write(build_dir.join("Cargo.toml"), s)
         .map_err(|e| format!("cannot write workspace Cargo.toml: {}", e))
 }
