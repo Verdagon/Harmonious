@@ -68,21 +68,33 @@ use std::any::Any;
 // ============================================================================
 // Consumer callback trait.
 //
-// Tier 3 #7.4 (this commit): retired the previous `LangPredicates` super-
-// trait. Its two methods (`is_consumer_type`, `is_consumer_fn`) used to
-// dispatch through `PredicateVtable` to the consumer's vtable; #7.3 migrated
-// the callers to read from the facade-owned `SkyUniverse` directly, leaving
-// the trait and its vtable as dead code. They are deleted here.
+// History: pre-Tier-3 the trait was split into `LangPredicates` (lock-free
+// readers — `is_consumer_type`, `is_consumer_fn`) and `LangCallbacks`
+// (stateful writers). Tier 3 #7 migrated the predicates to read from the
+// facade-owned `SkyUniverse` directly; #7.4 retired the trait and its
+// vtable. Tier 3 #9 retired `notify_concrete_entry_point` (replaced by the
+// stateless `consumer_symbol_for_callback_name`). Tier 3 #12 closed the
+// architectural deadlock concern — see @GCMLZ for the current locking
+// story.
 //
-// What remains: `LangCallbacks`, the stateful callback family. Each method
-// takes `&mut dyn Any state` (downcast to your concrete state type). The
-// facade dispatches them through `StatefulVtable`; their helpers lock
-// `MUTABLE_STATE` for the duration of the call. Locking story is unchanged
-// from before #7 (will change when #12 retires `MUTABLE_STATE`).
+// What remains: this one `LangCallbacks` trait. The methods split into
+// two families by signature:
+//
+//   - Stateless: `monomorphize_type`, `consumer_symbol_for_callback_name`.
+//     No `&mut dyn Any state` parameter; called from query providers
+//     (`lang_layout_of`, `lang_symbol_name`) that can fire concurrently
+//     on rustc's rayon workers. Dispatched without locking `MUTABLE_STATE`.
+//
+//   - Stateful: `create_state`, `collect_generic_rust_deps`,
+//     `after_rust_analysis`, `on_sky_lib_loaded`, `consumer_emit_modules`.
+//     Take `&mut dyn Any state`. The dispatch helper locks `MUTABLE_STATE`
+//     for the duration. Serialises concurrent fires of
+//     `collect_generic_rust_deps` (which runs on mono-walk worker threads)
+//     and orderly main-thread fires of the others.
 //
 // See `docs/architecture/rust-interop-guide.md` Part 2 for the family
-// taxonomy and @GCMLZ for the locking history. The two-vtable split is now
-// a one-vtable design.
+// taxonomy and `docs/arcana/GenerateCompileMutexLock-GCMLZ.md` for the
+// current locking contract.
 // ============================================================================
 
 /// Stateful callbacks: each takes `&mut dyn Any state` (downcast to your
@@ -98,13 +110,13 @@ pub trait LangCallbacks: Send + Sync {
     ///
     /// Stateless: no `&mut dyn Any state` param. Called from
     /// `lang_layout_of`, which can re-enter during
-    /// `generate_and_compile` (whose trampoline holds MUTABLE_STATE).
+    /// `consumer_emit_modules` (whose helper holds `MUTABLE_STATE`).
     /// Under rustc incremental cache + warm rebuild, `layout_of` queries
     /// that fired cold during the mono walk get skipped on cache hit and
     /// fire later when `codegen_extern_wrapper` calls
     /// `coerced_return_type_for_instance → fn_abi_of_instance → layout_of`
     /// — now inside the outer mutex. A stateful callback would re-lock
-    /// MUTABLE_STATE from `call_monomorphize_type` and deadlock. The
+    /// `MUTABLE_STATE` from `call_monomorphize_type` and deadlock. The
     /// stateless signature lets the facade dispatcher skip the lock.
     ///
     /// Correspondingly, no per-call logging can happen here; the former
@@ -315,10 +327,17 @@ struct StatefulVtable {
 // Mutable state (consumer_state) is behind its own Mutex.
 // Only callbacks that need &mut consumer_state lock this mutex.
 //
-// This separation prevents deadlocks: generate_and_compile holds the mutable
-// state mutex, but query providers triggered during codegen (e.g. symbol_name,
-// layout_of) only need immutable config — they never touch the state mutex.
-// See docs/arcana/GenerateCompileMutexLock-GCMLZ.md for the full analysis.
+// This separation prevents deadlocks: `consumer_emit_modules` (Phase 4.5's
+// inline-codegen path, replacing the retired `generate_and_compile`) holds
+// the mutable state mutex while consumer codegen runs, but query providers
+// triggered during codegen (e.g. `symbol_name`, `layout_of`) only need
+// immutable config + lock-free `SkyUniverse` reads — they never touch the
+// state mutex. Tier 3 #12 closed the @GCMLZ trap-fence: after #7
+// (predicates → universe), #9 (symbol_name made stateless), and Path B's
+// `consumer_emit_modules` (replacing `generate_and_compile`), every
+// re-entrance path that could have deadlocked is removed by construction.
+// See `docs/arcana/GenerateCompileMutexLock-GCMLZ.md` for the historical
+// catalogue and the current locking contract.
 // ============================================================================
 
 /// Immutable config: callbacks + the stateful vtable. Set once by
@@ -334,14 +353,11 @@ pub(crate) struct FacadeConfig {
 unsafe impl Send for FacadeConfig {}
 unsafe impl Sync for FacadeConfig {}
 
-/// Mutable state: consumer-owned state.
-pub(crate) struct FacadeMutableState {
-    consumer_state: Box<dyn Any + Send + Sync>,
-}
-
-// Safety: consumer_state is Box<dyn Any + Send + Sync>.
-unsafe impl Send for FacadeMutableState {}
-unsafe impl Sync for FacadeMutableState {}
+// Tier 3 #12 close-out: `FacadeMutableState` collapsed into a plain
+// `Box<dyn Any + Send + Sync>`. The struct was a single-field wrapper
+// (`consumer_state`) and the unsafe Send + Sync impls were redundant
+// because `Box<dyn Any + Send + Sync>` already provides them. Inlining
+// the type erases the artifact without changing the mutex's semantics.
 
 /// Immutable config (callbacks + vtable). Set once, never changes.
 static CONFIG: OnceLock<FacadeConfig> = OnceLock::new();
@@ -358,7 +374,7 @@ static DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR:
     OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsForFn> = OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
-static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock::new();
+static MUTABLE_STATE: OnceLock<std::sync::Mutex<Box<dyn Any + Send + Sync>>> = OnceLock::new();
 
 // ============================================================================
 // SkyUniverse — content-addressed Sky-item registry owned by the facade.
@@ -373,19 +389,19 @@ static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>> = OnceLock:
 // Predicates like "is `Widget` a Sky type?" become O(1) lock-free reads of
 // this structure — no vtable hop, no consumer callback. This is the
 // foundation Tier 3 #9 (retire symbol_name side-effect channel), #3 (retire
-// cgu_stash), and #12 (retire MUTABLE_STATE + two-vtable split) all build
-// on.
+// cgu_stash), and #12 (close out the @GCMLZ deadlock concern) all build on.
 //
 // Sky-locked design has read-mostly access: sidecar loads + local-registry
 // build are the only writes, both serialized by the rustc-invocation
 // lifecycle (each happens at a known pipeline phase before queries fire).
 // `RwLock` gives us lock-free reads; the lock is uncontended during
-// `generate_and_compile` (consistent with @GCMLZ's "no consumer-callback
+// `consumer_emit_modules` (consistent with @GCMLZ's "no consumer-callback
 // lock during codegen" rule).
 //
-// #7.1 (this commit): structure + accessors only. Call sites still go
-// through the vtable predicates. #7.2 populates; #7.3 migrates call sites;
-// #7.4 retires the vtable.
+// #7.1: structure + accessors only. Call sites still went through the
+// vtable predicates. #7.2 populates; #7.3 migrates call sites; #7.4
+// retires the vtable. Tier 3 #8 added `struct_infos` for type-erased
+// consumer struct metadata.
 // ============================================================================
 
 use std::collections::{HashMap, HashSet};
@@ -705,7 +721,7 @@ pub(crate) fn call_collect_generic_rust_deps<'tcx>(
     let func = c.stateful_vtable.collect_generic_rust_deps;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut **g;
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance)
 }
 
@@ -732,7 +748,7 @@ pub(crate) fn call_after_rust_analysis<'tcx>(tcx: TyCtxt<'tcx>) {
     let func = c.stateful_vtable.after_rust_analysis;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut **g;
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
@@ -748,7 +764,7 @@ pub(crate) fn call_on_sky_lib_loaded<'tcx>(
     let func = c.stateful_vtable.on_sky_lib_loaded;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut **g;
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx, crate_name, sidecar_bytes)
 }
 
@@ -762,7 +778,7 @@ pub(crate) fn call_consumer_emit_modules<'tcx>(
     let func = c.stateful_vtable.consumer_emit_modules;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
-    let state_ptr: *mut (dyn Any + Send + Sync) = &mut *g.consumer_state;
+    let state_ptr: *mut (dyn Any + Send + Sync) = &mut **g;
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
@@ -896,9 +912,7 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
             consumer_emit_modules: trampoline_consumer_emit_modules::<C>,
         },
     });
-    let _ = MUTABLE_STATE.set(std::sync::Mutex::new(FacadeMutableState {
-        consumer_state,
-    }));
+    let _ = MUTABLE_STATE.set(std::sync::Mutex::new(consumer_state));
     // Stage 4c retired `VISIBILITY_OVERRIDE_HOOK`: the partitioner override
     // in `queries::partition` now forces `(External, Default)` directly on
     // `__lang_stubs` items' `MonoItemData`. rustc_codegen_llvm reads the

@@ -699,75 +699,34 @@ not via a separately-stashed list.
 
 **Architecture refs:** §19, §20.4, §20.8.5 (cross-crate Sky generic mono).
 
-### 6.6 Item #12 — retire `MUTABLE_STATE` + two-vtable split
+### 6.6 Item #12 — **DONE** (see commit history). All three deliverables
+landed as side effects:
 
-**Effort:** ~1–2 weeks. Depends on #7 + #9 + the deeper half of #4.
+| Original deliverable | What actually retired it | When |
+|---|---|---|
+| Collapse the two vtables (`PredicateVtable` + `StatefulVtable`) | Tier 3 #7.4: predicates moved to `SkyUniverse` and the predicate vtable retired. Only `StatefulVtable` remains. | Session 13 |
+| Retire the thread-local fat-pointer bypass (Session 5) | Tier 3 #9: `symbol_name` side effect retired, no re-entrant lock path remains, bypass deleted with it. | Session 13 |
+| Replace `Mutex` with `RwLock` for read-mostly state | **Doesn't apply.** The `SkyUniverse` is already `RwLock` — that's where the read-mostly content lives. `MUTABLE_STATE` only wraps the writer state for the 4 stateful callbacks. None are readers. | (n/a) |
 
-**The problem today.** `rustc-lang-facade/src/lib.rs:342` holds
-`static MUTABLE_STATE: OnceLock<std::sync::Mutex<FacadeMutableState>>`.
-This mutex wraps:
-- A pointer to the consumer's state object (`Box<dyn Any>`).
-- The two vtables: `PredicateVtable` (lock-free reads) and
-  `StatefulVtable` (mutating ops).
-- The current session's config.
+**What about `MUTABLE_STATE` itself?** Still load-bearing —
+`collect_generic_rust_deps` fires from `lang_per_instance_mir` during
+rustc's mono walk on rayon worker threads, so the mutex serialises
+concurrent fires. Retiring it would require alternative thread sync
+that isn't worth the churn for toylang's volume. The mutex's role is
+now plain inter-callback serialisation, not @GCMLZ trap-fencing — see
+`docs/arcana/GenerateCompileMutexLock-GCMLZ.md` for the current
+locking contract.
 
-The mutex is held during `generate_and_compile` (lib.rs:571). Query
-providers that fire during codegen (re-entrant `layout_of` /
-`symbol_name`) must NOT lock it. `@GCMLZ` is the trap-fence; the
-two-vtable split exists to enforce lock-free reads for predicates while
-allowing mutating callbacks to lock. Session 5's thread-local
-fat-pointer bypass handles the @GCMLZ re-entrance via `symbol_name`.
-
-Sky's locked design: the universe (from #7) is the shared state, accessed
-via `RwLock` (lock-free reads). Codegen walks the queue inline (#4
-deeper) without crossing the consumer boundary mid-call. So there's no
-re-entrance to manage, no two-vtable split needed.
-
-**Pre-req: the deeper half of #4** (architecture §5.3). Session 6's #4
-work landed only the channel piece (the `Box<dyn Any>`-injecting wrapper).
-The architecture-locked design is that Sky's `codegen_crate` itself walks
-the queue and emits via Inkwell inline — no `generate_and_compile`
-callback to the consumer at all. The consumer registers its items into
-the universe at after_expansion; Sky's codegen does the rest. This is
-~1–2 weeks of work on its own and bundles naturally with #12.
-
-**The migration (once #4 deeper is done).**
-
-1. **Replace `Mutex` with `RwLock`.** The universe is read-mostly; only
-   sidecar-load + local-registry-load are writes, both rare and
-   serialized by the rustc-invocation lifecycle.
-
-2. **Collapse the two vtables.** `PredicateVtable` and `StatefulVtable`
-   merge into a single registration API. After #7 and #9, there are very
-   few callback methods left:
-   - `on_sky_lib_loaded` (sidecar load — #7 may rewrite to be
-     facade-driven)
-   - Possibly a "convert ResolvedType to Ty<'tcx>" callback if #8 left
-     that consumer-side
-   - The `per_instance_mir` provider (Approach A — stays)
-
-3. **Retire the thread-local fat-pointer bypass.** Once #9 retires the
-   symbol_name side effect and #4 deeper retires `generate_and_compile`,
-   the re-entrance scenario doesn't exist. Delete the bypass.
-
-**Verification.**
-- Suite passes 262/262.
-- @GCMLZ is verifiably dead: temporarily add `panic!("MUTABLE_STATE
-  accessed")` everywhere the mutex was locked → suite still passes (the
-  universe-RwLock path is exclusive).
-
-**Pitfalls.**
-- This is THE most invasive Tier 3 item structurally. Don't try to land
-  it before #7, #9, and the deeper #4 are in. Each prerequisite removes
-  a reason MUTABLE_STATE exists; until all three are gone, the mutex is
-  still load-bearing.
-- The Session 5 deadlock (@GCMLZ via symbol_name re-entrance) is a real
-  failure mode. If you remove the thread-local bypass before #9 lands,
-  you'll deadlock at the user-bin compile of any multi-crate fixture
-  (`case6_basic` is the canary).
-
-**Architecture refs:** §5.3 (CodegenBackend.codegen_crate inline
-emission), §26.2 (GCMLZ).
+The close-out commit refreshed:
+- `@GCMLZ` arcana: history-and-current-reality, replacing the
+  obsolete "two-vtable split enforces lock-freedom at type level"
+  language.
+- `lib.rs` comments throughout (the "Consumer callback trait"
+  header, the `monomorphize_type` doc, the global state separation
+  block).
+- `FacadeMutableState` struct inlined to `Box<dyn Any + Send + Sync>`
+  (was a single-field wrapper).
+- This handoff §6.6 + course-correct.md #12 + status snapshot.
 
 ### 6.7 What's NOT in this plan
 

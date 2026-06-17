@@ -6,13 +6,11 @@ This document catalogs the places in the current erw prototype that are on the *
 
 | Status | Items |
 |---|---|
-| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), #4 (codegen channel), #5 (after_expansion hook), #6 (`__SKY_STUBS_MARKER`), **#7 (LangPredicates → SkyUniverse)**, **#9 (symbol_name side-effect retired)**, #11 (no per-lib `.o`), #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs), #17 (cosmetic is_generic branches unified in stub_gen), #18 (build.rs comment refreshed) |
+| ✅ Done | #1 (Approach A), #2 (B2 linkage mutation), **#3 (`cgu_stash` retired)**, #4 (codegen channel), #5 (after_expansion hook), #6 (`__SKY_STUBS_MARKER`), #7 (LangPredicates → SkyUniverse), **#8 (SkyUniverse owns struct metadata)**, #9 (symbol_name side-effect retired), #11 (no per-lib `.o`), **#12 (@GCMLZ deadlock concern dissolved)**, #14 (CARGO_PRIMARY_PACKAGE), #15 (binary codegen site), #16 (per-Sky-library stub rlibs), #17 (cosmetic is_generic branches unified in stub_gen), #18 (build.rs comment refreshed) |
 | 🟡 Partial | #10 (Instance-keyed collect_generic_rust_deps — landed; the rest needs E.5-style threading) |
-| ⏳ Remaining | #3, #8, #12, #13 |
+| ⏳ Remaining | #13 (wrapper-mode retirement, bundles with Sky's actual toolchain shipping) |
 
-13 of 18 items done. **Session 8** closed Phase 2 C (Case 4 via `impl rust_trait for toylang_type`), bringing the seven-case interop taxonomy to full coverage. Pure-cleanup work is depleted. #3 audit (Session 7) found `cgu_stash` is NOT retire-ready: `llvm_gen.rs:1938` still consumes `upstream_cgus(tcx)` for accessor-method discovery and Case-1b generic consumer fns instantiated from Rust call sites — paths Workstream A's registry-driven walk doesn't cover. #3 stays bundled with the deeper rebuild.
-
-The remaining items: wrapper-mode `@MRRIWMZ` removal that needs forked-rustc-as-CodegenBackend (#13), and the deep facade-rebuild trio (#7/#8/#12 + #9 + #3, the sidecar-loaded universe replacing `LangPredicates`).
+**16 of 18 items done.** Phase 4.5 Path B (Session 15) landed the single-symbol architecture + #![no_builtins] LTO exclusion; Session 16 swept Tier 3 #8 (SkyUniverse absorbs consumer struct metadata via type-erased `Arc<dyn Any>`), #3 (`cgu_stash.rs` deleted; accessors collapsed into the regular function pipeline via parse-time `synthesize_accessor_pairs`; Case-1b discovery uses `default_collect_and_partition()` directly), and #12 (close-out: @GCMLZ doc + lib.rs comments refreshed; `FacadeMutableState` inlined; mutex stays for cross-worker-thread serialisation of `collect_generic_rust_deps` but no longer trap-fences the deadlock class). Only #13 — retiring wrapper-mode `@MRRIWMZ` for forked-rustc-as-CodegenBackend — remains.
 
 **Session 11 (separate from course-correct numbering)**: the generic-vs-non-generic uniformity audit landed Phases A → B → C → F per a focused plan (`tmp/claude-plan-2026-06-15-ccc8939f.md`). `ToyFunction::has_abstract_args()` helper rename (A), generalized `DeferredTypeParam.query` + TypeParam guards on 4 ungated oracle entry points + Check 5/6 skip drop (B), §20.4 entry-point walk replacing the registry walk in `populate_toylang_instances_from_cgus` (C), grep-based CI fence `tests/architecture_fence.rs` (F). Phase E (struct-shape ICE) was investigated — see `phase-e-investigation.md`; the documented rustc debuginfo ICE still reproduces on rustc 1.95.0-dev, recommendation is to file the upstream patch first. 253/253 tests passing.
 
@@ -39,6 +37,8 @@ Sky §5.1–5.2 explicitly delete this mechanism.
 
 ### 3. `cgu_stash.rs` — the B5 lifetime-erased stash
 This whole file (87 lines) shouldn't exist in Sky. It exists because toylangc walks rustc's unfiltered CGU slice to *discover* concrete consumer Instances (accessor methods, entry points). Under Sky's pipeline (§20.4, §20.7), Sky's frontend populates the codegen queue from sidecars + local Temputs at `after_expansion`, then Sky's `codegen_crate` walks that queue. Rustc's partition output is irrelevant for Sky-item discovery.
+
+**Status: DONE (commit `c0a83fe`).** Accessor discovery moved to `after_rust_analysis` via `synthesize_accessor_pairs` (per-`(struct, field)` `ToyFunction` synthesis); Case-1b generic instantiations from Rust callers now go through `default_collect_and_partition()(tcx, ())` called directly inside `codegen_crate` with live `'tcx`. `cgu_stash.rs` deleted; `stash_upstream_cgus` / `clear_upstream_cgus` / `upstream_cgus` retired. Architecture risks.md §B5 closed.
 
 ### 4. `codegen_wrapper.rs` — wrong emission point and channel
 - Lines 96–108: `inner.codegen_crate(tcx)` runs *first*, then `generate_and_compile` produces a `.o` and `join_codegen` injects it. Sky inverts: Sky's `codegen_crate` (§5.3, §20.7) calls inner first too, but then walks **Sky's own queue inline** and emits LLVM IR via Inkwell directly in `codegen_crate`. No callback returning a path; no `set_lang_compiled_object` cross-phase channel.
@@ -73,6 +73,8 @@ The whole "each Sky-marked crate produces an `.o`" model. Sky §5.5 / §9.6 lock
 
 ### 12. `lib.rs::MUTABLE_STATE` mutex + two-vtable split (lines 197–264, 270–304, 415–465)
 The whole `@GCMLZ` mutex architecture, the `PredicateVtable`/`StatefulVtable` split, the `_inner` bypass mentioned in `symbol_name.rs:14–18` — these exist to dodge re-entrant deadlocks during `generate_and_compile`. With Sky's pipeline (frontend populates queue at after_expansion; codegen walks queue inline; no callback returning a `.o` path; no symbol_name side-effect channel), the locking story is fundamentally different and most of this scaffolding is solving a problem that no longer exists.
+
+**Status: DONE (as side effects + close-out commit).** The `PredicateVtable` retired in Tier 3 #7.4 (predicates now read from `SkyUniverse`). The `notify_concrete_entry_point` side-effect callback + Session-5 thread-local fat-pointer bypass retired in Tier 3 #9. The `generate_and_compile` callback retired in Phase 4.5 Path B (Session 15), replaced by `consumer_emit_modules` via the `extra_modules_hook` fork patch. Net result: no query provider can re-enter a `MUTABLE_STATE` lock today. The mutex itself remains — load-bearing because `collect_generic_rust_deps` fires from `lang_per_instance_mir` during rustc's mono walk on rayon worker threads — but its sole role is now plain inter-callback serialisation, not @GCMLZ trap-fencing. Close-out commit refreshes the @GCMLZ doc + lib.rs comments to reflect the dissolved deadlock concern, and inlines the single-field `FacadeMutableState` struct.
 
 ---
 
