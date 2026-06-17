@@ -874,6 +874,7 @@ mod tests {
             imports: vec![],
             trait_impls: vec![],
             typeid_table: std::collections::BTreeMap::new(),
+            accessor_pairs: vec![],
         }
     }
 

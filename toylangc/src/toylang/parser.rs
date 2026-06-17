@@ -402,6 +402,10 @@ impl Parser {
             // Phase E Path 2: populated by `populate_typeid_table` in
             // callbacks_impl.rs after typing finishes; empty here is fine.
             typeid_table: std::collections::BTreeMap::new(),
+            // Tier 3 #3 Phase 1a: populated by `synthesize_accessor_pairs`
+            // in the public `parse` entry point after `parse_program`
+            // returns; empty here is fine.
+            accessor_pairs: Vec::new(),
         })
     }
 
@@ -1068,7 +1072,29 @@ impl Parser {
 // ---------------------------------------------------------------------------
 
 pub fn parse(src: &str) -> Result<ToylangRegistry, ParseError> {
-    Parser::new(tokenize(src)?).parse_program()
+    let mut registry = Parser::new(tokenize(src)?).parse_program()?;
+    // Tier 3 #3 Phase 1a: synthesize one accessor per (struct, field) pair.
+    // The discriminant lives ONLY in the registry's `accessor_pairs` field;
+    // everything downstream (populate, codegen, mangling) handles accessors
+    // through the regular function pipeline. C#-style: accessor is sugar
+    // over `fn (self: &Struct) -> &Field { &self.field }`.
+    synthesize_accessor_pairs(&mut registry);
+    Ok(registry)
+}
+
+/// Tier 3 #3 Phase 1a: enumerate one `(struct_name, field_name)` pair per
+/// Sky struct × each field. Stored in `registry.accessor_pairs` for the
+/// populate loop to consume; the `ToyFunction` body
+/// (`&self.field`) is synthesised on-the-fly when populate needs it,
+/// keeping the registry serialisation surface minimal (no synthetic
+/// function entries clogging `registry.functions` or the sidecar).
+fn synthesize_accessor_pairs(registry: &mut ToylangRegistry) {
+    registry.accessor_pairs.clear();
+    for (struct_name, toy_struct) in &registry.structs {
+        for field in &toy_struct.fields {
+            registry.accessor_pairs.push((struct_name.clone(), field.name.clone()));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -33,9 +33,14 @@ pub mod extra_modules_hook;
 pub mod mir_helpers;
 pub mod queries;
 
-mod cgu_stash;
-pub use cgu_stash::upstream_cgus;
-pub(crate) use cgu_stash::{clear_upstream_cgus, stash_upstream_cgus};
+// Tier 3 #3 Phase 3: `cgu_stash` retired. The lifetime-erased CGU stash
+// (87 lines of `'static`/`*const CodegenUnit`/unsafe pointer cast) is
+// gone. The consumer's `codegen_crate` re-calls
+// `default_collect_and_partition()` to get a sound `'tcx`-bound CGU
+// slice for its Case 1b generic-from-Rust discovery walk; accessors no
+// longer need CGU discovery at all (Phase 1c synthesises them at
+// populate time via `synthesize_accessor_pairs`). Architecture
+// risks.md §B5 closed.
 
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
@@ -788,7 +793,16 @@ pub fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
 // `per_instance.rs` override returns None directly for non-consumer items;
 // rustc's collector then queries `instance_mir` via the fork's patch 2.
 
-pub(crate) fn default_collect_and_partition() -> queries::partition::CollectAndPartitionFn {
+/// Tier 3 #3 Phase 2: pub so consumers can call rustc's UNFILTERED
+/// `collect_and_partition_mono_items` provider directly. Bypasses the
+/// in-memory query cache (which would return our filtered result).
+/// Used by `llvm_gen::generate_with_tcx` to discover Case 1b generic
+/// consumer instantiations (`__lang_stubs::wrap::<LocalThing>(42)`
+/// from a `rust_caller.rs`) without going through the lifetime-erased
+/// `upstream_cgus` stash. Cost: re-runs the mono collector once per
+/// build (negligible for toylang fixtures, linear in crate size for
+/// larger Sky projects).
+pub fn default_collect_and_partition() -> queries::partition::CollectAndPartitionFn {
     *DEFAULT_COLLECT_AND_PARTITION
         .get()
         .expect("default collect_and_partition_mono_items not saved")

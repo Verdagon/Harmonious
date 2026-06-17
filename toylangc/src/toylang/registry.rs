@@ -51,6 +51,23 @@ pub struct ToylangRegistry {
     /// harmless until Phase 3 starts referencing typeids that would need it.
     #[serde(default)]
     pub typeid_table: BTreeMap<u64, (String, Vec<ResolvedType>)>,
+    /// Tier 3 #3: synthesized accessor pairs — one entry per Sky struct ×
+    /// each field. Populated by `synthesize_accessor_pairs` after parsing.
+    /// Each `(struct_name, field_name)` becomes a regular Sky function
+    /// `fn (self: &Struct) -> &FieldType { &self.field }` in the codegen
+    /// queue; the populate loop synthesises the `ToyFunction` on-the-fly
+    /// (no entries in `functions`), looks up `stub_def_id` via
+    /// `oracle::find_inherent_method`, and pushes a standard
+    /// `ToylangInstance`. The dedicated CGU-walk accessor branch +
+    /// `codegen_accessor_inline` retire — accessors flow through the
+    /// regular function pipeline like any other consumer fn.
+    ///
+    /// C# precedent: an accessor IS a regular method with surface-level
+    /// `widget.field` sugar. The stub rlib still emits inherent-impl
+    /// shells (Rust syntax requirement for `widget.field` to typecheck),
+    /// but everything below the source surface is unified.
+    #[serde(default)]
+    pub accessor_pairs: Vec<(String, String)>,
 }
 
 impl ToylangRegistry {
@@ -71,6 +88,54 @@ impl ToylangRegistry {
             let typeid = crate::typeid::compute(name, &[]);
             self.typeid_table.insert(typeid, (name.clone(), Vec::new()));
         }
+    }
+}
+
+/// Tier 3 #3 Phase 1b: synthesize the `ToyFunction` for an accessor.
+///
+/// The body is `&self.field`. `self` is `&Struct` (single-ref param so
+/// the existing FieldAccess lowering picks the field offset; no
+/// auto-deref chain). Return type is `&FieldType`. Generic structs
+/// propagate their type params to the accessor; the populate loop
+/// filters generics out (the CGU walk handles their concrete
+/// instantiations).
+///
+/// Single source of truth so the populate loop AND the CGU-walk's
+/// accessor branch agree on the synthesized body — same Sky surface,
+/// same downstream codegen.
+pub fn synthesize_accessor_fn(
+    struct_name: &str,
+    toy_struct: &ToyStruct,
+    field: &ToyField,
+) -> ToyFunction {
+    use crate::toylang::ast::{Block, Expr};
+    use crate::toylang::typed_ast::ResolvedType;
+
+    let self_struct_ty = ResolvedType::StructRef {
+        name: struct_name.to_string(),
+        type_args: toy_struct
+            .type_params
+            .iter()
+            .map(|p| ResolvedType::TypeParam(p.clone()))
+            .collect(),
+    };
+    ToyFunction {
+        type_params: toy_struct.type_params.clone(),
+        params: vec![ToyParam {
+            name: "self".to_string(),
+            ty: ResolvedType::Ref { inner: Box::new(self_struct_ty) },
+        }],
+        return_ty: Some(ResolvedType::Ref {
+            inner: Box::new(field.rust_type.clone()),
+        }),
+        body: Some(Block {
+            stmts: vec![],
+            ret: Some(Expr::Ref(Box::new(Expr::FieldAccess {
+                receiver: Box::new(Expr::Var("self".to_string())),
+                field: field.name.clone(),
+            }))),
+        }),
+        is_export: true,
     }
 }
 

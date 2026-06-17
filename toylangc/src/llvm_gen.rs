@@ -21,7 +21,7 @@ use inkwell::AddressSpace;
 use rustc_middle::ty::{self, GenericArg, TyCtxt};
 
 use crate::toylang::typed_ast::*;
-use crate::toylang::registry::{ToylangRegistry, ToyStruct};
+use crate::toylang::registry::ToylangRegistry;
 
 
 /// Convert BasicTypeEnum to AnyTypeEnum (inkwell doesn't impl From directly).
@@ -229,61 +229,14 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
 
     // --- Type resolution ---
 
-    fn struct_type(&self, s: &ToyStruct) -> StructType<'ctx> {
-        let fields: Vec<BasicTypeEnum<'ctx>> = s.fields.iter()
-            .map(|f| {
-                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&f.rust_type, self.registry)
-                    .expect("struct field resolution should succeed (already validated)");
-                self.resolved_to_inkwell(&resolved)
-            })
-            .collect();
-        self.context.struct_type(&fields, false)
-    }
-
-    /// Build an inkwell StructType for a concrete struct instantiation.
-    /// Uses the instance's generic args to substitute type params in field types.
-    fn struct_type_for_instance(
-        &self,
-        toy_struct: &ToyStruct,
-        instance: ty::Instance<'tcx>,
-    ) -> StructType<'ctx> {
-        if toy_struct.type_params.is_empty() {
-            return self.struct_type(toy_struct);
-        }
-
-        // Get concrete type args from the accessor's self type
-        let sig = self.tcx.fn_sig(instance.def_id()).instantiate(self.tcx, instance.args);
-        let sig = self.tcx.normalize_erasing_late_bound_regions(
-            ty::TypingEnv::fully_monomorphized(), sig,
-        );
-        let self_ref_ty = sig.inputs()[0]; // &Self
-        let ty::TyKind::Ref(_, self_ty, _) = self_ref_ty.kind() else {
-            return self.struct_type(toy_struct);
-        };
-        let ty::TyKind::Adt(_, args) = self_ty.kind() else {
-            return self.struct_type(toy_struct);
-        };
-
-        // Build type param → concrete ResolvedType map
-        let subst: HashMap<String, ResolvedType> = toy_struct.type_params.iter()
-            .enumerate()
-            .map(|(i, param_name)| {
-                let concrete_ty = args[i].expect_ty();
-                (param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(self.tcx, concrete_ty))
-            })
-            .collect();
-
-        // Resolve each field type with substitution
-        let fields: Vec<BasicTypeEnum<'ctx>> = toy_struct.fields.iter()
-            .map(|f| {
-                let resolved = crate::toylang::type_resolve::substitute_type_params(&f.rust_type, &subst);
-                let resolved = crate::toylang::type_resolve::resolve_struct_fields(&resolved, self.registry)
-                    .expect("struct field resolution should succeed (already validated)");
-                self.resolved_to_inkwell(&resolved)
-            })
-            .collect();
-        self.context.struct_type(&fields, false)
-    }
+    // Tier 3 #3 Phase 1c: `struct_type` + `struct_type_for_instance`
+    // retired alongside `codegen_accessor_inline`. The standard
+    // `resolved_to_inkwell` lowering handles consumer struct types
+    // directly (via the StructRef / Struct arms); per-Instance generic
+    // substitution happens in `resolve_caller_from_instance` before
+    // codegen sees the body. The dedicated accessor helpers were
+    // specific to the old GEP-based emission and have no analog in the
+    // unified pipeline.
 
     fn resolved_type_to_rustc_ty(&self, resolved: &ResolvedType) -> ty::Ty<'tcx> {
         crate::oracle::resolved_to_rustc_ty(self.tcx, resolved)
@@ -966,6 +919,16 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
                     }
                     _ => ret_complex_ty.map(|t| t.into()),
                 }
+            }
+            // Tier 3 #3 Phase 1b: synthesised accessors return `&FieldType`
+            // (`Ref { inner }`). Returns as a pointer — same shape as
+            // `resolved_to_inkwell`'s default Ref arm. Before this arm
+            // accessor return types fell through to `_ => None` and the
+            // wrapper-codegen path panicked on `rust_ret_type.unwrap()`
+            // (llvm_gen.rs:1104). All non-{Str/ByteSlice}-payload Refs
+            // are simple pointers at the ABI level.
+            ResolvedType::Ref { .. } => {
+                Some(ctx.context.ptr_type(AddressSpace::default()).into())
             }
             _ => None,
         }
@@ -1988,7 +1951,12 @@ fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTyp
 pub fn generate_with_tcx<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
-    callbacks: &crate::toylang::callbacks_impl::ToylangCallbacks,
+    // Tier 3 #3 Phase 1c: `_callbacks` is unused since the accessor branch
+    // retired — the only caller was `notify_concrete_entry_point_inner`.
+    // Kept in the signature to avoid disturbing the public API for
+    // consumer-language reuse; the parameter could be removed in a
+    // separate API-cleanup PR.
+    _callbacks: &crate::toylang::callbacks_impl::ToylangCallbacks,
     state: &mut crate::toylang::callbacks_impl::ToylangState,
 ) -> (String, Vec<u8>, Vec<String>) {
     let context = Context::create();
@@ -2015,12 +1983,21 @@ pub fn generate_with_tcx<'tcx>(
 
     // Walk MonoItems for accessor methods (still discovered via rustc).
     // Regular toylang functions come from state.toylang_instances instead.
-    // Stage 4a: the facade's partitioner override removes consumer items
-    // from the CGU slice returned by `collect_and_partition_mono_items`, so
-    // we read the UNFILTERED slice from the facade's stash instead. The
-    // stash was populated by the partitioner override earlier in this same
-    // `codegen_crate` call.
-    let cgus = rustc_lang_facade::upstream_cgus(tcx);
+    // Tier 3 #3 Phase 2: re-call the upstream partition default to get
+    // the UNFILTERED CGU slice. The facade's `lang_collect_and_partition_mono_items`
+    // override (queries/partition.rs) filters consumer items so rustc
+    // doesn't try to codegen them as Rust functions, but we still need
+    // the unfiltered list here to discover Case 1b generic toylang fns
+    // instantiated from Rust callers (`__lang_stubs::wrap::<LocalThing>(42)`
+    // from a `rust_caller.rs`). The previous lifetime-erased
+    // `upstream_cgus` stash retired with `cgu_stash.rs`; calling the
+    // saved default fn pointer directly bypasses the in-memory query
+    // cache (which would return the filtered result) and gives us a
+    // true `'tcx`-bound slice with no unsafe pointer manipulation.
+    // Cost: re-runs the mono collector once; negligible for toylang
+    // fixtures, linear in crate size for larger Sky projects.
+    let partitions = rustc_lang_facade::default_collect_and_partition()(tcx, ());
+    let cgus = partitions.codegen_units;
     for cgu in cgus.iter() {
         for (&mono_item, _) in cgu.items() {
             let rustc_middle::mir::mono::MonoItem::Fn(instance) = mono_item else { continue };
@@ -2029,29 +2006,18 @@ pub fn generate_with_tcx<'tcx>(
                 continue;
             }
 
-            // Check if it's an accessor method
-            if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
-                let impl_def_id = assoc_item.container_id(tcx);
-                // instantiate_identity: structural inspection only — we want the impl's
-                // self type with its own params as placeholders so we can read the ADT
-                // name and look it up in the registry. Not producing a concrete type.
-                let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
-                if let ty::TyKind::Adt(adt_def, _) = self_ty.kind() {
-                    let struct_name = tcx.item_name(adt_def.did()).to_string();
-                    if let Some(toy_struct) = registry.structs.get(&struct_name) {
-                        let field_name = tcx.item_name(def_id).to_string();
-                        if let Some(field_index) = toy_struct.fields.iter().position(|f| f.name == field_name) {
-                            let callback_name = format!("{}.{}", struct_name, field_name);
-                            let extern_symbol = callbacks.notify_concrete_entry_point_inner(state, &callback_name, tcx, def_id, instance);
-                            if seen_symbols.insert(extern_symbol.clone()) {
-                                let struct_ty = ctx.struct_type_for_instance(toy_struct, instance);
-                                codegen_accessor_inline(&mut ctx, &extern_symbol, struct_ty, field_index);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
+            // Tier 3 #3 Phase 1c: accessor methods retired from the CGU
+            // walk. Synthesised at registry build via
+            // `synthesize_accessor_pairs`, populated via the standard
+            // `ToylangInstance` pipeline at populate time (non-generic
+            // structs) — see the accessor_pairs loop in
+            // `populate_toylang_instances_from_cgus`. Their
+            // codegen flows through the same
+            // `codegen_internal_function` + `codegen_extern_wrapper`
+            // pipeline as any other consumer fn, so the dedicated
+            // `codegen_accessor_inline` path is dead. Skipping the
+            // continue-on-assoc-item gate also drops Phase 1b's redundant
+            // dedup hit on the populate-side accessor entries.
 
             // For regular consumer functions from MonoItems: record the Instance
             // so we can generate an extern wrapper.
@@ -2259,21 +2225,10 @@ fn assemble_text_to_bitcode(ir: &str) -> Vec<u8> {
     bytes
 }
 
-/// Codegen an accessor function inline (GEP to field offset, return pointer).
-fn codegen_accessor_inline<'ctx>(
-    ctx: &mut CodegenCtx<'ctx, '_, '_>,
-    extern_symbol: &str,
-    struct_ty: StructType<'ctx>,
-    field_index: usize,
-) {
-    let ptr_ty = ctx.context.ptr_type(AddressSpace::default());
-    let fn_type = ptr_ty.fn_type(&[ptr_ty.into()], false);
-    let func = ctx.module.add_function(extern_symbol, fn_type, None);
-    let entry = ctx.context.append_basic_block(func, "entry");
-    ctx.builder.position_at_end(entry);
-    let self_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-    let gep = ctx.builder.build_struct_gep(struct_ty, self_ptr, field_index as u32, "ptr").unwrap();
-    ctx.builder.build_return(Some(&gep)).unwrap();
-}
+// Tier 3 #3 Phase 1c: `codegen_accessor_inline` retired. Accessors now
+// flow through the regular `codegen_internal_function` +
+// `codegen_extern_wrapper` pipeline via the synthesized `&self.field`
+// body. LLVM inlines the trivial wrapper at -O1 and above; pre-opt IR
+// carries the extra forwarding call but is bounded (one per field).
 
 

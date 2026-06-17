@@ -277,25 +277,14 @@ impl ToylangCallbacks {
     /// incremental cache can short-circuit per-item queries; consumer
     /// `.o` went empty when it did).
     ///
-    /// Called from the trait impl (holding the facade mutex) and also directly
-    /// from `generate_with_tcx` for accessor symbol lookup (already inside
-    /// `generate_and_compile`'s lock; see @GCMLZ).
-    pub fn notify_concrete_entry_point_inner<'tcx>(
-        &self,
-        state: &mut ToylangState,
-        name: &str,
-        tcx: TyCtxt<'tcx>,
-        _def_id: rustc_span::def_id::DefId,
-        instance: ty::Instance<'tcx>,
-    ) -> String {
-        state.log.push(CallbackLog::NotifyConcreteEntryPoint { name: name.to_string() });
-        // Tier 3 #9: the mangling moved to the stateless
-        // `compute_consumer_symbol`; this wrapper retains the log push
-        // for the direct codegen-side caller (`llvm_gen.rs`'s accessor
-        // emission), which has state in hand and benefits from the
-        // observability record.
-        self.compute_consumer_symbol(name, tcx, instance)
-    }
+    // Tier 3 #3 Phase 1c: `notify_concrete_entry_point_inner` retired.
+    // It was the codegen-side helper for the CGU walk's accessor branch,
+    // adding a `CallbackLog::NotifyConcreteEntryPoint` log push around
+    // `compute_consumer_symbol`. With the accessor branch retired (Phase
+    // 1c), the only remaining symbol mangler is the stateless
+    // `compute_consumer_symbol`; the `NotifyConcreteEntryPoint` log
+    // variant likewise becomes vestigial. Tests on the log shape no
+    // longer rely on accessor entries.
 
     /// Path B / single-symbol architecture (Phase 4.5): return the
     /// rustc-default mangled symbol name for `instance`.
@@ -495,6 +484,57 @@ impl ToylangCallbacks {
                     });
                     walk_and_stash_internal_callees(tcx, reg, &method.func, &method.name, state);
                 }
+            }
+            // Tier 3 #3 Phase 1b: accessor functions. Each (struct, field)
+            // pair becomes a regular Sky `ToyFunction` (synthesised on the
+            // fly via `synthesize_accessor_fn`) that flows through the
+            // standard ToylangInstance pipeline. The dedicated
+            // `codegen_accessor_inline` path retires; standard
+            // `codegen_internal_function` + `codegen_extern_wrapper`
+            // handle accessors uniformly.
+            //
+            // Generic struct accessors (struct has type_params) are
+            // skipped here — their concrete instantiations only become
+            // visible after rustc's mono walk surfaces them. The CGU
+            // walk's accessor branch in llvm_gen handles those (Phase 1c
+            // rewrites it to also call `synthesize_accessor_fn`).
+            for (struct_name, field_name) in &reg.accessor_pairs {
+                let Some(toy_struct) = reg.structs.get(struct_name) else { continue; };
+                let Some(field) = toy_struct.fields.iter().find(|f| &f.name == field_name)
+                    else { continue; };
+                let resolved_func = crate::toylang::registry::synthesize_accessor_fn(
+                    struct_name, toy_struct, field,
+                );
+                // Mirrors the trait_impls loop's gate at the same depth.
+                // Skips abstract-args (generic struct) accessors here;
+                // concrete instantiations get surfaced by rustc's mono walk
+                // (Case 1b path) and the CGU walk's accessor branch picks
+                // them up with concrete args.
+                if resolved_func.body.is_none() || resolved_func.has_abstract_args() {
+                    continue;
+                }
+                let Some(struct_def_id) = crate::oracle::find_local_struct_def_id(tcx, struct_name)
+                    else { continue; };
+                let Some(stub_def_id) = crate::oracle::find_inherent_method(
+                    tcx, struct_def_id, field_name,
+                ) else { continue; };
+                let instance = ty::Instance::new_raw(stub_def_id, ty::GenericArgs::empty());
+                let extern_symbol = compute_fn_symbol(field_name, tcx, instance);
+                if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                    continue;
+                }
+                // Sky-internal name qualified by `(struct, field)` so
+                // accessors don't collide with free fns or each other.
+                let internal_symbol = format!(
+                    "__toylang_internal__accessor__{}__{}",
+                    struct_name, field_name,
+                );
+                state.toylang_instances.push(ToylangInstance {
+                    extern_symbol,
+                    internal_symbol,
+                    resolved_func,
+                    stub_def_id: Some(stub_def_id),
+                });
             }
         }
     }

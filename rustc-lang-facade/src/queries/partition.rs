@@ -66,11 +66,14 @@ pub fn lang_collect_and_partition_mono_items<'tcx>(
         all_mono_items: reachable,
     } = upstream(tcx, key);
 
-    // Stash the unfiltered upstream slice for the consumer's own MonoItems
-    // walk in `generate_with_tcx`. Without this, the consumer couldn't find
-    // concrete consumer Instances — rustc's CGU list is the only source for
-    // collector-discovered Instances of accessor methods and consumer fns.
-    crate::stash_upstream_cgus(upstream_cgus);
+    // Tier 3 #3 Phase 3: lifetime-erased CGU stash retired. The consumer
+    // re-calls `default_collect_and_partition()` from inside
+    // `codegen_crate` (live `'tcx`) when it needs the unfiltered slice —
+    // see `toylangc::llvm_gen::generate_with_tcx`. Accessors are no
+    // longer discovered through this walk (Phase 1c retired the
+    // accessor branch); only Case 1b generic instantiations from Rust
+    // callers remain, and re-calling the upstream provider gives them a
+    // sound `'tcx`-bound slice with no unsafe pointer manipulation.
 
     // Reconstruct each CGU with consumer items removed. Items that survive
     // the filter (notably the Phase-6 `#[inline(never)]` generic wrappers

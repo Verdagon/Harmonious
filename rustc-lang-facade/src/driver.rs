@@ -56,16 +56,11 @@ struct LangDriver;
 
 impl rustc_driver::Callbacks for LangDriver {
     fn config(&mut self, config: &mut Config) {
-        // Clear any CGU stash left from a prior compile session (e.g., an
-        // earlier integration test that ran through the same process). The
-        // stash holds a raw pointer into a TyCtxt's arena; that arena no
-        // longer exists after the session ends, so we must invalidate the
-        // stash before another session starts populating it. Prior versions
-        // cleared inside `LangCodegenBackend::codegen_crate`, but under
-        // stage 5b two-crate the partitioner fires before that call (during
-        // rlib metadata setup) — clearing there wiped valid stash data. See
-        // `codegen_wrapper.rs` for the full reasoning.
-        crate::clear_upstream_cgus();
+        // Tier 3 #3 Phase 3: CGU stash retired. The consumer re-calls
+        // `default_collect_and_partition()` from inside `codegen_crate`
+        // for its Case 1b discovery walk; no `'static`-erased pointer
+        // outlives a compile session. The clear-before-config dance
+        // also retires.
 
         config.override_queries = Some(crate::queries::lang_override_queries);
         config.make_codegen_backend = Some(Box::new(|_opts, _target| {
