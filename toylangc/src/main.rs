@@ -1,6 +1,7 @@
 #![feature(rustc_private)]
 
 extern crate rustc_driver;
+extern crate rustc_target;
 
 mod build;
 mod llvm_gen;

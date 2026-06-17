@@ -2103,6 +2103,13 @@ pub fn generate_with_tcx<'tcx>(
         }
     }
 
+    // Phase 3 inline-codegen plan: mirror rustc's per-function attribute set
+    // so LLVM's cross-module ThinLTO inliner accepts Sky callers ↔ Rust
+    // callees inlining. Required attributes per
+    // `rustc_codegen_llvm/src/attributes.rs::llfn_attrs_from_instance` and
+    // LLVM's `functionsHaveCompatibleAttributes` check.
+    apply_rust_compat_attributes(&ctx);
+
     let rust_symbols = ctx.rust_symbols.clone();
     let ir = ctx.module.print_to_string().to_string();
     // Phase 2 inline-codegen path: bitcode bytes for `consumer_emit_modules`
@@ -2116,6 +2123,84 @@ pub fn generate_with_tcx<'tcx>(
     // llvm-dis and rustc's LTO parser accept.
     let bitcode = assemble_text_to_bitcode(&ir);
     (ir, bitcode, rust_symbols)
+}
+
+/// Phase 3: mirror rustc's per-function attribute set on every Sky-emitted
+/// function so cross-module ThinLTO can inline Sky ↔ Rust call sites.
+///
+/// LLVM's `InlineCost.cpp::functionsHaveCompatibleAttributes` rejects
+/// inlining across module boundaries when attributes mismatch. Required
+/// for compatibility:
+/// - "target-cpu" — drives the LLVM feature-bitset subset check.
+/// - "target-features" — same.
+/// - "frame-pointer" — common cause of "incompatible function attributes".
+/// - "probe-stack" — same.
+/// - `uwtable` — sync vs async unwind tables must match.
+/// - `nounwind` — required under panic=abort (Sky discipline).
+///
+/// Values pulled from `tcx.sess.target` so they automatically track rustc's
+/// per-target defaults (e.g., "non-leaf" frame pointer on aarch64-apple-*).
+fn apply_rust_compat_attributes<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>) {
+    use inkwell::attributes::AttributeLoc;
+    use rustc_target::spec::{FramePointer, StackProbeType};
+
+    let target = &ctx.tcx.sess.target;
+    let target_cpu = target.cpu.to_string();
+
+    let frame_pointer = match target.frame_pointer {
+        FramePointer::Always => Some("all"),
+        FramePointer::NonLeaf => Some("non-leaf"),
+        FramePointer::MayOmit => None,
+    };
+
+    let probe_stack: Option<&'static str> = match &target.stack_probes {
+        StackProbeType::None => None,
+        // Inline / InlineOrCall (under LLVM 21 the latter resolves to Inline)
+        // both map to "inline-asm".
+        StackProbeType::Inline | StackProbeType::InlineOrCall { .. } => Some("inline-asm"),
+        // Call form invokes __rust_probestack; the attribute value is the
+        // symbol name. We don't currently call into __rust_probestack so the
+        // attribute is omitted (Sky's IR doesn't need stack probing for its
+        // simple frames). If a future Sky-emitted function has a large
+        // stack frame, revisit.
+        StackProbeType::Call => None,
+    };
+
+    let nounwind_kind = inkwell::attributes::Attribute::get_named_enum_kind_id("nounwind");
+    let uwtable_kind = inkwell::attributes::Attribute::get_named_enum_kind_id("uwtable");
+
+    // uwtable values: 0 = none, 1 = sync, 2 = async. Match rustc's "must emit
+    // unwind tables" decision.
+    let uwtable_value: u64 = if ctx.tcx.sess.must_emit_unwind_tables() { 1 } else { 0 };
+
+    let nounwind_attr = ctx.context.create_enum_attribute(nounwind_kind, 0);
+    let uwtable_attr = ctx.context.create_enum_attribute(uwtable_kind, uwtable_value);
+    let target_cpu_attr = ctx.context.create_string_attribute("target-cpu", &target_cpu);
+    let frame_pointer_attr = frame_pointer
+        .map(|v| ctx.context.create_string_attribute("frame-pointer", v));
+    let probe_stack_attr = probe_stack
+        .map(|v| ctx.context.create_string_attribute("probe-stack", v));
+
+    for f in ctx.module.get_functions() {
+        // Skip pure declarations (extern decls). Their callees will get
+        // attributes when rustc emits the corresponding CGUs; cross-module
+        // ThinLTO uses the callee's attributes, not the local declaration's.
+        if f.count_basic_blocks() == 0 {
+            continue;
+        }
+        f.add_attribute(AttributeLoc::Function, target_cpu_attr);
+        if let Some(attr) = frame_pointer_attr {
+            f.add_attribute(AttributeLoc::Function, attr);
+        }
+        if uwtable_value != 0 {
+            f.add_attribute(AttributeLoc::Function, uwtable_attr);
+        }
+        // Sky discipline: panic=abort, so every fn is nounwind.
+        f.add_attribute(AttributeLoc::Function, nounwind_attr);
+        if let Some(attr) = probe_stack_attr {
+            f.add_attribute(AttributeLoc::Function, attr);
+        }
+    }
 }
 
 /// Workaround for Inkwell's bitcode-emission bug under LLVM 21: write the IR
