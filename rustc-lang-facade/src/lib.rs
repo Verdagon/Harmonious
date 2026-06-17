@@ -743,7 +743,14 @@ pub(crate) fn default_mir_shims() -> queries::drop_glue::MirShimsFn {
     *DEFAULT_MIR_SHIMS.get().expect("default mir_shims not saved")
 }
 
-pub(crate) fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
+/// Returns the saved upstream `symbol_name` provider for direct call.
+///
+/// Pub (not pub(crate)) so consumers can call rustc's default mangler for
+/// a concrete `Instance` without re-entering `lang_symbol_name` — Path B
+/// (Phase 4.5 single-symbol architecture) uses this to make
+/// `consumer_symbol_for_callback_name` return the rustc-mangled name
+/// rather than synthesizing `__toylang_impl_*`.
+pub fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
     *DEFAULT_SYMBOL_NAME.get().expect("default symbol_name not saved")
 }
 

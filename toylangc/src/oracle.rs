@@ -703,6 +703,17 @@ pub fn find_trait_impl_method_def_id(
         let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
         let ty::TyKind::Adt(adt_def, _) = self_ty.kind() else { continue; };
         if tcx.item_name(adt_def.did()).as_str() != self_type_name { continue; }
+        // Self-type name alone is ambiguous: `Box` matches both
+        // `case6_lib::Box` (Sky-defined) and `alloc::boxed::Box` /
+        // `std::ffi::os_str::Box<OsStr>` (Rust-stdlib-defined). Restrict to
+        // consumer-marker-bearing crates so we land on the Sky impl.
+        // Path B exposed this — pre-Path B the synthesized
+        // `__toylang_impl__<Self>__<Trait>__<m>` name didn't care which
+        // DefId we returned; Path B uses the DefId's rustc-default mangling
+        // directly and demands the right impl.
+        if !rustc_lang_facade::is_from_lang_stubs(tcx, adt_def.did()) {
+            continue;
+        }
         for &assoc_id in tcx.associated_item_def_ids(impl_def_id) {
             if tcx.item_name(assoc_id).as_str() == method_name {
                 return Some(assoc_id);

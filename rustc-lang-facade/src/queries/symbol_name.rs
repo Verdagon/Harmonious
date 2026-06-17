@@ -1,20 +1,28 @@
-//! symbol_name query override — map consumer function instances to consumer symbol names.
+//! symbol_name query override — classify consumer items by shape, delegate to consumer for the name.
 //!
-//! When rustc needs the linker symbol for a consumer function instance,
-//! we return the consumer's symbol name (e.g., __toylang_impl_make_counter)
-//! instead of rustc's default mangled name. This ensures that call sites
-//! in other functions emit calls to the consumer's extern symbol, which
-//! the consumer's .o provides.
+//! **Path B / single-symbol architecture (Phase 4.5, inline-codegen plan).**
+//! Sky's bitcode emits each consumer function under the rustc-mangled
+//! name rustc would have given the stub fn. The override therefore does
+//! NOT need to redirect to `__toylang_impl_*`; the consumer's
+//! `consumer_symbol_for_callback_name` returns the rustc-default name
+//! directly. This collapse is what makes ThinLTO see Sky's body as the
+//! sole definition of the symbol — the previous two-symbol scheme made
+//! ThinLTO see two definitions (rustc-mangled stub with `unreachable!()`
+//! body + Sky's `__toylang_impl_*` body) and the cross-module inliner
+//! picked the stub.
 //!
-//! Per @GCMLZ, this provider may fire during generate_and_compile. **Tier
-//! 3 #9 (this commit): pure read in both branches.** For non-consumer
-//! items it reads CONFIG + DEFAULT_SYMBOL_NAME (no lock). For consumer
-//! items it calls `call_consumer_symbol_for_callback_name`, which is
-//! stateless (no `MUTABLE_STATE` lock either). The previous
-//! `call_notify_concrete_entry_point` held the mutex; the @GCMLZ
-//! thread-local fat-pointer bypass (Session 5) was the workaround for
-//! its re-entrance via `generate_and_compile`. Both are gone now —
-//! @SyMINCZ stays as the invariant document.
+//! The shape-classification logic below stays — other facade sites still
+//! key on `is_consumer_fn` / `is_consumer_trait_impl_method` /
+//! `is_consumer_accessor_safe` for partitioner, layout, and drop-glue
+//! decisions. What this file does once Path B lands is route the
+//! callback (no rename, just structural diagnostics).
+//!
+//! Per @GCMLZ, this provider may fire during consumer codegen. Pure read
+//! in both branches: non-consumer items read CONFIG + DEFAULT_SYMBOL_NAME
+//! (no lock); consumer items round-trip through
+//! `call_consumer_symbol_for_callback_name`, which is stateless. The
+//! Session-5 @GCMLZ thread-local fat-pointer bypass was retired in Tier
+//! 3 #9 — @SyMINCZ stays as the invariant document.
 //!
 //! @SyMINCZ — computing a symbol name here does NOT force rustc to codegen
 //! the `Instance`. It is a pure read. Codegen for consumer-referenced Rust

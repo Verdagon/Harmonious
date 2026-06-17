@@ -25,6 +25,27 @@ use crate::toylang::registry::{ToylangRegistry, ToyStruct};
 
 
 /// Convert BasicTypeEnum to AnyTypeEnum (inkwell doesn't impl From directly).
+/// Path B: build the Sky-internal symbol for a function instance.
+///
+/// Sky's bitcode emits each consumer function in two pieces: an extern
+/// wrapper under the rustc-mangled name (for rustc-visible items) and an
+/// internal body under a Sky-chosen name. This helper computes the Sky-
+/// internal name: `__toylang_internal_<registry-name>__<type-arg-mangles>`.
+fn internal_symbol_for_instance<'tcx>(
+    registry_name: &str,
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+) -> String {
+    let mut sym = format!("__toylang_internal_{}", registry_name);
+    for arg in instance.args.iter() {
+        if let ty::GenericArgKind::Type(ty) = arg.kind() {
+            let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
+            sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
+        }
+    }
+    sym
+}
+
 fn basic_type_to_any<'ctx>(ty: BasicTypeEnum<'ctx>) -> inkwell::types::AnyTypeEnum<'ctx> {
     match ty {
         BasicTypeEnum::ArrayType(t) => t.into(),
@@ -1980,7 +2001,15 @@ pub fn generate_with_tcx<'tcx>(
         /// Some for entry-point functions (Rust calls them), None for internal-only.
         /// Used to generate extern ABI wrappers.
         instance: Option<ty::Instance<'tcx>>,
+        /// Path B: rustc-mangled name for rustc-visible items (so Sky's body is
+        /// the sole definition of the symbol rustc emits call sites to); Sky-
+        /// internal name for deep-walker items rustc never references.
         extern_symbol: String,
+        /// Sky-internal symbol for the simple-ABI body. Distinct from
+        /// `extern_symbol` for rustc-visible items (the extern wrapper calls
+        /// the internal). Equal to `extern_symbol` for Sky-internal items
+        /// (which never get a wrapper).
+        internal_symbol: String,
     }
     let mut fn_items: Vec<FnItem<'tcx>> = Vec::new();
 
@@ -2057,10 +2086,12 @@ pub fn generate_with_tcx<'tcx>(
             } else {
                 crate::toylang::callbacks_impl::resolve_caller_from_instance(toy_fn, instance, tcx)
             };
+            let internal_symbol = internal_symbol_for_instance(&registry_name, tcx, instance);
             fn_items.push(FnItem {
                 resolved_func,
                 instance: Some(instance),
                 extern_symbol,
+                internal_symbol,
             });
         }
     }
@@ -2071,19 +2102,26 @@ pub fn generate_with_tcx<'tcx>(
     // that carries a `stub_def_id` (looked up via the upstream `__lang_stubs`
     // rlib's `pub fn` shell) gets promoted to `instance: Some(...)` here so
     // it qualifies for extern-wrapper codegen below — without that promotion
-    // we'd only emit the internal symbol and link would fail with
-    // `__toylang_impl_<name>` undefined. The `def_id`-only Instance
-    // (`Instance::new_raw(def_id, empty_args)`) carries enough info for
-    // `fn_abi_of_instance` to compute the Rust ABI for non-generic fns.
+    // link would fail with the rustc-mangled stub symbol undefined.
+    // The `def_id`-only Instance (`Instance::new_raw(def_id, empty_args)`)
+    // carries enough info for `fn_abi_of_instance` to compute the Rust ABI
+    // for non-generic fns AND for `default_symbol_name` to return the
+    // rustc-mangled name Path B's `compute_fn_symbol` used at populate time.
     for inst in &state.toylang_instances {
         if seen_symbols.insert(inst.extern_symbol.clone()) {
             let instance = inst.stub_def_id.map(|def_id| {
                 ty::Instance::new_raw(def_id, ty::GenericArgs::empty())
             });
+            // Path B: internal_symbol is now pre-computed at populate time
+            // (see ToylangInstance docs). For rustc-visible items it's
+            // distinct from the rustc-mangled extern_symbol; for Sky-
+            // internal items it equals extern_symbol (the wrapper loop
+            // skips them anyway).
             fn_items.push(FnItem {
                 resolved_func: inst.resolved_func.clone(),
                 instance,
                 extern_symbol: inst.extern_symbol.clone(),
+                internal_symbol: inst.internal_symbol.clone(),
             });
         }
     }
@@ -2093,13 +2131,11 @@ pub fn generate_with_tcx<'tcx>(
     // Extern wrappers adapt to Rust ABI and delegate to the internal function.
     // Only entry-point functions (with Instance) get extern wrappers.
     for item in &fn_items {
-        let internal_symbol = item.extern_symbol.replace("__toylang_impl_", "__toylang_internal_");
-        codegen_internal_function(&mut ctx, &item.resolved_func, &internal_symbol);
+        codegen_internal_function(&mut ctx, &item.resolved_func, &item.internal_symbol);
     }
     for item in &fn_items {
         if let Some(instance) = item.instance {
-            let internal_symbol = item.extern_symbol.replace("__toylang_impl_", "__toylang_internal_");
-            codegen_extern_wrapper(&mut ctx, &item.resolved_func, instance, &item.extern_symbol, &internal_symbol);
+            codegen_extern_wrapper(&mut ctx, &item.resolved_func, instance, &item.extern_symbol, &item.internal_symbol);
         }
     }
 

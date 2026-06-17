@@ -112,12 +112,26 @@ pub enum CallbackLog {
 /// `__lang_stubs` rlib's source. It's `Some` when populated at the user-bin
 /// compile via Workstream A's registry-driven discovery path; the codegen
 /// pass uses it to construct an `Instance::new_raw(def_id, empty_args)` for
-/// ABI-aware extern-wrapper emission (`__toylang_impl_*`). At the rlib
-/// compile this field stays `None` (CGU-walk-driven discovery surfaces
-/// real `Instance`s directly, and the old code path didn't need this).
+/// One Sky-emitted function destined for the codegen pass.
+///
+/// `extern_symbol`: the name external callers (Rust source or other Sky
+/// items reached via rustc) use to reach this function. Under Path B this
+/// is the rustc-default mangled name for items rustc references, and a
+/// Sky-internal name for items only Sky's bitcode references.
+///
+/// `internal_symbol`: the Sky-internal name for the simple-ABI body.
+/// Always distinct from `extern_symbol` for rustc-visible items (the
+/// extern wrapper delegates to the internal); equal to `extern_symbol`
+/// for Sky-internal items (which never get a wrapper).
+///
+/// `stub_def_id`: ABI-aware extern-wrapper emission needs an `Instance`.
+/// At the rlib compile this field stays `None` (CGU-walk-driven discovery
+/// surfaces real `Instance`s directly, and the old code path didn't need
+/// this).
 #[derive(Clone)]
 pub struct ToylangInstance {
     pub extern_symbol: String,
+    pub internal_symbol: String,
     pub resolved_func: crate::toylang::registry::ToyFunction,
     pub stub_def_id: Option<rustc_span::def_id::DefId>,
 }
@@ -280,48 +294,34 @@ impl ToylangCallbacks {
         self.compute_consumer_symbol(name, tcx, instance)
     }
 
-    /// Tier 3 #9 (stateless): compute the consumer's chosen extern symbol
-    /// for the given callback-name + Instance. Pure function of
-    /// `(self.registry, callback_name, tcx, instance)`. The facade's
-    /// `consumer_symbol_for_callback_name` trait method delegates here;
-    /// so does `notify_concrete_entry_point_inner` (plus a log push).
+    /// Path B / single-symbol architecture (Phase 4.5): return the
+    /// rustc-default mangled symbol name for `instance`.
+    ///
+    /// Sky's bitcode now emits every rustc-visible consumer body (exports,
+    /// accessors, trait-impl methods) under the rustc-mangled name rustc
+    /// would have given the stub fn. Call sites and definitions share one
+    /// symbol; ThinLTO sees a single definition and inlines it cross-
+    /// module. The previous two-symbol scheme (`__toylang_impl_*` vs
+    /// rustc-mangled stub) confused ThinLTO into inlining the
+    /// `unreachable!()` stub body.
+    ///
+    /// `crate::default_symbol_name()` returns the saved upstream
+    /// `SymbolNameFn`. Calling it directly (not `tcx.symbol_name(...)`)
+    /// dodges re-entrance through the facade's `lang_symbol_name`
+    /// override.
+    ///
+    /// The `_name` parameter (callback-name shape from the facade) is now
+    /// unused for routing but kept in the signature so the trait method
+    /// stays stable until Tier 3 #12 retires the
+    /// `consumer_symbol_for_callback_name` callback entirely.
     pub fn compute_consumer_symbol<'tcx>(
         &self,
-        name: &str,
+        _name: &str,
         tcx: TyCtxt<'tcx>,
         instance: ty::Instance<'tcx>,
     ) -> String {
-        // Phase 2 C.6 — trait-impl method shape from the facade is
-        //   `__impl_method__<Self>__<Trait>__<m>`
-        // Mangle to a concrete consumer symbol distinct from both the
-        // accessor pattern (`__toylang_accessor_*`) and free-fn pattern
-        // (`__toylang_impl_*`):
-        //   `__toylang_impl__<Self>__<Trait>__<m>`
-        if let Some(rest) = name.strip_prefix("__impl_method__") {
-            let mut sym = format!("__toylang_impl__{}", rest);
-            for arg in instance.args.iter() {
-                if let ty::GenericArgKind::Type(ty) = arg.kind() {
-                    let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
-                    sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
-                }
-            }
-            return sym;
-        }
-
-        // Accessor methods come in as "StructName.field_name"
-        if let Some((struct_name, field_name)) = name.split_once('.') {
-            let mut sym = format!("__toylang_accessor_{}_{}", struct_name, field_name);
-            for arg in instance.args.iter() {
-                if let ty::GenericArgKind::Type(ty) = arg.kind() {
-                    let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
-                    sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
-                }
-            }
-            return sym;
-        }
-
-        let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main" } else { name };
-        compute_fn_symbol(registry_name, tcx, instance)
+        let default = rustc_lang_facade::default_symbol_name();
+        default(tcx, instance).name.to_string()
     }
 
     /// Populate `state.toylang_instances` + `state.walked_entry_points` by
@@ -397,10 +397,13 @@ impl ToylangCallbacks {
                 {
                     continue;
                 }
-                let extern_symbol = compute_fn_symbol_from_type_args(name, &[]);
-                if !state.walked_entry_points.insert(extern_symbol.clone()) {
-                    continue;
-                }
+                // Path B: lookup stub_def_id FIRST so we can build an
+                // Instance and compute the rustc-default mangled name.
+                // Non-generic exports are rustc-visible — rustc-emitted
+                // call sites query `symbol_name` for them, and Sky's
+                // bitcode must emit the body under the same symbol so
+                // ThinLTO sees one definition.
+                //
                 // The stub's name uses toylang's mangling convention —
                 // `main` becomes `__toylang_main` (per `oracle::TOYLANG_MAIN`),
                 // everything else stays as-is.
@@ -410,8 +413,24 @@ impl ToylangCallbacks {
                     name.clone()
                 };
                 let stub_def_id = crate::oracle::find_stub_fn_in_stub_rlib(tcx, &stub_name);
+                let extern_symbol = if let Some(def_id) = stub_def_id {
+                    // arch-fence-allow: degenerate-case-fast-path
+                    // (non-generic exports filtered by has_abstract_args above —
+                    // empty args feeds Instance::new_raw cleanly).
+                    let instance = ty::Instance::new_raw(def_id, ty::GenericArgs::empty());
+                    compute_fn_symbol(name, tcx, instance)
+                } else {
+                    // No stub shell ⇒ no rustc reference. Sky-internal naming
+                    // is sufficient (and required, since we have no Instance).
+                    compute_internal_symbol_from_type_args(name, &[])
+                };
+                if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                    continue;
+                }
+                let internal_symbol = compute_internal_symbol_from_type_args(name, &[]);
                 state.toylang_instances.push(ToylangInstance {
                     extern_symbol,
+                    internal_symbol,
                     resolved_func: toy_fn.clone(),
                     stub_def_id,
                 });
@@ -428,21 +447,46 @@ impl ToylangCallbacks {
                     if method.func.body.is_none() || method.func.has_abstract_args() {
                         continue;
                     }
-                    let extern_symbol = format!(
-                        "__toylang_impl__{}__{}__{}",
-                        toy_impl.self_type_name, toy_impl.trait_name, method.name,
-                    );
-                    if !state.walked_entry_points.insert(extern_symbol.clone()) {
-                        continue;
-                    }
                     let stub_def_id = crate::oracle::find_trait_impl_method_def_id(
                         tcx,
                         &toy_impl.trait_name,
                         &toy_impl.self_type_name,
                         &method.name,
                     );
+                    // Path B: emit under the rustc-mangled name of the
+                    // impl method (e.g.,
+                    // `<__lang_stubs::Widget as core::clone::Clone>::clone`).
+                    // The trait-impl-method Instance lives at the impl side
+                    // (`find_trait_impl_method_def_id` returns the
+                    // associated-item DefId, not the trait-declaration's),
+                    // so empty args suffices for case4-shaped impls.
+                    // arch-fence-allow: degenerate-case-fast-path
+                    // (has_abstract_args filter above rules out impl-block
+                    // generics at this populate point; trait methods with
+                    // their own type params would need a richer args build).
+                    let extern_symbol = if let Some(def_id) = stub_def_id {
+                        let instance = ty::Instance::new_raw(def_id, ty::GenericArgs::empty());
+                        compute_fn_symbol(&method.name, tcx, instance)
+                    } else {
+                        // No stub shell — fall back to Sky-internal naming.
+                        format!(
+                            "__toylang_internal__{}__{}__{}",
+                            toy_impl.self_type_name, toy_impl.trait_name, method.name,
+                        )
+                    };
+                    if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                        continue;
+                    }
+                    // Sky-internal name for the trait-impl method body —
+                    // qualified by (Self, Trait, method) since the method
+                    // name alone (e.g., `clone`) collides across impls.
+                    let internal_symbol = format!(
+                        "__toylang_internal__{}__{}__{}",
+                        toy_impl.self_type_name, toy_impl.trait_name, method.name,
+                    );
                     state.toylang_instances.push(ToylangInstance {
                         extern_symbol,
+                        internal_symbol,
                         resolved_func: method.func.clone(),
                         stub_def_id,
                     });
@@ -1128,13 +1172,19 @@ fn resolve_caller_from_type_args(
     }
 }
 
-/// Compute an extern symbol from a function name and ResolvedType type args.
-/// Used during the deep walk where we don't have a rustc Instance.
-fn compute_fn_symbol_from_type_args(
+/// Compute a Sky-internal symbol from a function name and ResolvedType type args.
+///
+/// Used during the deep walker (Sky→Sky callees) where we don't have a rustc
+/// Instance. These items are NEVER referenced by rustc-emitted code — only
+/// Sky's own bitcode calls them — so we choose a Sky-internal name and don't
+/// need to match anything rustc would emit. The wrapper loop in llvm_gen skips
+/// them (no `stub_def_id` ⇒ no `Instance` ⇒ no extern wrapper); they're
+/// emitted only via the internal-function loop.
+pub fn compute_internal_symbol_from_type_args(
     name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> String {
-    let mut sym = format!("__toylang_impl_{}", name);
+    let mut sym = format!("__toylang_internal_{}", name);
     for ta in type_args {
         sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(ta)));
     }
@@ -1245,7 +1295,7 @@ fn collect_rust_deps_recursive<'tcx>(
             // walker) — two entry points reaching the same internal helper
             // must each collect its deps, since rustc's collector dedups Rust
             // items independently.
-            let callee_symbol = compute_fn_symbol_from_type_args(callee_name, type_args);
+            let callee_symbol = compute_internal_symbol_from_type_args(callee_name, type_args);
             if cycle_guard.insert(callee_symbol) {
                 let resolved_callee = resolve_toylang_callee(callee_fn, type_args);
                 let transitive_deps = collect_rust_deps_recursive(
@@ -1344,11 +1394,12 @@ fn walk_and_stash_internal_callees<'tcx>(
         if callee_fn.body.is_none() {
             continue; // Extern fn — not our concern.
         }
-        let callee_symbol = compute_fn_symbol_from_type_args(callee_name, type_args);
+        let callee_symbol = compute_internal_symbol_from_type_args(callee_name, type_args);
         if state.walked_entry_points.insert(callee_symbol.clone()) {
             let resolved_callee = resolve_toylang_callee(callee_fn, type_args);
             state.toylang_instances.push(ToylangInstance {
-                extern_symbol: callee_symbol,
+                extern_symbol: callee_symbol.clone(),
+                internal_symbol: callee_symbol,
                 resolved_func: resolved_callee.clone(),
                 stub_def_id: None,
             });
@@ -1533,18 +1584,19 @@ fn collect_rust_type_names(ty: &crate::toylang::typed_ast::ResolvedType) -> Vec<
     names
 }
 
-/// Compute the extern symbol for a consumer function instance.
-/// Concrete: "__toylang_impl_make_counter"
-/// Generic: "__toylang_impl_wrap__i32"
-pub fn compute_fn_symbol<'tcx>(name: &str, tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> String {
-    let mut sym = format!("__toylang_impl_{}", name);
-    for arg in instance.args.iter() {
-        if let ty::GenericArgKind::Type(ty) = arg.kind() {
-            let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
-            sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
-        }
-    }
-    sym
+/// Path B: compute the rustc-default mangled symbol for a consumer Instance.
+///
+/// Used at populate sites where Sky's bitcode emission needs to match the
+/// symbol rustc would have given the stub fn — so call sites and definition
+/// share one symbol. Calls `default_symbol_name()` directly (not
+/// `tcx.symbol_name(...)`) to dodge re-entrance through the facade's
+/// `lang_symbol_name` override.
+///
+/// The `_name` parameter (registry name) is unused for naming but kept for
+/// observability / future log entries.
+pub fn compute_fn_symbol<'tcx>(_name: &str, tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> String {
+    let default = rustc_lang_facade::default_symbol_name();
+    default(tcx, instance).name.to_string()
 }
 
 
