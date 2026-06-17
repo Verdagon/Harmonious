@@ -218,32 +218,3 @@ fn run_plain_rustc(args: &[String]) {
     rustc_driver::run_compiler(args, &mut cb);
 }
 
-pub fn find_sysroot_tool(tool_name: &str) -> PathBuf {
-    let plus_pin = format!("+{}", TOYLANG_NIGHTLY);
-    let sysroot = std::process::Command::new("rustc")
-        .arg(&plus_pin)
-        .arg("--print")
-        .arg("sysroot")
-        .output()
-        .expect("failed to run rustc --print sysroot");
-    let sysroot = String::from_utf8(sysroot.stdout).unwrap();
-    let sysroot = sysroot.trim();
-
-    let host = std::process::Command::new("rustc")
-        .arg(&plus_pin)
-        .arg("-vV")
-        .output()
-        .expect("failed to run rustc -vV");
-    let host_output = String::from_utf8(host.stdout).unwrap();
-    let host_triple = host_output.lines()
-        .find(|l| l.starts_with("host:"))
-        .map(|l| l.trim_start_matches("host:").trim())
-        .expect("could not determine host triple");
-
-    PathBuf::from(sysroot)
-        .join("lib/rustlib")
-        .join(host_triple)
-        .join("bin")
-        .join(tool_name)
-}
-

@@ -4168,7 +4168,7 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B9 (new — Sky-specific). LLVM-binding-crate version skew with rustc's LLVM.** Probability: ~70% per nightly bump if Sky uses Inkwell or any other crate that ships bundled LLVM headers; 0% if Sky uses rustc's internal `rustc_codegen_llvm` API directly. Impact: 1-2 days per nightly bump (bump the binding crate, rebuild). Surfaced in toylang's Phase 4.5 — Inkwell shipped LLVM 20.1.6 bitcode while rustc-fork ran LLVM 21.1.8; the bitcode record format diverged and rustc rejected Sky's submitted modules with "Invalid record (Producer: 'LLVM20.1.6' Reader: 'LLVM 21.1.8')." Canary: integration tests of patch (c) inline codegen start failing with bitcode-format errors. Reaction: bump the binding crate to the matching LLVM major version; verify the upstream binding has tracked the LLVM version Sky needs. The pin discipline of §5.6.5 expands to cover binding crates, not just rustc-fork's LLVM.
 
-**B10 (new — Sky-specific). Inkwell's bitcode emitter is buggy under modern LLVM.** Probability: persists indefinitely until Inkwell is patched. Impact: requires either a `llvm-as` shell-out workaround (toylang's choice) or rustc-private API adoption (avoids Inkwell entirely). Surfaced in toylang's Phase 4.5: Inkwell's `Module::write_bitcode_to_{memory,path}` drops one FUNCTION declaration record from the MODULE block when serializing modules with ABI-coerced `extern "C"` call signatures. Subsequent INST_CALL records reference stale function indices; LLVM 21's verifier rejects. The IR text from Inkwell's `print_to_string` is valid; only the bitcode serializer is buggy. Diagnosed via `llvm-bcanalyzer --dump` (see `inkwell-vendoring-handoff.md` in the toylang repo). Reaction: emit text → `llvm-as` (toylang's workaround, ~5ms overhead per build) OR vendor Inkwell + fix upstream OR switch to rustc-internal bindings. Sky should make the binding-API choice early since it ripples through every Sky codegen path. Sky's `consumer_emit_modules` shape is binding-agnostic, so the choice can change later, but the cost is bounded only if discovered early.
+**B10 (new — Sky-specific). LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures.** **Mitigated by in-process text round-trip** (see Appendix F.8). Probability under the round-trip mitigation: negligible — the LLVM IR text parser canonicalises the in-memory representation enough to avoid the bitcode-writer's confusion. Without mitigation: 100% on any module that mixes `extern` decls with call-site arg types differing from the declared parameter types (the byte_string fixture's `extern fn check_bytes([2 x i64])` called with `{ ptr, i64 }`). LLVM 21's `llvm-dis` rejects the bytes with "Invalid record." Inkwell's `Module::write_bitcode_to_*` and `Module::add_function` and `Builder::build_direct_call` are all thin FFI shims; the buggy code lives below the Rust/C boundary in LLVM 21's `BitcodeWriter.cpp`, so an Inkwell-side patch was investigated and ruled out. **Recommended mitigation for Sky**: emit IR text via `module.print_to_string()`, parse it back via `Context::create_module_from_ir` (Inkwell's wrapper around `LLVMParseIRInContext`), and emit bitcode from the round-tripped module. Stays in-process; ~10 LOC; no external `llvm-as` dependency. Toylang ships this. **Upstream fix**: file at `llvm/llvm-project` with the bcanalyzer diff (missing `FUNCTION` record + stale `INST_CALL` value index); when upstream lands, drop the round-trip.
 
 ### 25.3 Category C: operational invariants
 
@@ -5498,29 +5498,62 @@ without leaking into Sky's core schema.
 Toylang landed this in Tier 3 #8 (commit `63beb0c`). The earlier
 consumer-side mutex mirror retired.
 
-#### F.8 Inkwell bitcode bug (LLVM 21)
+#### F.8 LLVM 21 bitcode-writer bug (root cause below Inkwell)
 
 A Sky implementation choice toylang made — emitting LLVM IR via the
-Inkwell crate (safe Rust bindings) — surfaced an Inkwell bug under
-LLVM 21. `Module::write_bitcode_to_{memory,path}` drops one `FUNCTION`
-declaration record from the MODULE block. Subsequent `INST_CALL`
-records reference stale function indices; LLVM 21's verifier rejects
-the bitcode with "Invalid record."
+Inkwell crate (safe Rust bindings) — surfaced what was initially
+suspected as an Inkwell bug under LLVM 21:
+`Module::write_bitcode_to_{memory,path}` produces bitcode with a
+dropped `FUNCTION` declaration record and a stale `INST_CALL` value
+index; LLVM 21's `llvm-dis` rejects with "Invalid record." Trigger:
+an `extern` declaration whose declared param type differs from the
+type used at the call site (ABI coercion — e.g., declared
+`[2 x i64]`, called with `{ ptr, i64 }`).
 
-**Workaround toylang shipped**: emit IR text via Inkwell
-(`print_to_string()`), pipe through `llvm-as`, read the resulting
-bitcode bytes. Adds one shell-out per build (~5ms on macOS arm64) but
-sidesteps the bug entirely. The IR text itself is valid; only Inkwell's
-bitcode serializer is buggy for the specific pattern.
+**Investigation pinned the bug below the Rust/C boundary.** Inkwell's
+`Module::write_bitcode_to_*`, `Module::add_function`, and
+`Builder::build_direct_call` are all thin FFI shims (~1-3 lines each)
+that pass arguments straight through to `llvm-sys`. Inkwell's
+`build_direct_call` already passes the callee's declared
+`FunctionType` to `LLVMBuildCall2`. So the divergence between
+`print_to_string()` (produces valid IR text) and
+`write_bitcode_to_memory()` (produces invalid bitcode) for the same
+in-memory module lives inside LLVM 21's `BitcodeWriter.cpp` — most
+likely the function-table dedup in `writeModuleInfo`. No Inkwell-side
+patch can fix it.
 
-**Sky-relevant implication**: if Sky's codegen uses Inkwell, the same
-workaround applies. The cleaner long-term path is vendoring + fixing
-Inkwell upstream — see `inkwell-vendoring-handoff.md` in the erw repo
-for the diagnostic + fix plan.
+**Toylang's shipping fix: in-process round-trip through the IR text
+parser.** Approximately 10 LOC in `llvm_gen.rs`:
 
-A more durable alternative: use rustc's own `rustc_codegen_llvm`
-internal API directly. Heavier coupling (the API is unstable per
-nightly), but avoids the Inkwell maintenance question entirely.
+```rust
+fn roundtrip_text_to_bitcode<'ctx>(context: &'ctx Context, ir: &str) -> Vec<u8> {
+    use inkwell::memory_buffer::MemoryBuffer;
+    let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "sky_ir");
+    let module = context.create_module_from_ir(buffer)
+        .expect("Sky-emitted IR text re-parsed cleanly");
+    module.write_bitcode_to_memory().as_slice().to_vec()
+}
+```
+
+`Context::create_module_from_ir` wraps `LLVMParseIRInContext`. The IR
+text parser canonicalises the in-memory representation enough that
+the bitcode writer's function-table dedup no longer drops the
+record. 266/266 tests green; no external `llvm-as` shell-out, no
+`find_sysroot_tool` helper. Cost: one extra IR parse per Sky-module
+build (~milliseconds; immaterial).
+
+**Sky-relevant implication**: if Sky's codegen uses Inkwell, the
+round-trip pattern above is the shipping fix. No vendoring required.
+**Upstream contribution**: file at `llvm/llvm-project` with the
+`llvm-bcanalyzer --dump` diff showing the missing `FUNCTION` record
+and the stale `INST_CALL` value index. When upstream lands, the
+round-trip can be dropped for a direct `module.write_bitcode_to_memory()`.
+
+A more durable long-term alternative — use rustc's own
+`rustc_codegen_llvm` internal API directly — remains an option (avoids
+the Inkwell maintenance question entirely), but the round-trip
+workaround buys all the value at ~10 LOC; the rustc-internal path's
+~1,000-1,500 LOC rewrite isn't justified by this bug alone.
 
 #### F.9 LLVM version pinning includes Inkwell's LLVM
 

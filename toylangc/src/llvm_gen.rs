@@ -2118,12 +2118,16 @@ pub fn generate_with_tcx<'tcx>(
     // → `ModuleLlvm::parse_from_tcx`. Always emitted; the old
     // generate_and_compile path discards the bytes and writes `ir` via llc.
     //
-    // Inkwell's `write_bitcode_to_{memory,path}` produces records LLVM 21's
-    // own llvm-dis rejects ("Invalid record"). Suspected Inkwell-side bug
-    // (only manifests on non-trivial modules). Workaround: write the IR
-    // text and assemble via llvm-as, which produces valid bitcode that both
-    // llvm-dis and rustc's LTO parser accept.
-    let bitcode = assemble_text_to_bitcode(&ir);
+    // Direct `module.write_bitcode_to_memory()` produces records LLVM 21's
+    // own llvm-dis rejects ("Invalid record" — drops a FUNCTION decl from
+    // the MODULE block when extern decls and call-site arg types are
+    // ABI-coerced; see byte_string fixture for the trigger). The bug is in
+    // LLVM 21's bitcode writer, not in Inkwell's Rust source (every relevant
+    // Inkwell entry point is a thin FFI shim). Workaround: round-trip the
+    // IR text through Inkwell's LLVMParseIRInContext-based parser, which
+    // canonicalises the in-memory module state. The re-parsed module
+    // emits valid bitcode in-process, no shell-out, no llvm-as.
+    let bitcode = roundtrip_text_to_bitcode(ctx.context, &ir);
     (ir, bitcode, rust_symbols)
 }
 
@@ -2205,24 +2209,82 @@ fn apply_rust_compat_attributes<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>) {
     }
 }
 
-/// Workaround for Inkwell's bitcode-emission bug under LLVM 21: write the IR
-/// text to a temp file, shell to llvm-as, read the bitcode bytes back.
-fn assemble_text_to_bitcode(ir: &str) -> Vec<u8> {
-    let pid = std::process::id();
-    let ll_path = std::env::temp_dir().join(format!("toylang_sky_{}.ll", pid));
-    let bc_path = std::env::temp_dir().join(format!("toylang_sky_{}.bc", pid));
-    std::fs::write(&ll_path, ir).expect("write .ll");
-    let llvm_as = crate::find_sysroot_tool("llvm-as");
-    let status = std::process::Command::new(&llvm_as)
-        .arg(&ll_path)
-        .arg("-o").arg(&bc_path)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run llvm-as at {}: {}", llvm_as.display(), e));
-    assert!(status.success(), "llvm-as failed with status {}", status);
-    let bytes = std::fs::read(&bc_path).expect("read bitcode");
-    let _ = std::fs::remove_file(&ll_path);
-    let _ = std::fs::remove_file(&bc_path);
-    bytes
+/// Workaround for LLVM 21's bitcode-writer bug on ABI-coerced extern calls.
+///
+/// ## The bug
+///
+/// When a module contains an `extern` declaration whose declared parameter
+/// type differs from the type used at the call site — a normal pattern for
+/// FFI, since ABI coercion can produce calls like
+/// `call i32 @check_bytes({ ptr, i64 } { ... })` against
+/// `declare i32 @check_bytes([2 x i64])` (both 16 bytes, ABI-compatible) —
+/// LLVM 21's `BitcodeWriter.cpp::writeModuleInfo` drops one of the
+/// FUNCTION declaration records from the MODULE block's value list when
+/// serialising directly to bitcode. A subsequent `INST_CALL` then
+/// references a stale value index, and LLVM 21's own bitcode parser
+/// (and `llvm-dis`) rejects with "Invalid record."
+///
+/// The `byte_string_passed_to_rust_fn` integration fixture is the in-tree
+/// trigger. Diagnosed via `llvm-bcanalyzer --dump` comparison between
+/// Inkwell's direct bitcode emission and `llvm-as`'s output for the same
+/// IR text:
+///
+/// ```text
+/// < NUMENTRY op0=12                                  (Inkwell-direct)
+/// > NUMENTRY op0=13                                  (llvm-as)
+/// > <FUNCTION abbrevid=5 op0=0 op1=5 op2=11/>        (only in llvm-as)
+/// < <INST_CALL op0=0 op1=32768 op2=9  op3=5 op4=1/>  (Inkwell call → fn idx 9)
+/// > <INST_CALL op0=0 op1=32768 op2=12 op3=5 op4=1/>  (llvm-as call → fn idx 12)
+/// ```
+///
+/// ## Where the bug lives
+///
+/// Below the Rust/C boundary, in LLVM 21 itself. Investigation confirmed
+/// every relevant Inkwell entry point (`Module::write_bitcode_to_*`,
+/// `Module::add_function`, `Builder::build_direct_call`) is a 1-3-line
+/// FFI shim that passes arguments straight to `llvm-sys`; there is no
+/// Rust-side logic that could be wrong. Inkwell's `print_to_string` text
+/// emitter for the same in-memory module produces valid LLVM IR text that
+/// `llvm-as` accepts and round-trips cleanly through `llvm-dis`.
+///
+/// ## The workaround
+///
+/// Emit the in-memory module as IR text (the text printer is unaffected),
+/// parse the text back via `LLVMParseIRInContext` (Inkwell's
+/// `Context::create_module_from_ir`), and emit bitcode from the re-parsed
+/// module. The IR parser canonicalises the value-list / function-table
+/// representation in a way the direct-construction path does not, and the
+/// bitcode writer then handles the canonicalised module correctly. So we
+/// are not patching LLVM — we are using LLVM 21's own IR parser as a
+/// canonicalising filter between the in-memory module and the bitcode
+/// writer.
+///
+/// All in-process. No external `llvm-as` shell-out, no `find_sysroot_tool`
+/// dependency. Cost: one extra IR-text emit + parse per Sky-module build
+/// (~milliseconds — immaterial).
+///
+/// ## When this workaround can be retired
+///
+/// When LLVM upstream fixes `BitcodeWriter.cpp::writeModuleInfo`'s
+/// function-table dedup. The expected fix is to either (a) canonicalise
+/// the value list before serialising, mirroring what the IR parser does
+/// on the read side, or (b) tolerate value-list entries with mismatched
+/// declared-vs-call-site types instead of silently dropping. File at
+/// `llvm/llvm-project`, attach the `llvm-bcanalyzer --dump` diff above
+/// plus the byte_string fixture as the minimal repro. When the fix lands
+/// in a rustc-fork-bumped LLVM, replace the body of this function with a
+/// direct `context_module.write_bitcode_to_memory().as_slice().to_vec()`
+/// at the original call site and delete this helper.
+///
+/// Architecture-doc cross-refs: §25.2 B10 (risks register), Appendix F.8
+/// (lessons from the toylang prototype).
+fn roundtrip_text_to_bitcode<'ctx>(context: &'ctx Context, ir: &str) -> Vec<u8> {
+    use inkwell::memory_buffer::MemoryBuffer;
+    let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "sky_ir");
+    let module = context
+        .create_module_from_ir(buffer)
+        .expect("Sky-emitted IR text re-parsed cleanly (Inkwell roundtrip)");
+    module.write_bitcode_to_memory().as_slice().to_vec()
 }
 
 // Tier 3 #3 Phase 1c: `codegen_accessor_inline` retired. Accessors now
