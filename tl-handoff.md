@@ -1,23 +1,24 @@
-# Handoff: erw → Sky / Tier 3 facade rebuilds
+# Handoff: erw → Sky / clean checkpoint
 
-Hi, future-you. You're picking up after Session 14. Phases 1 and 2 of the
-quarter-of-work plan are done; the seven-case interop taxonomy is fully
-tested; the Sky-architectural `__ToylangOpaque<HASH>` wrapper migration
-landed; fork patch 4 (debuginfo clamp) was retired in Session 12; Tier 3
-#7 (`SkyUniverse` foundation) + #9 (`symbol_name` side-effect retired)
-landed in Session 13. **264/264 tests passing** against
-unpatched-aside-from-`per_instance_mir`-trio rustc.
+Hi, future-you. The toylang prototype has reached **a major clean
+checkpoint**. **266/266 tests passing** against
+unpatched-aside-from-`per_instance_mir`-trio + fork-patch-4-for-
+`extra_modules`-hook rustc. **16 of 18 course-correct items done.**
+The seven-case interop taxonomy is fully tested. Cross-language
+ThinLTO inlining is **empirically CI-fenced** by disassembly assertion
+(`test_lto_smoke` verifies `lto_smoke::main` constant-folds Sky's
+body down to `mov w8, #50` with no remaining `bl` to Sky symbols).
 
-Session 14 (today) was a deep investigation + planning session, no commits.
-The team decided to pursue **inline-codegen via a new rustc fork patch (c)**
-as the next major workstream. It folds three Tier 3 items (#3, #4-deeper,
-#12) into one architectural change AND empirically validates Sky's load-
-bearing cross-language ThinLTO inlining claim. The detailed implementation
-plan is at **`/Users/verdagon/.claude/plans/parsed-singing-globe.md`** —
-read that file first.
+There is no pressing toylang work left. The remaining course-correct
+item (#13, wrapper-mode retirement) bundles with Sky's actual
+toolchain shipping. The architecturally interesting next moves all
+live outside toylang — Sky comptime spike, async two-type split,
+groups/regions — and are separate projects.
 
-**If you only read one thing, read the plan file. After that, read §6.0
-Latest direction below for the rationale.**
+**If you only need a quick read: §1 → §8 → §10.** §6 (Tier 3 plan)
+and the active inline-codegen plan
+(`/Users/verdagon/.claude/plans/parsed-singing-globe.md`) are now
+**historical** — preserved for reference; execution is done.
 
 ---
 
@@ -27,17 +28,27 @@ Latest direction below for the rationale.**
 that hooks into rustc via query overrides) and `toylangc` (a toy consumer
 language exercising the facade). Architecturally we're aiming at **Sky**,
 the design locked in `rust-interop-architecture.md` (5,148 lines). The
-divergence catalog is `course-correct.md` (18 items, **13 done**: #1, #2,
-#4, #5, #6, #7, #9, #11, #14, #15, #16, #17, #18; #10 partial; #3, #8,
-#12, #13 remaining). The seven-case interop taxonomy (1a/1b/2/3/4/5/6) has
-been fully tested since Session 8; the architecturally-hard cases
+divergence catalog is `course-correct.md` (18 items, **16 done**: #1,
+#2, **#3 (cgu_stash retired + accessors collapsed)**, #4, #5, #6, #7,
+**#8 (SkyUniverse owns struct metadata)**, #9, #11, **#12 (@GCMLZ
+deadlock concern dissolved)**, #14, #15, #16, #17, #18; #10 partial;
+**only #13 remaining** — wrapper-mode retirement, bundles with Sky's
+toolchain shipping). The seven-case interop taxonomy (1a/1b/2/3/4/5/6)
+has been fully tested since Session 8; the architecturally-hard cases
 (rustc-walking-a-Rust-generic-body-dispatching-to-a-Sky-impl) all have
 fixtures. Toylang now uses **Approach A** (Instance-keyed
 `per_instance_mir`), **per-library stub rlibs** with `__SKY_STUBS_MARKER`,
 **sidecar-driven** (`.sky-meta` carries Temputs), **codegen-at-binary**
-(no per-rlib `.o`), **`export`-gated** stub generation (Sky §9), and
-**wrapper-as-field** Sky struct stubs (`__ToylangOpaque<HASH>` per §10.6).
-Three rustc fork patches remain — the `per_instance_mir` trio only.
+(no per-rlib `.o`), **`export`-gated** stub generation (Sky §9),
+**wrapper-as-field** Sky struct stubs (`__ToylangOpaque<HASH>` per §10.6),
+**single-symbol architecture** (Path B — Sky's bitcode emits under the
+rustc-mangled name), **`#![no_builtins]` stub rlibs** (excluded from
+ThinLTO's IR linker pool), and **inline codegen via patch (c)
+extra_modules hook** (Sky's bitcode contributed to rustc's pipeline
+through `consumer_emit_modules`). **Cross-language ThinLTO inlining
+empirically verified** by `test_lto_smoke`'s disassembly assertion.
+Four rustc fork patches in effect — `per_instance_mir` trio + the
+`extra_modules` hook.
 
 ---
 
@@ -58,7 +69,10 @@ Three rustc fork patches remain — the `per_instance_mir` trio only.
 | 11 | `8faca57`, `5a1e7d0`, `d87638d`, `a43569c`, `4c19bec`, `8a9adc8`, `70e3069`, `c17cf7e`, `747d0e6`, `ed4e07e`, `a3a7c94`, `09d50bb` + fork `e67de69ef35` | Generic/non-generic uniformity sweep (Phases A/B/C/F); Phase E investigation; fork patch 4 (debuginfo clamp) shipped; struct shape unified to `pub struct Foo<P...>(PhantomData<(P...)>);`; vestigial `__toylang_impl_*` + `__toylang_accessor_*` extern decls retired. **CLAUDE.md compiler-law violation count: zero.** |
 | 12 | `72a929e`, `41423cf`, `90599cf`, `7f6bf97` + fork `003f91e4df9` | **Phase E Path 2**: `__ToylangOpaque<const T: u64>` wrapper-as-field migration (architecture §10.4.5 path 2 / §10.6). typeid helper + wrapper emission + typeid table (Phase 1), const-generic-u64 encode/decode (Phase 2), Sky struct stub shape migration + layout-field-count match (Phase 3), fork patch 4 reverted (Phase 5). **262/262 against unpatched rustc.** |
 | 13 | `c801638`, `fa3fdd3`, `45e903b`, `c4fc74a` | **Tier 3 #7 + #9**: `LangPredicates` → `SkyUniverse`, then symbol_name side-effect channel retired. `SkyUniverse { typeids, fn_names, type_names }` populated at sidecar load + local registry build; predicates are O(1) RwLock reads. `LangPredicates` trait + `PredicateVtable` + trampolines + toylang's per-callbacks name mirrors all gone. Then: `notify_concrete_entry_point` callback replaced by stateless `consumer_symbol_for_callback_name`; the @GCMLZ thread-local fat-pointer bypass (Session 5) retired with it. **264/264 passing.** Both landed in ~1.5h vs the handoff's ~4-week sum estimate — the chokepoint pattern repeats. |
-| 14 | (no code commits — planning session) | **Strategic pivot**: deep investigation into Sky's cross-language inlining design. Five agents traced: (a) rustc post-`codegen_crate` lifecycle teardown, (b) ThinLTO cross-module inlining mechanism, (c) LLVM IR type interop requirements at link level, (d) rustc function attributes for ThinLTO compatibility (`rustc_codegen_llvm/src/attributes.rs:376-583`), (e) `LangCodegenBackend` wrapper integration surface. Two prior-investigation errors corrected: (i) "share LLVMContext with rustc" was overstated as a constraint — rustc itself runs one context per CGU and patch (c) just adds Sky's module as another, (ii) "std stays uninlineable" was wrong — rustc's own LTO bitcode-extraction handles `.llvmbc` rlibs natively, so std inlining works once Sky's module rides rustc's pipeline. **Plan written:** `/Users/verdagon/.claude/plans/parsed-singing-globe.md`. Folds Tier 3 #3 + #4-deeper + #12 into one workstream; adds new fork patch 4 (`extra_modules` hook on `ExtraBackendMethods`); empirically validates cross-language ThinLTO inlining including std. Est ~6–8 days. |
+| 14 | (no code commits — planning session) | **Strategic pivot**: deep investigation into Sky's cross-language inlining design. Two prior-investigation errors corrected: (i) "share LLVMContext with rustc" was overstated — rustc runs one context per CGU and patch (c) just adds Sky's module as another, (ii) "std stays uninlineable" was wrong — rustc's own LTO bitcode-extraction handles `.llvmbc` rlibs natively. **Plan written:** `/Users/verdagon/.claude/plans/parsed-singing-globe.md` (historical now — execution complete). |
+| 15 | `0f539d29d0d` (fork) + `690b7d2`, `ec77f6d`, `3f8ac11`, `08a65ad`, `f9f9c03` (main) | **Phase 0–3 of the inline-codegen plan**. Fork patch 4 (`extra_modules` hook on `ExtraBackendMethods` + `ModuleLlvm::parse_from_tcx` + visibility upgrades). Facade: hook installation, `consumer_emit_modules` trait + vtable + trampoline, attribute mirroring. Toylang: codegen migrates from `.ll`/`llc` shell-out to `ModuleCodegen<ModuleLlvm>` via bitcode round-trip; legacy `.o` path retired. Findings: coordinator handshake protocol forced synchronous extras processing; LLVM 20→21 bitcode skew forced Inkwell bump; Inkwell bitcode bug → `llvm-as` shell-out workaround. **264/264 passing.** |
+| 15 (cont) | `8fbd928`, `745aed3`, `6bd793a` (main) | **Phase 4.5 Path B + touch points 5+6**. Single-symbol architecture: Sky's bitcode emits each rustc-visible body under the rustc-mangled name; the synthesised `__toylang_impl_*` retirement collapses two symbols → one so ThinLTO sees Sky's body as the sole def. `#![no_builtins]` excludes stub rlibs from LTO's IR linker pool. `lto_smoke` integration fixture + manifest `lto`/`opt-level` knobs verify the LTO path doesn't panic. **265/265 passing.** Key debugging lessons in §5 traps #11–#15. |
+| 16 | `63beb0c`, `c0a83fe`, `b92f101`, `1730c53` (main) | **Tier 3 sweep close-out**. #8 (SkyUniverse absorbs consumer struct metadata via type-erased `Arc<dyn Any>`; toylang-side `upstream_structs` mirror retires). #3 (cgu_stash + accessor-inline retired; accessors collapsed into the regular function pipeline via parse-time `synthesize_accessor_pairs`; Case-1b discovery via `default_collect_and_partition()`). #12 close-out (@GCMLZ doc rewrite, lib.rs comment refresh, `FacadeMutableState` inlined; mutex retained for `collect_generic_rust_deps` worker-thread serialisation but no longer trap-fences). `test_lto_smoke` tightened from "doesn't panic" → "cross-language inlining empirically verified via disassembly assertion." **266/266 passing.** **16/18 course-correct items done.** |
 
 Anchor commits worth knowing: `c38d7e0` is the doc cleanup right before
 Session 12 started; `ce437ae` is the last commit with full Approach A
@@ -812,53 +826,71 @@ freestanding tool.
 
 ## 8. Status snapshot (where you start)
 
-**Tests**: **264/264** (106 toylangc unit + 2 facade unit + 1 fence + 139
-integration + 16 standalone) when run with `integration-projects-cache`
-wiped.
+**Tests**: **266/266** (107 toylangc unit + 3 facade unit + 1 fence + 140
+integration + 16 standalone — includes `test_lto_smoke`'s tightened
+cross-language inlining assertion) when run with
+`integration-projects-cache` wiped.
 
 **Seven-case taxonomy**: 7/7 tested (1a/1b/2/3/4/5/6).
 
-**Course-correct.md items done**: 13/18 (#1, #2, #4, #5, #6, #7, #9,
-#11, #14, #15, #16, #17, #18). #10 partial. #3, #8, #12 remaining.
-#3 + #4-deeper + #12 are folded into the next-session plan at
-`/Users/verdagon/.claude/plans/parsed-singing-globe.md`. #8 is a separate
-~1–2 day item to land after. #13 explicitly out of scope.
+**Course-correct.md items done**: **16/18** (#1, #2, #3, #4, #5, #6,
+#7, #8, #9, #11, #12, #14, #15, #16, #17, #18). #10 partial. Only #13
+remaining — wrapper-mode `@MRRIWMZ` retirement, bundles with Sky's
+actual toolchain shipping. Out of scope for toylang.
 
-**Active plan**: `/Users/verdagon/.claude/plans/parsed-singing-globe.md` —
-inline-codegen prototype via new rustc fork patch (c). Est ~6–8 days.
-Validates cross-language ThinLTO inlining empirically.
+**No active plan.** The previous active plan
+`/Users/verdagon/.claude/plans/parsed-singing-globe.md` (inline-codegen
++ Tier 3 #3 + #12) is **historical** — Sessions 15 + 16 executed it
+end-to-end. Preserved on disk for reference; nothing pending.
 
-**Fork state**: `~/rust` on `per-instance-mir`, 3 patches in effect
-(query decl, collector hook, default-None provider). Patch 4 (debuginfo
-clamp `e67de69ef35`) was reverted (`003f91e4df9`) — Session 12 made it
-unnecessary. **The plan will add a new patch 4** (the `extra_modules`
-hook on `ExtraBackendMethods` + ~3 visibility upgrades) — net count will
-go to 4 in Phase 0 of the plan. Built for nightly-2026-01-20 / rustc
-1.95.0-dev / commit `d940e568`. Installed as toolchain `rustc-fork`.
+**Fork state**: `~/rust` on `per-instance-mir`, **4 patches** in effect:
+
+1. `per_instance_mir` query declaration (`rustc_middle/src/query/mod.rs`).
+2. Mono collector hook (`rustc_monomorphize/src/collector.rs`).
+3. Default-None provider (`rustc_mir_transform/src/lib.rs`).
+4. `extra_modules` hook + `ModuleLlvm::parse_from_tcx` + visibility
+   upgrades on `submit_codegened_module_to_llvm` (`rustc_codegen_ssa` +
+   `rustc_codegen_llvm`). Session 15 fork commit, supports patch (c)
+   inline-codegen.
+
+Built for nightly-2026-01-20 / rustc 1.95.0-dev / commit `d940e568`.
+Installed as toolchain `rustc-fork`. The debuginfo-clamp patch
+(`e67de69ef35`) that briefly landed in Session 11 was reverted
+(`003f91e4df9`) in Session 12 — `__ToylangOpaque<HASH>` wrapper-as-field
+made it unnecessary.
 
 **Toolchain pin**: `rust-toolchain.toml` channel = `"rustc-fork"`. Four
 sites stay in sync (toolchain file + `TOYLANG_NIGHTLY` in main.rs + two
 test files).
 
-**Codegen architecture**: post-Workstream-A — rlib compile produces rlib
-+ sidecar only (no toylang `.o`). User-bin compile is the codegen site,
-driven by §20.4-aligned entry-point walk + transitive callee walking +
-upstream-CGU iteration for Case-1b/accessors.
+**Codegen architecture**: post-Workstream-A + Phase 4.5 Path B —
+rlib compile produces rlib + sidecar only (no toylang `.o`). User-bin
+compile contributes Sky's bitcode via `consumer_emit_modules` → patch
+(c) `extra_modules` hook, which submits a `ModuleCodegen<ModuleLlvm>`
+into rustc's optimize → ThinLTO summary → emission pipeline. Sky's
+bitcode emits each rustc-visible body under the rustc-mangled name
+(single-symbol architecture); `#![no_builtins]` excludes the stub rlib
+from LTO's IR linker pool so Sky's body is the sole def.
 
 **Sky struct stub shape**: Phase E Path 2 wrapper-as-field newtype.
 Non-generic: `pub struct Foo(__ToylangOpaque<HASH>);`. Generic:
 `pub struct Foo<P...>(__ToylangOpaque<HASH>, PhantomData<(P...)>);`.
 
-**§9 export commitment**: fenced by stub_gen unit test
-`non_export_body_bearing_fn_gets_no_stub_shell`.
+**CI fences** (any regression fires a named test):
 
-**§4.4 byte-identical pass-through**: fenced by
-`test_a5_byte_identical_pass_through`.
-
-**Compiler-law generic/non-generic uniformity**: fenced by
-`tests/architecture_fence.rs` (scans `callbacks_impl.rs` +
-`type_resolve.rs` + `stub_gen.rs` for unmarked
-`type_params.is_empty()`/`type_args.is_empty()` branches).
+- **§9 export commitment**: `non_export_body_bearing_fn_gets_no_stub_shell`
+  (stub_gen unit test).
+- **§4.4 byte-identical pass-through**:
+  `test_a5_byte_identical_pass_through` (standalone test).
+- **Compiler-law generic/non-generic uniformity**:
+  `tests/architecture_fence.rs` (scans `callbacks_impl.rs` +
+  `type_resolve.rs` + `stub_gen.rs` for unmarked
+  `type_params.is_empty()`/`type_args.is_empty()` branches).
+- **Cross-language ThinLTO inlining**: `test_lto_smoke`'s
+  `assert_sky_inlined_into_main` — disassembles the binary, asserts the
+  user_bin's Rust `main` contains no `bl` to Sky symbols. Fixture sets
+  `lto = "thin"` + `opt-level = "3"` via manifest's new `Project::lto`
+  + `Project::opt_level` fields.
 
 **Working tree**: clean.
 
@@ -866,21 +898,19 @@ Non-generic: `pub struct Foo(__ToylangOpaque<HASH>);`. Generic:
 
 | Commit | What |
 |---|---|
-| `c4fc74a` | Session 13 doc refresh (#7 + #9 marked done in course-correct.md + handoff) |
-| `45e903b` | Session 13 doc refresh (#7 landed) |
-| `fa3fdd3` | **Tier 3 #9** — `symbol_name` side-effect retired; stateless `consumer_symbol_for_callback_name`; @GCMLZ thread-local bypass gone |
-| `c801638` | **Tier 3 #7** — `LangPredicates` → `SkyUniverse`; predicates are now O(1) RwLock reads |
-| `7f6bf97` | Phase E Path 2 Phase 5 — fork patch 4 retired, docs refreshed |
-| `90599cf` | Phase E Path 2 Phase 3 — Sky struct stubs migrated to wrapper-as-field |
-| `41423cf` | Phase E Path 2 Phase 2 — const-generic-u64 plumbing |
-| `72a929e` | Phase E Path 2 Phase 1 — wrapper decl + typeid helper + table |
-| `c38d7e0` | Pre-Session-12 stale comment cleanup |
-| `09d50bb` | Session 11 doc refresh |
-| `ed4e07e` | Vestigial `__toylang_impl_*` / `__toylang_accessor_*` extern decls retired |
-| `c17cf7e` | Phase E Path 1 completion — struct shape unified (under fork patch 4) |
-| `1b738e6` | Session 10 — `export` keyword |
-| `b56cf4c` | Phase 2 C — Case 4 end-to-end |
-| `671f002` | Approach A + Sidecar + Workstream A + Phase 3 multi-crate (big bang) |
+| `1730c53` | **`test_lto_smoke` tightened** — cross-language inlining proven via disassembly assertion. Manifest gains `opt-level`. |
+| `b92f101` | **Tier 3 #12 close-out** — @GCMLZ doc rewrite, lib.rs comment refresh, `FacadeMutableState` inlined. |
+| `c0a83fe` | **Tier 3 #3 retire `cgu_stash`** — accessors collapsed into the regular function pipeline via parse-time synthesis; Case-1b via `default_collect_and_partition()`. |
+| `63beb0c` | **Tier 3 #8** — `SkyUniverse.struct_infos` (typed-erased `Arc<dyn Any>`); consumer-side `upstream_structs` mutex mirror retires. |
+| `6bd793a` | `lto_smoke` fixture + integration test (originally just "doesn't panic"; tightened later in `1730c53`). |
+| `745aed3` | `#![no_builtins]` excludes stub rlibs from LTO's IR linker pool. |
+| `8fbd928` | **Phase 4.5 Path B** — single-symbol architecture; Sky's bitcode emits under rustc-mangled name. |
+| `f9f9c03` | Phase 2 step 3 — inline-codegen path becomes default; legacy `.o` path retired. |
+| `0f539d29d0d` (fork) | Phase 0 fork patch 4 — `extra_modules` hook + `parse_from_tcx` + visibility upgrades. |
+| `fa3fdd3`, `c801638` | Tier 3 #7 + #9 — `LangPredicates` → `SkyUniverse`; `symbol_name` side effect retired. |
+| `7f6bf97`, `72a929e` | Phase E Path 2 — `__ToylangOpaque<HASH>` wrapper-as-field migration. |
+| `b56cf4c`, `1b738e6` | Phase 2 C Case 4 + Session 10 `export` keyword. |
+| `671f002` | Approach A + Sidecar + Workstream A + Phase 3 multi-crate (big bang). |
 
 Use `git log <commit>..HEAD` to walk forward.
 
@@ -939,49 +969,71 @@ For routine "this took longer than I estimated" — keep going.
 
 ## 10. Closing notes
 
-You're inheriting a working baseline at a **major checkpoint**, with the
-architecturally interesting interop machinery proven end-to-end:
+You're inheriting a **clean-checkpoint baseline** with every
+architecturally interesting interop machine empirically fenced:
 
 - Approach A fires per-Instance with concrete args (`case1b` exercises
   this directly).
-- The rustc fork is 3 patches against nightly-2026-01-20, installed as
-  `rustc-fork`.
+- The rustc fork is 4 patches against nightly-2026-01-20, installed as
+  `rustc-fork`: the `per_instance_mir` trio + the `extra_modules` hook
+  for patch (c) inline codegen.
 - Per-library stub rlibs with `__SKY_STUBS_MARKER` + adjacent
   `.sky-meta` sidecars work end-to-end.
 - Multi-toylang-crate projects build (case6_basic + sharpened
   case4/5/6).
 - The seven-case taxonomy is fully tested (7/7).
+- Phase 4.5 Path B single-symbol architecture: Sky's bitcode emits
+  every rustc-visible body under the rustc-mangled name. `#![no_builtins]`
+  excludes stub rlibs from LTO's IR linker pool.
+- `extra_modules_hook` contributes Sky's `ModuleCodegen<ModuleLlvm>`
+  into rustc's optimize → ThinLTO → emission pipeline.
+- **Cross-language ThinLTO inlining empirically verified.**
+  `test_lto_smoke` builds with `lto = "thin"` + `opt-level = 3` and
+  disassembles the binary; the user_bin's Rust `main` constant-folds
+  Sky's `compute() = 10 + 20*2` down to `mov w8, #50` with no `bl`
+  to Sky symbols. Any regression of Path B, `#![no_builtins]`, function
+  attribute mirroring, or the patch (c) hook fires the assertion.
 - Sky §9 export commitment is fenced; §4.4 byte-identical pass-through is
   fenced; generic/non-generic uniformity is fenced; Sky struct stub
   shape is wrapper-as-field per §10.6.
-- 264/264 tests pass against an unpatched-aside-from-the-Approach-A-trio
-  rustc.
-- Tier 3 #7 (`SkyUniverse` foundation) + #9 (`symbol_name` side-effect
-  retirement) landed in Session 13. Predicates are O(1) RwLock reads;
-  the @GCMLZ thread-local fat-pointer bypass (Session 5) is dead code.
+- 266/266 tests pass. 16/18 course-correct items done; #10 partial;
+  only #13 (wrapper-mode retirement, bundles with Sky's toolchain
+  shipping) remains.
+- The @GCMLZ deadlock concern dissolved (Tier 3 #7 / #9 / #12 close-out).
+  `MUTABLE_STATE` retained for `collect_generic_rust_deps`'s rayon
+  worker-thread serialisation; not a trap-fence.
 
-**The next workstream — the active plan at
-`/Users/verdagon/.claude/plans/parsed-singing-globe.md`** — is the most
-architecturally ambitious yet. It validates Sky's cross-language ThinLTO
-inlining claim empirically by reshaping toylang's codegen to ride rustc's
-own optimization + LTO pipeline via a new fork patch. The patch is small
-(~15 lines + visibility upgrades), the integration is well-scoped (~6–8
-days), and the deliverable is both a Sky-aligned facade AND empirical
-proof that the perf story works. Along the way it retires three Tier 3
-items (#3, #4-deeper, #12) as natural side effects.
+**There is no pressing toylang work left.** The bounded follow-ups
+that could still land:
 
-After the plan lands: only #8 (`layout_of` walks Sky-side, ~1–2 days
-under the chokepoint pattern) and #13 (wrapper-mode retirement, deferred
-with Sky's toolchain shipping) remain. The facade will then look like
-Sky's locked design: owned universe populated at after_expansion,
-lock-free reads everywhere, codegen walking the queue inline, no
-MUTABLE_STATE, no two-vtable split, no CGU stash, no `symbol_name` side
-effect, AND empirical verification of cross-language inlining.
+1. **File the rustc upstream PRs.** Two drafts exist:
+   - `phase-e-rustc-pr-draft.md` (debuginfo clamp — Sky-side no longer
+     needs it after Phase E Path 2 but benefits cranelift/miri/plugins).
+   - The `extra_modules` hook isn't drafted as a PR; would benefit
+     cranelift/gcc-rs/spirv backends. ~few hours to write up.
+2. **Phase 4.4 benchmark.** Quantitative measurement of cross-language
+   inlining perf delta (with/without `lto = "thin"`). Would validate
+   "ThinLTO closes the cross-language gap" architecturally. ~½ day.
 
-Read the architecture doc. Read course-correct.md (status table at the
-top). Read the active plan file. Then start with the plan's Phase 0
-(rustc fork patch).
+**The big shifts that aren't toylang work:**
+
+- **Sky comptime spike** (§13 slab-based comptime). The highest-leverage
+  Sky pre-1.0 derisking. 2–4 week vertical slice proving the slab-
+  pointer-as-`usize` trick survives non-degenerate cases. Separate
+  project; toylang can't validate it.
+- **Sky async two-type split** (`SkyNotStarted_foo` /
+  `SkyRunning_foo`, §14). Most distinctive Sky design choice; never
+  exercised. Out of scope for toylang.
+- **Toylang → Sky bootstrap planning.** A doc that maps which parts
+  of erw forward-port to Sky and which were pure prototype scaffolding.
+
+Read `course-correct.md` (status table at the top) to confirm the
+scoreboard. Read the architecture doc if you'll touch Sky design.
+Read this handoff §1, §8, §10 for current state. The Tier 3 plan in
+§6 and the inline-codegen plan at
+`/Users/verdagon/.claude/plans/parsed-singing-globe.md` are
+**historical** — Sessions 13/15/16 executed them.
 
 Good luck.
 
-— previous engineer (Session 14 end)
+— previous engineer (Session 16 end)
