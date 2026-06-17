@@ -257,6 +257,59 @@ From CLAUDE.md (both project + user-global):
     Substituted-args fast paths + degenerate-case helpers carry inline
     `// arch-fence-allow: <reason>` markers (on the same line OR the
     immediately-preceding line — not further back).
+11. **LTO tests need the wrapper engaged.** When manually testing under
+    `[profile.dev] lto = "thin"` (e.g., reproducing the Path B / Phase 4.5
+    empirical proof), invoking `cargo build` directly bypasses
+    `RUSTC_WORKSPACE_WRAPPER` and the facade's
+    `extra_modules_hook` is never installed — Sky contributes zero
+    bitcode, the binary panics or links to the stub's `unreachable!()`,
+    and you wrongly conclude "patch (c) is broken under LTO." Set
+    `RUSTC_WORKSPACE_WRAPPER=$ERW/target/debug/toylangc` AND
+    `DYLD_LIBRARY_PATH=$RUSTUP_HOME/toolchains/rustc-fork/lib` (plus
+    `LD_LIBRARY_PATH` on Linux) before invoking cargo. `toylangc build`
+    sets these automatically; direct `cargo build` does not. Watch for the
+    probe line `[lang-facade] extra_modules hook fired; consumer
+    returned N module(s)` (gated on `LANG_FACADE_EXTRA_MODULES_PROBE=1`)
+    to confirm the hook actually runs.
+12. **Cargo profile overrides only live at workspace root.** A
+    `[profile.dev]` block in a workspace MEMBER package is silently
+    ignored. To enable LTO for an integration test, edit the
+    workspace's top-level `Cargo.toml`
+    (`.toylang-build/Cargo.toml`), not the member's
+    (`.toylang-build/user_bin/Cargo.toml`). Cargo doesn't warn; the
+    rustc command just won't carry `-C lto=thin`.
+13. **Path B touch-point 3 misjudged the plumbing.** The Phase 4.5 plan
+    said `ToylangInstance.extern_symbol` flows from
+    `compute_consumer_symbol`; it actually flows from `compute_fn_symbol`
+    (line ~1525) and `compute_fn_symbol_from_type_args` (now
+    `compute_internal_symbol_from_type_args`, line ~1119) at four sites:
+    `callbacks_impl.rs:241/400/1337` and `llvm_gen.rs:2048`. PLUS the
+    `llvm_gen.rs` string-replace `extern_symbol.replace(
+    "__toylang_impl_", "__toylang_internal_")` at the codegen loops
+    (lines 2096, 2101) — broken the moment extern_symbol becomes the
+    rustc-mangled name. Future "trust the plan's surface area" reviews
+    should walk the actual call graph for the field being changed.
+14. **`find_trait_impl_method_def_id` had a hidden ambiguity.** Pre-Path
+    B, when the consumer's self-type-name was `Box`, the helper's
+    `tcx.all_impls(Clone)` walk matched both `case6_lib::Box` (Sky-
+    defined) AND `std::ffi::os_str::Box<OsStr>` (stdlib-defined). The
+    pre-Path-B synthesized `__toylang_impl__Box__Clone__clone` extern
+    name didn't care which DefId was returned; Path B uses the DefId's
+    rustc-mangled name directly, so picking the std impl produced a
+    symbol Sky never defines. Fix at `oracle.rs:705-712` filters
+    `tcx.all_impls` results via
+    `rustc_lang_facade::is_from_lang_stubs(tcx, adt_def.did())`. Any
+    future oracle helper that walks `tcx.all_impls(...)` for a consumer
+    type should apply the same filter — the self-type-name check is
+    name-only and inherently ambiguous across the crate graph.
+15. **`#[inline(never)]` is not a fix for symbol-priority bugs.** When
+    two strong defs of a symbol compete (e.g., stub rlib's
+    `unreachable!()` body vs Sky's real body under ThinLTO),
+    `#[inline(never)]` on one side doesn't change which def wins — it
+    only relocates *where* the panic happens. The fix is at the symbol-
+    resolution layer (LTO inclusion via `#![no_builtins]`, linkage
+    attributes, partitioner filtering), not at the inliner layer. Don't
+    reach for inline controls to fix a definition-priority bug.
 
 ---
 

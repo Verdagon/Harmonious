@@ -20,6 +20,8 @@ Consumer types appear to rustc as opaque stubs with `unreachable!()` bodies. Int
 
 **`instantiate_identity()` requires a comment.** `EarlyBinder::instantiate_identity()` is a no-op unwrap — it discards the binder and returns the inner value with all `ty::Param` placeholders intact. It is only correct for structural inspection (e.g., "is this impl for a consumer type?"), never for producing a concrete type at a call site. Every call to `instantiate_identity()` must have a comment explaining why we are intentionally not substituting real values for the generic parameters.
 
+**Never revert unilaterally.** If a change doesn't pan out, stop and ask before undoing anything — including changes you just made. The failing tree carries diagnostic signal, and the user may want partial work kept. Reverting is a pivot.
+
 ## Key docs
 
 - [Architecture guide](docs/architecture/rust-interop-guide.md) — full compilation flow, query providers, LLVM backend, ABI handling

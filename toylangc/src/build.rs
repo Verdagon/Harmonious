@@ -269,6 +269,20 @@ fn write_stub_crate(
     let stubs = crate::stub_gen::generate(&registry);
 
     let mut stubs_with_features = String::new();
+    // Path B / Phase 4.5 touch point 5: exclude the stub rlib from ThinLTO's
+    // IR linker pool. Without this, LTO sees the stub rlib's `unreachable!()`
+    // bodies as candidate definitions for the rustc-mangled consumer symbols
+    // alongside Sky's real bodies (contributed via patch (c) at the user_bin
+    // compile), and the IR linker non-deterministically picks the wrong one —
+    // user reports `arithmetic` panicking with `unreachable!()` under
+    // `lto = "thin"`. `#![no_builtins]` is rustc's canonical per-crate LTO
+    // exclusion mechanism (the same one `compiler_builtins` uses): the stub
+    // rlib's `.rcgu.o`s still link normally (so the rlib still serves its
+    // typecheck role) but its bitcode never enters the LTO module pool.
+    // Cross-language inlining is unaffected — Sky's bodies live in user_bin's
+    // bitcode and Rust deps' bodies live in their own rlibs; both participate
+    // in LTO independently.
+    stubs_with_features.push_str("#![no_builtins]\n\n");
     for feat in &manifest.project.features {
         stubs_with_features.push_str(&format!("#![feature({})]\n", feat));
     }
