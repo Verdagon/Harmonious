@@ -688,9 +688,15 @@ The slab-pointer trick (representing comptime Sky values as integer slab address
 
 This is the Approach A constraint inherited from `dep-discovery-approaches.md`'s analysis: when the downstream substitutor (rustc's collector) cannot handle the value type, the upstream substitution (Sky's provider) must do it. Sky's compile-time metaprogramming makes Sky the only entity that can substitute Sky-typed comptime args correctly. Hence per_instance_mir, Instance-keyed.
 
-### 3.2 The three patches
+### 3.2 The four patches
 
-Sky's fork is three patches against vanilla nightly rustc, identical in shape to erw's pre-stage-3 fork. The patches add the `per_instance_mir` query to rustc; they do not modify any other rustc behavior.
+Sky's fork is four patches against vanilla nightly rustc. Three add the
+`per_instance_mir` query — identical in shape to erw's pre-stage-3
+fork. The fourth (added during toylang's Phase 4.5 / Session 15) adds
+an `extra_modules` hook on `ExtraBackendMethods` for inline codegen
+contribution. None modify rustc's behavior for vanilla compiles
+(default-empty / default-None providers preserve the pass-through
+invariant; see §4.4).
 
 **Patch 1: declare the query.** In `compiler/rustc_middle/src/query/mod.rs`, add a query declaration:
 
@@ -727,7 +733,50 @@ providers.per_instance_mir = |_tcx, _instance| None;
 
 This makes the query a no-op for vanilla rustc. Without a plugin installing a real provider, the collector's `tcx.per_instance_mir(instance)` always returns `None`, the unwrap_or_else falls through to `instance_mir`, and rustc's behavior is unchanged from a non-forked rustc. This means the forked rustc, when compiling pure-Rust code (no Sky plugin active), produces byte-identical output to vanilla rustc — a testable invariant.
 
-**Total patch surface:** approximately 50 lines across three files. Each patch is small, structurally local, and follows established patterns in rustc's source. The patches collectively add an extension point that rustc's existing infrastructure (query macros, collector dispatch) already accommodates structurally; the patches just connect the dots.
+**Patch 4: `extra_modules` hook for inline codegen.** In
+`compiler/rustc_codegen_ssa/src/traits/backend.rs`, add a new trait
+method on `ExtraBackendMethods`:
+
+```rust
+fn extra_modules<'tcx>(
+    &self,
+    _tcx: TyCtxt<'tcx>,
+) -> Vec<ModuleCodegen<Self::Module>> {
+    Vec::new()
+}
+```
+
+Default-empty so non-adopting backends are unaffected. The LLVM
+backend's impl in `compiler/rustc_codegen_llvm/src/lib.rs` consults a
+process-global `OnceLock<ExtraModulesHook>` settable via
+`set_extra_modules_hook(fn_ptr)`. Sky's facade installs the hook
+during driver setup alongside `Config::override_queries`.
+
+In `compiler/rustc_codegen_ssa/src/base.rs::codegen_crate`, call the
+hook **synchronously on the main thread BEFORE `start_async_codegen`**:
+
+```rust
+let extra_modules = backend.extra_modules(tcx);
+// ... existing call to start_async_codegen ...
+// extra_modules passed in; processed via execute_optimize_work_item
+// before the worker pool starts.
+```
+
+Sub-patch: `ModuleLlvm::parse_from_tcx(tcx, name, buffer)` added to
+`rustc_codegen_llvm` for tcx-bound bitcode parsing (the hook fires
+from the main thread, not from a worker, so the per-worker
+`CodegenContext` isn't available). Plus visibility upgrades on
+`submit_codegened_module_to_llvm`, `ModuleLlvm::new`, and
+`ModuleLlvm::parse` (crate-private → `pub`).
+
+**Total patch surface:** approximately 50 lines for the
+`per_instance_mir` trio + ~93 lines for the `extra_modules` hook =
+~143 lines across 7 files. Each patch is small, structurally local,
+and follows established patterns in rustc's source. The patches
+collectively add two extension points that rustc's existing
+infrastructure (query macros, collector dispatch, the codegen
+backend trait) already accommodates structurally; the patches just
+connect the dots.
 
 ### 3.3 Long-term: upstream as `adt_const_params`-extension or new query
 
@@ -751,9 +800,9 @@ The upstream effort is *not* on Sky's critical path. Sky ships with the fork, ma
 
 ### 3.4 Fork maintenance budget
 
-The empirical baseline for fork maintenance is erw's pre-stage-3 experience: ~2-3 days per nightly bump for a 5-patch fork. Sky's fork is 3 patches (smaller), but the patches touch the mono collector (a churn-prone area). The realistic estimate:
+The empirical baseline for fork maintenance is erw's pre-stage-3 experience: ~2-3 days per nightly bump for a 5-patch fork. Sky's fork is 4 patches (per_instance_mir trio + `extra_modules` hook), and one of them touches the mono collector (a churn-prone area). The realistic estimate:
 
-- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the three patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent. (Optionally a 4th patch — the debuginfo walker clamp, §10.4.5 / §25 B8 — if not yet upstream-landed. ~10 LOC defensive change in `rustc_codegen_llvm`; mechanically simple to rebase. Toylang carries this as commit `e67de69ef35` on its `per-instance-mir` branch as the reference implementation.)
+- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the four patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent. Patch 4 (`extra_modules` hook) touches `rustc_codegen_ssa::base::codegen_crate` and the coordinator pipeline in `back/write.rs` — the latter has historical churn risk because the codegen coordinator is a complex state machine; the rebase may take a half-day during the rare period when rustc restructures it. The debuginfo walker clamp (§10.4.5 / §25 B8) is no longer needed under the wrapper-as-field shape (§10.6) — the structural fix made the defensive patch obsolete.
 - **Per-bump cost: ~1 week for MIR construction churn.** This is independent of the fork — it's the cost of Sky's per_instance_mir provider building synthetic MIR bodies, which uses rustc-internal MIR construction APIs that drift. The empirical erw data point: 15 months of MIR drift was ~1 hour for erw's 6 sites. Sky's count is higher (every generic Sky function exported produces per_instance_mir output containing ReifyFnPointer casts), so the per-bump cost is larger, but the per-site cost is similar.
 - **Per-bump cost: ~1-2 days for ABI helpers drift.** PassMode variants, BackendRepr changes, layout-data shape shifts. Sky inherits erw's ABI helpers wholesale; the drift surface is identical.
 - **Per-bump cost: ~0.5-1 day for everything else.** Driver entry-point changes, Callbacks trait additions, layout query key shape, providers struct restructuring. All small, all mechanical.
@@ -4109,13 +4158,17 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B4. ABI helpers drift.** Probability: 15-25% over 5 years. Sky inherits erw's ABI helpers; PassMode variants and similar surface drift. Canary: ABI-shape tests fail. Reaction: 1-2 weeks repair.
 
-**B5. CGU lifetime erasure fragility.** Probability: 15-20% over 5 years. Sky may need to stash CGU references across query boundaries (for the deferred Sky-codegen pass). The lifetime laundering mechanism is delicate. Canary: lifetime errors in partition.rs. Reaction: 1-2 weeks redesign.
+**B5. CGU lifetime erasure fragility.** **CLOSED by toylang.** Probability previously 15-20% over 5 years. The original concern was that Sky might need to stash CGU references across query boundaries with `'static`-erased pointers (the delicate lifetime-laundering pattern erw used in `cgu_stash.rs`). Toylang's Tier 3 #3 (commit `c0a83fe`) replaced the stash with a direct re-call of the saved upstream partition provider: `default_collect_and_partition()(tcx, ())` from inside `codegen_crate`, where `'tcx` is live. Sound by construction; no unsafe; bypasses the in-memory query cache cleanly. Sky should follow the same pattern from day one. The risk entry remains in the doc for historical context; the architectural answer is "don't stash, re-call."
 
 **B6 (Sky-specific). Slab/comptime interaction with incremental cache.** Probability: ~30% over 5 years. Sky's per-invocation slab plus query-cache interactions may produce non-determinism if the slab is touched in incremental-cache-skippable code paths. Erw's B6 pattern applies here: query-provider side-effect fragility. Canary: tests fail deterministically on warm runs but pass on cold. Reaction: move side-effects to up-front walks (Sky's analog of erw's `populate_toylang_instances_from_cgus`). Pre-emptively designed in Sky's pipeline (Section 20).
 
 **B7 (Sky-specific). Comptime evaluator nondeterminism.** Probability: ~20% over 5 years. Sky's comptime evaluator must be deterministic; if a regression introduces nondeterminism (HashMap iteration order leaking into comptime output), the reproducible-build invariant breaks. Canary: byte-comparison CI catches it. Reaction: identify the nondeterministic source, fix.
 
-**B8 (Sky-specific). Debuginfo walker's source-vs-layout-field-count assumption.** Probability: **negligible under the wrapper-as-field stub shape** (architecture §10.4.5 path 2 / §10.6); 100% per nightly bump under the older PhantomData-only shape if path 1's defensive clamp hasn't landed upstream. Rustc's `build_struct_type_di_node` and `build_union_type_di_node` iterate source-level `FieldDef`s and query `layout.field(cx, i)` / `layout.fields.offset(i)` per source field, relying on `source.len() == layout.fields.count()`. Under the **wrapper-as-field shape** Sky stubs emit `pub struct Foo(__SkyOpaqueType<HASH>);` (1 source field) or `pub struct Foo<P...>(__SkyOpaqueType<HASH>, PhantomData<(P...)>);` (2 source fields), and `layout_of` reports the matching count — bound check holds at every level; the wrapper itself has 0 source fields and gets the default ZST layout so the walker iterates zero times when it recurses in. Under the older PhantomData-only shape the source had 1 field but layout reported 0 — `offset(0)` on an empty vec panics, ICEs the debuginfo walker; surfaces when a Sky ADT appears inside a Rust generic (e.g., `Vec<MySkyType>`); canary is integration tests that fail with `index out of bounds: the len is 0 but the index is 0` in `rustc_abi/src/lib.rs::FieldsShape::offset`. Reaction (older shape): carry the defensive clamp as a fork patch (~10 LOC; toylang's fork commit `e67de69ef35` is the working reference). Reaction (wrapper-as-field shape): nothing — the structural property holds and no fork patch is needed. Toylang shipped the wrapper-as-field migration as commits `72a929e`/`41423cf`/`90599cf` (Phase E Path 2) and retired its fork patch 4 entirely. New plugins should adopt the wrapper-as-field shape from day one; existing plugins using the older shape can carry path 1's clamp as a transitional measure.
+**B8 (Sky-specific). Debuginfo walker's source-vs-layout-field-count assumption.** **CLOSED by wrapper-as-field adoption.** Probability under the wrapper-as-field stub shape: negligible. Probability under the older PhantomData-only shape would have been 100% per nightly bump. Rustc's `build_struct_type_di_node` and `build_union_type_di_node` iterate source-level `FieldDef`s and query `layout.field(cx, i)` / `layout.fields.offset(i)` per source field, relying on `source.len() == layout.fields.count()`. Under the **wrapper-as-field shape** Sky stubs emit `pub struct Foo(__SkyOpaqueType<HASH>);` (1 source field) or `pub struct Foo<P...>(__SkyOpaqueType<HASH>, PhantomData<(P...)>);` (2 source fields), and `layout_of` reports the matching count — bound check holds at every level. Under the older PhantomData-only shape the source had 1 field but layout reported 0 — `offset(0)` on an empty vec ICE'd the debuginfo walker; surfaced when a Sky ADT appeared inside a Rust generic (e.g., `Vec<MySkyType>`). Toylang shipped the wrapper-as-field migration as commits `72a929e`/`41423cf`/`90599cf` (Phase E Path 2); the brief fork patch 4 carrying the defensive clamp (commit `e67de69ef35`) was reverted (`003f91e4df9`) because wrapper-as-field made it unnecessary. **Sky should adopt the wrapper-as-field shape from day one.** The risk entry remains for historical context.
+
+**B9 (new — Sky-specific). LLVM-binding-crate version skew with rustc's LLVM.** Probability: ~70% per nightly bump if Sky uses Inkwell or any other crate that ships bundled LLVM headers; 0% if Sky uses rustc's internal `rustc_codegen_llvm` API directly. Impact: 1-2 days per nightly bump (bump the binding crate, rebuild). Surfaced in toylang's Phase 4.5 — Inkwell shipped LLVM 20.1.6 bitcode while rustc-fork ran LLVM 21.1.8; the bitcode record format diverged and rustc rejected Sky's submitted modules with "Invalid record (Producer: 'LLVM20.1.6' Reader: 'LLVM 21.1.8')." Canary: integration tests of patch (c) inline codegen start failing with bitcode-format errors. Reaction: bump the binding crate to the matching LLVM major version; verify the upstream binding has tracked the LLVM version Sky needs. The pin discipline of §5.6.5 expands to cover binding crates, not just rustc-fork's LLVM.
+
+**B10 (new — Sky-specific). Inkwell's bitcode emitter is buggy under modern LLVM.** Probability: persists indefinitely until Inkwell is patched. Impact: requires either a `llvm-as` shell-out workaround (toylang's choice) or rustc-private API adoption (avoids Inkwell entirely). Surfaced in toylang's Phase 4.5: Inkwell's `Module::write_bitcode_to_{memory,path}` drops one FUNCTION declaration record from the MODULE block when serializing modules with ABI-coerced `extern "C"` call signatures. Subsequent INST_CALL records reference stale function indices; LLVM 21's verifier rejects. The IR text from Inkwell's `print_to_string` is valid; only the bitcode serializer is buggy. Diagnosed via `llvm-bcanalyzer --dump` (see `inkwell-vendoring-handoff.md` in the toylang repo). Reaction: emit text → `llvm-as` (toylang's workaround, ~5ms overhead per build) OR vendor Inkwell + fix upstream OR switch to rustc-internal bindings. Sky should make the binding-API choice early since it ripples through every Sky codegen path. Sky's `consumer_emit_modules` shape is binding-agnostic, so the choice can change later, but the cost is bounded only if discovered early.
 
 ### 25.3 Category C: operational invariants
 
@@ -4128,6 +4181,12 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 **C4. Sky's comptime evaluator must be deterministic.** Section 13.5. Canary: byte-comparison CI.
 
 **C5. Sidecar must be deterministic.** Section 7.4. Canary: byte-comparison CI.
+
+**C6 (new — operational). Cargo profile overrides only live at workspace root.** Risk that Sky's `skyc` orchestrator emits profile blocks (LTO, opt-level, codegen-units, panic strategy) in per-package `Cargo.toml`s instead of the workspace root. Cargo silently ignores member-level profile blocks; the rustc command simply doesn't carry the override. Canary: any test that depends on a profile setting having actually been applied (e.g. cross-language inlining tests). Reaction: emit profile overrides only at the generated workspace's root `Cargo.toml`. Toylang's `build.rs::write_workspace_toml` is the reference shape. Documented at appendix F.10.
+
+**C7 (new — operational). `RUSTC_WORKSPACE_WRAPPER` necessity for hook installation.** Sky's facade-side `extra_modules_hook` install happens during `LangDriver::config`, which only runs when Sky's binary is invoked as the rustc workspace wrapper. Direct `cargo build` invocations that bypass the wrapper get vanilla rustc-fork without Sky's hook installed; the build "succeeds" but produces a binary missing Sky's bodies (linked from the stub rlib's `unreachable!()` bodies). Canary: a test that runs the binary's output, not just that the build returns 0. Reaction: any integration test of patch (c) behavior must invoke through Sky's wrapper, not direct cargo. Operational discipline; documented in toylang's `tl-handoff.md` traps list and appendix F.11.
+
+**C8 (new — operational). Stale incremental cache surfaces as mysterious test failures.** Rustc's incremental cache + Sky's universe pre-population at after_expansion can produce cache-shape mismatches when Sky's schema evolves. Toylang regularly hit this when bumping facade types. Canary: tests failing in seemingly random ways across runs of the same code. Reaction: wipe the integration-projects-cache directory and re-run. Operational; build a `skyc clean` command early.
 
 ### 25.3.5 The byte-identical pass-through invariant as a continuous discipline
 
@@ -4380,11 +4439,12 @@ This chapter describes the order in which Sky's implementation should be built. 
 **v1 scope (recommended phasing for the initial implementation):**
 
 **Phase 1: Fork + minimal codegen plugin (4-8 weeks).**
-- Apply the three per_instance_mir patches to nightly rustc.
+- Apply the four fork patches: the three `per_instance_mir` patches + the `extra_modules` hook on `ExtraBackendMethods` (see §3.2).
 - Build the Sky codegen backend as a CodegenBackend impl that wraps LlvmCodegenBackend.
 - Implement the marker-based per-crate activation.
+- Install the `extra_modules_hook` returning empty (no Sky-side bitcode contribution yet).
 - Skip Sky's frontend for now: Sky's per_instance_mir provider always returns None (effectively, Sky's machinery activates but does nothing).
-- Verify the byte-identical pass-through invariant for pure-Rust crates (Section 4.4).
+- Verify the byte-identical pass-through invariant for pure-Rust crates (Section 4.4). Set up the CI corpus from day one — pass-through is the single hardest invariant to maintain (§25.3.5).
 
 **Phase 2: Sky frontend MVP (8-12 weeks).**
 - Parser for `.sky` source files.
@@ -4433,6 +4493,23 @@ This chapter describes the order in which Sky's implementation should be built. 
 - Source-level debugger integration.
 
 **Total v1 estimated effort: ~50-80 weeks for a focused engineer (or smaller for a team).** This is a multi-year project at any reasonable team size.
+
+**Empirical timing input from toylang's implementation.** Toylang executed every facade-architectural piece of this plan end-to-end (Phases 1 + 3 minus comptime, plus all the facade-rebuild work that would appear as a Sky-Phase-1.5 between Phase 1 and Phase 2 here). Three calibrations worth folding into the estimate:
+
+1. **The fork-patch work fits comfortably in Phase 1's 4-8 week budget.** Toylang landed the four-patch fork (per_instance_mir trio + extra_modules hook) in ~3 sessions. The work is mostly waiting for rustc rebuilds (~15-20 min each); the patches themselves are small and structurally local.
+
+2. **Facade-internal refactors come in dramatically under estimate when chokepoints exist.** Toylang's Tier 3 rebuild work (the items that would correspond to Sky-Phase-1.5 "harden the facade architecture") was originally estimated at ~6-10 weeks based on call-site count. Actual landing was hours-to-1-day per item because each touched a 1-2 helper-function chokepoint that propagated to all callers. See appendix F.12. **Implication for Sky's estimate:** Phases 1.5 / 5 / 7 (facade rebuild, group system, stdlib internals) may come in well under the doc's estimates if Sky's surface area has chokepoints; Phase 4 (comptime) and Phase 6 (async two-type split) likely don't, because they introduce new architecture rather than refactoring existing surface.
+
+3. **Cross-language ThinLTO inlining works empirically.** Sky's perf claim ("ThinLTO closes the cross-language gap") is no longer architecturally-asserted; toylang's `test_lto_smoke` mechanically proves it. The empirical proof unblocks Phase 8 / 9 marketing and benchmark work.
+
+4. **The five CI fences toylang built are forward-portable.** Sky should land equivalent fences in Phase 1 alongside the codegen plugin:
+   - **Byte-identical pass-through corpus** (§25.3.5) — set up first; the hardest invariant.
+   - **§9 export commitment** (non-export items get no rustc DefId) — fence with a stub_gen-equivalent unit test.
+   - **Generic/non-generic uniformity** — grep-fence the discovery/typecheck/codegen paths for unmarked `type_params.is_empty()` branches (toylang's `architecture_fence.rs` is the reference).
+   - **Cross-language inlining** — `test_lto_smoke`-equivalent that disassembles a built binary and asserts no `bl` to Sky symbols inside the user's main function.
+   - **Sidecar determinism** — Section 7.4; build twice with isolated target dirs, byte-compare `.sky-meta`.
+
+   Without these fences, the architectural invariants degrade silently. With them, regressions surface as named test failures with specific file/line refs.
 
 **Sky stdlib bootstrap.** Sky's stdlib is itself a Sky library — it's written in Sky source and compiled by Sky's compiler. This is the standard bootstrap concern for compiled-language stdlibs. Sky's bootstrap path:
 
