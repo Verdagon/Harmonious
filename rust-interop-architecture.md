@@ -245,6 +245,31 @@ Concretely, this affects design decisions in three patterns:
 
 The posture is not "ignore costs." Costs are real, and Section 25 (risks) and Section 28 (phasing) document them honestly. The posture is: when costs are at the level of "this takes weeks rather than days" or "this requires a new fork patch," they are not by themselves disqualifying. They are tradeoffs to be weighed against the long-term correctness benefit.
 
+### 1.5.5 Non-generic is the degenerate case of generic (uniform N=0 / N≥1 handling)
+
+A positive design discipline Sky's compiler implementer is expected to follow throughout, especially at every architectural boundary that touches generic items:
+
+**Non-generic is the degenerate case of generic. Never branch on "does this function/type have type parameters?" A non-generic item is simply one with zero type args — it goes through the same instantiation path as a generic one. Code that special-cases the non-generic path creates false distinctions and latent bugs when items gain type params or the code is reused in a more general context. Always write the general path; zero args is a valid input to it.**
+
+The principle is expressed positively. Concretely:
+
+- A populate loop that iterates concrete monomorphizations handles N=0 (one mono, empty args) and N≥1 (one mono per instantiation, non-empty args) through the same code. The N=0 case falls out as one iteration with `concrete_args = []`.
+- A substitution helper that zips `type_params` against `instance.args.types()` produces an identity substitution for N=0 (empty zip, empty map). No `if N == 0 { skip }` branch.
+- A discovery channel that captures monomorphizations from rustc's mono walker captures N=0 entries (concrete_args = []) the same way it captures N≥1 entries (concrete_args = [i32, ...]).
+- A symbol-mangler that suffixes type args produces no suffix for N=0 (empty iteration) and the proper suffix for N≥1. Same code path.
+
+**Where Sky may not follow this discipline:** three classes of forced exceptions, each must be `arch-fence-allow`-annotated when it appears:
+
+1. **Rust syntax constraints.** `impl<>`, `Foo<>`, and `Self<>` are parse errors in Rust. Sky's stub_gen emission must skip the `<>` decoration when N=0. The branch lives at the syntactic surface, not in the architecture.
+2. **External rustc behavior with no consumer override.** When a rustc query's contract differs for N=0 vs N≥1 in a way Sky cannot influence (e.g., debug-info walker assumptions that pre-Phase-E required different stub-gen shapes per N), the asymmetry is forced. Document and fence; remove when the upstream lifts the constraint.
+3. **Approach A invariants.** The `debug_assert!(!instance.args.has_param())` in Sky's `per_instance_mir` body construction is a load-bearing assertion that arguments are concrete by the time Sky sees them. It is not "N==0 vs N>0"; it is "substituted vs unsubstituted." Keep.
+
+**Why this matters for Sky's frontend implementer.** Sky's eventual implementation will land before all the generic-shape surfaces exist (e.g., comptime args, group params, method-level type params on impl methods). The discipline ensures every code path written for non-generic items extends to generic ones without an intervening refactor. When a code path is written with a `type_params.is_empty()` check, the path is essentially declaring "I don't know what to do for the generic case yet"; that declaration ages badly. Better to write the general path from the start and let N=0 fall out.
+
+**Empirical reinforcement.** Toylang's session 17–18 audit cycle surfaced this pattern explicitly: every place that branched on type-param emptiness eventually broke when generic surfaces grew (impl blocks with type params, multi-param impl blocks). Phase A retired four such branches; the audit cycle response retired three more. The empirical pattern is consistent — branches on type-param emptiness are tripwires waiting for the right test.
+
+The corresponding cross-cutting invariant in §26.15 (NNGZ) gives this discipline a named tag for invocation in code comments. Source-level `arch-fence-allow:` markers + a grep-based architecture-fence CI test enforce the discipline mechanically.
+
 ### 1.6 Nightly rustc forever
 
 Sky pins to a nightly rustc release. There is no path to stable rustc compatibility for Sky's compiler. The decision is locked.
@@ -4409,8 +4434,28 @@ When Sky-side helpers walk `tcx.all_impls(trait_def_id)` to find a consumer-type
 
 **Latent risk:** if Sky ever gains a syntax for naming a non-default parent-type arg (a custom allocator for `Vec`, a non-default hasher for `HashMap`), silent truncation becomes a real bug — the user's explicit non-default would silently become the default. Documented as tech debt in Sky's known-debt list; fix is to validate truncation at the helper site (compare against the parent's default; error if non-matching).
 
-### 26.15 Cross-references
+### 26.15 NNGZ (Non-generic is the Normal-case-of-Generic)
 
+Sky's source-level positive design principle (§1.5.5) elevated to arcanum form for in-code invocation: **non-generic is the degenerate case of generic. Never branch on "does this item have type parameters?"**
+
+**Where:** every architectural surface that handles items with type parameters. Stub-gen emission, discovery channels, populate loops, substitution helpers, symbol mangling, layout queries.
+
+**Mechanism:** write the general N≥1 path; let N=0 fall out as one iteration over an empty list / one entry with `concrete_args = []` / one identity substitution map. Don't gate on `type_params.is_empty()`.
+
+**Forced exceptions** (each must be `arch-fence-allow`-annotated):
+1. Rust syntax constraints — `impl<>` / `Foo<>` / `Self<>` are parse errors. Stub-gen emits no `<>` decoration for N=0.
+2. External rustc behavior with no consumer override — when a query's contract differs for N=0 vs N≥1 without a sanctioned customization point.
+3. Approach A invariants — `debug_assert!(!instance.args.has_param())` is "substituted vs unsubstituted," not "N=0 vs N≥1." Keep.
+
+**Failure mode:** every gated `type_params.is_empty()` branch creates a tripwire that fires when a new generic-shape surface appears (impl blocks with type params, multi-param impls, method-level type params on impl methods, generic accessors). Toylang's session 17–18 audit cycle exhibited four such breakages; the audit response retired three more. Empirical: branches on type-param emptiness age badly.
+
+**Detection:** a grep-based architecture-fence CI test (toylang's `tests/architecture_fence.rs`) walks Sky's frontend source for `type_params.is_empty()` patterns and asserts each is annotated `arch-fence-allow: <reason>` (where the reason names one of the three forced exceptions above). Unannotated occurrences fail the test.
+
+**Cleanup:** when retiring a previously-fenced branch (because the consumer's mechanism now handles N=0 uniformly), remove the `arch-fence-allow` marker along with the branch.
+
+### 26.16 Cross-references
+
+- Section 1.5.5 — the positive form of NNGZ (Sky's design principle).
 - Section 5 — codegen path that respects ABI invariants.
 - Section 11 — group system and HRTB handling.
 - Section 14, 15 — async migratory/cancellable mechanism.
@@ -4478,6 +4523,7 @@ This chapter describes the order in which Sky's implementation should be built. 
 - Install the `extra_modules_hook` returning empty (no Sky-side bitcode contribution yet).
 - Skip Sky's frontend for now: Sky's per_instance_mir provider always returns None (effectively, Sky's machinery activates but does nothing).
 - Verify the byte-identical pass-through invariant for pure-Rust crates (Section 4.4). Set up the CI corpus from day one — pass-through is the single hardest invariant to maintain (§25.3.5).
+- **Set up the architecture fence CI test from day one** (§26.15 NNGZ enforcement). The grep-based check that flags unannotated `type_params.is_empty()` branches is cheap to write and catches drift before any generic-shape surface exists; retrofitting the discipline after several months of "we'll get to it" produces dozens of fence-allow markers that all need re-evaluation. Toylang's session 11 wrote it after several violations had accumulated; Sky should write it first.
 
 **Phase 2: Sky frontend MVP (8-12 weeks).**
 - Parser for `.sky` source files.
@@ -4488,10 +4534,12 @@ This chapter describes the order in which Sky's implementation should be built. 
 - Stub rlib generation from skyc.
 
 **Phase 3: Generics (4-6 weeks).**
-- Type-parametric Sky functions and structs.
+- Type-parametric Sky functions and structs (including generic impl blocks: `impl<T: Bound, ...> Trait for SkyType<T, ...>`).
 - Sky's per_instance_mir provider returns real synthetic bodies for generic items.
 - ReifyFnPointer-based dep registration in the synthetic body.
-- Layout_of override for generic Sky types.
+- Layout_of override for generic Sky types (handles abstract Param-bearing args by propagating `LayoutError::TooGeneric` from `tcx.layout_of` rather than gating on `has_param()` — same uniform code path as N=0 per §1.5.5).
+- **Discovered-trait-impl-instances pipeline** (§8.9.5). The capture-and-ship-and-synthesize mechanism that handles cases 4/6 of the interop taxonomy: stub-rlib compile captures cascade-surfaced trait-impl Instances at `consumer_emit_modules` time (NOT `after_rust_analysis` — @GCMLZ re-entry); sidecar carries them as `discovered_trait_impl_instances`; user-bin's `on_sky_lib_loaded` pushes them into `SkyUniverse.discoveries`; user-bin populate drains and emits via the same code path as N=0 export items (uniform handling per §26.15); facade's `synthesize_upstream_monomorphizations` stateless callback walks discoveries and the `upstream_monomorphizations` whole-map query override augments rustc's default map so the v0 mangler picks `__lang_stubs` as the instantiating-crate disambig.
+- Architecture fence CI test (§26.15) catches non-generic special-cases introduced in Phase 3's discovery + populate machinery.
 
 **Phase 4: Comptime (6-10 weeks).**
 - Full comptime evaluator (Zig-style, slab-based).
