@@ -966,19 +966,18 @@ impl LangCallbacks for ToylangCallbacks {
             .expect("SkyUniverse.struct_infos entry is not a ToyStruct");
 
         // Build type-param substitution at the rustc Ty level (no round-trip through ResolvedType).
-        // arch-fence-allow: substituted-args-fast-path (no substitution needed when zero type params).
-        let ty_subst: HashMap<&str, Ty<'tcx>> = if !toy_struct.type_params.is_empty() {
-            if let TyKind::Adt(_, args) = ty.kind() {
-                toy_struct.type_params.iter()
-                    .enumerate()
-                    .map(|(i, name)| (name.as_str(), args[i].expect_ty()))
-                    .collect()
-            } else {
-                HashMap::new()
-            }
+        // Compiler-law: general zip-and-collect form handles the zero-param
+        // degenerate case naturally (empty params → empty zip → empty subst).
+        // No branch on param count.
+        let args = if let TyKind::Adt(_, args) = ty.kind() {
+            *args
         } else {
-            HashMap::new()
+            ty::GenericArgs::empty()
         };
+        let ty_subst: HashMap<&str, Ty<'tcx>> = toy_struct.type_params.iter()
+            .zip(args.types())
+            .map(|(name, arg_ty)| (name.as_str(), arg_ty))
+            .collect();
 
         // Convert each field's ResolvedType to rustc Ty, substituting TypeParams directly.
         let field_types: Vec<Ty<'tcx>> = toy_struct.fields.iter().map(|field| {
@@ -1161,23 +1160,23 @@ fn resolved_to_rustc_ty_with_subst<'tcx>(
 }
 
 /// Resolve a ToyFunction for a concrete rustc Instance by substituting type params.
+///
+/// Compiler-law: no branch on param count. For N=0 the zip yields
+/// nothing → empty subst → `resolve_caller_from_type_args` runs
+/// `substitute_type_params` with an empty map (identity) and returns a
+/// caller_fn-equivalent. The zero-param case falls out of the general path.
 pub fn resolve_caller_from_instance<'tcx>(
     caller_fn: &crate::toylang::registry::ToyFunction,
     instance: ty::Instance<'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> crate::toylang::registry::ToyFunction {
-    // arch-fence-allow: substituted-args-fast-path (no substitution work to do).
-    if caller_fn.type_params.is_empty() {
-        return caller_fn.clone();
-    }
-    let mut subst = std::collections::HashMap::new();
-    for (i, param_name) in caller_fn.type_params.iter().enumerate() {
-        if let Some(arg) = instance.args.get(i) {
-            if let ty::GenericArgKind::Type(ty) = arg.kind() {
-                subst.insert(param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(tcx, ty));
-            }
-        }
-    }
+    let subst: std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType> =
+        caller_fn.type_params.iter()
+            .zip(instance.args.types())
+            .map(|(param_name, ty)| {
+                (param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(tcx, ty))
+            })
+            .collect();
     resolve_caller_from_type_args(caller_fn, &subst)
 }
 
@@ -1266,20 +1265,19 @@ fn type_resolve_body<'tcx>(
 }
 
 /// Substitute a toylang callee's body given call-site type args.
+///
+/// Compiler-law: no branch on param count. For N=0 the zip yields
+/// nothing → empty subst → `resolve_caller_from_type_args` returns a
+/// callee_fn-equivalent. The zero-param case falls out of the general path.
 fn resolve_toylang_callee(
     callee_fn: &crate::toylang::registry::ToyFunction,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
 ) -> crate::toylang::registry::ToyFunction {
-    // arch-fence-allow: substituted-args-fast-path (no substitution work to do).
-    if callee_fn.type_params.is_empty() {
-        callee_fn.clone()
-    } else {
-        let subst: std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType> =
-            callee_fn.type_params.iter().zip(type_args.iter())
-                .map(|(param, arg)| (param.clone(), arg.clone()))
-                .collect();
-        resolve_caller_from_type_args(callee_fn, &subst)
-    }
+    let subst: std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType> =
+        callee_fn.type_params.iter().zip(type_args.iter())
+            .map(|(param, arg)| (param.clone(), arg.clone()))
+            .collect();
+    resolve_caller_from_type_args(callee_fn, &subst)
 }
 
 /// Walker A: collect the transitive Rust deps of a consumer function body.

@@ -169,22 +169,24 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             .collect();
         let typeid = crate::typeid::compute(name, &[]);
         let typeid_lit = syn::LitInt::new(&format!("{}u64", typeid), proc_macro2::Span::call_site());
-        // Non-generic structs omit the PhantomData carrier because there
-        // are no type params for it to "use" per rustc's E0392. Generic
-        // and non-generic structs share the wrapper field; the PhantomData
-        // tail is the per-N degenerate diverger forced by rustc syntax.
-        // arch-fence-allow: phantomdata-only-when-generics-present
-        let item: syn::ItemStruct = if toy_struct.type_params.is_empty() {
-            parse_quote! {
-                pub struct #ident (__ToylangOpaque<#typeid_lit>);
-            }
-        } else {
-            parse_quote! {
-                pub struct #ident #generics_clause (
-                    __ToylangOpaque<#typeid_lit>,
-                    std::marker::PhantomData<(#(#type_params_idents),*)>,
-                );
-            }
+        // Compiler-law: emit one universal struct shape regardless of N.
+        // For N=0 this renders as
+        //   `pub struct Foo(__ToylangOpaque<HASH>, std::marker::PhantomData<()>);`
+        // (rustc's E0392 only triggers on *declared* generic params that
+        // aren't used, so non-generic structs with `PhantomData<()>` are
+        // fine — the unit tuple is a valid ZST type with no params).
+        // For N>0 it renders as
+        //   `pub struct Foo<A, B>(__ToylangOpaque<HASH>, std::marker::PhantomData<(A, B)>);`
+        // — `fn_generics_clause` returns an empty TokenStream (not `<>`) for
+        // N=0, so the same template handles both.
+        //
+        // The downstream `layout_of` query reports a matching 2-source-field
+        // count at every N; see `queries/layout.rs`.
+        let item: syn::ItemStruct = parse_quote! {
+            pub struct #ident #generics_clause (
+                __ToylangOpaque<#typeid_lit>,
+                std::marker::PhantomData<(#(#type_params_idents),*)>,
+            );
         };
         items.push(syn::Item::Struct(item));
 

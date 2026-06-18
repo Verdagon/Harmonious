@@ -137,45 +137,32 @@ fn build_layout<'tcx>(
     // the walker's recursive `layout.fields.offset(i)` queries always
     // succeed. `BackendRepr::Memory { sized: true }` keeps rustc from
     // decomposing the struct into scalars — same protection that made
-    // the previous 0-field layout safe; the wrapper field is itself
-    // opaque-with-size, so even with per-field exposure rustc can't
-    // unpack it.
+    // stub_gen emits a single universal struct shape regardless of N:
+    //   `pub struct Foo<P...>(__ToylangOpaque<HASH>, PhantomData<(P...)>);`
+    // (for N=0 this renders as
+    //   `pub struct Foo(__ToylangOpaque<HASH>, PhantomData<()>);`)
+    // — always 2 source `FieldDef`s. The wrapper at offset 0 occupies the
+    // whole payload; the PhantomData carrier is a ZST at offset = total_size
+    // (just past the payload). Memory order matches declaration order.
     //
-    // Source field count comes from `adt_def.non_enum_variant().fields`
-    // rather than from `field_types` because the latter holds Sky
-    // user-visible fields (e.g. `Pair<i32,i64>` has 2 Sky fields) while
-    // the former mirrors what stub_gen emitted (1 wrapper field or
-    // wrapper+PhantomData). Pre-Phase-3 we reported 0 layout fields and
-    // relied on fork patch 4's defensive clamp; Path 2 makes the patch
-    // unnecessary.
-    let source_field_count = if let TyKind::Adt(adt_def, _) = ty.kind() {
-        adt_def.non_enum_variant().fields.len()
-    } else {
-        0
-    };
-    let (offsets, in_memory_order): (IndexVec<FieldIdx, Size>, IndexVec<u32, FieldIdx>) =
-        match source_field_count {
-            0 => (IndexVec::new(), IndexVec::new()),
-            1 => (
-                IndexVec::from_iter([Size::ZERO]),
-                IndexVec::from_iter([FieldIdx::from_u32(0)]),
-            ),
-            // 2 fields: wrapper at offset 0 occupying the whole size;
-            // PhantomData ZST at offset = total_size (i.e. just past the
-            // payload). Memory order matches declaration order.
-            2 => (
-                IndexVec::from_iter([Size::ZERO, Size::from_bytes(total_size)]),
-                IndexVec::from_iter([FieldIdx::from_u32(0), FieldIdx::from_u32(1)]),
-            ),
-            // 3+ would mean stub_gen emitted a shape we don't recognize —
-            // panic so the regression surfaces loudly rather than
-            // silently producing wrong debuginfo.
-            other => panic!(
-                "Sky struct {:?} has {} source FieldDefs; stub_gen only emits \
-                 1 (non-generic) or 2 (generic) under Phase E Path 2",
-                ty, other,
-            ),
-        };
+    // The debug_assert below catches any regression where stub_gen emits
+    // a shape we don't recognise; the layout body itself has no branching
+    // by N — Compiler-law's degenerate case (N=0) produces the same shape
+    // as N>0.
+    if let TyKind::Adt(adt_def, _) = ty.kind() {
+        debug_assert_eq!(
+            adt_def.non_enum_variant().fields.len(),
+            2,
+            "Sky struct {:?} has {} source FieldDefs; stub_gen emits the universal \
+             2-field shape (opaque wrapper + PhantomData carrier) regardless of N",
+            ty,
+            adt_def.non_enum_variant().fields.len(),
+        );
+    }
+    let offsets: IndexVec<FieldIdx, Size> =
+        IndexVec::from_iter([Size::ZERO, Size::from_bytes(total_size)]);
+    let in_memory_order: IndexVec<u32, FieldIdx> =
+        IndexVec::from_iter([FieldIdx::from_u32(0), FieldIdx::from_u32(1)]);
 
     let layout_data = LayoutData {
         fields: FieldsShape::Arbitrary { offsets, in_memory_order },
