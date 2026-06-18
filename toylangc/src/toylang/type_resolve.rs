@@ -374,80 +374,60 @@ fn resolve_expr(
 
         Expr::FnCall { name, type_args, args } => {
             if let Some(func) = registry.functions.get(name.as_str()) {
-            // arch-fence-allow: type-arg-arity check (zero params requires zero args; non-zero requires matching count).
-            if !func.type_params.is_empty() {
-                if type_args.len() != func.type_params.len() {
-                    return Err(TypeResolveError::WrongTypeArgCount {
-                        func_name: name.clone(),
-                        expected: func.type_params.len(),
-                        got: type_args.len(),
-                    });
-                }
-
-                let type_arg_subst: HashMap<String, ResolvedType> = func.type_params.iter()
-                    .zip(type_args.iter())
-                    .map(|(param, arg)| (param.clone(), arg.clone()))
-                    .collect();
-
-                let ret_ty = if let Some(ret) = &func.return_ty {
-                    let substituted = substitute_type_params(ret, &type_arg_subst);
-                    resolve_struct_fields(&substituted, registry)?
-                } else {
-                    ResolvedType::Void
-                };
-
-                let typed_args: Vec<TypedExpr> = args.iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        let substituted = substitute_type_params(&func.params[i].ty, &type_arg_subst);
-                        let expected = resolve_struct_fields(&substituted, registry)?;
-                        let typed = resolve_expr(a, &expected, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
-                        if expected != ResolvedType::Void && !types_match(&typed.ty, &expected) {
-                            return Err(TypeResolveError::ArgTypeMismatch {
-                                func_name: name.clone(), param_index: i,
-                                expected, got: typed.ty.clone(),
-                            });
-                        }
-                        Ok(typed)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                Ok(TypedExpr {
-                    kind: TypedExprKind::FnCall {
-                        name: name.clone(),
-                        type_args: type_args.clone(),
-                        args: typed_args,
-                    },
-                    ty: ret_ty,
-                })
-            } else {
-                let ret_ty = match func.return_ty.as_ref() {
-                    Some(rt) => resolve_struct_fields(rt, registry)?,
-                    None => ResolvedType::Void,
-                };
-                let typed_args: Vec<TypedExpr> = args.iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        let expected = if i < func.params.len() {
-                            resolve_struct_fields(&func.params[i].ty, registry)?
-                        } else {
-                            ResolvedType::Void
-                        };
-                        let typed = resolve_expr(a, &expected, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
-                        if expected != ResolvedType::Void && !types_match(&typed.ty, &expected) {
-                            return Err(TypeResolveError::ArgTypeMismatch {
-                                func_name: name.clone(), param_index: i,
-                                expected, got: typed.ty.clone(),
-                            });
-                        }
-                        Ok(typed)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(TypedExpr {
-                    kind: TypedExprKind::FnCall { name: name.clone(), type_args: vec![], args: typed_args },
-                    ty: ret_ty,
-                })
+            // Compiler-law audit C3: one code path for N=0 and N≥1. The
+            // arity check enforces matching count (0==0 passes naturally
+            // for non-generic); the substitution map is empty for N=0 ⇒
+            // identity substitution ⇒ same behavior as the old non-generic
+            // branch. CLAUDE.md: non-generic is the degenerate case of
+            // generic, falls out of the general path without a branch.
+            if type_args.len() != func.type_params.len() {
+                return Err(TypeResolveError::WrongTypeArgCount {
+                    func_name: name.clone(),
+                    expected: func.type_params.len(),
+                    got: type_args.len(),
+                });
             }
+            let type_arg_subst: HashMap<String, ResolvedType> = func.type_params.iter()
+                .zip(type_args.iter())
+                .map(|(param, arg)| (param.clone(), arg.clone()))
+                .collect();
+            let ret_ty = if let Some(ret) = &func.return_ty {
+                let substituted = substitute_type_params(ret, &type_arg_subst);
+                resolve_struct_fields(&substituted, registry)?
+            } else {
+                ResolvedType::Void
+            };
+            let typed_args: Vec<TypedExpr> = args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    // Extra args beyond declared params fall through with
+                    // Void expected (no ArgTypeMismatch raised). This is a
+                    // well-formedness guard, not a generic-vs-non-generic
+                    // branch — applies uniformly.
+                    let expected = if i < func.params.len() {
+                        let substituted = substitute_type_params(&func.params[i].ty, &type_arg_subst);
+                        resolve_struct_fields(&substituted, registry)?
+                    } else {
+                        ResolvedType::Void
+                    };
+                    let typed = resolve_expr(a, &expected, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
+                    if expected != ResolvedType::Void && !types_match(&typed.ty, &expected) {
+                        return Err(TypeResolveError::ArgTypeMismatch {
+                            func_name: name.clone(), param_index: i,
+                            expected, got: typed.ty.clone(),
+                        });
+                    }
+                    Ok(typed)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(TypedExpr {
+                kind: TypedExprKind::FnCall {
+                    name: name.clone(),
+                    type_args: type_args.clone(),
+                    args: typed_args,
+                },
+                ty: ret_ty,
+            })
             } else {
                 // Free function: use rust_param_types as existence check (None → not found)
                 let param_types = rust_param_types("", name, type_args)?

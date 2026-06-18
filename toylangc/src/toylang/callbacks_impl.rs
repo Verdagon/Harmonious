@@ -1666,12 +1666,23 @@ fn walk_and_stash_internal_callees<'tcx>(
         let callee_symbol = compute_internal_symbol_from_type_args(callee_name, type_args);
         if state.walked_entry_points.insert(callee_symbol.clone()) {
             let resolved_callee = resolve_toylang_callee(callee_fn, type_args);
+            // Compiler-law audit B1: pass `type_args` (captured at the call
+            // site) as `instance_args` rather than hardcoding `vec![]`.
+            // For non-generic callees `type_args` is empty (degenerate case
+            // of the general path); for generic callees it carries the
+            // concrete instantiation so any downstream codegen that builds
+            // a rustc Instance via `build_generic_args_for_item` produces
+            // the right args. Today `stub_def_id: None` means the Instance
+            // is never reconstructed for transitive callees, but threading
+            // the args here makes the unification hold structurally —
+            // i.e. the next time we need `stub_def_id` for an internal-
+            // only generic chain (e.g. ABI lookup), the args are present.
             state.toylang_instances.push(ToylangInstance {
                 extern_symbol: callee_symbol.clone(),
                 internal_symbol: callee_symbol,
                 resolved_func: resolved_callee.clone(),
                 stub_def_id: None,
-                instance_args: vec![],
+                instance_args: type_args.clone(),
             });
             walk_and_stash_internal_callees(
                 tcx, registry, &resolved_callee, callee_name, state,

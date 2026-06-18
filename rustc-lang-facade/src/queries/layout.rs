@@ -58,18 +58,24 @@ pub fn lang_layout_of<'tcx>(
 
     // Only intercept ADT types from __lang_stubs whose name matches a consumer type.
     // Checking the module prevents collisions with user-defined types sharing a name.
-    if let TyKind::Adt(adt_def, args) = ty.kind() {
+    //
+    // Compiler-law audit A1 cleanup: the previous `!args.has_param()` gate
+    // routed unsubstituted-param ADTs to rustc's default. That was a branch on
+    // genericity-status that the consumer's `monomorphize_type` already
+    // handles uniformly — it zips `toy_struct.type_params` against
+    // `args.types()` (empty zip for N=0; Param-bearing zip for the abstract
+    // case), and `build_layout` then calls `tcx.layout_of` on each field
+    // which propagates `LayoutError::TooGeneric` for Param-bearing field
+    // types naturally. One code path, N=0 and Param-bearing N≥1 alike.
+    if let TyKind::Adt(adt_def, _args) = ty.kind() {
         let name = tcx.item_name(adt_def.did()).to_string();
-        // Only intercept fully monomorphized types (no unresolved type params).
-        let has_params = args.iter().any(|a| a.has_param());
-        if !has_params && crate::is_consumer_type(&name) && crate::is_from_lang_stubs(tcx, adt_def.did()) {
-            // Ask the consumer to monomorphize this type — returns concrete field types.
-            // For non-generic types, this just returns the field types directly.
-            // For generic types like Pair<i32, i32>, the consumer substitutes
-            // type params with concrete args and returns [tcx.types.i32, tcx.types.i32].
+        if crate::is_consumer_type(&name) && crate::is_from_lang_stubs(tcx, adt_def.did()) {
+            // Ask the consumer to monomorphize this type — returns concrete field types
+            // (or Param-bearing types for the abstract case; `build_layout` propagates
+            // the layout error uniformly).
             let result = crate::call_monomorphize_type(&name, tcx, ty);
 
-            let layout = build_layout(tcx, ty, &result.field_types, query.typing_env);
+            let layout = build_layout(tcx, ty, &result.field_types, query.typing_env)?;
 
             // Stage 5c: log includes size + align so integration-test harnesses
             // (`run_integration_project` reading the build output) can assert
@@ -98,7 +104,7 @@ fn build_layout<'tcx>(
     ty: Ty<'tcx>,
     field_types: &[Ty<'tcx>],
     typing_env: TypingEnv<'tcx>,
-) -> TyAndLayout<'tcx> {
+) -> Result<TyAndLayout<'tcx>, &'tcx LayoutError<'tcx>> {
     use rustc_abi::FieldIdx;
     use rustc_index::IndexVec;
 
@@ -106,13 +112,21 @@ fn build_layout<'tcx>(
     // user-visible field types. These come from `monomorphize_type`'s
     // substitution — they are the Sky-level fields, not the stub rlib's
     // PhantomData / opaque-wrapper carrier fields.
+    //
+    // Compiler-law A1 cleanup: when the consumer returns Param-bearing
+    // field types (the abstract case — Sky type queried at rustc's
+    // borrow-check time before monomorphization), `tcx.layout_of` returns
+    // `LayoutError::TooGeneric` for the Param-typed field. We propagate
+    // that error upward — it's the same answer rustc's default would have
+    // given for an abstract type, just routed through one code path
+    // instead of two.
     let mut offset = 0u64;
     let mut max_align = 1u64;
     for &field_ty in field_types {
         let layout = tcx.layout_of(PseudoCanonicalInput {
             value: field_ty,
             typing_env: TypingEnv::fully_monomorphized(),
-        }).expect("layout of field type");
+        })?;
         let fsz = layout.size.bytes();
         let falign = layout.align.abi.bytes();
         max_align = max_align.max(falign);
@@ -177,10 +191,10 @@ fn build_layout<'tcx>(
         randomization_seed: rustc_hashes::Hash64::ZERO,
     };
 
-    TyAndLayout {
+    Ok(TyAndLayout {
         ty,
         layout: tcx.mk_layout(layout_data),
-    }
+    })
 }
 
 fn align_up(offset: u64, align: u64) -> u64 {
