@@ -896,6 +896,11 @@ fn assert_sky_inlined_into_main(project_name: &str) {
 /// Expected output: `42\n7`.
 #[test] fn test_case_generic_impl_block() { run_integration_project("case_generic_impl_block"); }
 
+/// E3 — multi-param generic impl block. Two distinct instantiations of
+/// `impl<A: Clone, B: Clone> Clone for Pair<A, B>` (Pair<i32,i64> and
+/// Pair<i64,i32>) prove the args-list machinery doesn't assume single-T.
+#[test] fn test_case_generic_impl_block_two_params() { run_integration_project("case_generic_impl_block_two_params"); }
+
 #[test] fn test_arithmetic_sub_div() { run_integration_project("arithmetic_sub_div"); }
 #[test] fn test_vec_i32() { run_integration_project("vec_i32"); }
 #[test] fn test_single_field_struct() { run_integration_project("single_field_struct"); }
