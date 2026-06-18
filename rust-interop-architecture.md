@@ -559,6 +559,10 @@ For Sky to pre-anchor this, Sky would need to enumerate every concrete `Writer` 
 
 The key insight again: Sky tells rustc that the impl exists (via the stub rlib's impl block); rustc walks the Rust caller's body and discovers the dispatch; rustc queues the trait method; Sky's per_instance_mir provides the body.
 
+**Empirical correction (sessions 18-19).** The "rustc's collector queues `duplicate<Widget>` when walking Sky's main" sentence above is correct in terms of *cascade flow*, but it elides *when* the cascade fires. Empirically — verified by per_instance_mir-probing toylang's `case_generic_impl_block` fixture — the consumer-side `per_instance_mir` cascade for an item like Sky's `__sky_main` fires **at the stub rlib compile, not at the user-bin compile**. At user-bin compile, rustc's mono collector at `collector.rs::collect_used_items` gates on `is_reachable_non_generic(def_id) || instance.upstream_monomorphization(tcx).is_some()` for non-local items: when `__sky_main` is a non-generic upstream symbol (which it is — Sky's main lives in the bin's own stub rlib), this gate returns `false` and the collector never queries `per_instance_mir` for it at user-bin time. The cascade — and therefore the discovery of `duplicate<Widget>` and `<Widget as Clone>::clone` — is **exclusively a stub-rlib-compile-time mechanism.**
+
+For the consumer's `consumer_emit_modules` at user-bin compile to know which trait-impl method monomorphizations to emit, it must consume them out-of-band — Sky ships them through the sidecar via the "discovered trait-impl instances" mechanism (§8.10). The stub rlib compile captures the cascade-surfaced Instances at `consumer_emit_modules` time (after the mono walk completes — capturing during `after_rust_analysis` would re-enter the consumer-state mutex and deadlock per @GCMLZ), writes them into the sidecar, and the binary compile reads them at `on_sky_lib_loaded` time. The synthesized `upstream_monomorphizations` query (§7.5 / Step 5) then surfaces them to rustc's v0 mangler so call sites resolve to a single canonical symbol with the upstream stub rlib's instantiating-crate disambig.
+
 ### 2.7 Cases 5 and 6: transitive library structure
 
 These are compositions of the simpler cases, one hop deeper.
@@ -1233,6 +1237,13 @@ Sky's `.o` containing Sky-emitted bodies is produced at every crate compile wher
 
 This is the locked decision from the design conversation: Sky libraries do *not* ship precompiled bodies. They ship only the Rust stub source + the Sky source + the Temputs sidecar. Every Sky body in the final binary is codegenned at the binary's compile, from the library's Sky AST stored in the sidecar.
 
+**Qualifier — what "no `.o` for Sky bodies" does and doesn't mean.** The stub rlib's `.o` does NOT contain Sky-emitted bodies, *but it does still carry Rust-side machinery rustc emits during its own normal flow*, including:
+
+1. **Generic Rust monomorphizations that Sky's `per_instance_mir` cascade surfaces.** When Sky's `__sky_main` is compiled at the stub rlib stage, the cascade walks Sky's synthetic body, finds ReifyFnPointer casts pointing at Rust dep generics (e.g., `some_rust_lib::duplicate<Widget>`), and rustc's collector queues the substituted Rust bodies. Those Rust bodies *are* emitted into the stub rlib's `.o`. From the user-bin compile's perspective, `duplicate<Widget>` is then a normal upstream Rust monomorphization, resolved through the standard Rust share-generics mechanism.
+2. **The stub rlib's `unreachable!()` bodies** for the Sky stub fn shells (`pub fn __sky_main() { unreachable!() }`). Rustc compiles them; Sky's partitioner override filters them out of the binary-targeted CGUs at the stub-rlib compile so they don't reach LLVM there, but the metadata declaring them as items is in the rlib so the user-bin compile can typecheck calls.
+
+The "no `.o` for Sky bodies" rule applies specifically to *Sky-emitted bodies* — i.e., bodies the Sky codegen backend produces from Sky source via its Inkwell pipeline. Those happen only at the binary compile. Rust generic intermediaries the Sky source transitively reaches still flow through rustc's normal mono/codegen at whatever crate's compile rustc first encounters them, which under Sky's interleaved-mono model is typically the stub rlib's compile (where the cascade fires — see §2.6's empirical correction and Appendix F for the `is_reachable_non_generic` collector gate that makes this true).
+
 **The implication:** the binary's compile is heavy. Every Sky item the binary reaches needs Sky's frontend (substitute, comptime evaluate if needed) plus Sky's codegen (Inkwell IR + llc) to produce. For a small Sky project, ~hundreds of items, this is seconds of work. For a large project, ~thousands of items, this could be minutes. The cost is acceptable given the simplicity benefits (every Sky compiler version's codegen improvements apply uniformly across the binary; no cross-Sky-version compatibility concerns; Sky-source-only distribution model for libraries works cleanly).
 
 Section 8.8 (no pre-computed layouts) carries the analogous decision for layouts, and the rationale is the same: ship the AST, recompute at consumer compile.
@@ -1847,12 +1858,34 @@ A `skyc inspect <sidecar-path>` command dumps the sidecar in a human-readable fo
 
 The output format is text (probably JSON or YAML). Each section of the sidecar (header, typeid table, item table) is dumped in turn.
 
+### 8.9.5 Discovered trait-impl instances
+
+For Sky-defined types implementing Rust traits (case 4 / case 6 of §2's taxonomy), the binary compile needs to emit one body per concrete instantiation rustc actually monomorphized. Under Sky's interleaved-mono model, the cascade that discovers those instantiations fires **at the stub rlib compile**, not at user-bin (§2.6's empirical correction; Appendix F's `is_reachable_non_generic` collector gate). The user-bin compile can't re-run the cascade for non-generic upstream symbols. So the discoveries are captured at the stub rlib compile, written into the sidecar, and consumed at user-bin compile.
+
+The sidecar carries this as a `discovered_trait_impl_instances` list. Each entry records:
+
+| Field | Type | What |
+|---|---|---|
+| `self_type_name` | string | The Sky struct the impl is for (e.g. "Wrapper"). |
+| `trait_name` | string | The Rust trait's short name (e.g. "Clone"). |
+| `method_name` | string | The method's source-level name. |
+| `concrete_args` | `Vec<ResolvedType>` | Concrete instantiation args (impl-block params followed by method-level params, in source order). Empty for non-generic impls; one entry per type param for generic impls. |
+
+**Capture point.** At the stub rlib's `consumer_emit_modules` callback (NOT `after_rust_analysis` — capturing there would trigger mono walk and re-enter MUTABLE_STATE per @GCMLZ). The capture helper walks the unfiltered partition (via the saved default `collect_and_partition_mono_items` provider, bypassing the in-memory query cache which holds the Sky-filtered result), iterates `MonoItem::Fn(instance)`s, filters by `is_consumer_trait_impl_method`, and records the tuple. The sidecar — already written at `after_rust_analysis` with no discoveries — is rewritten at this point with discoveries.
+
+**Consumption.** At the binary's `on_sky_lib_loaded`, the consumer deserializes the upstream sidecar and pushes each `DiscoveredTraitImplInstance` into the facade-owned `SkyUniverse` (lock-free via `with_sky_universe_mut`'s short write window). At binary populate time, a dedicated loop drains every upstream's discoveries, substitutes the impl-method body with the captured args, and pushes a `ToylangInstance`-equivalent for each — flowing through the same Sky codegen pipeline as any other reachable Sky item. The CLAUDE.md compiler-law payoff: this loop handles N=0 (non-generic impls) and N≥1 (generic impls) uniformly — non-generic is the degenerate case of generic, with empty `concrete_args` falling through the same path.
+
+**Cross-Sky-crate (case 6) caveat.** The impl body may live in a different upstream from where the discovery was captured (the bin's stub rlib captures the cascade that crosses crates). The consumption loop searches all loaded registries (`local ∪ upstream_clones`) for a matching `ToyImpl` rather than assuming locality.
+
+**Synthesis for v0 mangler.** Capture-and-emit alone is not sufficient. The stub rlib's `duplicate<Wrapper<i32>>` body references `<Wrapper<i32> as Clone>::clone` with `__lang_stubs` as the v0-mangler instantiating-crate disambig. Without telling rustc that the stub rlib "owns" this monomorphization, the user-bin compile's mangler picks user-bin as the disambig — mismatch → link error. So Sky overrides the rustc `upstream_monomorphizations` query (the whole-map version, not per-DefId, because the outer `DefIdMap` is arena-allocatable but the inner `UnordMap` isn't), augmenting rustc's default-built map with the consumer's synthesized entries. The consumer's `synthesize_upstream_monomorphizations` stateless callback walks `SkyUniverse.discoveries`, builds `(DefId, GenericArgsRef, CrateNum)` triples, and the facade merges them into the map. Per-DefId lookups (`upstream_monomorphizations_for`) then find the augmented entries and the mangler picks the upstream stub rlib's crate — symbols match.
+
 ### 8.10 Cross-references
 
 - Section 6 — what gets generated into the stub rlib (exports only).
 - Section 9 — the export keyword's effect on sidecar content (full universe, regardless of export status).
 - Section 10 — typeid mechanism's role in cross-crate type identity.
 - Section 13 — comptime that may add typeids and other entries to the sidecar.
+- Section 2.6 + Appendix F — the cascade-fires-at-stub-rlib-compile empirical correction that motivates §8.9.5.
 
 ---
 
@@ -5633,6 +5666,108 @@ shape — accessors + Case 1b discovery needed two separate path
 migrations, not one chokepoint, so it took the estimated ~2 days
 rather than collapsing to hours. The pattern doesn't always apply;
 when it does, it dramatically beats handoff estimates.
+
+#### F.13 The per_instance_mir cascade fires at the stub rlib compile,
+not at user-bin
+
+The single most load-bearing empirical correction from sessions
+18-19. The case 4 / case 6 worked examples in §2.6 describe rustc's
+collector queuing `<Widget as Clone>::clone` "at user-bin compile"
+when walking Sky's main. That elides *when* the cascade actually
+fires. Probing toylang's `case_generic_impl_block` fixture revealed:
+
+**At user-bin compile**, rustc's mono collector walks
+`main.rs::main`'s body and reaches the call to Sky's `__sky_main`.
+`__sky_main`'s DefId is non-local (lives in the bin's own stub rlib).
+At `rustc_monomorphize/collector.rs::collect_used_items`, the
+collector gates on:
+
+```rust
+if tcx.is_reachable_non_generic(def_id)
+   || instance.upstream_monomorphization(tcx).is_some() {
+    return false;  // don't mono locally; it's upstream
+}
+```
+
+For `__sky_main` (non-generic, upstream), `is_reachable_non_generic`
+is `true`. The collector returns `false` — it **never calls
+`per_instance_mir`** for `__sky_main` at user-bin time. Sky's
+synthetic body for `__sky_main` doesn't fire at user-bin. The
+cascade — and therefore the discovery of `duplicate<Widget>`,
+`duplicate<Wrapper<i32>>`, `<Widget as Clone>::clone`, etc. — is
+**exclusively a stub-rlib-compile-time mechanism.**
+
+This has three architectural consequences:
+
+1. **The stub rlib's `.o` IS where rustc-emitted Rust generic
+   intermediaries land.** The Sky cascade at the stub rlib walks
+   Sky's bodies, surfaces ReifyFnPointer casts on Rust deps, and
+   rustc emits the substituted Rust bodies into the stub rlib's
+   `.o`. This refines §5.5's "no `.o` for Sky bodies" — Rust generic
+   monomorphizations the Sky source transitively reaches DO go into
+   the stub rlib's `.o`, even though Sky-emitted bodies don't. (§5.5
+   has been updated with the qualifier.)
+
+2. **Case 4 / case 6 monomorphization discovery must ship via
+   sidecar.** Sky's binary compile can't replay the cascade for
+   non-generic upstream symbols. The consumer captures the
+   cascade-surfaced trait-impl mono Instances at the stub rlib's
+   `consumer_emit_modules` time (a window after the mono walk has
+   completed, so no @GCMLZ re-entry risk), writes them into the
+   sidecar, and the binary compile reads them at `on_sky_lib_loaded`.
+   §8.9.5 covers the format and machinery.
+
+3. **The `upstream_monomorphizations` query needs Sky-side
+   augmentation.** Without it, the user-bin compile's v0 mangler
+   picks user-bin as the instantiating-crate disambig for trait-impl
+   methods (since rustc's default-built map has no entry — Sky's
+   partition override filtered them out of stub-rlib CGUs, so the
+   metadata recorded nothing). The stub rlib's
+   `duplicate<Widget>` body references `<Widget as Clone>::clone`
+   with the stub rlib's disambig; mismatch → link error. The fix:
+   override `upstream_monomorphizations` (the whole-map query) and
+   augment with the consumer's synthesized entries (§8.9.5,
+   "Synthesis for v0 mangler").
+
+The corresponding insight for handoff-style decision-making: **when
+debugging a "Sky's body isn't getting emitted" failure, check WHICH
+compile is supposed to emit it.** Under the cascade-at-stub-rlib
+model, the answer is almost always "the binary compile, surfaced via
+sidecar capture from the stub rlib's discoveries" — not "rerun the
+cascade at user-bin."
+
+#### F.14 Approach C (per_instance_mir suppression at stub rlib) is
+load-bearing-against
+
+Session 19 considered three approaches for fixing the disambig
+mismatch:
+
+- **A** (partition filter extension at stub rlib): drop generic
+  Rust intermediaries from the stub rlib's CGUs so user-bin re-emits
+  them.
+- **B** (the shipped fix, F.13 above): capture-and-ship via
+  sidecar; augment `upstream_monomorphizations`.
+- **C** (suppress `per_instance_mir` at stub rlib): return `None`
+  from Sky's provider when the local crate is a stub rlib, so the
+  cascade never fires there.
+
+Approaches A and C were empirically rejected. Both share the same
+failure mode: they assume the user-bin compile would re-discover the
+deps via its own collector walk. **It won't.** The
+`is_reachable_non_generic` gate (F.13) blocks the user-bin
+collector from calling `per_instance_mir` on `__sky_main` —
+suppressing the cascade at the stub rlib means the cascade fires
+nowhere, deps are queued nowhere, and the binary fails to link
+`duplicate<Widget>` itself (much less the clone method). Probe
+confirmation: when Approach C was prototyped, the failing symbol
+became `duplicate<Widget>` rather than `<Widget as Clone>::clone`.
+
+The cascade at the stub rlib compile is therefore architecturally
+**load-bearing**, not a leak. Sky's `per_instance_mir` provider must
+fire there for the rest of the system to function. The "lib compiles
+produce rlib + sidecar only" guidance in §5.5 reads as a rule about
+*Sky-emitted bodies*, not about *rust-emitted bodies the Sky cascade
+queues*. The qualifier in §5.5 makes this explicit.
 
 ---
 
