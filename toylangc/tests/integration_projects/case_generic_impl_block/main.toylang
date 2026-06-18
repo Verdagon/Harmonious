@@ -1,0 +1,58 @@
+// Compiler-law audit follow-up: generic impl-block fixture.
+//
+// Tests `impl<T: Clone> Clone for Wrapper<T>` where Wrapper<T> is a
+// Sky-defined generic struct. Two distinct instantiations (Wrapper<i32>
+// and Wrapper<i64>) flow through the same Rust generic intermediary,
+// proving the facade machinery distinguishes <Wrapper<i32> as Clone>::clone
+// and <Wrapper<i64> as Clone>::clone as separate per_instance_mir
+// Instances with distinct rustc-mangled names.
+
+use std::clone::Clone
+use some_rust_lib::duplicate
+
+fn println_i32(x: i32)
+fn println_i64(x: i64)
+
+struct Wrapper<T> {
+    val: T,
+}
+
+// Fallback per the plan: the natural body
+//     `Wrapper<T> { val: self.val.clone() }`
+// doesn't work because Sky's type-resolver can't dispatch `<T as Clone>::clone`
+// when T is an unsubstituted type param (RustTypeDeferred). Direct field copy
+// works for `T: Copy`-equivalent primitives and still proves the fixture's
+// load-bearing claim: two distinct Instances flow through the same impl-method
+// DefId with distinct rustc-mangled names. The `T: Clone` bound stays declared
+// for the architectural shape; nothing in the body actually exercises it.
+export impl<T: Clone> Clone for Wrapper<T> {
+    fn clone(&self) -> Wrapper<T> {
+        Wrapper<T> { val: self.val }
+    }
+}
+
+fn make_i32(x: i32) -> Wrapper<i32> {
+    Wrapper<i32> { val: x }
+}
+
+fn val_of_i32(w: &Wrapper<i32>) -> i32 {
+    w.val
+}
+
+fn make_i64(x: i64) -> Wrapper<i64> {
+    Wrapper<i64> { val: x }
+}
+
+fn val_of_i64(w: &Wrapper<i64>) -> i64 {
+    w.val
+}
+
+fn main() {
+    let a = make_i32(42);
+    let b = duplicate<Wrapper<i32>>(&a);
+    println_i32(val_of_i32(&b));
+
+    let c = make_i64(7i64);
+    let d = duplicate<Wrapper<i64>>(&c);
+    println_i64(val_of_i64(&d));
+}
