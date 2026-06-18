@@ -1,30 +1,26 @@
-//! `upstream_monomorphizations_for` override — force local mono for consumer items.
+//! `upstream_monomorphizations` and `upstream_monomorphizations_for` overrides.
 //!
-//! When consumer stubs live in their own rlib (stage 4c's separate-crate
-//! model), the user bin's mono collector sees the stub crate as "upstream"
-//! and asks `upstream_monomorphizations_for` whether a given generic
-//! monomorphization should be linked from the upstream crate rather than
-//! emitted locally. For consumer generic wrappers (e.g., the Phase-6
-//! `#[inline(never)]` `__toylang_option_unwrap<T>` / `__toylang_result_unwrap<T, E>`
-//! functions), the upstream rlib doesn't contain any concrete monomorphizations
-//! — it has no local callers of the generic, so rustc's collector never
-//! reached the generic from inside the rlib's compile. Default behavior
-//! would route the user bin's link to a nonexistent upstream mono → link
-//! fails with "cannot find function ...".
+//! Two queries play together here:
 //!
-//! Fix: return `None` for consumer DefIds so the user bin's collector
-//! emits the mono locally. The plugin's backend then codegens the wrapper
-//! body directly via toylang's Inkwell backend (for consumer fns) or via
-//! the stage-4a partitioner pass-through (for non-consumer items that
-//! happen to live in `__lang_stubs`, like the Phase-6 unwrap wrappers
-//! whose bodies are real Rust and flow through rustc's codegen).
+//! - **`upstream_monomorphizations(())`** (whole-map): builds the per-DefId
+//!   table of `args → CrateNum` from the metadata of every loaded rlib.
+//!   Returned as `&'tcx DefIdMap<UnordMap<GenericArgsRef<'tcx>, CrateNum>>`.
+//!   Sky overrides this query (Step 5) to **augment** the default-built map
+//!   with consumer trait-impl method synthesised entries — the stub rlib's
+//!   metadata doesn't record consumer trait-impl mono items (Sky's
+//!   partition override removed them from the CGU list), so the default
+//!   alone leaves user-bin's v0 mangler picking the wrong instantiating
+//!   crate.
 //!
-//! POC #2 §4.3.D identifies this as risk #1's remedy; spike findings §4.1
-//! confirms it's ~5 LoC of wiring. No rustc fork patch required — this is
-//! a standard `Config::override_queries` override.
+//! - **`upstream_monomorphizations_for(DefId)`** (per-DefId): looks up one
+//!   DefId in the whole-map. Sky overrides this query to force `None` for
+//!   Phase-6 generic wrappers (`__toylang_option_unwrap<T>` etc.) so the
+//!   user bin emits them locally. For consumer trait-impl methods the
+//!   override passes through to the default — which now finds Sky's
+//!   synthesised entries thanks to the whole-map augmentation.
 
 use rustc_data_structures::unord::UnordMap;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{DefIdMap, LocalDefId};
 use rustc_middle::ty::{GenericArgsRef, TyCtxt};
 use rustc_span::def_id::CrateNum;
 
@@ -33,16 +29,51 @@ pub type UpstreamMonomorphizationsForFn = for<'tcx> fn(
     LocalDefId,
 ) -> Option<&'tcx UnordMap<GenericArgsRef<'tcx>, CrateNum>>;
 
+pub type UpstreamMonomorphizationsFn = for<'tcx> fn(
+    TyCtxt<'tcx>,
+    (),
+) -> DefIdMap<UnordMap<GenericArgsRef<'tcx>, CrateNum>>;
+
+/// Step 5: augment rustc's default-built whole-map with consumer
+/// trait-impl method synthesised entries. Returns by value; rustc's
+/// `arena_cache` query modifier wraps the result.
+pub fn lang_upstream_monomorphizations<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    (): (),
+) -> DefIdMap<UnordMap<GenericArgsRef<'tcx>, CrateNum>> {
+    let default = crate::default_upstream_monomorphizations();
+    let mut map: DefIdMap<UnordMap<GenericArgsRef<'tcx>, CrateNum>> = default(tcx, ());
+    for (def_id, args, crate_num) in crate::call_synthesize_upstream_monomorphizations(tcx) {
+        map.entry(def_id).or_default().insert(args, crate_num);
+    }
+    map
+}
+
 pub fn lang_upstream_monomorphizations_for<'tcx>(
     tcx: TyCtxt<'tcx>,
     local_def_id: LocalDefId,
 ) -> Option<&'tcx UnordMap<GenericArgsRef<'tcx>, CrateNum>> {
     let def_id = local_def_id.to_def_id();
-    // Force local mono for anything in `__lang_stubs`: the consumer's
-    // generic wrappers (Phase-6 unwraps + any future cross-crate generic
-    // stubs) must be emitted in whatever crate currently needs them, not
-    // routed to a nonexistent upstream instantiation.
-    if crate::is_from_lang_stubs(tcx, def_id) {
+    // Two distinct categories of `is_from_lang_stubs` items:
+    //
+    // 1. **Phase-6 generic wrappers** (`__toylang_option_unwrap<T>` etc.).
+    //    Bodies are real Rust source; rustc codegens them. The stub rlib
+    //    has no callers, so its mono walker never reached them → the
+    //    default returns `None`. User-bin's collector falls back to local
+    //    mono and rustc emits them. The override's None-return is a
+    //    redundant guard here but doesn't harm.
+    //
+    // 2. **Consumer trait-impl methods** (e.g.
+    //    `<Wrapper<i32> as Clone>::clone`). Pass through to the default —
+    //    the default `upstream_monomorphizations_for` does
+    //    `tcx.upstream_monomorphizations(()).get(&def_id)`, and our
+    //    whole-map override above has augmented that map with the
+    //    consumer's synthesised entries. So the per-DefId lookup now finds
+    //    them, and user-bin's v0 mangler picks the stub rlib's crate as
+    //    the disambiguator.
+    if crate::is_from_lang_stubs(tcx, def_id)
+        && crate::is_consumer_trait_impl_method(tcx, def_id).is_none()
+    {
         return None;
     }
     let default = crate::default_upstream_monomorphizations_for();

@@ -51,6 +51,7 @@ pub fn lang_override_queries(
         providers.queries.symbol_name,
         providers.queries.collect_and_partition_mono_items,
         providers.queries.upstream_monomorphizations_for,
+        providers.queries.upstream_monomorphizations,
     );
 
     providers.queries.layout_of        = layout::lang_layout_of;
@@ -60,4 +61,8 @@ pub fn lang_override_queries(
     providers.queries.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
     providers.queries.upstream_monomorphizations_for =
         upstream_monomorphization::lang_upstream_monomorphizations_for;
+    // Step 5: augment rustc's default-built whole-map with consumer
+    // synthesised trait-impl entries.
+    providers.queries.upstream_monomorphizations =
+        upstream_monomorphization::lang_upstream_monomorphizations;
 }

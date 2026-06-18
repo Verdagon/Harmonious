@@ -139,6 +139,13 @@ pub struct ToylangInstance {
     pub internal_symbol: String,
     pub resolved_func: crate::toylang::registry::ToyFunction,
     pub stub_def_id: Option<rustc_span::def_id::DefId>,
+    /// Concrete args for the rustc Instance. Empty `Vec` is the degenerate
+    /// (non-generic) case of the general path — falls out without a branch.
+    /// For generic items (e.g. `<Wrapper<i32> as Clone>::clone` discovered
+    /// via Option B sidecar) carries the `instance.args.types()` snapshot used
+    /// to build the rustc `Instance` at codegen time via
+    /// `oracle::build_generic_args_for_item`.
+    pub instance_args: Vec<crate::toylang::typed_ast::ResolvedType>,
 }
 
 /// Mutable state accumulated during compilation. Stored in the facade's global
@@ -425,66 +432,23 @@ impl ToylangCallbacks {
                     internal_symbol,
                     resolved_func: toy_fn.clone(),
                     stub_def_id,
+                    instance_args: vec![],
                 });
                 // Transitive walk: surfaces non-export Sky callees + generic
                 // monomorphizations reachable from this root.
                 walk_and_stash_internal_callees(tcx, reg, toy_fn, name, state);
             }
-            // Export impl-block methods.
-            for toy_impl in &reg.trait_impls {
-                if !toy_impl.is_export {
-                    continue;
-                }
-                for method in &toy_impl.methods {
-                    if method.func.body.is_none() || method.func.has_abstract_args() {
-                        continue;
-                    }
-                    let stub_def_id = crate::oracle::find_trait_impl_method_def_id(
-                        tcx,
-                        &toy_impl.trait_name,
-                        &toy_impl.self_type_name,
-                        &method.name,
-                    );
-                    // Path B: emit under the rustc-mangled name of the
-                    // impl method (e.g.,
-                    // `<__lang_stubs::Widget as core::clone::Clone>::clone`).
-                    // The trait-impl-method Instance lives at the impl side
-                    // (`find_trait_impl_method_def_id` returns the
-                    // associated-item DefId, not the trait-declaration's),
-                    // so empty args suffices for case4-shaped impls.
-                    // arch-fence-allow: degenerate-case-fast-path
-                    // (has_abstract_args filter above rules out impl-block
-                    // generics at this populate point; trait methods with
-                    // their own type params would need a richer args build).
-                    let extern_symbol = if let Some(def_id) = stub_def_id {
-                        let instance = ty::Instance::new_raw(def_id, ty::GenericArgs::empty());
-                        compute_fn_symbol(&method.name, tcx, instance)
-                    } else {
-                        // No stub shell — fall back to Sky-internal naming.
-                        format!(
-                            "__toylang_internal__{}__{}__{}",
-                            toy_impl.self_type_name, toy_impl.trait_name, method.name,
-                        )
-                    };
-                    if !state.walked_entry_points.insert(extern_symbol.clone()) {
-                        continue;
-                    }
-                    // Sky-internal name for the trait-impl method body —
-                    // qualified by (Self, Trait, method) since the method
-                    // name alone (e.g., `clone`) collides across impls.
-                    let internal_symbol = format!(
-                        "__toylang_internal__{}__{}__{}",
-                        toy_impl.self_type_name, toy_impl.trait_name, method.name,
-                    );
-                    state.toylang_instances.push(ToylangInstance {
-                        extern_symbol,
-                        internal_symbol,
-                        resolved_func: method.func.clone(),
-                        stub_def_id,
-                    });
-                    walk_and_stash_internal_callees(tcx, reg, &method.func, &method.name, state);
-                }
-            }
+            // Trait-impl method monomorphizations flow uniformly through the
+            // Option B discovered-instances loop below — captured at the
+            // upstream stub-rlib compile's mono cascade for every concrete
+            // instantiation rustc actually queues, regardless of impl-block
+            // genericity. The prior `for toy_impl in &reg.trait_impls`
+            // populate channel only pushed an empty-args mono per method
+            // — which is meaningful only for impls with zero type params,
+            // i.e. it was a non-generic special case. CLAUDE.md compiler
+            // law: non-generic is the degenerate case of generic; the cascade
+            // captures it uniformly (case4's `<Widget as Clone>::clone`
+            // appears in the captured list with `concrete_args = []`).
             // Tier 3 #3 Phase 1b: accessor functions. Each (struct, field)
             // pair becomes a regular Sky `ToyFunction` (synthesised on the
             // fly via `synthesize_accessor_fn`) that flows through the
@@ -534,7 +498,89 @@ impl ToylangCallbacks {
                     internal_symbol,
                     resolved_func,
                     stub_def_id: Some(stub_def_id),
+                    instance_args: vec![],
                 });
+            }
+        }
+        // Option B sidecar consumption — discovered trait-impl
+        // monomorphizations from upstream stub rlib compiles. The stub-rlib
+        // mono walker surfaced these concrete instantiations (e.g.
+        // `<Wrapper<i32> as Clone>::clone` reached via the
+        // `duplicate<Wrapper<T>>` cascade) via Sky's `per_instance_mir`.
+        // Sky's bitcode at user-bin compile must emit the body so the
+        // linker resolves the stub rlib's reference to it.
+        //
+        // Iterates ONLY upstream registries — the local registry has no
+        // discoveries (those come from the upstream's stub-rlib compile,
+        // not the binary's own typing pass). Cross-registry impl lookup:
+        // `impl Clone for Box` may live in a different upstream registry
+        // (case6_lib pattern) from where the discovery was captured (the
+        // bin's own stub rlib captures the cascade that crosses crates).
+        for upstream in &upstream_clones {
+            for inst in &upstream.discovered_trait_impl_instances {
+                // Find the matching `ToyImpl` across all registries
+                // (cross-Sky-crate; case6_lib).
+                let mut toy_impl_found = None;
+                for r in std::iter::once(self.registry.as_ref()).chain(upstream_clones.iter()) {
+                    if let Some(found) = r.trait_impls.iter().find(|imp| {
+                        imp.self_type_name == inst.self_type_name
+                            && imp.trait_name == inst.trait_name
+                    }) {
+                        toy_impl_found = Some(found);
+                        break;
+                    }
+                }
+                let Some(toy_impl) = toy_impl_found else { continue; };
+                let Some(method) = toy_impl.methods.iter().find(|m| m.name == inst.method_name)
+                    else { continue; };
+                let Some(stub_def_id) = crate::oracle::find_trait_impl_method_def_id(
+                    tcx, &inst.trait_name, &inst.self_type_name, &inst.method_name,
+                ) else { continue; };
+                // Build Instance with the captured concrete args so the
+                // rustc-default mangler produces the same name the stub
+                // rlib's `duplicate<...>` body references.
+                let rustc_type_args: Vec<ty::GenericArg<'tcx>> = inst.concrete_args.iter()
+                    .map(|a| ty::GenericArg::from(
+                        crate::oracle::resolved_to_rustc_ty(tcx, a)
+                    ))
+                    .collect();
+                let args = crate::oracle::build_generic_args_for_item(
+                    tcx, stub_def_id, &rustc_type_args,
+                );
+                let instance = ty::Instance::new_raw(stub_def_id, args);
+                let extern_symbol = compute_fn_symbol(&inst.method_name, tcx, instance);
+                if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                    continue;
+                }
+                // Sky-internal name qualified by `(self, trait, method, args)`
+                // so the body matches uniquely across instantiations.
+                let mut internal_symbol = format!(
+                    "__toylang_internal__{}__{}__{}",
+                    inst.self_type_name, inst.trait_name, inst.method_name,
+                );
+                for arg in &inst.concrete_args {
+                    internal_symbol.push_str("__");
+                    internal_symbol.push_str(&crate::oracle::resolved_type_to_mangled_name(arg));
+                }
+                // Substitute the method body using the captured concrete
+                // args. `resolve_caller_from_instance` zips
+                // `method.func.type_params` (impl-block params + method-level
+                // params, in source order) against `instance.args.types()`
+                // and substitutes throughout the body. For N=0 (non-generic
+                // impl) the zip is empty → identity substitution → body
+                // unchanged. CLAUDE.md compiler law: the same code path
+                // handles non-generic and generic uniformly.
+                let resolved_func = resolve_caller_from_instance(&method.func, instance, tcx);
+                state.toylang_instances.push(ToylangInstance {
+                    extern_symbol,
+                    internal_symbol,
+                    resolved_func: resolved_func.clone(),
+                    stub_def_id: Some(stub_def_id),
+                    instance_args: inst.concrete_args.clone(),
+                });
+                walk_and_stash_internal_callees(
+                    tcx, upstream, &resolved_func, &inst.method_name, state,
+                );
             }
         }
     }
@@ -569,6 +615,19 @@ impl ToylangCallbacks {
 // items directly in the CGU slice. Stage 5c.4 retired the `generate_stubs`
 // trait method: wrapper mode's `build::write_stub_crate` calls
 // `stub_gen::generate` directly.
+
+/// Step 5 / Option B — record stashed in the facade-owned `SkyUniverse`
+/// at `on_sky_lib_loaded` time, read by
+/// `synthesize_upstream_monomorphizations`. The `crate_name` is captured
+/// here so the stateless synthesis can look up the upstream's `CrateNum`
+/// via `tcx.crates(())` without a side channel.
+struct StashedDiscovery {
+    crate_name: String,
+    self_type_name: String,
+    trait_name: String,
+    method_name: String,
+    concrete_args: Vec<crate::toylang::typed_ast::ResolvedType>,
+}
 
 impl LangCallbacks for ToylangCallbacks {
     fn create_state(&self) -> Box<dyn Any + Send + Sync> {
@@ -932,6 +991,22 @@ impl LangCallbacks for ToylangCallbacks {
         // queries. `populate_sky_universe_from_registry` writes both in
         // one pass.
         populate_sky_universe_from_registry(&registry);
+        // Step 5 / Option B: push the upstream's captured discoveries into
+        // the facade-owned SkyUniverse so the stateless
+        // `lang_upstream_monomorphizations_for` query override can
+        // synthesise the args→CrateNum map without re-locking
+        // MUTABLE_STATE (@GCMLZ).
+        rustc_lang_facade::with_sky_universe_mut(|u| {
+            for d in &registry.discovered_trait_impl_instances {
+                u.push_discovery(std::sync::Arc::new(StashedDiscovery {
+                    crate_name: crate_name.to_string(),
+                    self_type_name: d.self_type_name.clone(),
+                    trait_name: d.trait_name.clone(),
+                    method_name: d.method_name.clone(),
+                    concrete_args: d.concrete_args.clone(),
+                }));
+            }
+        });
         ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
 
@@ -1039,7 +1114,60 @@ impl LangCallbacks for ToylangCallbacks {
         }
 
         if !self.is_user_bin_compile {
-            // Rlib compile produces no Sky `.o` (Workstream A).
+            // Stub rlib compile: no Sky `.o` (Workstream A), but THIS is the
+            // window where rustc's mono walker has completed its cascade
+            // from Sky's `per_instance_mir` synthetic bodies — so concrete
+            // monomorphizations like `<Wrapper<i32> as Clone>::clone`
+            // appear in the unfiltered partition. Capture them into the
+            // registry and overwrite the sidecar so the downstream binary
+            // compile can:
+            //   (a) pick them up at populate (Sky emits the body), and
+            //   (b) synthesise `upstream_monomorphizations_for` so rustc's
+            //       v0 mangler picks `__lang_stubs` as the
+            //       instantiating-crate disambig (matching the stub rlib's
+            //       `duplicate<Wrapper<i32>>` body's reference).
+            //
+            // Done HERE, not at `after_rust_analysis`, because
+            // `default_collect_and_partition` triggers mono walk which
+            // re-enters `collect_generic_rust_deps` — @GCMLZ. The mutex
+            // is owned by `after_rust_analysis`'s trampoline; we're inside
+            // `consumer_emit_modules`'s trampoline which already owns it
+            // exclusively, and mono walk has long since completed.
+            let mut effective_registry: ToylangRegistry = (*self.registry).clone();
+            capture_discovered_trait_impl_instances(tcx, &mut effective_registry);
+            // Sort for sidecar byte-determinism (see registry doc).
+            effective_registry.discovered_trait_impl_instances.sort_by(|a, b| {
+                let arg_key = |args: &Vec<crate::toylang::typed_ast::ResolvedType>| -> String {
+                    args.iter()
+                        .map(crate::oracle::resolved_type_to_mangled_name)
+                        .collect::<Vec<_>>()
+                        .join("__")
+                };
+                (&a.self_type_name, arg_key(&a.concrete_args), &a.trait_name, &a.method_name).cmp(
+                    &(&b.self_type_name, arg_key(&b.concrete_args), &b.trait_name, &b.method_name),
+                )
+            });
+            effective_registry.populate_typeid_table();
+            // Overwrite the sidecar written by `after_rust_analysis` —
+            // same path, now carrying discoveries.
+            let sidecar_path = tcx.output_filenames(()).with_extension("sky-meta");
+            let bytes = crate::sidecar::serialize_sidecar(&effective_registry)
+                .unwrap_or_else(|e| panic!("[toylang] sidecar (post-discovery) serialize failed: {}", e));
+            std::fs::write(&sidecar_path, &bytes).unwrap_or_else(|e| {
+                panic!(
+                    "[toylang] sidecar (post-discovery) write failed at {}: {}",
+                    sidecar_path.display(),
+                    e,
+                )
+            });
+            if std::env::var("TOYLANG_LOG_PATH").is_ok() {
+                eprintln!(
+                    "[toylang] rewrote sidecar with {} discovered trait-impl instance(s): {} ({} bytes)",
+                    effective_registry.discovered_trait_impl_instances.len(),
+                    sidecar_path.display(),
+                    bytes.len(),
+                );
+            }
             return Vec::new();
         }
 
@@ -1086,10 +1214,118 @@ impl LangCallbacks for ToylangCallbacks {
         let cgu_name = build_sky_cgu_name(tcx);
         vec![(cgu_name, bitcode)]
     }
+
+    /// Step 5: stateless synthesis driver. Walks the discoveries stashed
+    /// in `SkyUniverse` (lock-free) and for each captured
+    /// `(self_type, trait, method, concrete_args)` quartet returns:
+    ///   - The DefId of the impl-method (looked up via
+    ///     `oracle::find_trait_impl_method_def_id` — filters on
+    ///     `is_from_lang_stubs` so name collisions with stdlib impls don't
+    ///     hijack — ATAFLBZ).
+    ///   - The concrete `GenericArgsRef`.
+    ///   - The upstream `CrateNum` matching the stashed `crate_name`.
+    /// The facade's whole-map override slots each record into the
+    /// `DefIdMap<UnordMap<...>>` rustc returns, augmenting the default.
+    fn synthesize_upstream_monomorphizations<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+    ) -> Vec<(rustc_hir::def_id::DefId, ty::GenericArgsRef<'tcx>, rustc_span::def_id::CrateNum)> {
+        let stash = rustc_lang_facade::sky_universe().discoveries_clone();
+        let mut records: Vec<(
+            rustc_hir::def_id::DefId,
+            ty::GenericArgsRef<'tcx>,
+            rustc_span::def_id::CrateNum,
+        )> = Vec::new();
+        for arc in &stash {
+            let Some(d) = arc.downcast_ref::<StashedDiscovery>() else { continue; };
+            // Look up the impl-method DefId from (self_type, trait, method).
+            let Some(def_id) = crate::oracle::find_trait_impl_method_def_id(
+                tcx, &d.trait_name, &d.self_type_name, &d.method_name,
+            ) else { continue; };
+            // Build GenericArgsRef from the stored ResolvedType list.
+            let rustc_type_args: Vec<ty::GenericArg<'tcx>> = d.concrete_args.iter()
+                .map(|a| ty::GenericArg::from(
+                    crate::oracle::resolved_to_rustc_ty(tcx, a)
+                ))
+                .collect();
+            let args = crate::oracle::build_generic_args_for_item(
+                tcx, def_id, &rustc_type_args,
+            );
+            // Map stashed `crate_name` to its `CrateNum`. `tcx.crates(())`
+            // returns all loaded upstream crates; match by name.
+            let mut crate_num: Option<rustc_span::def_id::CrateNum> = None;
+            for &c in tcx.crates(()).iter() {
+                if tcx.crate_name(c).as_str() == d.crate_name {
+                    crate_num = Some(c);
+                    break;
+                }
+            }
+            let Some(crate_num) = crate_num else { continue; };
+            records.push((def_id, args, crate_num));
+        }
+        records
+    }
 }
 
 /// Strip Mach-O bitcode wrapper (20-byte header) if present, returning the
 /// raw bitcode that rustc's `LLVMRustParseBitcodeForLTO` accepts.
+/// Option B sidecar capture (called at the stub-rlib `consumer_emit_modules`
+/// gate). Walks the unfiltered partition for trait-impl method Instances and
+/// records `(self_type, trait, method, concrete_args)` tuples into the
+/// registry's `discovered_trait_impl_instances` list. The downstream binary
+/// compile uses these for:
+///   (a) populate, to push a `ToylangInstance` per discovered
+///       monomorphization so Sky emits the body; and
+///   (b) `lang_upstream_monomorphizations_for` synthesis (Step 5), so
+///       rustc's v0 mangler picks `__lang_stubs` as the
+///       instantiating-crate disambig.
+///
+/// Calls `default_collect_and_partition` (bypasses the in-memory query
+/// cache that would return Sky's filtered result); see partition.rs and
+/// Tier 3 #3 for the same pattern.
+fn capture_discovered_trait_impl_instances<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    registry: &mut ToylangRegistry,
+) {
+    use crate::toylang::registry::DiscoveredTraitImplInstance;
+    let partitions = rustc_lang_facade::default_collect_and_partition()(tcx, ());
+    for cgu in partitions.codegen_units.iter() {
+        for (&mono_item, _) in cgu.items() {
+            let rustc_middle::mir::mono::MonoItem::Fn(instance) = mono_item else { continue };
+            let def_id = instance.def_id();
+            // Pre-filter on `is_from_lang_stubs` to skip items in other
+            // crates (std, hashbrown, etc.). `is_consumer_trait_impl_method`
+            // assumes the container is an impl block; for assoc items
+            // whose container is a trait def (e.g. `hashbrown::TagSliceExt`
+            // method defaults) `impl_opt_trait_ref` panics with
+            // "expected Impl for DefId(...)". Sky trait-impl method bodies
+            // live in the stub rlib (§6.2), so the filter is also a
+            // semantic match.
+            if !rustc_lang_facade::is_from_lang_stubs(tcx, def_id) {
+                continue;
+            }
+            let Some((self_type_name, trait_name, method_name)) =
+                rustc_lang_facade::is_consumer_trait_impl_method(tcx, def_id)
+            else { continue };
+            // Extract concrete type args (the impl block's type params,
+            // substituted). Skip the receiver/self-type args of the
+            // method itself — those are subsumed by the impl block's args.
+            let concrete_args: Vec<crate::toylang::typed_ast::ResolvedType> = instance
+                .args
+                .iter()
+                .filter_map(|a| a.as_type())
+                .map(|ty| crate::oracle::rustc_ty_to_resolved_type(tcx, ty))
+                .collect();
+            registry.discovered_trait_impl_instances.push(DiscoveredTraitImplInstance {
+                self_type_name,
+                trait_name,
+                method_name,
+                concrete_args,
+            });
+        }
+    }
+}
+
 /// Wrapper magic is 0x0B17C0DE little-endian (`DE C0 17 0B`); offset of raw
 /// bitcode is at bytes 8-11 little-endian.
 fn strip_macho_wrapper(bitcode: Vec<u8>) -> Vec<u8> {
@@ -1435,6 +1671,7 @@ fn walk_and_stash_internal_callees<'tcx>(
                 internal_symbol: callee_symbol,
                 resolved_func: resolved_callee.clone(),
                 stub_def_id: None,
+                instance_args: vec![],
             });
             walk_and_stash_internal_callees(
                 tcx, registry, &resolved_callee, callee_name, state,

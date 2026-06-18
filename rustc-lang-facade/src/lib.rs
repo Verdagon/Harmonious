@@ -239,6 +239,29 @@ pub trait LangCallbacks: Send + Sync {
     ) -> Vec<(String, Vec<u8>)> {
         Vec::new()
     }
+
+    /// Option B / Step 5 — stateless synthesis for the
+    /// `upstream_monomorphizations` query (the whole-map version, not
+    /// per-DefId). Called from `lang_upstream_monomorphizations` to
+    /// augment rustc's default-built map with consumer discoveries
+    /// captured at upstream stub rlib compiles.
+    ///
+    /// The consumer walks `SkyUniverse` (lock-free), and for each
+    /// captured discovery returns a `(DefId, GenericArgsRef, CrateNum)`
+    /// triple identifying the impl-method + concrete args + upstream
+    /// crate. The facade slots each triple into the
+    /// `DefIdMap<UnordMap<...>>` rustc returns.
+    ///
+    /// Stateless because the query may fire during `consumer_emit_modules`
+    /// (which holds `MUTABLE_STATE` via its trampoline) and re-locking the
+    /// mutex would deadlock (@GCMLZ). Default returns `Vec::new()` so
+    /// non-adopting consumers see no behavior change.
+    fn synthesize_upstream_monomorphizations<'tcx>(
+        &self,
+        _tcx: TyCtxt<'tcx>,
+    ) -> Vec<(DefId, ty::GenericArgsRef<'tcx>, rustc_span::def_id::CrateNum)> {
+        Vec::new()
+    }
 }
 
 // ============================================================================
@@ -314,6 +337,14 @@ struct StatefulVtable {
         &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
     ) -> Vec<(String, Vec<u8>)>,
+
+    // Step 5: stateless synthesis for the whole-map
+    // `upstream_monomorphizations` query. Skips the mutex (no
+    // `&mut state` param); reads from SkyUniverse.
+    synthesize_upstream_monomorphizations: for<'tcx> fn(
+        &(dyn Any + Send + Sync),
+        TyCtxt<'tcx>,
+    ) -> Vec<(DefId, ty::GenericArgsRef<'tcx>, rustc_span::def_id::CrateNum)>,
 }
 
 // ============================================================================
@@ -372,6 +403,8 @@ static DEFAULT_COLLECT_AND_PARTITION: OnceLock<queries::partition::CollectAndPar
     OnceLock::new();
 static DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR:
     OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsForFn> = OnceLock::new();
+static DEFAULT_UPSTREAM_MONOMORPHIZATIONS:
+    OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsFn> = OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<Box<dyn Any + Send + Sync>>> = OnceLock::new();
@@ -430,6 +463,16 @@ pub struct SkyUniverse {
     /// duplicated this surface to handle cross-Sky-crate layouts (Case 6
     /// sharpening).
     pub struct_infos: HashMap<String, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Option B sidecar carry — discovered trait-impl method monomorphizations
+    /// captured at upstream stub rlib compiles via Sky's `per_instance_mir`
+    /// cascade. Stored type-erased so the facade stays consumer-agnostic;
+    /// the consumer pushes one entry per record at `on_sky_lib_loaded` time
+    /// and downcasts when synthesising the
+    /// `upstream_monomorphizations_for` query. Read by
+    /// `lang_upstream_monomorphizations_for` via the new stateless trait
+    /// method `synthesize_upstream_monomorphizations` — populated once per
+    /// upstream rlib load, lock-free reads from there on.
+    pub discoveries: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl SkyUniverse {
@@ -460,6 +503,26 @@ impl SkyUniverse {
         name: &str,
     ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         self.struct_infos.get(name).cloned()
+    }
+    /// Option B / Step 5: push a discovery record (captured at an upstream
+    /// stub rlib compile). Called once per `DiscoveredTraitImplInstance`
+    /// during the consumer's `on_sky_lib_loaded`. Stored type-erased; the
+    /// stateless `synthesize_upstream_monomorphizations` callback downcasts
+    /// when matching by (self_type, trait, method).
+    pub fn push_discovery(
+        &mut self,
+        record: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        self.discoveries.push(record);
+    }
+    /// Option B / Step 5: borrow the discoveries for read-only matching.
+    /// Returned as `Vec<Arc<...>>` clones so the caller can release the
+    /// `SkyUniverse` read guard before doing the (slow-ish) downcast +
+    /// args-build per match.
+    pub fn discoveries_clone(&self)
+        -> Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>
+    {
+        self.discoveries.clone()
     }
 }
 
@@ -782,6 +845,23 @@ pub(crate) fn call_consumer_emit_modules<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
+/// Step 5: stateless call into the consumer for
+/// `synthesize_upstream_monomorphizations`. Lock-free — reads only from
+/// `CONFIG` (immutable `OnceLock`). Safe to call from inside
+/// `lang_upstream_monomorphizations_for` regardless of whether
+/// `MUTABLE_STATE` is held by an enclosing trampoline. The consumer's
+/// impl reads from `SkyUniverse` (lock-free) for the captured
+/// discoveries.
+pub fn call_synthesize_upstream_monomorphizations<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Vec<(DefId, ty::GenericArgsRef<'tcx>, rustc_span::def_id::CrateNum)> {
+    let c = CONFIG.get().expect("config not installed");
+    let func = c.stateful_vtable.synthesize_upstream_monomorphizations;
+    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
+    // Safety: callbacks is immutable (from CONFIG, no lock needed).
+    (func)(unsafe { &*callbacks_ptr }, tcx)
+}
+
 /// Read saved default query providers. Per @GCMLZ, no locking — stored in
 /// OnceLock so they're safe to call during generate_and_compile.
 pub(crate) fn default_layout_of() -> queries::layout::LayoutOfFn {
@@ -830,6 +910,14 @@ pub(crate) fn default_upstream_monomorphizations_for()
     *DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR
         .get()
         .expect("default upstream_monomorphizations_for not saved")
+}
+
+pub(crate) fn default_upstream_monomorphizations()
+    -> queries::upstream_monomorphization::UpstreamMonomorphizationsFn
+{
+    *DEFAULT_UPSTREAM_MONOMORPHIZATIONS
+        .get()
+        .expect("default upstream_monomorphizations not saved")
 }
 
 // Trampoline functions — monomorphized for a specific C, then stored as fn pointers.
@@ -896,6 +984,13 @@ fn trampoline_consumer_emit_modules<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().consumer_emit_modules(state, tcx)
 }
 
+fn trampoline_synthesize_upstream_monomorphizations<'tcx, C: LangCallbacks + 'static>(
+    data: &(dyn Any + Send + Sync),
+    tcx: TyCtxt<'tcx>,
+) -> Vec<(DefId, ty::GenericArgsRef<'tcx>, rustc_span::def_id::CrateNum)> {
+    data.downcast_ref::<C>().unwrap().synthesize_upstream_monomorphizations(tcx)
+}
+
 /// Install callbacks for use by query overrides. Phase 1 of globals init.
 pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
     callbacks: C,
@@ -910,6 +1005,8 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
             on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
             consumer_emit_modules: trampoline_consumer_emit_modules::<C>,
+            synthesize_upstream_monomorphizations:
+                trampoline_synthesize_upstream_monomorphizations::<C>,
         },
     });
     let _ = MUTABLE_STATE.set(std::sync::Mutex::new(consumer_state));
@@ -938,12 +1035,15 @@ pub(crate) fn install_query_defaults(
     collect_and_partition: queries::partition::CollectAndPartitionFn,
     upstream_monomorphizations_for:
         queries::upstream_monomorphization::UpstreamMonomorphizationsForFn,
+    upstream_monomorphizations:
+        queries::upstream_monomorphization::UpstreamMonomorphizationsFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
     let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
     let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR.set(upstream_monomorphizations_for);
+    let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS.set(upstream_monomorphizations);
 }
 
 #[cfg(test)]

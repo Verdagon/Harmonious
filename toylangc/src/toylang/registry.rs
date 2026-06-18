@@ -68,6 +68,43 @@ pub struct ToylangRegistry {
     /// but everything below the source surface is unified.
     #[serde(default)]
     pub accessor_pairs: Vec<(String, String)>,
+    /// Phase 4.5+ / Option B sidecar capture — concrete `(self_type, trait, method, args)`
+    /// tuples that the stub rlib compile's mono walker discovered via Sky's
+    /// `per_instance_mir` cascade. Captured in `consumer_emit_modules` (so the
+    /// mono walk has already completed and there's no @GCMLZ re-entrance risk)
+    /// and serialized into the sidecar; the downstream binary compile reads
+    /// the upstream registries' lists in two places:
+    ///   (a) populate, to push a `ToylangInstance` per discovered
+    ///       monomorphization so Sky's bitcode emits the body; and
+    ///   (b) `lang_upstream_monomorphizations_for`, to synthesize a
+    ///       `Some(map)` so rustc's v0 mangler picks `__lang_stubs` as the
+    ///       instantiating-crate disambiguator — matching the stub rlib's
+    ///       `duplicate<Wrapper<i32>>` body's reference to `clone`.
+    ///
+    /// Sorted deterministically before serialization (sidecar byte-equality).
+    /// `#[serde(default)]` because pre-Phase-B sidecars don't carry the
+    /// field; loading one yields an empty list, which is harmless for the
+    /// non-generic Sky-top fixtures (case4, etc.).
+    #[serde(default)]
+    pub discovered_trait_impl_instances: Vec<DiscoveredTraitImplInstance>,
+}
+
+/// One concrete trait-impl monomorphization the stub rlib's mono walker
+/// surfaced. Self-contained so the downstream consumer can rebuild a
+/// rustc `Instance` from it without referring back to the registry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveredTraitImplInstance {
+    /// The Sky struct the impl is for (e.g. "Wrapper").
+    pub self_type_name: String,
+    /// The Rust trait name (e.g. "Clone").
+    pub trait_name: String,
+    /// The method on the trait (e.g. "clone").
+    pub method_name: String,
+    /// Concrete type arguments for the impl block at this instantiation
+    /// (e.g. `[i32]` for `<Wrapper<i32> as Clone>::clone`). Sky-side
+    /// `ResolvedType` so the downstream consumer can round-trip through
+    /// `oracle::resolved_to_rustc_ty` + `oracle::build_generic_args_for_item`.
+    pub concrete_args: Vec<ResolvedType>,
 }
 
 impl ToylangRegistry {
@@ -155,6 +192,25 @@ pub struct ToyImpl {
     /// crossing items.
     #[serde(default)]
     pub is_export: bool,
+    /// Impl-block-level type parameters. For `impl<T, U> Trait for Foo<T, U>`
+    /// this is `["T", "U"]`; empty for non-generic impls (the degenerate
+    /// case). Method bodies need these in scope to resolve `T` (etc.) as a
+    /// `ResolvedType::TypeParam`. Stub_gen emits them in the impl block's
+    /// header.
+    #[serde(default)]
+    pub type_params: Vec<String>,
+    /// Trait bounds on the impl-block-level type parameters. Each entry
+    /// `(param, trait_path)` corresponds to `T: Clone`-style source syntax.
+    /// Stub_gen emits them in the impl block's header so rustc's typecheck
+    /// of the stub bodies is satisfied (the body itself is `unreachable!()`
+    /// but the bound is part of the trait obligations rustc checks).
+    #[serde(default)]
+    pub type_param_bounds: Vec<(String, String)>,
+    /// Self-type argument list. For `impl<T> Trait for Foo<T>` this is
+    /// `["T"]`; for non-generic `impl Trait for Foo` it's empty. Used by
+    /// stub_gen to emit the self type as `Foo<T>` in the impl header.
+    #[serde(default)]
+    pub self_type_args: Vec<String>,
 }
 
 /// A method inside a `ToyImpl`. Stored as `ToyFunction` plus the method's

@@ -406,6 +406,10 @@ impl Parser {
             // in the public `parse` entry point after `parse_program`
             // returns; empty here is fine.
             accessor_pairs: Vec::new(),
+            // Option B sidecar capture: populated by
+            // `capture_discovered_trait_impl_instances` at the stub-rlib
+            // `consumer_emit_modules` gate, not at parse time.
+            discovered_trait_impl_instances: Vec::new(),
         })
     }
 
@@ -431,6 +435,33 @@ impl Parser {
     {
         use crate::toylang::registry::{ToyImpl, ToyImplMethod};
         self.consume(); // eat "impl"
+
+        // Optional impl-block-level generics: `impl<T, U: Clone> ...`.
+        let mut impl_type_params: Vec<String> = Vec::new();
+        let mut impl_type_param_bounds: Vec<(String, String)> = Vec::new();
+        if self.peek() == &Token::LAngle {
+            self.consume();
+            while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
+                let param = self.expect_ident()?;
+                // Optional bound: `T: Trait`. Single trait for now (no `+`).
+                // Only the trait's short name is captured; the `use`-import
+                // mechanism (stub_gen's re-exports) resolves it for rustc.
+                if self.peek() == &Token::Colon {
+                    self.consume();
+                    let bound = self.expect_ident()?;
+                    // Support `::`-separated bound paths; keep last segment.
+                    let mut last = bound;
+                    while self.peek() == &Token::DoubleColon {
+                        self.consume();
+                        last = self.expect_ident()?;
+                    }
+                    impl_type_param_bounds.push((param.clone(), last));
+                }
+                impl_type_params.push(param);
+                if self.peek() == &Token::Comma { self.consume(); }
+            }
+            self.expect(Token::RAngle)?;
+        }
 
         // Parse the trait path as `::`-separated segments; keep only the last.
         let mut path_segments = vec![self.expect_ident()?];
@@ -460,13 +491,36 @@ impl Parser {
             });
         }
 
+        // Optional self-type args: `Wrapper<T>`. Each arg must be one of the
+        // impl-block's type params. The names are stored verbatim; downstream
+        // (stub_gen) emits them as type-arg tokens in the self-type position.
+        let mut self_type_args: Vec<String> = Vec::new();
+        if self.peek() == &Token::LAngle {
+            self.consume();
+            while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
+                let arg = self.expect_ident()?;
+                if !impl_type_params.iter().any(|p| p == &arg) {
+                    return Err(ParseError::UnexpectedTopLevelToken {
+                        got: format!(
+                            "self-type arg `{}` is not declared in the impl block's <…> generics",
+                            arg,
+                        ),
+                    });
+                }
+                self_type_args.push(arg);
+                if self.peek() == &Token::Comma { self.consume(); }
+            }
+            self.expect(Token::RAngle)?;
+        }
+
         self.expect(Token::LBrace)?;
         let mut methods: Vec<ToyImplMethod> = Vec::new();
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
             match self.peek() {
                 Token::Ident(s) if s == "fn" => {
                     let (m_name, m_func) = self.parse_impl_method(
-                        &self_type_name, struct_names,
+                        &self_type_name, struct_names, &impl_type_params,
+                        &self_type_args,
                     )?;
                     methods.push(ToyImplMethod { name: m_name, func: m_func });
                 }
@@ -478,7 +532,15 @@ impl Parser {
         }
         self.expect(Token::RBrace)?;
 
-        Ok(ToyImpl { trait_name, self_type_name, methods, is_export: false })
+        Ok(ToyImpl {
+            trait_name,
+            self_type_name,
+            methods,
+            is_export: false,
+            type_params: impl_type_params,
+            type_param_bounds: impl_type_param_bounds,
+            self_type_args,
+        })
     }
 
     /// Phase 2 C.1: parse one method inside an `impl ... for ... {}` block.
@@ -490,6 +552,8 @@ impl Parser {
         &mut self,
         self_type_name: &str,
         struct_names: &[String],
+        impl_block_type_params: &[String],
+        impl_block_self_type_args: &[String],
     ) -> Result<(String, ToyFunction), ParseError> {
         use crate::toylang::registry::{ToyParam};
         use crate::toylang::typed_ast::ResolvedType;
@@ -501,19 +565,28 @@ impl Parser {
         }
 
         // Method-level generics: <T, U>. Reuse the same shape as fns.
-        let mut type_params = Vec::new();
+        let mut method_type_params = Vec::new();
         if self.peek() == &Token::LAngle {
             self.consume();
             while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
-                type_params.push(self.expect_ident()?);
+                method_type_params.push(self.expect_ident()?);
                 if self.peek() == &Token::Comma { self.consume(); }
             }
             self.expect(Token::RAngle)?;
         }
 
+        // Merge impl-block + method type params for body-scope resolution.
+        // The method's `type_params` (stored on the ToyFunction) carries
+        // only the method-level set; the impl-block's params live on the
+        // enclosing ToyImpl. The body parser sees the union so `Wrapper<T>`
+        // (with T from the impl block) resolves to `ResolvedType::TypeParam`.
+        let mut body_scope_type_params = impl_block_type_params.to_vec();
+        body_scope_type_params.extend(method_type_params.iter().cloned());
+
         self.expect(Token::LParen)?;
         // Receiver: must be `&self` (taken by shared ref). Elevate to an
-        // explicit first parameter `self: &Struct`.
+        // explicit first parameter `self: &Struct[<args>]`. The self-type
+        // args come from the impl block (`Wrapper<T>` ⇒ args = `[T]`).
         let mut params: Vec<ToyParam> = Vec::new();
         if self.peek() == &Token::Ampersand {
             self.consume();
@@ -524,10 +597,12 @@ impl Parser {
                     got: format!("{:?}", t),
                 }),
             }
-            // Build `self: &Struct`. ResolvedType::Ref { inner: StructRef }.
             let self_struct = ResolvedType::StructRef {
                 name: self_type_name.to_string(),
-                type_args: Vec::new(),
+                type_args: impl_block_self_type_args
+                    .iter()
+                    .map(|p| ResolvedType::TypeParam(p.clone()))
+                    .collect(),
             };
             params.push(ToyParam {
                 name: "self".to_string(),
@@ -535,32 +610,45 @@ impl Parser {
             });
             if self.peek() == &Token::Comma { self.consume(); }
         } else {
-            // No receiver — disallow for now; trait impls almost always have one.
             return Err(ParseError::UnexpectedToken {
                 expected: "&self".to_string(),
                 got: format!("{:?}", self.peek()),
             });
         }
-        // Remaining parameters.
-        let rest = self.parse_params(&type_params, struct_names)?;
+        // Remaining parameters — visible to the merged scope.
+        let rest = self.parse_params(&body_scope_type_params, struct_names)?;
         params.extend(rest);
         self.expect(Token::RParen)?;
 
         let return_ty = if self.peek() == &Token::Arrow {
             self.consume();
-            Some(self.parse_type(&type_params, struct_names)?)
+            Some(self.parse_type(&body_scope_type_params, struct_names)?)
         } else {
             None
         };
 
         self.expect(Token::LBrace)?;
-        let body = self.parse_fn_body(&type_params, struct_names)?;
+        let body = self.parse_fn_body(&body_scope_type_params, struct_names)?;
+        // Persist the FULL body-scope type-param list on the ToyFunction
+        // (impl-block params first, then method-level). From the body's
+        // perspective every entry is just "a type param in scope" —
+        // there's no semantic difference between "T from the enclosing
+        // impl block" and "T from the method's own <T>" once the body is
+        // parsed. Downstream substitution (resolve_caller_from_instance)
+        // zips `type_params` against `instance.args.types()`; rustc orders
+        // an impl-method's instance args impl-block-first too, so the
+        // listing matches by construction.
+        //
+        // Storing the union also unifies generic-aware code paths with the
+        // free-fn pipeline — `has_abstract_args` returns true when any
+        // body-relevant param is unsubstituted, regardless of where it
+        // came from in the source.
         Ok((name, ToyFunction {
-            type_params,
+            type_params: body_scope_type_params,
             params,
             return_ty,
             body: Some(body),
-            is_export: false, // overridden by impl-block caller if export prefix present
+            is_export: false,
         }))
     }
 

@@ -2076,7 +2076,21 @@ pub fn generate_with_tcx<'tcx>(
     for inst in &state.toylang_instances {
         if seen_symbols.insert(inst.extern_symbol.clone()) {
             let instance = inst.stub_def_id.map(|def_id| {
-                ty::Instance::new_raw(def_id, ty::GenericArgs::empty())
+                // Use the stored concrete args (empty `Vec` for non-generics —
+                // the degenerate case of the general path; `build_generic_args_for_item`
+                // produces empty `GenericArgs` for an item with no type params).
+                // For generic items (discovered via Option B sidecar) the stored
+                // `instance_args` carry the concrete `ResolvedType` per type
+                // param so codegen reconstructs the rustc Instance correctly.
+                let rustc_type_args: Vec<ty::GenericArg<'tcx>> = inst.instance_args.iter()
+                    .map(|a| ty::GenericArg::from(
+                        crate::oracle::resolved_to_rustc_ty(tcx, a)
+                    ))
+                    .collect();
+                let args = crate::oracle::build_generic_args_for_item(
+                    tcx, def_id, &rustc_type_args,
+                );
+                ty::Instance::new_raw(def_id, args)
             });
             // Path B: internal_symbol is now pre-computed at populate time
             // (see ToylangInstance docs). For rustc-visible items it's

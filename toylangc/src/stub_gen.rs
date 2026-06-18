@@ -362,6 +362,39 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         }
         let trait_ident = format_ident!("{}", toy_impl.trait_name);
         let self_ident = format_ident!("{}", toy_impl.self_type_name);
+
+        // Impl-block generics: `impl<T: Clone> Trait for Self<T>`. Falls out
+        // for non-generic impls as empty TokenStreams (the degenerate-case
+        // shape of the general path). Bounds are merged in per param.
+        let impl_generics: TokenStream = if toy_impl.type_params.is_empty() { // arch-fence-allow: degenerate-case-fast-path (empty token stream — Rust syntax forbids `impl<> ...`).
+            quote! {}
+        } else {
+            let entries: Vec<TokenStream> = toy_impl.type_params.iter().map(|p| {
+                let pident = format_ident!("{}", p);
+                let bounds: Vec<TokenStream> = toy_impl.type_param_bounds.iter()
+                    .filter(|(name, _)| name == p)
+                    .map(|(_, bound)| {
+                        let bident = format_ident!("{}", bound);
+                        quote! { #bident }
+                    }).collect();
+                if bounds.is_empty() {
+                    quote! { #pident }
+                } else {
+                    quote! { #pident: #(#bounds)+* }
+                }
+            }).collect();
+            quote! { <#(#entries),*> }
+        };
+        let self_ty_generics: TokenStream = if toy_impl.self_type_args.is_empty() { // arch-fence-allow: degenerate-case-fast-path (empty token stream — Rust syntax forbids `Foo<>` at use sites).
+            quote! {}
+        } else {
+            let args: Vec<TokenStream> = toy_impl.self_type_args.iter().map(|a| {
+                let aident = format_ident!("{}", a);
+                quote! { #aident }
+            }).collect();
+            quote! { <#(#args),*> }
+        };
+
         let method_items: Vec<syn::TraitItemFn> = toy_impl.methods.iter().map(|m| {
             let m_name = format_ident!("{}", m.name);
             // Skip the elevated `self: &Self` first param when rendering;
@@ -382,7 +415,7 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             }
         }).collect();
         let impl_block: syn::ItemImpl = parse_quote! {
-            impl #trait_ident for #self_ident {
+            impl #impl_generics #trait_ident for #self_ident #self_ty_generics {
                 #(#method_items)*
             }
         };
@@ -532,6 +565,9 @@ mod tests {
             trait_name: "Clone".to_string(),
             self_type_name: "Widget".to_string(),
             is_export: true,
+            type_params: vec![],
+            type_param_bounds: vec![],
+            self_type_args: vec![],
             methods: vec![ToyImplMethod {
                 name: "clone".to_string(),
                 func: ToyFunction {
