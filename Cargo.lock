@@ -180,7 +180,6 @@ dependencies = [
 [[package]]
 name = "inkwell"
 version = "0.9.0"
-source = "git+https://github.com/TheDan64/inkwell?rev=39f778f#39f778fc393ee6d31d595ae1bb1c524b9d799e57"
 dependencies = [
  "bitflags",
  "inkwell_internals",
@@ -192,7 +191,6 @@ dependencies = [
 [[package]]
 name = "inkwell_internals"
 version = "0.14.0"
-source = "git+https://github.com/TheDan64/inkwell?rev=39f778f#39f778fc393ee6d31d595ae1bb1c524b9d799e57"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -42,6 +42,8 @@ pub mod queries;
 // populate time via `synthesize_accessor_pairs`). Architecture
 // risks.md §B5 closed.
 
+use rustc_codegen_llvm::ModuleLlvm;
+use rustc_codegen_ssa::traits::ExtraModuleAllocator;
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
 
@@ -86,7 +88,7 @@ use std::any::Any;
 //     on rustc's rayon workers. Dispatched without locking `MUTABLE_STATE`.
 //
 //   - Stateful: `create_state`, `collect_generic_rust_deps`,
-//     `after_rust_analysis`, `on_sky_lib_loaded`, `consumer_emit_modules`.
+//     `after_rust_analysis`, `on_sky_lib_loaded`, `consumer_fill_modules`.
 //     Take `&mut dyn Any state`. The dispatch helper locks `MUTABLE_STATE`
 //     for the duration. Serialises concurrent fires of
 //     `collect_generic_rust_deps` (which runs on mono-walk worker threads)
@@ -110,7 +112,7 @@ pub trait LangCallbacks: Send + Sync {
     ///
     /// Stateless: no `&mut dyn Any state` param. Called from
     /// `lang_layout_of`, which can re-enter during
-    /// `consumer_emit_modules` (whose helper holds `MUTABLE_STATE`).
+    /// `consumer_fill_modules` (whose helper holds `MUTABLE_STATE`).
     /// Under rustc incremental cache + warm rebuild, `layout_of` queries
     /// that fired cold during the mono walk get skipped on cache hit and
     /// fire later when `codegen_extern_wrapper` calls
@@ -219,25 +221,27 @@ pub trait LangCallbacks: Send + Sync {
         sidecar_bytes: &[u8],
     );
 
-    /// Phase 2 (inline-codegen plan): emit the consumer's function bodies as
-    /// LLVM bitcode buffers. Each returned `(module_name, bitcode_bytes)`
-    /// pair becomes a `ModuleCodegen<ModuleLlvm>` via
-    /// `rustc_codegen_llvm::ModuleLlvm::parse_from_tcx` and rides rustc's
-    /// optimize → ThinLTO → emission pipeline alongside Rust CGUs.
+    /// Approach B (rustc-owns-lends, patch 4 rev 2): fill the consumer's
+    /// function bodies into rustc-allocated LLVM modules. For each Sky CGU,
+    /// the consumer calls `allocator.allocate(&name)` to obtain a fresh
+    /// rustc-owned `&mut ModuleLlvm` (LLVMContext + LLVMModule +
+    /// TargetMachine) and emits IR into it via its own LLVM API (e.g.
+    /// Inkwell's `ContextRef::new` + `Module::new_borrowed`). Each filled
+    /// module rides rustc's optimize → ThinLTO → emission pipeline as just
+    /// another CGU.
     ///
-    /// Sidesteps the separate `.o` emission path: instead of writing IR
-    /// to disk and shelling to `llc`, the consumer hands rustc the
-    /// bitcode and lets rustc's pipeline finish it.
+    /// No bitcode serialization, no LLVM-context migration: rustc retains
+    /// ownership of every allocated module throughout, and the consumer's
+    /// IR-emission borrowed wrappers (suppressed-Drop) leave it untouched.
     ///
-    /// Default returns empty. Override to participate in inline codegen.
-    /// (Phase 2 step 3 made this the canonical codegen path; the legacy
-    /// `generate_and_compile` trait method was retired.)
-    fn consumer_emit_modules<'tcx>(
+    /// Default no-ops. Override to participate in inline codegen.
+    fn consumer_fill_modules<'tcx>(
         &self,
         _state: &mut dyn Any,
         _tcx: TyCtxt<'tcx>,
-    ) -> Vec<(String, Vec<u8>)> {
-        Vec::new()
+        _allocator: &mut dyn ExtraModuleAllocator<ModuleLlvm>,
+    ) {
+        // Default: no modules contributed.
     }
 
     /// Option B / Step 5 — stateless synthesis for the
@@ -252,7 +256,7 @@ pub trait LangCallbacks: Send + Sync {
     /// crate. The facade slots each triple into the
     /// `DefIdMap<UnordMap<...>>` rustc returns.
     ///
-    /// Stateless because the query may fire during `consumer_emit_modules`
+    /// Stateless because the query may fire during `consumer_fill_modules`
     /// (which holds `MUTABLE_STATE` via its trampoline) and re-locking the
     /// mutex would deadlock (@GCMLZ). Default returns `Vec::new()` so
     /// non-adopting consumers see no behavior change.
@@ -332,11 +336,12 @@ struct StatefulVtable {
         &[u8],
     ),
 
-    consumer_emit_modules: for<'tcx> fn(
+    consumer_fill_modules: for<'tcx, 'a> fn(
         &(dyn Any + Send + Sync),
         &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
-    ) -> Vec<(String, Vec<u8>)>,
+        &'a mut (dyn ExtraModuleAllocator<ModuleLlvm> + 'a),
+    ),
 
     // Step 5: stateless synthesis for the whole-map
     // `upstream_monomorphizations` query. Skips the mutex (no
@@ -358,14 +363,14 @@ struct StatefulVtable {
 // Mutable state (consumer_state) is behind its own Mutex.
 // Only callbacks that need &mut consumer_state lock this mutex.
 //
-// This separation prevents deadlocks: `consumer_emit_modules` (Phase 4.5's
+// This separation prevents deadlocks: `consumer_fill_modules` (Phase 4.5's
 // inline-codegen path, replacing the retired `generate_and_compile`) holds
 // the mutable state mutex while consumer codegen runs, but query providers
 // triggered during codegen (e.g. `symbol_name`, `layout_of`) only need
 // immutable config + lock-free `SkyUniverse` reads — they never touch the
 // state mutex. Tier 3 #12 closed the @GCMLZ trap-fence: after #7
 // (predicates → universe), #9 (symbol_name made stateless), and Path B's
-// `consumer_emit_modules` (replacing `generate_and_compile`), every
+// `consumer_fill_modules` (replacing `generate_and_compile`), every
 // re-entrance path that could have deadlocked is removed by construction.
 // See `docs/arcana/GenerateCompileMutexLock-GCMLZ.md` for the historical
 // catalogue and the current locking contract.
@@ -428,7 +433,7 @@ static MUTABLE_STATE: OnceLock<std::sync::Mutex<Box<dyn Any + Send + Sync>>> = O
 // build are the only writes, both serialized by the rustc-invocation
 // lifecycle (each happens at a known pipeline phase before queries fire).
 // `RwLock` gives us lock-free reads; the lock is uncontended during
-// `consumer_emit_modules` (consistent with @GCMLZ's "no consumer-callback
+// `consumer_fill_modules` (consistent with @GCMLZ's "no consumer-callback
 // lock during codegen" rule).
 //
 // #7.1: structure + accessors only. Call sites still went through the
@@ -831,18 +836,25 @@ pub(crate) fn call_on_sky_lib_loaded<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx, crate_name, sidecar_bytes)
 }
 
-/// Call the consumer's consumer_emit_modules. Holds MUTABLE_STATE for the
-/// duration; same re-entrance discipline as `call_generate_and_compile`.
-/// Called from the `extra_modules` hook (Phase 2 inline-codegen plan).
-pub(crate) fn call_consumer_emit_modules<'tcx>(
+/// Call the consumer's consumer_fill_modules. Holds MUTABLE_STATE for the
+/// duration; same re-entrance discipline as the retired
+/// `call_consumer_fill_modules` it replaces. Called from the
+/// `fill_extra_modules` hook (patch 4 rev 2 / Approach B).
+pub(crate) fn call_consumer_fill_modules<'tcx>(
     tcx: TyCtxt<'tcx>,
-) -> Vec<(String, Vec<u8>)> {
+    allocator: &mut dyn ExtraModuleAllocator<ModuleLlvm>,
+) {
     let c = CONFIG.get().expect("config not installed");
-    let func = c.stateful_vtable.consumer_emit_modules;
+    let func = c.stateful_vtable.consumer_fill_modules;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
     let state_ptr: *mut (dyn Any + Send + Sync) = &mut **g;
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
+    (func)(
+        unsafe { &*callbacks_ptr },
+        unsafe { &mut *state_ptr },
+        tcx,
+        allocator,
+    )
 }
 
 /// Step 5: stateless call into the consumer for
@@ -976,12 +988,13 @@ fn trampoline_on_sky_lib_loaded<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().on_sky_lib_loaded(state, tcx, crate_name, sidecar_bytes)
 }
 
-fn trampoline_consumer_emit_modules<'tcx, C: LangCallbacks + 'static>(
+fn trampoline_consumer_fill_modules<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     state: &mut (dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
-) -> Vec<(String, Vec<u8>)> {
-    data.downcast_ref::<C>().unwrap().consumer_emit_modules(state, tcx)
+    allocator: &mut (dyn ExtraModuleAllocator<ModuleLlvm> + '_),
+) {
+    data.downcast_ref::<C>().unwrap().consumer_fill_modules(state, tcx, allocator)
 }
 
 fn trampoline_synthesize_upstream_monomorphizations<'tcx, C: LangCallbacks + 'static>(
@@ -1004,7 +1017,7 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
             consumer_symbol_for_callback_name: trampoline_consumer_symbol_for_callback_name::<C>,
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
             on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
-            consumer_emit_modules: trampoline_consumer_emit_modules::<C>,
+            consumer_fill_modules: trampoline_consumer_fill_modules::<C>,
             synthesize_upstream_monomorphizations:
                 trampoline_synthesize_upstream_monomorphizations::<C>,
         },
