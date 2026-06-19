@@ -1,13 +1,26 @@
 # Handoff: erw → Sky / clean checkpoint
 
 Hi, future-you. The toylang prototype has reached **a major clean
-checkpoint**. **266/266 tests passing** against
-unpatched-aside-from-`per_instance_mir`-trio + fork-patch-4-for-
-`extra_modules`-hook rustc. **16 of 18 course-correct items done.**
-The seven-case interop taxonomy is fully tested. Cross-language
-ThinLTO inlining is **empirically CI-fenced** by disassembly assertion
-(`test_lto_smoke` verifies `lto_smoke::main` constant-folds Sky's
-body down to `mov w8, #50` with no remaining `bl` to Sky symbols).
+checkpoint**. **265/265 tests passing** against the
+`per_instance_mir`-trio + **patch-4-rev-2 (Approach B)** rustc fork.
+**16 of 18 course-correct items done.** The seven-case interop
+taxonomy is fully tested. Cross-language ThinLTO inlining is
+**empirically CI-fenced** by disassembly assertion (`test_lto_smoke`
+verifies `lto_smoke::main` constant-folds Sky's body down to
+`mov w8, #50` with no remaining `bl` to Sky symbols).
+
+**Patch 4 rev 2 (Approach B) landed in the Approach-B migration
+sequence (commits `ce97773` … `941cb47` … `89166a5e693` in
+`~/rust`/per-instance-mir branch … `29bbe59` … `8257a35`).** The
+v1 bytes-as-interface shape (`extra_modules() -> Vec<ModuleCodegen>`
++ `ModuleLlvm::parse_from_tcx` + Inkwell write_bitcode round-trip)
+retired entirely; replaced with `fill_extra_modules(tcx, allocator)`
++ `ExtraModuleAllocator<M>` + `VecAllocator<M, F>`. Rustc owns each
+per-CGU `ModuleLlvm` and lends it via the allocator callback; Sky
+emits IR directly via Inkwell wrappers (vendored Inkwell at
+`vendor/inkwell/` adds `Module::new_borrowed` for the suppressed-Drop
+borrowed-Module API). Closes risks B9/B10/B11 architecturally —
+see `rust-interop-architecture.md` §3.2/§B.4/§C.4/§F.15.
 
 There is no pressing toylang work left. The remaining course-correct
 item (#13, wrapper-mode retirement) bundles with Sky's actual
@@ -43,12 +56,16 @@ fixtures. Toylang now uses **Approach A** (Instance-keyed
 **wrapper-as-field** Sky struct stubs (`__ToylangOpaque<HASH>` per §10.6),
 **single-symbol architecture** (Path B — Sky's bitcode emits under the
 rustc-mangled name), **`#![no_builtins]` stub rlibs** (excluded from
-ThinLTO's IR linker pool), and **inline codegen via patch (c)
-extra_modules hook** (Sky's bitcode contributed to rustc's pipeline
-through `consumer_emit_modules`). **Cross-language ThinLTO inlining
-empirically verified** by `test_lto_smoke`'s disassembly assertion.
-Four rustc fork patches in effect — `per_instance_mir` trio + the
-`extra_modules` hook.
+ThinLTO's IR linker pool), and **inline codegen via patch 4 rev 2
+(Approach B)** — rustc owns each per-CGU `ModuleLlvm` and lends it
+via the `fill_extra_modules(tcx, allocator)` callback; toylang's
+`llvm_gen::fill_module` wraps the borrowed `LLVMContext`/`LLVMModule`
+in suppressed-Drop Inkwell handles (`ManuallyDrop<Context>` +
+`Module::new_borrowed` from vendored Inkwell) and emits IR directly.
+No bitcode serialization, no `parse_from_tcx` round-trip.
+**Cross-language ThinLTO inlining empirically verified** by
+`test_lto_smoke`'s disassembly assertion. Four rustc fork patches in
+effect — `per_instance_mir` trio + the `fill_extra_modules` hook.
 
 ---
 
@@ -74,6 +91,7 @@ Four rustc fork patches in effect — `per_instance_mir` trio + the
 | 15 (cont) | `8fbd928`, `745aed3`, `6bd793a` (main) | **Phase 4.5 Path B + touch points 5+6**. Single-symbol architecture: Sky's bitcode emits each rustc-visible body under the rustc-mangled name; the synthesised `__toylang_impl_*` retirement collapses two symbols → one so ThinLTO sees Sky's body as the sole def. `#![no_builtins]` excludes stub rlibs from LTO's IR linker pool. `lto_smoke` integration fixture + manifest `lto`/`opt-level` knobs verify the LTO path doesn't panic. **265/265 passing.** Key debugging lessons in §5 traps #11–#15. |
 | 16 | `63beb0c`, `c0a83fe`, `b92f101`, `1730c53` (main) | **Tier 3 sweep close-out**. #8 (SkyUniverse absorbs consumer struct metadata via type-erased `Arc<dyn Any>`; toylang-side `upstream_structs` mirror retires). #3 (cgu_stash + accessor-inline retired; accessors collapsed into the regular function pipeline via parse-time `synthesize_accessor_pairs`; Case-1b discovery via `default_collect_and_partition()`). #12 close-out (@GCMLZ doc rewrite, lib.rs comment refresh, `FacadeMutableState` inlined; mutex retained for `collect_generic_rust_deps` worker-thread serialisation but no longer trap-fences). `test_lto_smoke` tightened from "doesn't panic" → "cross-language inlining empirically verified via disassembly assertion." **266/266 passing.** **16/18 course-correct items done.** |
 | 17 | (one commit, pending) | **`llvm-as` shell-out retired** via in-process IR text round-trip through `Context::create_module_from_ir` (Inkwell's wrapper around `LLVMParseIRInContext`). Investigation reframed the long-running B10 risk: the LLVM 21 bitcode-writer bug lives below the Rust/C boundary (Inkwell's bitcode emitters are thin FFI shims), so no Inkwell patch can fix it. The IR parser canonicalises the in-memory module enough that the round-tripped module emits valid bitcode. `assemble_text_to_bitcode` + `find_sysroot_tool` deleted; vendoring not needed. Architecture doc B10 + Appendix F.8 updated. **266/266 passing.** |
+| 18 | `ce97773`, `941cb47`, `29bbe59`, `8257a35` (main) + `89166a5e693` (fork) | **Approach B migration (patch 4 rev 2): bytes-as-interface → rustc-owns-lends.** Plan: `~/.claude/plans/parsed-singing-globe.md` (now historical — execution complete). Phase 0 prep: arch-doc folds B9/B10/B11 framing. Phase 1: vendor Inkwell at `vendor/inkwell/`, add `Module::new_borrowed(LLVMModuleRef) -> ManuallyDrop<Module<'ctx>>`. Phase 2: fork patch 4 swap — `extra_modules() -> Vec<ModuleCodegen<M>>` retires; `fill_extra_modules(tcx, &mut dyn ExtraModuleAllocator<M>)` + companion `allocate_extra_module` + `ExtraModuleAllocator<M>` trait + `VecAllocator<M, F>` land; `parse_from_tcx` retires; `ModuleLlvm::llcx_raw_mut`/`llmod_raw` accessors expose `*mut c_void`. Phase 3: facade `consumer_emit_modules` → `consumer_fill_modules` (trait + vtable + trampoline + helper); `extra_modules_hook.rs` switches to `set_fill_extra_modules_hook`. Phase 4: toylang `generate_with_tcx` → `fill_module(... &mut ModuleLlvm)`; `CodegenCtx::module` becomes `ManuallyDrop<Module<'ctx>>`; redundant `set_data_layout`/`set_triple` retire (rustc owns it); `roundtrip_text_to_bitcode` + `strip_macho_wrapper` deleted. Phase 5: docs (§3.2 / §B.4 / §C.4 / §F.8 / §F.15 / §25.2 B9-B11 all updated to reflect shipped Approach B; B9/B10/B11 marked **CLOSED**). **265/265 passing** (count baseline-adjusted; LTO smoke + single-symbol mangling both still green). Risks B9/B10/B11 architecturally closed by construction. |
 
 Anchor commits worth knowing: `c38d7e0` is the doc cleanup right before
 Session 12 started; `ce437ae` is the last commit with full Approach A

@@ -762,61 +762,89 @@ providers.per_instance_mir = |_tcx, _instance| None;
 
 This makes the query a no-op for vanilla rustc. Without a plugin installing a real provider, the collector's `tcx.per_instance_mir(instance)` always returns `None`, the unwrap_or_else falls through to `instance_mir`, and rustc's behavior is unchanged from a non-forked rustc. This means the forked rustc, when compiling pure-Rust code (no Sky plugin active), produces byte-identical output to vanilla rustc — a testable invariant.
 
-**Patch 4: `extra_modules` hook for inline codegen.** In
-`compiler/rustc_codegen_ssa/src/traits/backend.rs`, add a new trait
-method on `ExtraBackendMethods`:
+**Patch 4: `fill_extra_modules` allocator-callback hook for inline codegen (Approach B).** In
+`compiler/rustc_codegen_ssa/src/traits/backend.rs`, add two methods on
+`ExtraBackendMethods` plus a companion `ExtraModuleAllocator<M>`
+trait and a generic `VecAllocator<'a, M, F>` driver:
 
 ```rust
-fn extra_modules<'tcx>(
-    &self,
-    _tcx: TyCtxt<'tcx>,
-) -> Vec<ModuleCodegen<Self::Module>> {
-    Vec::new()
+pub trait ExtraModuleAllocator<M> {
+    fn allocate(&mut self, name: &str) -> &mut M;
+}
+
+pub struct VecAllocator<'a, M, F: FnMut(&str) -> M> {
+    pub modules: &'a mut Vec<ModuleCodegen<M>>,
+    pub make_module: F,
+}
+
+pub trait ExtraBackendMethods: ... {
+    // ... existing methods ...
+
+    /// Backend-specific module constructor used by the codegen driver to
+    /// mint freshly-allocated modules on the consumer's behalf. Default
+    /// panics; adopting backends override to call their own per-CGU
+    /// constructor (e.g. `ModuleLlvm::new(tcx, name)`).
+    fn allocate_extra_module<'tcx>(&self, tcx: TyCtxt<'tcx>, name: &str) -> Self::Module { panic!(...) }
+
+    /// Contribute extra modules to the codegen pipeline before
+    /// `start_async_codegen`. The consumer calls `allocator.allocate(name)`
+    /// to obtain a fresh rustc-owned `&mut Self::Module`, fills it in place
+    /// via its own IR API, and returns. Rustc retains ownership throughout.
+    fn fill_extra_modules<'tcx>(
+        &self,
+        _tcx: TyCtxt<'tcx>,
+        _allocator: &mut dyn ExtraModuleAllocator<Self::Module>,
+    ) { }
 }
 ```
 
-Default-empty so non-adopting backends are unaffected. The LLVM
+Default-no-op so non-adopting backends are unaffected. The LLVM
 backend's impl in `compiler/rustc_codegen_llvm/src/lib.rs` consults a
-process-global `OnceLock<ExtraModulesHook>` settable via
-`set_extra_modules_hook(fn_ptr)`. Sky's facade installs the hook
-during driver setup alongside `Config::override_queries`.
+process-global `OnceLock<FillExtraModulesHook>` settable via
+`set_fill_extra_modules_hook(fn_ptr)`, and overrides `allocate_extra_module`
+to construct `ModuleLlvm` via the same `ModuleLlvm::new(tcx, name)` path
+rustc's per-CGU pipeline uses. Sky's facade installs the hook during
+driver setup alongside `Config::override_queries`.
 
 In `compiler/rustc_codegen_ssa/src/base.rs::codegen_crate`, call the
 hook **synchronously on the main thread BEFORE `start_async_codegen`**:
 
 ```rust
-let extra_modules = backend.extra_modules(tcx);
-// ... existing call to start_async_codegen ...
-// extra_modules passed in; processed via execute_optimize_work_item
-// before the worker pool starts.
+let mut extra_modules: Vec<ModuleCodegen<B::Module>> = Vec::new();
+{
+    let mut allocator = VecAllocator {
+        modules: &mut extra_modules,
+        make_module: |name: &str| backend.allocate_extra_module(tcx, name),
+    };
+    backend.fill_extra_modules(tcx, &mut allocator);
+}
+// extra_modules passed into start_async_codegen; processed via
+// execute_optimize_work_item before the worker pool starts.
 ```
 
-Sub-patch: `ModuleLlvm::parse_from_tcx(tcx, name, buffer)` added to
-`rustc_codegen_llvm` for tcx-bound bitcode parsing (the hook fires
-from the main thread, not from a worker, so the per-worker
-`CodegenContext` isn't available). Plus visibility upgrades on
-`submit_codegened_module_to_llvm`, `ModuleLlvm::new`, and
-`ModuleLlvm::parse` (crate-private → `pub`).
+Sub-patch: `ModuleLlvm::llcx_raw_mut() -> *mut c_void` and
+`ModuleLlvm::llmod_raw() -> *mut c_void` exposed for FFI bridging into
+externally-managed LLVM wrappers (Inkwell's `ContextRef::new` +
+`Module::new_borrowed`). Type-erased to `c_void` to avoid leaking
+private `llvm::Context` / `llvm::Module` types through the public API.
 
-**Note on the bytes-as-interface design choice.** Patch 4's signature
-takes pre-built `ModuleCodegen<Self::Module>` values, and Sky's
-implementation produces them by serializing Inkwell-built modules to
-bitcode bytes and parsing back via `parse_from_tcx`. This works but
-the bitcode round-trip is interface-laziness in patch 4, not a
-fundamental architectural requirement (Sky's context isn't migrating
-into rustc's — Sky's CGU context is structurally equivalent to any
-other rustc-per-CGU context). See §F.15 + §C.4 for the recommended
-evolution: replace the `Vec<ModuleCodegen>` return with an
-allocator-callback shape where rustc owns the per-CGU resources and
-lends them to Sky's emitter (Approach B). Targets v1.x or v2.0 —
-not blocking for v1.
+**Approach B design.** Rustc owns each per-CGU module's lifecycle
+(LLVMContext + LLVMModule + TargetMachine); the consumer's emitter
+wraps the borrowed LLVM pointers in suppressed-Drop Inkwell handles
+(`ManuallyDrop<Context>` + `Module::new_borrowed`) and emits IR
+directly. No bitcode serialization, no LLVM-context migration, no
+`parse_from_tcx` round-trip — closing risks B9 / B10 / B11 from §25.2
+by construction. The earlier v1 bytes-as-interface shape (which had
+`extra_modules() -> Vec<ModuleCodegen<M>>` and a `parse_from_tcx`
+sub-patch) is retired; see §F.15 for the design history and §C.4 for
+the full shipping shape.
 
 **Total patch surface:** approximately 50 lines for the
-`per_instance_mir` trio + ~93 lines for the `extra_modules` hook =
-~143 lines across 7 files. Each patch is small, structurally local,
-and follows established patterns in rustc's source. The patches
-collectively add two extension points that rustc's existing
-infrastructure (query macros, collector dispatch, the codegen
+`per_instance_mir` trio + ~100 lines for the `fill_extra_modules`
+hook + allocator trait = ~150 lines across 7 files. Each patch is
+small, structurally local, and follows established patterns in rustc's
+source. The patches collectively add two extension points that rustc's
+existing infrastructure (query macros, collector dispatch, the codegen
 backend trait) already accommodates structurally; the patches just
 connect the dots.
 
@@ -4250,11 +4278,11 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B8 (Sky-specific). Debuginfo walker's source-vs-layout-field-count assumption.** **CLOSED architecturally** by the wrapper-as-field shape (§10.6). Rustc's `build_struct_type_di_node` and `build_union_type_di_node` iterate source-level `FieldDef`s and query `layout.fields.offset(i)` per source field, assuming `source.len() == layout.fields.count()`. The wrapper-as-field shape — `pub struct Foo(SkyOpaqueType<HASH>);` (1 source field) or `pub struct Foo<P...>(SkyOpaqueType<HASH>, PhantomData<(P...)>);` (2 source fields) — matches the count rustc expects, so the bound check holds. **Sky should adopt the wrapper-as-field shape from day one.** Under the older "opaque-with-zero-fields" shape (PhantomData only, layout reports 0 fields), the walker ICE'd whenever a Sky ADT appeared inside a Rust generic like `Vec<SkyType>`.
 
-**B9 (Sky-specific). LLVM-binding-crate version skew with rustc's LLVM.** Probability: ~70% per nightly bump if Sky's codegen uses Inkwell or any other crate that ships bundled LLVM headers; 0% if Sky uses rustc's internal `rustc_codegen_llvm` API directly. Impact: 1-2 days per nightly bump (bump the binding crate, verify). Failure mode: rustc rejects Sky's submitted modules with `"Invalid record (Producer: 'LLVM20.x.y' Reader: 'LLVM 21.x.y')"` or similar. The bitcode record format changes across LLVM major versions. Canary: integration tests of patch 4 inline codegen start failing with bitcode-format errors. Reaction: bump the binding crate to the matching LLVM major version. The pin discipline of §5.6.5 expands to cover binding crates, not just rustc-fork's own LLVM.
+**B9 (Sky-specific). LLVM-binding-crate version skew with rustc's LLVM.** **CLOSED architecturally** by Approach B (patch 4 rev 2). Under the rustc-owns-lends shape, rustc constructs each per-CGU `ModuleLlvm` (`LLVMContext` + `LLVMModule` + `OwnedTargetMachine`) via `ModuleLlvm::new(tcx, name)` and lends Sky the borrowed pointers through an `ExtraModuleAllocator` callback. Sky's emitter wraps them in suppressed-Drop Inkwell handles (`Context::new` + `Module::new_borrowed`) and emits IR directly. **Sky has zero TargetMachine configuration to drift from rustc's** — the failure mode (Inkwell-bundled LLVM vs rustc's LLVM disagreeing on bitcode record format) cannot arise because no bitcode is serialized and no parallel context is constructed. The historical concern survives only as discipline on Inkwell's *Rust-binding* layer matching rustc-fork's LLVM major (so the FFI symbols resolve); the LLVM versions themselves are guaranteed identical by construction.
 
-**B10 (Sky-specific). LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures.** **Mitigated by in-process text round-trip** (§F.8). Failure trigger: any module mixing `extern` decls with call-site arg types differing from the declared parameter types (e.g. declared `extern fn check_bytes([2 x i64])`, called with `{ ptr, i64 }` after ABI coercion). The bitcode writer's function-table dedup drops a `FUNCTION` record; a later `INST_CALL` references a stale value index; LLVM 21's verifier rejects with "Invalid record." The buggy code is below the Rust/C boundary (`BitcodeWriter.cpp`), so a Sky-side patch isn't possible. **Mitigation**: emit IR text via `module.print_to_string()`, parse it back via `LLVMParseIRInContext`, emit bitcode from the round-tripped module. ~10 LOC, in-process, no external `llvm-as` dependency. See §F.8 for the code shape and the per-build cost story (which is unmeasured at production scale). **Upstream fix**: file at `llvm/llvm-project` with the bcanalyzer diff; drop the round-trip when it lands. **Escalation path**: if the round-trip's per-build cost turns out to be material at Sky-production scale (multi-second per build), Sky can carry the BitcodeWriter fix as a patch against rust-llvm — see B11.
+**B10 (Sky-specific). LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures.** **CLOSED — irrelevant under Approach B.** The failure trigger was Sky's prior pipeline (build Inkwell module → `write_bitcode_to_memory` → `ModuleLlvm::parse_from_tcx`). Approach B eliminates the serialization step entirely: Sky's IR lands directly in rustc's `LLVMModule`, then rides rustc's optimize → ThinLTO → emission pipeline as just another CGU. No `BitcodeWriter::writeModuleInfo` call happens in Sky's path. The historical IR-text round-trip workaround (formerly `llvm_gen::roundtrip_text_to_bitcode`) was retired in the Phase 4 migration. The upstream LLVM bug remains real but is no longer Sky-blocking; if Sky ever re-introduces a serialize/parse step (e.g. for cross-process module caching), the workaround can be revived from git history.
 
-**B11 (Sky-specific). Round-trip workaround scaling cost unmeasured.** The B10 mitigation (in-process IR text round-trip) has only been measured against toylang-fixture-scale workloads (handful of functions, dozens to low-hundreds of instructions). At that scale the round-trip is sub-millisecond. **At production Sky scale (hypothetical: ~100k LOC of Sky source producing ~500k LLVM instructions across all Sky modules) the cost is not measured.** Plausible per-build cost range: hundreds of ms to ~tens of seconds, depending on module sharding strategy and partition sizes. Compounds under `lto = "thin"` because Sky's modules ride rustc's optimize → ThinLTO pipeline; per-module cost matters per-LTO-pass. Compounds again under cargo's per-crate incremental — every Sky source change triggers a full re-codegen of that crate's modules + round-trip. Memory pressure also unmeasured (peak holds 3 copies: original module + IR text + re-parsed module). Mitigation paths: (a) measure at first real Sky workload; if material, (b) carry the BitcodeWriter fix as a Sky patch against rust-llvm — sets up an LLVM-patch pipeline (~1 week one-time, ~30–60 min per nightly bump for LLVM-from-source builds replacing `download-ci-llvm`), or (c) wait for upstream LLVM fix. Don't carry "round-trip is free" as a load-bearing planning assumption.
+**B11 (Sky-specific). Round-trip workaround scaling cost unmeasured.** **CLOSED — no round-trip occurs.** B11 was the meta-risk that B10's mitigation might scale poorly. With B10's mitigation retired (no bitcode is written, no IR text is printed, no parse happens), the question of round-trip cost at production scale is moot. The per-build cost contributed by Approach B is whatever Inkwell's direct IR construction already costs — the same path Sky was using to build the in-memory module before the round-trip, minus the round-trip itself. Memory pressure also returns to baseline (no triple-buffered original-module + IR-text + re-parsed-module peak).
 
 ### 25.3 Category C: operational invariants
 
@@ -5180,38 +5208,65 @@ providers.per_instance_mir = |_tcx, _instance| None;
 
 This makes the query a no-op for non-Sky use. Sky's codegen backend's `provide()` method overrides this with Sky's real provider.
 
-#### B.4 `extra_modules` hook for inline codegen contribution
+#### B.4 `fill_extra_modules` allocator-callback hook (Approach B)
 
 `compiler/rustc_codegen_ssa/src/traits/backend.rs`:
 
 ```rust
+pub trait ExtraModuleAllocator<M> {
+    /// Allocate a fresh backend module owned by the codegen driver and
+    /// borrowed for the duration of the surrounding fill_extra_modules
+    /// call. Subsequent allocate calls invalidate prior references.
+    fn allocate(&mut self, name: &str) -> &mut M;
+}
+
+pub struct VecAllocator<'a, M, F: FnMut(&str) -> M> {
+    pub modules: &'a mut Vec<ModuleCodegen<M>>,
+    pub make_module: F,
+}
+
+impl<'a, M, F: FnMut(&str) -> M> ExtraModuleAllocator<M> for VecAllocator<'a, M, F> {
+    fn allocate(&mut self, name: &str) -> &mut M {
+        let module = (self.make_module)(name);
+        self.modules.push(ModuleCodegen::new_regular(name, module));
+        &mut self.modules.last_mut().unwrap().module_llvm
+    }
+}
+
 pub trait ExtraBackendMethods: ... {
     // ... existing methods ...
 
-    /// Returns extra modules the backend wants to contribute to the
-    /// current codegen. Called from `codegen_crate` synchronously on
-    /// the main thread BEFORE `start_async_codegen`. Default empty so
-    /// non-adopting backends are unaffected.
-    fn extra_modules<'tcx>(
+    /// Backend-specific module constructor used to mint freshly-allocated
+    /// modules. Default panics; backends that participate in extras
+    /// override this to call their own per-CGU constructor.
+    fn allocate_extra_module<'tcx>(
         &self,
         _tcx: TyCtxt<'tcx>,
-    ) -> Vec<ModuleCodegen<Self::Module>> {
-        Vec::new()
-    }
+        _name: &str,
+    ) -> Self::Module { panic!("...") }
+
+    /// Contribute extra modules. Called from `codegen_crate` synchronously
+    /// on the main thread BEFORE `start_async_codegen`. Default no-ops so
+    /// non-adopting backends are unaffected.
+    fn fill_extra_modules<'tcx>(
+        &self,
+        _tcx: TyCtxt<'tcx>,
+        _allocator: &mut dyn ExtraModuleAllocator<Self::Module>,
+    ) { }
 }
 ```
 
-`compiler/rustc_codegen_ssa/src/base.rs::codegen_crate` calls the hook before async codegen begins; each returned module is fed through `execute_optimize_work_item` synchronously, mirroring the allocator-module pattern. See §F.4 for the load-bearing detail about insertion-point timing.
+`compiler/rustc_codegen_ssa/src/base.rs::codegen_crate` constructs a `VecAllocator` around the in-flight extras vec, passes it to `backend.fill_extra_modules`, then forwards the filled vec into `start_async_codegen`. Each filled module is fed through `execute_optimize_work_item` synchronously, mirroring the allocator-module pattern. See §F.4 for the load-bearing detail about insertion-point timing.
 
 `compiler/rustc_codegen_llvm/src/lib.rs` adds:
 
-- An `extra_modules` impl reading a process-global `OnceLock<ExtraModulesHook>` settable via `set_extra_modules_hook(fn_ptr)`. The facade installs the hook in `LangDriver::config` alongside `Config::override_queries`. Process-global storage is forced by the crate-dependency graph (`rustc_session` is upstream of both `rustc_middle` and `rustc_codegen_llvm`, so the `TyCtxt`-typed hook can't live on `Session`); the hook is set once at init and read lock-free thereafter.
-- `ModuleLlvm::parse_from_tcx(tcx, name, buffer)` — tcx-bound bitcode parsing. The hook fires from the main thread, not from a worker, so the per-worker `CodegenContext` isn't available; `parse_from_tcx` is the substitute.
-- Visibility upgrades: `submit_codegened_module_to_llvm`, `ModuleLlvm::new`, `ModuleLlvm::parse` go from crate-private to `pub`.
+- An `allocate_extra_module` override calling `ModuleLlvm::new(tcx, name)` — the same constructor rustc's own per-CGU pipeline uses.
+- A `fill_extra_modules` override reading a process-global `OnceLock<FillExtraModulesHook>` settable via `set_fill_extra_modules_hook(fn_ptr)`. The facade installs the hook in `LangDriver::config` alongside `Config::override_queries`. Process-global storage is forced by the crate-dependency graph (`rustc_session` is upstream of both `rustc_middle` and `rustc_codegen_llvm`, so the `TyCtxt`-typed hook can't live on `Session`); the hook is set once at init and read lock-free thereafter.
+- `ModuleLlvm::llcx_raw_mut() -> *mut c_void` and `ModuleLlvm::llmod_raw() -> *mut c_void` — type-erased raw-pointer accessors for FFI bridging into externally-managed LLVM wrappers (Inkwell's `ContextRef::new` + `Module::new_borrowed`). Type-erased to `c_void` to avoid leaking private `llvm::Context` / `llvm::Module` types through the public API.
 
-Total surface for patch 4: ~93 lines across 4 files. Default-empty trait method preserves vanilla rustc behavior. Forward-portable to other backends (cranelift, gcc-rs, spirv) — recommended as the first patch to attempt upstream landing.
+Total surface for patch 4: ~100 lines across 4 files. Default-no-op trait methods preserve vanilla rustc behavior. Forward-portable to other backends (cranelift, gcc-rs, spirv) — recommended as the first patch to attempt upstream landing.
 
-**Endgame variant (Approach B, §C.4/§F.15).** The current `Vec<ModuleCodegen>` return shape is v1 expediency; the recommended v1.x or v2.0 evolution swaps to an allocator-callback shape where rustc owns the per-CGU resources and lends them to Sky's emitter. ~30–50 LOC patch extension. Eliminates Sky-side serialization, target-attr skew (B9), the LLVM 21 BitcodeWriter dependency (B10), and the round-trip scaling cost (B11). Gated on an Inkwell upstream PR adding borrowed-context wrappers (`Context::from_raw_borrowed`).
+**Approach B vs the earlier v1 bytes-as-interface shape.** The v1 patch 4 had `extra_modules() -> Vec<ModuleCodegen<M>>` and a `parse_from_tcx` sub-patch; Sky's emitter serialized Inkwell-built modules to bitcode bytes and rustc parsed them back. That shape worked but was interface-laziness — Sky's CGU context isn't migrating into rustc's, just being constructed and thrown away. Approach B eliminates the round-trip by having rustc own the LLVM resources and lend them to Sky via the allocator callback. Closes risks B9 (LLVM-binding version skew — structurally impossible), B10 (LLVM 21 BitcodeWriter bug — no bitcode is written), and B11 (round-trip scaling cost — no round-trip). See §F.15 for the design history.
 
 #### B.5 Future patch sites (if needed)
 
@@ -5301,9 +5356,9 @@ Sky's codegen produces target-specific LLVM IR. The target triple comes from `tc
 
 Target-specific runtime support (e.g., the runtime's I/O implementation differs between Linux and Windows) is selected at runtime build time, similar to how Rust's stdlib has target-conditional code.
 
-#### C.4 Endgame patch 4 shape: rustc-owns-lends (Approach B)
+#### C.4 Shipping patch 4 shape: rustc-owns-lends (Approach B)
 
-The v1 patch 4 hook accepts bitcode bytes (§3.2, §B.4). The recommended v2/v3 evolution per §F.15 changes the hook from "Sky returns built modules" to "Sky fills rustc-allocated modules via a callback." This is sketched here so the Sky implementer knows what they're targeting.
+The patch 4 hook lends rustc-allocated modules to the consumer via a callback (§3.2, §B.4). The shape below was the original recommendation in §F.15 and was migrated into the shipping fork during the rev-2 patch-4 rewrite; toylangc consumes it through `llvm_gen::fill_module`. Sketched here in detail because the rustc-side trait shape and the consumer-side use pattern are load-bearing for any future consumer-language adopting the facade.
 
 **Rustc-side trait shape:**
 
@@ -5397,20 +5452,26 @@ fn sky_emit_into<'tcx>(tcx: TyCtxt<'tcx>, module_llvm: &mut ModuleLlvm, cgu: &Sk
 }
 ```
 
-**Fork patch surface** (extending patch 4): ~30–50 LOC. Adds the
-`ExtraModuleAllocator` trait + the `fill_extra_modules` method,
-implements `LlvmAllocator`, calls `fill_extra_modules` from
-`base.rs::codegen_crate` before `start_async_codegen`. Preserves the
-old `extra_modules` bytes-in path for backward compatibility during
-the transition; deprecate once Sky migrates.
+**Fork patch surface** (shipping patch 4): ~100 LOC across 4 files. Adds
+the `ExtraModuleAllocator<M>` trait + generic `VecAllocator<'a, M, F>`
+driver, the `allocate_extra_module` + `fill_extra_modules` trait
+methods, the `FillExtraModulesHook` OnceLock + installer, the
+`ModuleLlvm::llcx_raw_mut` + `llmod_raw` raw-pointer accessors, and the
+call-site change in `base.rs::codegen_crate`. The earlier v1 bytes-in
+shape (`extra_modules() -> Vec<ModuleCodegen<M>>` plus
+`ModuleLlvm::parse_from_tcx`) was retired in the rev-2 rewrite — no
+backward-compatibility surface remains.
 
-**Inkwell upstream PR** (the gating dependency): add
-`Context::from_raw_borrowed(NonNull<LLVMContext>) -> Context<'_>` and
-`Module::from_raw_borrowed<'ctx>(&'ctx Context, *mut LLVMModule) -> Module<'ctx>`,
-both `unsafe`, both with no-op Drop. The Inkwell PR is conservative
-(adds a borrowed-flavor constructor; doesn't change existing
-ownership semantics) and benefits any project doing FFI-bridged
-LLVM-emission work, not just Sky.
+**Inkwell vendored patch**: rather than waiting for upstream Inkwell to
+ship a borrowed-Module API, the patch was applied locally at
+`vendor/inkwell/src/module.rs`: `Module::new_borrowed(LLVMModuleRef) -> ManuallyDrop<Module<'ctx>>`,
+~5 LOC + safety doc-comment. Mirrors Inkwell's existing
+`ContextRef::new` borrowed-Context shape, so no `Context::from_raw_borrowed`
+companion is needed — `ManuallyDrop::new(unsafe { Context::new(raw) })`
+at the call site keeps `&'ctx Context` flowing through `CodegenCtx`
+unchanged. The vendor tree + workspace `[patch."https://github.com/TheDan64/inkwell"]`
+override retire together when/if Inkwell upstream lands an equivalent
+API.
 
 ### Appendix D. Reference: Temputs Schema
 
@@ -5794,7 +5855,11 @@ without leaking into Sky's core schema.
 The earlier alternative — a consumer-side mutex-protected mirror of
 upstream struct metadata — retires under this pattern.
 
-#### F.8 LLVM 21 bitcode-writer bug (root cause below Inkwell)
+#### F.8 LLVM 21 bitcode-writer bug — historical, retired under Approach B
+
+**Status: closed.** The bug below is preserved as design history; under the shipping patch 4 rev 2 (Approach B, §F.15) no bitcode is serialized in Sky's pipeline, so the bug doesn't apply. The IR-text round-trip workaround (`llvm_gen::roundtrip_text_to_bitcode`) was retired in the Phase 4 migration that wired toylangc through `fill_module`. The B10 entry in §25.2 marks the risk **CLOSED** for the same reason.
+
+---
 
 A Sky implementation choice toylang made — emitting LLVM IR via the
 Inkwell crate (safe Rust bindings) — surfaced what was initially
@@ -6089,9 +6154,13 @@ produce rlib + sidecar only" guidance in §5.5 reads as a rule about
 *Sky-emitted bodies*, not about *rust-emitted bodies the Sky cascade
 queues*. The qualifier in §5.5 makes this explicit.
 
-#### F.15 Patch 4's bitcode-bytes interface is v1 expediency, not architecture
+#### F.15 Patch 4 design history: from bytes-in to Approach B
 
-The current shape of patch 4 has the hook signature
+**Status: Approach B is the shipping patch 4 design.** This subsection now reads as design history; the architectural conclusions below were locked in during the Phase 2 fork-patch rewrite and are reflected in §3.2 + §B.4 + §C.4.
+
+---
+
+The original v1 shape of patch 4 had the hook signature
 
 ```rust
 fn extra_modules<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Vec<ModuleCodegen<Self::Module>>;
@@ -6099,8 +6168,8 @@ fn extra_modules<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Vec<ModuleCodegen<Self::Modu
 
 implemented by Sky's facade emitting LLVM IR via Inkwell, serializing
 to bitcode bytes, calling `ModuleLlvm::parse_from_tcx(tcx, name, buffer)`,
-and returning the parsed `ModuleLlvm`s. This works (toylang ships
-it) but the bitcode round-trip is **interface-laziness in the patch
+and returning the parsed `ModuleLlvm`s. This worked (toylang shipped
+it through Phase 4.5) but the bitcode round-trip was **interface-laziness in the patch
 design, not a fundamental architectural requirement.**
 
 The right question is: "why are we serializing an in-memory data
@@ -6139,35 +6208,46 @@ architecturally correct.
 
 **The recommended endgame path:**
 
-1. **Now (v1 ships this):** keep the bitcode round-trip. Small, works.
-2. **PR Inkwell upstream** for a borrowed-context wrapper:
-   `Context::from_raw_borrowed(NonNull<LLVMContext>) -> Context<'_>`,
-   plus a matching `Module::from_raw_borrowed`. Lifetime annotations
-   make the wrappers safe to use; Drop is a no-op (borrowed).
-3. **Extend patch 4** with an allocator-callback shape (Approach B).
-   Sky's `fill_extra_modules(tcx, allocator)` receives rustc-allocated
-   `&mut ModuleLlvm`s, wraps the borrowed context/module pointers in
-   Inkwell, emits IR via Sky's existing emission code, returns. No
-   serialization, no `mem::forget`, no `parse_from_tcx`. See
-   Appendix C.4 for the shape.
+**What actually shipped:**
 
-**Net architectural improvements once Approach B lands:**
+1. **Vendor Inkwell + patch locally.** Rather than waiting for an
+   upstream Inkwell PR, `vendor/inkwell/src/module.rs` got
+   `Module::new_borrowed(LLVMModuleRef) -> ManuallyDrop<Module<'ctx>>`
+   added in place (~5 LOC), and the workspace `Cargo.toml` carries a
+   `[patch."https://github.com/TheDan64/inkwell"]` override pointing at
+   the vendored tree. `Context::new` already existed in Inkwell as an
+   `unsafe fn(LLVMContextRef) -> Self` constructor, so wrapping in
+   `ManuallyDrop` at the call site sufficed — no separate
+   `Context::from_raw_borrowed` was needed.
+2. **Patch 4 rev 2.** The hook signature became
+   `fill_extra_modules(&self, tcx, allocator: &mut dyn ExtraModuleAllocator<Self::Module>)`,
+   with a companion `allocate_extra_module(&self, tcx, name) -> Self::Module`
+   constructor method, an `ExtraModuleAllocator<M>` trait, and a generic
+   `VecAllocator<'a, M, F>` driver. `rustc_codegen_llvm` exposes
+   `ModuleLlvm::llcx_raw_mut()` + `llmod_raw()` as
+   `*mut c_void` FFI bridges. The bitcode-bytes shape (`extra_modules`,
+   `set_extra_modules_hook`, `parse_from_tcx`) was retired entirely;
+   no backward-compatibility surface remains.
+3. **Toylangc consumes the borrowed `ModuleLlvm`** through
+   `llvm_gen::fill_module`. Inkwell wrappers
+   (`ManuallyDrop<Context>` + `Module::new_borrowed`) suppress Drop;
+   rustc retains ownership of the LLVM resources throughout.
 
-- B9 (LLVM-binding version skew) becomes structurally impossible —
-  there's no Sky-side target-machine configuration to drift from
-  rustc's.
-- B10 (LLVM 21 BitcodeWriter bug) becomes irrelevant — no bitcode
-  serialization happens.
-- B11 (round-trip scaling cost) becomes irrelevant — no round-trip.
-- The bitcode-writer canonicalization side effect (currently masking
-  the writer bug) goes away. The upstream LLVM fix becomes a
-  Sky-irrelevant cleanup rather than a Sky-blocking item.
+**Architectural improvements that landed:**
 
-The doc currently treats the bitcode round-trip as a workaround for a
-specific LLVM bug. The deeper truth is that the round-trip itself is
-the wrong design choice; Approach B is what Sky should target.
-**Sky's planning should treat bytes-as-interface as a v1 placeholder,
-not a stable endpoint.**
+- **B9 (LLVM-binding version skew):** **CLOSED.** No Sky-side
+  TargetMachine configuration exists to drift from rustc's.
+- **B10 (LLVM 21 BitcodeWriter bug):** **CLOSED.** No bitcode
+  serialization happens in Sky's path; the bug is unreachable.
+- **B11 (round-trip scaling cost):** **CLOSED.** No round-trip occurs.
+- **The bitcode-writer canonicalization side effect** that previously
+  masked B10 is gone. The upstream LLVM fix becomes a Sky-irrelevant
+  cleanup rather than a Sky-blocking item.
+
+The earlier guidance — *"treat bytes-as-interface as a v1 placeholder,
+not a stable endpoint"* — was followed: the v1 placeholder did its
+job during Phase 4.5 (proving the patch-4 + LTO pipeline worked at
+all), then retired cleanly when Approach B landed.
 
 ---
 
