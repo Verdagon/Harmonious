@@ -1,4 +1,12 @@
 [workspace]
 members = ["rustc-lang-facade", "toylangc"]
-exclude = ["rust"]
+exclude = ["rust", "vendor"]
 resolver = "2"
+
+# Vendored Inkwell at upstream rev 39f778f, with a local patch adding
+# Module::new_borrowed (suppressed-Drop wrapper) needed by the Approach B
+# patch 4 migration. See vendor/inkwell/src/module.rs and rust-interop-
+# architecture.md §C.4. When/if upstream lands the borrowed-Module API the
+# patch line and vendor tree can both retire.
+[patch."https://github.com/TheDan64/inkwell"]
+inkwell = { path = "vendor/inkwell" }
