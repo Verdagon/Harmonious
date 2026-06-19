@@ -7,10 +7,14 @@
 //! consults a process-global hook installed via
 //! `rustc_codegen_llvm::set_fill_extra_modules_hook`. The backend allocates
 //! each per-CGU `ModuleLlvm` (LLVMContext + LLVMModule + TargetMachine) on
-//! the consumer's behalf via the `ExtraModuleAllocator` callback; the
-//! consumer fills each module in place via its own IR API (e.g. Inkwell's
-//! `ContextRef::new` + `Module::new_borrowed`), and rustc retains ownership
-//! throughout.
+//! the consumer's behalf via the `ExtraModuleAllocator` callback.
+//!
+//! This hook is the boundary where rustc's `ExtraModuleAllocator<ModuleLlvm>`
+//! becomes the facade-owned [`crate::LlvmModuleFactory`] surface the consumer
+//! sees. From the consumer's perspective, `ModuleLlvm` and
+//! `ExtraModuleAllocator` do not exist — only [`crate::BorrowedLlvmModule`]
+//! raw pointers (`*mut c_void`) the consumer wraps via whichever LLVM API it
+//! prefers (Inkwell, `llvm-sys`, C++ via FFI).
 //!
 //! No bitcode serialization, no LLVM-context migration, no `parse_from_tcx`
 //! round-trip — Approach B closes risks B9 / B10 / B11.
@@ -29,10 +33,12 @@ use rustc_codegen_llvm::ModuleLlvm;
 use rustc_codegen_ssa::traits::ExtraModuleAllocator;
 use rustc_middle::ty::TyCtxt;
 
-/// patch 4 rev 2 hook. Forwards directly into the consumer's
-/// `consumer_fill_modules` callback (via the facade trampoline). The
-/// `allocator` is provided by rustc — calling `allocator.allocate(name)`
-/// returns a fresh rustc-owned `&mut ModuleLlvm` the consumer fills in place.
+use crate::LlvmModuleFactory;
+
+/// patch 4 rev 2 hook. Wraps rustc's `ExtraModuleAllocator<ModuleLlvm>` in
+/// an [`LlvmModuleFactory`] (the LLVM-API-agnostic facade surface) and
+/// forwards into the consumer's `consumer_fill_modules` callback via the
+/// facade trampoline.
 pub fn consumer_fill_modules_hook<'tcx>(
     tcx: TyCtxt<'tcx>,
     allocator: &mut dyn ExtraModuleAllocator<ModuleLlvm>,
@@ -41,7 +47,8 @@ pub fn consumer_fill_modules_hook<'tcx>(
     if probe {
         eprintln!("[lang-facade] fill_extra_modules hook fired");
     }
-    crate::call_consumer_fill_modules(tcx, allocator);
+    let mut factory = LlvmModuleFactory::new(allocator);
+    crate::call_consumer_fill_modules(tcx, &mut factory);
 }
 
 /// Register the hook with rustc_codegen_llvm. Idempotent.

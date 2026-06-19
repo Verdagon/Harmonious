@@ -64,13 +64,11 @@ fn basic_type_to_any<'ctx>(ty: BasicTypeEnum<'ctx>) -> inkwell::types::AnyTypeEn
 
 struct CodegenCtx<'ctx, 'tcx, 'reg> {
     context: &'ctx Context,
-    // Approach B (patch 4 rev 2): the module is owned by rustc's ModuleLlvm.
-    // We wrap a borrowed copy in ManuallyDrop so Inkwell's Drop (which calls
-    // LLVMDisposeModule) is suppressed; the actual disposal happens when
-    // rustc finalises the module after fill_extra_modules returns. Deref
-    // makes `ctx.module.foo()` continue to work for the `&self` Inkwell APIs
-    // we use.
-    module: std::mem::ManuallyDrop<Module<'ctx>>,
+    // Approach B (patch 4 rev 2): the module is owned by rustc; the caller
+    // (consumer_fill_modules's closure) wraps the borrowed LLVMModuleRef in
+    // a suppressed-Drop Inkwell handle and lends us this borrow. Every
+    // Inkwell `Module` method we use takes `&self`, so a borrow is enough.
+    module: &'ctx Module<'ctx>,
     builder: Builder<'ctx>,
     tcx: TyCtxt<'tcx>,
     registry: &'reg ToylangRegistry,
@@ -100,7 +98,7 @@ struct RustMethodInfo<'ctx> {
 
 impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
     /// Approach B (patch 4 rev 2): the caller supplies a borrowed
-    /// `&'ctx Context` and a `ManuallyDrop<Module<'ctx>>` wrapping rustc's
+    /// `&'ctx Context` and a borrowed `&'ctx Module<'ctx>` wrapping rustc's
     /// LLVMContext + LLVMModule. We DO NOT call `module.set_data_layout` /
     /// `module.set_triple` here — rustc's `ModuleLlvm::new` already set both
     /// from `tcx.sess.target` via `create_target_machine`. Double-setting
@@ -108,7 +106,7 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
     /// later-pipeline TargetMachine drifts from what Sky configured.
     fn new(
         context: &'ctx Context,
-        module: std::mem::ManuallyDrop<Module<'ctx>>,
+        module: &'ctx Module<'ctx>,
         tcx: TyCtxt<'tcx>,
         registry: &'reg ToylangRegistry,
     ) -> Self {
@@ -1947,20 +1945,19 @@ fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTyp
 // Public API (preserved for callbacks_impl.rs and main.rs)
 // ============================================================================
 
-/// Approach B (patch 4 rev 2): fill rustc-owned LLVM module with Sky's
-/// codegen output. The caller — `consumer_fill_modules` — has just received
-/// a freshly-allocated `&mut ModuleLlvm` from rustc's `ExtraModuleAllocator`
-/// containing a new LLVMContext + LLVMModule + TargetMachine. We wrap the
-/// borrowed LLVM pointers in Inkwell's `Context::new` + `Module::new_borrowed`
-/// (both with their Drop suppressed via `ManuallyDrop`), construct a
-/// `CodegenCtx`, walk the consumer instances + accessors, emit IR directly
-/// into rustc's module, and return.
+/// Approach B (patch 4 rev 2): fill the rustc-owned LLVM module with Sky's
+/// codegen output. The caller — `consumer_fill_modules` in
+/// `callbacks_impl.rs` — has wrapped the borrowed `LLVMContextRef` +
+/// `LLVMModuleRef` (handed out by the facade's `LlvmModuleFactory`) in
+/// suppressed-Drop Inkwell handles and lends us `&Context` + `&Module<'ctx>`.
+/// We construct a `CodegenCtx`, walk the consumer instances + accessors,
+/// and emit IR directly into rustc's module via Inkwell's `&self` APIs.
 ///
 /// No bitcode serialisation, no IR-text round-trip, no LLVM-context migration:
 /// rustc retains ownership of the module throughout, and finalises it through
 /// the standard optimise → ThinLTO → emission pipeline after the
 /// `fill_extra_modules` call returns.
-pub fn fill_module<'tcx>(
+pub fn fill_module<'tcx, 'ctx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
     // Tier 3 #3 Phase 1c: `_callbacks` is unused since the accessor branch
@@ -1970,26 +1967,10 @@ pub fn fill_module<'tcx>(
     // separate API-cleanup PR.
     _callbacks: &crate::toylang::callbacks_impl::ToylangCallbacks,
     state: &mut crate::toylang::callbacks_impl::ToylangState,
-    module_llvm: &mut rustc_codegen_llvm::ModuleLlvm,
+    context: &'ctx Context,
+    module: &'ctx Module<'ctx>,
 ) -> Vec<String> {
-    use std::mem::ManuallyDrop;
-
-    // Wrap rustc's borrowed LLVMContext via Inkwell. Drop is suppressed via
-    // ManuallyDrop — rustc owns the context and disposes it through
-    // ModuleLlvm's own Drop after fill_extra_modules returns.
-    let ctx_owner: ManuallyDrop<Context> = unsafe {
-        ManuallyDrop::new(Context::new(
-            module_llvm.llcx_raw_mut() as inkwell::llvm_sys::prelude::LLVMContextRef,
-        ))
-    };
-    // Same for the module: Inkwell's Module::new_borrowed returns a
-    // ManuallyDrop wrapper that suppresses LLVMDisposeModule.
-    let module_owner: ManuallyDrop<Module<'_>> = unsafe {
-        Module::new_borrowed(
-            module_llvm.llmod_raw() as inkwell::llvm_sys::prelude::LLVMModuleRef,
-        )
-    };
-    let mut ctx = CodegenCtx::new(&ctx_owner, module_owner, tcx, registry);
+    let mut ctx = CodegenCtx::new(context, module, tcx, registry);
     let mut seen_symbols = std::collections::HashSet::new();
 
     // Collect all toylang mono items (accessors and functions) first, then codegen.

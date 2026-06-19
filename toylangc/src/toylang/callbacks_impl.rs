@@ -1091,16 +1091,14 @@ impl LangCallbacks for ToylangCallbacks {
         &self,
         s: &mut dyn Any,
         tcx: TyCtxt<'tcx>,
-        allocator: &mut dyn rustc_codegen_ssa::traits::ExtraModuleAllocator<
-            rustc_codegen_llvm::ModuleLlvm,
-        >,
+        factory: &mut rustc_lang_facade::LlvmModuleFactory,
     ) {
-        // Approach B (patch 4 rev 2): rustc allocates each per-CGU ModuleLlvm
-        // (LLVMContext + LLVMModule + TargetMachine) via allocator.allocate()
-        // and lends it to us. We fill it in place through Inkwell wrappers
-        // (Context::new + Module::new_borrowed) whose Drop is suppressed via
-        // ManuallyDrop; rustc retains ownership and finalises the module
-        // through its optimise → ThinLTO → emission pipeline once we return.
+        // Approach B (patch 4 rev 2): the facade hands us a fresh
+        // LLVMContextRef + LLVMModuleRef through `factory.fill_module(name,
+        // |handles| { ... })`; rustc owns both. Toylang's choice is Inkwell
+        // for IR emission, so we wrap the raw pointers in suppressed-Drop
+        // Inkwell handles inside the closure. (Sky's planned codegen uses
+        // C++ via FFI instead and skips the Inkwell wrap.)
 
         let ts = state(s);
         ts.log.push(CallbackLog::GenerateAndCompile);
@@ -1207,17 +1205,33 @@ impl LangCallbacks for ToylangCallbacks {
         // doesn't clash with rustc's own CGUs.
         let cgu_name = build_sky_cgu_name(tcx);
 
-        // Approach B: ask rustc for a fresh ModuleLlvm under our CGU name,
-        // then fill it in place via Inkwell wrappers. rustc retains
-        // ownership; we return without producing any bytes.
-        let module_llvm = allocator.allocate(&cgu_name);
-        let _rust_symbols = crate::llvm_gen::fill_module(
-            tcx,
-            &effective_registry,
-            self,
-            ts,
-            module_llvm,
-        );
+        // Approach B: ask the facade for a fresh rustc-owned LLVM module
+        // under our CGU name. Inside the closure we wrap the raw pointers
+        // in suppressed-Drop Inkwell handles and hand them to llvm_gen.
+        // rustc retains ownership; we return without producing any bytes.
+        factory.fill_module(&cgu_name, |handles| {
+            use std::mem::ManuallyDrop;
+            use inkwell::context::Context;
+            use inkwell::module::Module;
+            let ctx_owner: ManuallyDrop<Context> = unsafe {
+                ManuallyDrop::new(Context::new(
+                    handles.context as inkwell::llvm_sys::prelude::LLVMContextRef,
+                ))
+            };
+            let module_owner: ManuallyDrop<Module<'_>> = unsafe {
+                Module::new_borrowed(
+                    handles.module as inkwell::llvm_sys::prelude::LLVMModuleRef,
+                )
+            };
+            let _rust_symbols = crate::llvm_gen::fill_module(
+                tcx,
+                &effective_registry,
+                self,
+                ts,
+                &*ctx_owner,
+                &*module_owner,
+            );
+        });
     }
 
     /// Step 5: stateless synthesis driver. Walks the discoveries stashed

@@ -47,6 +47,76 @@ use rustc_codegen_ssa::traits::ExtraModuleAllocator;
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
 
+/// Borrowed raw LLVM resources owned by rustc, surfaced to consumers in an
+/// LLVM-API-agnostic shape. Valid only for the duration of the surrounding
+/// [`LlvmModuleFactory::fill_module`] closure. Consumers MUST NOT call
+/// `LLVMContextDispose` / `LLVMDisposeModule` on these pointers — rustc owns
+/// the lifecycle and disposes the resources through its own pipeline after
+/// `fill_extra_modules` returns.
+///
+/// The pointers are type-erased to `*mut c_void` so the facade does not take a
+/// position on which LLVM API the consumer uses:
+///
+/// - **Inkwell**: cast `context` to `inkwell::llvm_sys::prelude::LLVMContextRef`
+///   and pass to `Context::new`; same for `module` / `Module::new_borrowed`.
+///   Wrap both in `ManuallyDrop` so Inkwell's Drop is suppressed.
+/// - **`llvm-sys` direct**: cast to `LLVMContextRef` / `LLVMModuleRef` and
+///   pass straight to any `llvm-sys` function. No wrapping needed.
+/// - **C++ via FFI**: pass the raw pointers to an `extern "C"` function that
+///   `reinterpret_cast`s them to `llvm::LLVMContext*` / `llvm::Module*`. This
+///   is the canonical LLVM C-to-C++ conversion (`DEFINE_SIMPLE_CONVERSION_FUNCTIONS`),
+///   so it is zero-cost and well-defined.
+#[derive(Debug, Clone, Copy)]
+pub struct BorrowedLlvmModule {
+    /// `LLVMContextRef`. Cast / wrap / pass-through depending on which LLVM
+    /// API the consumer uses (see [`BorrowedLlvmModule`] docs).
+    pub context: *mut std::ffi::c_void,
+    /// `LLVMModuleRef`. Same: cast / wrap / pass-through as needed.
+    pub module: *mut std::ffi::c_void,
+}
+
+/// Mediates between rustc's `ExtraModuleAllocator<ModuleLlvm>` (facade-internal)
+/// and consumer code (sees only [`BorrowedLlvmModule`]).
+///
+/// Consumers receive `&mut LlvmModuleFactory` in their
+/// [`LangCallbacks::consumer_fill_modules`] impl and call
+/// [`LlvmModuleFactory::fill_module`] once per Sky CGU to obtain borrowed
+/// LLVM pointers and fill in IR.
+pub struct LlvmModuleFactory<'a> {
+    // Private. `ModuleLlvm` + `ExtraModuleAllocator` are facade-internal types
+    // the consumer never names.
+    inner: &'a mut (dyn ExtraModuleAllocator<ModuleLlvm> + 'a),
+}
+
+impl<'a> LlvmModuleFactory<'a> {
+    /// Construct a factory around rustc's allocator. Used by the
+    /// `extra_modules_hook` bridge to wrap the rustc-supplied allocator
+    /// before handing it to the consumer. Not for consumer use.
+    #[doc(hidden)]
+    pub fn new(
+        inner: &'a mut (dyn ExtraModuleAllocator<ModuleLlvm> + 'a),
+    ) -> Self {
+        Self { inner }
+    }
+
+    /// Allocate a fresh rustc-owned LLVM module under `name` and invoke
+    /// `fill` with borrowed pointers to its `LLVMContext` and `LLVMModule`.
+    /// Rustc retains ownership of the resources; the pointers are valid
+    /// only for the duration of the closure call.
+    ///
+    /// May be called multiple times to contribute multiple CGUs; each call
+    /// borrows the allocator independently so the closure's borrow ends
+    /// before the next `fill_module` runs.
+    pub fn fill_module<F: FnOnce(BorrowedLlvmModule)>(&mut self, name: &str, fill: F) {
+        let m = self.inner.allocate(name);
+        let handles = BorrowedLlvmModule {
+            context: m.llcx_raw_mut(),
+            module: m.llmod_raw(),
+        };
+        fill(handles);
+    }
+}
+
 /// Result of monomorphizing a consumer type for a specific set of type args.
 pub struct MonomorphizeTypeResult<'tcx> {
     /// The concrete field types for this instantiation, in declaration order.
@@ -223,23 +293,24 @@ pub trait LangCallbacks: Send + Sync {
 
     /// Approach B (rustc-owns-lends, patch 4 rev 2): fill the consumer's
     /// function bodies into rustc-allocated LLVM modules. For each Sky CGU,
-    /// the consumer calls `allocator.allocate(&name)` to obtain a fresh
-    /// rustc-owned `&mut ModuleLlvm` (LLVMContext + LLVMModule +
-    /// TargetMachine) and emits IR into it via its own LLVM API (e.g.
-    /// Inkwell's `ContextRef::new` + `Module::new_borrowed`). Each filled
+    /// the consumer calls `factory.fill_module(&name, |handles| { ... })`
+    /// to obtain borrowed `LLVMContextRef` + `LLVMModuleRef` pointers (via
+    /// [`BorrowedLlvmModule`]) and emit IR through whichever LLVM API the
+    /// consumer prefers — Inkwell, `llvm-sys`, or C++ via FFI. Each filled
     /// module rides rustc's optimize → ThinLTO → emission pipeline as just
     /// another CGU.
     ///
     /// No bitcode serialization, no LLVM-context migration: rustc retains
     /// ownership of every allocated module throughout, and the consumer's
-    /// IR-emission borrowed wrappers (suppressed-Drop) leave it untouched.
+    /// IR-emission borrowed wrappers (suppressed-Drop / no-op-Drop) leave
+    /// it untouched.
     ///
     /// Default no-ops. Override to participate in inline codegen.
     fn consumer_fill_modules<'tcx>(
         &self,
         _state: &mut dyn Any,
         _tcx: TyCtxt<'tcx>,
-        _allocator: &mut dyn ExtraModuleAllocator<ModuleLlvm>,
+        _factory: &mut LlvmModuleFactory,
     ) {
         // Default: no modules contributed.
     }
@@ -336,11 +407,11 @@ struct StatefulVtable {
         &[u8],
     ),
 
-    consumer_fill_modules: for<'tcx, 'a> fn(
+    consumer_fill_modules: for<'tcx, 'a, 'b> fn(
         &(dyn Any + Send + Sync),
         &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
-        &'a mut (dyn ExtraModuleAllocator<ModuleLlvm> + 'a),
+        &'b mut LlvmModuleFactory<'a>,
     ),
 
     // Step 5: stateless synthesis for the whole-map
@@ -842,7 +913,7 @@ pub(crate) fn call_on_sky_lib_loaded<'tcx>(
 /// `fill_extra_modules` hook (patch 4 rev 2 / Approach B).
 pub(crate) fn call_consumer_fill_modules<'tcx>(
     tcx: TyCtxt<'tcx>,
-    allocator: &mut dyn ExtraModuleAllocator<ModuleLlvm>,
+    factory: &mut LlvmModuleFactory<'_>,
 ) {
     let c = CONFIG.get().expect("config not installed");
     let func = c.stateful_vtable.consumer_fill_modules;
@@ -853,7 +924,7 @@ pub(crate) fn call_consumer_fill_modules<'tcx>(
         unsafe { &*callbacks_ptr },
         unsafe { &mut *state_ptr },
         tcx,
-        allocator,
+        factory,
     )
 }
 
@@ -992,9 +1063,9 @@ fn trampoline_consumer_fill_modules<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     state: &mut (dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
-    allocator: &mut (dyn ExtraModuleAllocator<ModuleLlvm> + '_),
+    factory: &mut LlvmModuleFactory<'_>,
 ) {
-    data.downcast_ref::<C>().unwrap().consumer_fill_modules(state, tcx, allocator)
+    data.downcast_ref::<C>().unwrap().consumer_fill_modules(state, tcx, factory)
 }
 
 fn trampoline_synthesize_upstream_monomorphizations<'tcx, C: LangCallbacks + 'static>(
