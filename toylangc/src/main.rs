@@ -1,5 +1,7 @@
 #![feature(rustc_private)]
 
+extern crate rustc_codegen_llvm;
+extern crate rustc_codegen_ssa;
 extern crate rustc_driver;
 extern crate rustc_target;
 

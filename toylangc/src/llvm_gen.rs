@@ -64,7 +64,13 @@ fn basic_type_to_any<'ctx>(ty: BasicTypeEnum<'ctx>) -> inkwell::types::AnyTypeEn
 
 struct CodegenCtx<'ctx, 'tcx, 'reg> {
     context: &'ctx Context,
-    module: Module<'ctx>,
+    // Approach B (patch 4 rev 2): the module is owned by rustc's ModuleLlvm.
+    // We wrap a borrowed copy in ManuallyDrop so Inkwell's Drop (which calls
+    // LLVMDisposeModule) is suppressed; the actual disposal happens when
+    // rustc finalises the module after fill_extra_modules returns. Deref
+    // makes `ctx.module.foo()` continue to work for the `&self` Inkwell APIs
+    // we use.
+    module: std::mem::ManuallyDrop<Module<'ctx>>,
     builder: Builder<'ctx>,
     tcx: TyCtxt<'tcx>,
     registry: &'reg ToylangRegistry,
@@ -93,24 +99,20 @@ struct RustMethodInfo<'ctx> {
 }
 
 impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
+    /// Approach B (patch 4 rev 2): the caller supplies a borrowed
+    /// `&'ctx Context` and a `ManuallyDrop<Module<'ctx>>` wrapping rustc's
+    /// LLVMContext + LLVMModule. We DO NOT call `module.set_data_layout` /
+    /// `module.set_triple` here — rustc's `ModuleLlvm::new` already set both
+    /// from `tcx.sess.target` via `create_target_machine`. Double-setting
+    /// would be at best redundant, at worst inconsistent if rustc's
+    /// later-pipeline TargetMachine drifts from what Sky configured.
     fn new(
         context: &'ctx Context,
+        module: std::mem::ManuallyDrop<Module<'ctx>>,
         tcx: TyCtxt<'tcx>,
         registry: &'reg ToylangRegistry,
     ) -> Self {
         let dl = &tcx.data_layout;
-        let module = context.create_module("toylang");
-
-        // Set target layout and triple
-        let target_datalayout = tcx.sess.target.data_layout.to_string();
-        let target_triple = tcx.sess.opts.target_triple.tuple();
-        module.set_data_layout(
-            &inkwell::targets::TargetData::create(&target_datalayout).get_data_layout(),
-        );
-        module.set_triple(
-            &inkwell::targets::TargetTriple::create(target_triple),
-        );
-
         CodegenCtx {
             context,
             module,
@@ -1945,10 +1947,20 @@ fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTyp
 // Public API (preserved for callbacks_impl.rs and main.rs)
 // ============================================================================
 
-/// Check if a function is eligible for external LLVM compilation.
-/// Generate LLVM IR by walking MonoItems to find all consumer instances and codegen them.
-/// Discovery and codegen happen in the same `'tcx` scope so we can use live Instance values.
-pub fn generate_with_tcx<'tcx>(
+/// Approach B (patch 4 rev 2): fill rustc-owned LLVM module with Sky's
+/// codegen output. The caller — `consumer_fill_modules` — has just received
+/// a freshly-allocated `&mut ModuleLlvm` from rustc's `ExtraModuleAllocator`
+/// containing a new LLVMContext + LLVMModule + TargetMachine. We wrap the
+/// borrowed LLVM pointers in Inkwell's `Context::new` + `Module::new_borrowed`
+/// (both with their Drop suppressed via `ManuallyDrop`), construct a
+/// `CodegenCtx`, walk the consumer instances + accessors, emit IR directly
+/// into rustc's module, and return.
+///
+/// No bitcode serialisation, no IR-text round-trip, no LLVM-context migration:
+/// rustc retains ownership of the module throughout, and finalises it through
+/// the standard optimise → ThinLTO → emission pipeline after the
+/// `fill_extra_modules` call returns.
+pub fn fill_module<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
     // Tier 3 #3 Phase 1c: `_callbacks` is unused since the accessor branch
@@ -1958,9 +1970,26 @@ pub fn generate_with_tcx<'tcx>(
     // separate API-cleanup PR.
     _callbacks: &crate::toylang::callbacks_impl::ToylangCallbacks,
     state: &mut crate::toylang::callbacks_impl::ToylangState,
-) -> (String, Vec<u8>, Vec<String>) {
-    let context = Context::create();
-    let mut ctx = CodegenCtx::new(&context, tcx, registry);
+    module_llvm: &mut rustc_codegen_llvm::ModuleLlvm,
+) -> Vec<String> {
+    use std::mem::ManuallyDrop;
+
+    // Wrap rustc's borrowed LLVMContext via Inkwell. Drop is suppressed via
+    // ManuallyDrop — rustc owns the context and disposes it through
+    // ModuleLlvm's own Drop after fill_extra_modules returns.
+    let ctx_owner: ManuallyDrop<Context> = unsafe {
+        ManuallyDrop::new(Context::new(
+            module_llvm.llcx_raw_mut() as inkwell::llvm_sys::prelude::LLVMContextRef,
+        ))
+    };
+    // Same for the module: Inkwell's Module::new_borrowed returns a
+    // ManuallyDrop wrapper that suppresses LLVMDisposeModule.
+    let module_owner: ManuallyDrop<Module<'_>> = unsafe {
+        Module::new_borrowed(
+            module_llvm.llmod_raw() as inkwell::llvm_sys::prelude::LLVMModuleRef,
+        )
+    };
+    let mut ctx = CodegenCtx::new(&ctx_owner, module_owner, tcx, registry);
     let mut seen_symbols = std::collections::HashSet::new();
 
     // Collect all toylang mono items (accessors and functions) first, then codegen.
@@ -2127,22 +2156,14 @@ pub fn generate_with_tcx<'tcx>(
     apply_rust_compat_attributes(&ctx);
 
     let rust_symbols = ctx.rust_symbols.clone();
-    let ir = ctx.module.print_to_string().to_string();
-    // Phase 2 inline-codegen path: bitcode bytes for `consumer_emit_modules`
-    // → `ModuleLlvm::parse_from_tcx`. Always emitted; the old
-    // generate_and_compile path discards the bytes and writes `ir` via llc.
-    //
-    // Direct `module.write_bitcode_to_memory()` produces records LLVM 21's
-    // own llvm-dis rejects ("Invalid record" — drops a FUNCTION decl from
-    // the MODULE block when extern decls and call-site arg types are
-    // ABI-coerced; see byte_string fixture for the trigger). The bug is in
-    // LLVM 21's bitcode writer, not in Inkwell's Rust source (every relevant
-    // Inkwell entry point is a thin FFI shim). Workaround: round-trip the
-    // IR text through Inkwell's LLVMParseIRInContext-based parser, which
-    // canonicalises the in-memory module state. The re-parsed module
-    // emits valid bitcode in-process, no shell-out, no llvm-as.
-    let bitcode = roundtrip_text_to_bitcode(ctx.context, &ir);
-    (ir, bitcode, rust_symbols)
+
+    // Approach B: no bitcode emission, no IR-text round-trip. rustc's
+    // module has been filled in place via the borrowed Inkwell wrappers;
+    // dropping `ctx` here calls ManuallyDrop's no-op Drop on both `module`
+    // and (via `ctx_owner` going out of scope at the end of fill_module)
+    // the Context. rustc retains ownership and finalises the module
+    // through the standard pipeline.
+    rust_symbols
 }
 
 /// Phase 3: mirror rustc's per-function attribute set on every Sky-emitted
@@ -2223,83 +2244,6 @@ fn apply_rust_compat_attributes<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>) {
     }
 }
 
-/// Workaround for LLVM 21's bitcode-writer bug on ABI-coerced extern calls.
-///
-/// ## The bug
-///
-/// When a module contains an `extern` declaration whose declared parameter
-/// type differs from the type used at the call site — a normal pattern for
-/// FFI, since ABI coercion can produce calls like
-/// `call i32 @check_bytes({ ptr, i64 } { ... })` against
-/// `declare i32 @check_bytes([2 x i64])` (both 16 bytes, ABI-compatible) —
-/// LLVM 21's `BitcodeWriter.cpp::writeModuleInfo` drops one of the
-/// FUNCTION declaration records from the MODULE block's value list when
-/// serialising directly to bitcode. A subsequent `INST_CALL` then
-/// references a stale value index, and LLVM 21's own bitcode parser
-/// (and `llvm-dis`) rejects with "Invalid record."
-///
-/// The `byte_string_passed_to_rust_fn` integration fixture is the in-tree
-/// trigger. Diagnosed via `llvm-bcanalyzer --dump` comparison between
-/// Inkwell's direct bitcode emission and `llvm-as`'s output for the same
-/// IR text:
-///
-/// ```text
-/// < NUMENTRY op0=12                                  (Inkwell-direct)
-/// > NUMENTRY op0=13                                  (llvm-as)
-/// > <FUNCTION abbrevid=5 op0=0 op1=5 op2=11/>        (only in llvm-as)
-/// < <INST_CALL op0=0 op1=32768 op2=9  op3=5 op4=1/>  (Inkwell call → fn idx 9)
-/// > <INST_CALL op0=0 op1=32768 op2=12 op3=5 op4=1/>  (llvm-as call → fn idx 12)
-/// ```
-///
-/// ## Where the bug lives
-///
-/// Below the Rust/C boundary, in LLVM 21 itself. Investigation confirmed
-/// every relevant Inkwell entry point (`Module::write_bitcode_to_*`,
-/// `Module::add_function`, `Builder::build_direct_call`) is a 1-3-line
-/// FFI shim that passes arguments straight to `llvm-sys`; there is no
-/// Rust-side logic that could be wrong. Inkwell's `print_to_string` text
-/// emitter for the same in-memory module produces valid LLVM IR text that
-/// `llvm-as` accepts and round-trips cleanly through `llvm-dis`.
-///
-/// ## The workaround
-///
-/// Emit the in-memory module as IR text (the text printer is unaffected),
-/// parse the text back via `LLVMParseIRInContext` (Inkwell's
-/// `Context::create_module_from_ir`), and emit bitcode from the re-parsed
-/// module. The IR parser canonicalises the value-list / function-table
-/// representation in a way the direct-construction path does not, and the
-/// bitcode writer then handles the canonicalised module correctly. So we
-/// are not patching LLVM — we are using LLVM 21's own IR parser as a
-/// canonicalising filter between the in-memory module and the bitcode
-/// writer.
-///
-/// All in-process. No external `llvm-as` shell-out, no `find_sysroot_tool`
-/// dependency. Cost: one extra IR-text emit + parse per Sky-module build
-/// (~milliseconds — immaterial).
-///
-/// ## When this workaround can be retired
-///
-/// When LLVM upstream fixes `BitcodeWriter.cpp::writeModuleInfo`'s
-/// function-table dedup. The expected fix is to either (a) canonicalise
-/// the value list before serialising, mirroring what the IR parser does
-/// on the read side, or (b) tolerate value-list entries with mismatched
-/// declared-vs-call-site types instead of silently dropping. File at
-/// `llvm/llvm-project`, attach the `llvm-bcanalyzer --dump` diff above
-/// plus the byte_string fixture as the minimal repro. When the fix lands
-/// in a rustc-fork-bumped LLVM, replace the body of this function with a
-/// direct `context_module.write_bitcode_to_memory().as_slice().to_vec()`
-/// at the original call site and delete this helper.
-///
-/// Architecture-doc cross-refs: §25.2 B10 (risks register), Appendix F.8
-/// (lessons from the toylang prototype).
-fn roundtrip_text_to_bitcode<'ctx>(context: &'ctx Context, ir: &str) -> Vec<u8> {
-    use inkwell::memory_buffer::MemoryBuffer;
-    let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "sky_ir");
-    let module = context
-        .create_module_from_ir(buffer)
-        .expect("Sky-emitted IR text re-parsed cleanly (Inkwell roundtrip)");
-    module.write_bitcode_to_memory().as_slice().to_vec()
-}
 
 // Tier 3 #3 Phase 1c: `codegen_accessor_inline` retired. Accessors now
 // flow through the regular `codegen_internal_function` +
