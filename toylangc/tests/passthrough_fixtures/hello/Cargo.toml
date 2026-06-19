@@ -1,0 +1,31 @@
+# Passthrough corpus fixture (pure-Rust hello-world).
+#
+# Built by `tests/passthrough_corpus.rs` with both vanilla
+# `nightly-2026-01-20` and `rustc-fork`; runtime behaviour of the resulting
+# binaries must be identical. The crate has no `__SKY_STUBS_MARKER`, so the
+# forked rustc's Sky machinery stays dormant — the fence verifies that the
+# patches don't disturb pure-Rust compilation.
+#
+# Not a workspace member.
+
+# Stand alone: not a member of the parent erw workspace.
+[workspace]
+
+[package]
+name = "passthrough_hello"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[profile.release]
+debug = 0
+strip = "symbols"
+panic = "abort"
+opt-level = 3
+codegen-units = 1
+lto = false
+
+[profile.dev]
+debug = 0
+strip = "symbols"
+panic = "abort"
