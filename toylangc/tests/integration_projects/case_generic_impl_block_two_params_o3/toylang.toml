@@ -1,0 +1,8 @@
+[project]
+name = "case_generic_impl_block_two_params_o3"
+source = "main.toylang"
+opt-level = "3"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
+some_rust_lib = { path = "../some_rust_lib" }

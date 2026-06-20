@@ -87,8 +87,12 @@ pub fn build_project(manifest_path: &Path) -> i32 {
     let root_opt_level = graph
         .last()
         .and_then(|p| p.manifest.project.opt_level.clone());
+    let root_codegen_units = graph
+        .last()
+        .and_then(|p| p.manifest.project.codegen_units);
     if let Err(e) = write_workspace_toml(
         &build_dir, &stub_dir_names, root_lto.as_deref(), root_opt_level.as_deref(),
+        root_codegen_units,
     ) {
         eprintln!("toylangc: {}", e);
         return 1;
@@ -153,6 +157,7 @@ fn write_workspace_toml(
     stub_dir_names: &[String],
     lto: Option<&str>,
     opt_level: Option<&str>,
+    codegen_units: Option<u32>,
 ) -> Result<(), String> {
     let mut members: Vec<&str> = stub_dir_names.iter().map(|s| s.as_str()).collect();
     members.push("user_bin");
@@ -171,7 +176,8 @@ fn write_workspace_toml(
     // here.
     let lto_value = lto.filter(|v| !v.is_empty());
     let opt_value = opt_level.filter(|v| !v.is_empty());
-    if lto_value.is_some() || opt_value.is_some() {
+    let cgu_value = codegen_units;
+    if lto_value.is_some() || opt_value.is_some() || cgu_value.is_some() {
         s.push_str("\n[profile.dev]\n");
         if let Some(v) = lto_value {
             s.push_str(&format!("lto = \"{}\"\n", v));
@@ -185,6 +191,9 @@ fn write_workspace_toml(
             } else {
                 s.push_str(&format!("opt-level = \"{}\"\n", v));
             }
+        }
+        if let Some(v) = cgu_value {
+            s.push_str(&format!("codegen-units = {}\n", v));
         }
     }
     fs::write(build_dir.join("Cargo.toml"), s)

@@ -907,6 +907,46 @@ fn assert_sky_inlined_into_main(project_name: &str) {
 /// short-circuits when `share_generics()` is false at -O2/-O3.
 #[test] fn test_release_mode_smoke() { run_integration_project("release_mode_smoke"); }
 
+/// Release-mode coverage at opt-level = "2". Different inlining thresholds
+/// + different MIR-optimization passes than -O3; if Sky's emission survives
+/// -O3 but not -O2 (or vice versa), this catches the asymmetry.
+#[test] fn test_opt_level_2_smoke() { run_integration_project("opt_level_2_smoke"); }
+
+/// Release-mode coverage at opt-level = "3" + lto = "fat". Fat LTO uses a
+/// different bitcode path through rustc's pipeline than ThinLTO; this
+/// fixture catches DCE / linkage interactions specific to fat-LTO's
+/// merged-module pass.
+///
+/// CURRENTLY FAILING: fat LTO drops Sky's emitted clone bodies despite
+/// the `@llvm.compiler.used` pin. The undefined-symbol error references
+/// `<Wrapper<i32> as Clone>::clone` from inside the stub rlib's body,
+/// with the correct `__lang_stubs` disambig (so the mangler chain is
+/// intact). Something in fat-LTO's bitcode-merge or internalize pipeline
+/// strips Sky's emission. Investigation pending. Tracking arch §25.2
+/// (would become B15).
+#[test] #[ignore = "fat LTO drops Sky's clone emission despite llvm.compiler.used; tracked as future B15"]
+fn test_opt_level_3_fat_lto_smoke() { run_integration_project("opt_level_3_fat_lto_smoke"); }
+
+/// Release-mode coverage at opt-level = "3" + codegen-units = 1. Forces
+/// all bodies into a single rustc CGU instead of the default split; the
+/// monolithic-CGU layout exposes a different `GlobalDCE` execution shape
+/// than the default. Verifies Sky's `@llvm.compiler.used` pin still
+/// preserves rustc-visible symbols under that layout.
+#[test] fn test_single_cgu_smoke() { run_integration_project("single_cgu_smoke"); }
+
+/// case_generic_impl_block_two_params at opt-level = "3". Two distinct
+/// instantiations of `impl<A: Clone, B: Clone> Clone for Pair<A, B>` flow
+/// through the same Rust generic intermediary; this proves the args-list
+/// machinery survives release-mode passes.
+#[test] fn test_case_generic_impl_block_two_params_o3() { run_integration_project("case_generic_impl_block_two_params_o3"); }
+
+/// case6 (cross-Sky-crate trait dispatch) at opt-level = "3". The `Box`
+/// struct + Clone impl live in case6_lib; the bin calls into them
+/// transitively via Rust generic. Stresses the discovery + augmented
+/// `upstream_monomorphizations_for` chain across crate boundaries under
+/// release-mode optimization.
+#[test] fn test_case6_app_o3() { run_integration_project("case6_app_o3"); }
+
 #[test] fn test_arithmetic_sub_div() { run_integration_project("arithmetic_sub_div"); }
 #[test] fn test_vec_i32() { run_integration_project("vec_i32"); }
 #[test] fn test_single_field_struct() { run_integration_project("single_field_struct"); }

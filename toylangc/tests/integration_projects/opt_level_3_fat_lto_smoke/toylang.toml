@@ -1,0 +1,9 @@
+[project]
+name = "opt_level_3_fat_lto_smoke"
+source = "main.toylang"
+opt-level = "3"
+lto = "fat"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
+some_rust_lib = { path = "../some_rust_lib" }

@@ -1,0 +1,68 @@
+// Compiler-law audit follow-up: multi-param generic impl-block fixture.
+//
+// Tests `impl<A: Clone, B: Clone> Clone for Pair<A, B>` — two type params
+// on the impl block, two bounds. Exercises the same Option B sidecar
+// capture path as case_generic_impl_block but with N=2 on the impl block
+// instead of N=1, to surface any code path that assumes single-param.
+//
+// Two distinct instantiations (Pair<i32, i64> and Pair<i64, i32>) prove
+// rustc's mono walker queues separate Instances for permutations of args,
+// and that Sky's discovered-instances loop substitutes each correctly.
+
+use std::clone::Clone
+use some_rust_lib::duplicate
+
+fn println_i32(x: i32)
+fn println_i64(x: i64)
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+// Fallback per case_generic_impl_block: direct field copy, not
+// `self.first.clone()` / `self.second.clone()` — Sky's oracle returns
+// RustTypeDeferred for trait dispatch through unsubstituted TypeParam.
+// The `A: Clone, B: Clone` bounds stay declared (proving the bounds-
+// parsing + emission machinery handles multiple bounds in one impl block).
+export impl<A: Clone, B: Clone> Clone for Pair<A, B> {
+    fn clone(&self) -> Pair<A, B> {
+        Pair<A, B> { first: self.first, second: self.second }
+    }
+}
+
+fn make_a(x: i32, y: i64) -> Pair<i32, i64> {
+    Pair<i32, i64> { first: x, second: y }
+}
+
+fn first_of_a(p: &Pair<i32, i64>) -> i32 {
+    p.first
+}
+
+fn second_of_a(p: &Pair<i32, i64>) -> i64 {
+    p.second
+}
+
+fn make_b(x: i64, y: i32) -> Pair<i64, i32> {
+    Pair<i64, i32> { first: x, second: y }
+}
+
+fn first_of_b(p: &Pair<i64, i32>) -> i64 {
+    p.first
+}
+
+fn second_of_b(p: &Pair<i64, i32>) -> i32 {
+    p.second
+}
+
+fn main() {
+    let a = make_a(11, 22i64);
+    let a2 = duplicate<Pair<i32, i64>>(&a);
+    println_i32(first_of_a(&a2));
+    println_i64(second_of_a(&a2));
+
+    let b = make_b(33i64, 44);
+    let b2 = duplicate<Pair<i64, i32>>(&b);
+    println_i64(first_of_b(&b2));
+    println_i32(second_of_b(&b2));
+}

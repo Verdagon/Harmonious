@@ -1,0 +1,8 @@
+[project]
+name = "opt_level_2_smoke"
+source = "main.toylang"
+opt-level = "2"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
+some_rust_lib = { path = "../some_rust_lib" }

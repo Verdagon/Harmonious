@@ -68,6 +68,14 @@ pub struct Project {
     /// `opt-level = 3`, etc.); the field carries the literal text.
     #[serde(default, rename = "opt-level")]
     pub opt_level: Option<String>,
+    /// Optional `codegen-units` for the generated workspace's
+    /// `[profile.dev]`. Forces every member crate to compile with the
+    /// specified codegen-units value. Used by `single_cgu_smoke` to verify
+    /// Sky's emission survives when rustc consolidates all bodies into a
+    /// single CGU (instead of the default 16+); a different DCE path runs
+    /// in that case.
+    #[serde(default, rename = "codegen-units")]
+    pub codegen_units: Option<u32>,
 }
 
 fn default_edition() -> String {

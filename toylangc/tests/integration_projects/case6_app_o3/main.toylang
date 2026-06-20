@@ -1,0 +1,12 @@
+use case6_lib::Box
+use case6_lib::make_box
+use case6_lib::box_value
+use some_rust_lib::duplicate
+
+fn println_i32(x: i32)
+
+fn main() {
+    let b = make_box(42);
+    let copy = duplicate<Box>(&b);
+    println_i32(box_value(&copy));
+}
