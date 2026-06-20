@@ -102,10 +102,54 @@ impl rustc_driver::Callbacks for LangDriver {
         // marker is `__SKY_STUBS_MARKER` per arch §4.5/§6.3). Pure-Rust
         // crates compiled through this rustc binary keep byte-identical
         // behavior to vanilla because their crate name doesn't match.
-        if config.opts.crate_name.as_deref() == Some("__lang_stubs")
-            && config.opts.unstable_opts.share_generics.is_none()
-        {
-            config.opts.unstable_opts.share_generics = Some(true);
+        if config.opts.crate_name.as_deref() == Some("__lang_stubs") {
+            match config.opts.unstable_opts.share_generics {
+                None => {
+                    config.opts.unstable_opts.share_generics = Some(true);
+                }
+                Some(true) => {
+                    // Already on — nothing to do.
+                }
+                Some(false) => {
+                    // User explicitly disabled share-generics on the stub
+                    // rlib. The disambig coordination chain (rust-interop-
+                    // architecture.md §3.2 patch 5 / §25.2 B14) REQUIRES
+                    // share-generics on at the stub rlib so its cstore
+                    // metadata records cascade-emitted Rust generic monos
+                    // like `duplicate<Wrapper<i32>>`. Without that, the
+                    // downstream user-bin compile's
+                    // `upstream_monomorphizations_for(...)` lookup returns
+                    // empty for those Instances, patch 5's escape clause
+                    // never finds an entry, and the v0 mangler falls back
+                    // to LOCAL_CRATE — producing undefined-symbol link
+                    // errors at -O>=2 that look like an architecture bug
+                    // but are actually downstream of this flag.
+                    //
+                    // Fail loudly at config time so the user sees the
+                    // cause directly instead of debugging a confusing
+                    // link error 30 seconds later.
+                    eprintln!(
+                        "error: -Z share-generics=no is unsupported on the consumer-language \
+                         stub rlib (crate name `__lang_stubs`).\n\
+                         \n\
+                         The disambig coordination Sky's interop architecture relies on \
+                         (rust-interop-architecture.md §3.2 patch 5 / §25.2 B14) requires \
+                         the stub rlib's cstore metadata to record cascade-emitted Rust \
+                         generic monomorphizations. share-generics being on at the stub \
+                         rlib is what produces that metadata.\n\
+                         \n\
+                         With share-generics off at the stub rlib, downstream user-bin \
+                         compiles at -O>=2 will fail with `Undefined symbols` link errors \
+                         mismatching on instantiating-crate disambig (e.g. expected \
+                         `__lang_stubs` disambig but found the bin's crate name).\n\
+                         \n\
+                         Either remove `-Z share-generics=no` from the stub rlib's compile, \
+                         or remove the stub rlib's profile override and let Sky's facade \
+                         force it on by default."
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         // Phase 2 (inline-codegen plan): install the hook that submits
         // consumer-emitted bitcode modules into rustc's optimize → ThinLTO
