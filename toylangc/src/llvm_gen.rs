@@ -939,6 +939,9 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
         None => ctx.context.void_type().fn_type(&param_types, false),
     };
 
+    // The rustc-visible extern wrapper. Per @SMPLZ, this symbol gets
+    // pinned in `@llvm.used` later in `fill_module` so LTO `internalize`
+    // doesn't demote its linkage and break cross-crate references.
     let function = ctx.module.add_function(extern_symbol, fn_type, None);
 
     // Add sret attribute if Rust ABI uses sret
@@ -2136,9 +2139,9 @@ pub fn fill_module<'tcx, 'ctx>(
     // LLVM's `functionsHaveCompatibleAttributes` check.
     apply_rust_compat_attributes(&ctx);
 
-    // Pin every Sky-emitted rustc-visible function in `@llvm.used` so
-    // BOTH the in-process optimize pipeline AND the LTO internalize pass
-    // preserve them at -O>=2.
+    // Per @SMPLZ, pin every Sky-emitted rustc-visible function in
+    // `@llvm.used` so BOTH the in-process optimize pipeline AND the LTO
+    // `internalize` pass preserve them at -O>=2.
     //
     // Functions like `<Wrapper<i32> as Clone>::clone` are emitted into
     // Sky's CGU but referenced only from OTHER compile units (the stub
@@ -2273,6 +2276,10 @@ fn apply_rust_compat_attributes<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>) {
 /// Append the given function symbols to an `@llvm.used` array so LLVM's
 /// `GlobalOpt`/`GlobalDCE`, LTO `internalize`, and linker `-dead_strip`
 /// passes all preserve them, AND preserve their original linkage.
+///
+/// Codifies @SMPLZ — the discipline that any Sky-emitted symbol whose
+/// intended caller is in another compile unit's machine code MUST be
+/// pinned in `@llvm.used` (not the weaker `@llvm.compiler.used`).
 ///
 /// Why this is needed: Sky emits rustc-visible bodies (the rustc-mangled
 /// extern symbols for trait-impl methods etc.) into its own CGU. Their only

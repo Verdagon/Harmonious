@@ -941,6 +941,27 @@ fn assert_sky_inlined_into_main(project_name: &str) {
 /// release-mode optimization.
 #[test] fn test_case6_app_o3() { run_integration_project("case6_app_o3"); }
 
+/// case6 (cross-Sky-crate trait dispatch) at opt-level = "3" + lto = "fat".
+/// Fills the matrix gap: case 6 has the most complex chain (discovery
+/// captured at case6_lib's stub rlib, augmented map at user-bin, Sky-
+/// emitted clone at user-bin reaching back to case6_lib's struct). Fat
+/// LTO stresses SMPLZ across that whole chain. This is the highest-risk
+/// case in the 7-case taxonomy under the most aggressive optimization.
+#[test] fn test_case6_app_fat_lto() { run_integration_project("case6_app_fat_lto"); }
+
+/// case 4 at opt-level = "3" + lto = "thin". Completes the case-4 LTO
+/// matrix (we have no-LTO via release_mode_smoke and fat LTO via
+/// opt_level_3_fat_lto_smoke). ThinLTO uses per-CGU optimization +
+/// cross-module summary inlining; different code path than fat LTO's
+/// monolithic merge.
+#[test] fn test_release_mode_thin_lto_smoke() { run_integration_project("release_mode_thin_lto_smoke"); }
+
+/// case 1b (Rust top calls Sky generic with Sky-defined arg) at
+/// opt-level = "3". Fills the case-1b gap in the taxonomy × opt-level
+/// matrix; previously only debug. Different call shape from case 4
+/// (Rust caller is the source; Sky's stub fn is the destination).
+#[test] fn test_case1b_rust_calls_generic_o3() { run_integration_project("case1b_rust_calls_generic_o3"); }
+
 /// Diagnostic: verify the hard-error fires when a user explicitly sets
 /// `-Z share-generics=no` on the `__lang_stubs` stub rlib (the unsupported
 /// configuration that would silently produce confusing link errors at

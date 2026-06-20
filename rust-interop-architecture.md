@@ -4348,7 +4348,26 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B14 (Sky-specific). v0 mangler instantiating-crate disambig mismatch at -O>=2 (`share_generics` defaults false).** **CLOSED** by the combination of (a) `consumer_lang_active(())` query + gated escape clause in `Instance::upstream_monomorphization` (rustc fork patch 5; see §3.2 patch 5), (b) forcing `share_generics = true` for Sky stub rlib compiles via `LangDriver::config` heuristic (gated on crate name `__lang_stubs`), and (c) Sky's existing `synthesize_upstream_monomorphizations` augmentation for consumer trait-impl methods plus rustc's default cstore-walk for Rust generic intermediaries (now populated because share-generics is on at the stub rlib). Symptoms before the fix: `cargo build --release` on any toylang/Sky fixture matching `case_generic_impl_block`'s shape (Sky-owned trait impl reached through a Rust generic intermediary) fails at link with undefined symbols mismatching on instantiating-crate disambig (`__lang_stubs` vs the bin's crate name). Pass-through preserved: vanilla rustc default provider returns `false`; pure-Rust crates compiled via Sky's rustc binary that don't match the `__lang_stubs` name and don't load a marker-bearing upstream both see byte-identical behavior to vanilla. Toylang reproducer + fence: `tests/integration_projects/release_mode_smoke/` + `test_release_mode_smoke`.
 
-**B15 (Sky-specific). LTO `internalize` pass changes External linkage on Sky-emitted rustc-visible symbols at `lto = "fat"`.** **CLOSED architecturally** by pinning every Sky-emitted extern wrapper in `@llvm.used` (not the weaker `@llvm.compiler.used` variant). The distinction matters: `@llvm.compiler.used` blocks only `GlobalDCE` from removing the function; `@llvm.used` ALSO blocks LTO `internalize` from changing the linkage AND blocks the linker's dead-strip pass. Under `lto = "fat"` (and only fat — ThinLTO and non-LTO don't run `internalize` the same way), Sky's emitted clone bodies were being silently demoted from `External` to `Internal` linkage during LTO's pre-merge `internalize` step. The resulting `.o` had the symbol present but as a local definition (objdump: `l F` vs `g F`); the stub rlib's cross-crate reference to it then went unresolved at the linker step. Symptoms before the fix: identical-looking "undefined symbol" link errors as B14, but at `lto = "fat"` only — `lto = "thin"` and `lto = false/off` worked fine. The disambig (`__lang_stubs`) was correct in the symbol name, masking the real cause (linkage demotion) as a disambig issue. Toylang reproducer + fence: `tests/integration_projects/opt_level_3_fat_lto_smoke/` + `test_opt_level_3_fat_lto_smoke`. See `toylangc/src/llvm_gen.rs::pin_in_llvm_used` for the implementation + the doc-comment that captures the three LLVM passes the pin defeats.
+**B15 (Sky-specific). LTO `internalize` pass changes External linkage on Sky-emitted rustc-visible symbols at `lto = "fat"`.** **CLOSED architecturally** by pinning every Sky-emitted extern wrapper in `@llvm.used` (not the weaker `@llvm.compiler.used` variant). The distinction matters: `@llvm.compiler.used` blocks only `GlobalDCE` from removing the function; `@llvm.used` ALSO blocks LTO `internalize` from changing the linkage AND blocks the linker's dead-strip pass. Under `lto = "fat"` (and only fat — ThinLTO and non-LTO don't run `internalize` the same way), Sky's emitted clone bodies were being silently demoted from `External` to `Internal` linkage during LTO's pre-merge `internalize` step. The resulting `.o` had the symbol present but as a local definition (objdump: `l F` vs `g F`); the stub rlib's cross-crate reference to it then went unresolved at the linker step. Symptoms before the fix: identical-looking "undefined symbol" link errors as B14, but at `lto = "fat"` only — `lto = "thin"` and `lto = false/off` worked fine. The disambig (`__lang_stubs`) was correct in the symbol name, masking the real cause (linkage demotion) as a disambig issue. Toylang reproducer + fence: `tests/integration_projects/opt_level_3_fat_lto_smoke/` + `test_opt_level_3_fat_lto_smoke`. See `toylangc/src/llvm_gen.rs::pin_in_llvm_used` for the implementation + the doc-comment that captures the three LLVM passes the pin defeats. Codified as `@SMPLZ` arcanum.
+
+**B14 and B15 produce byte-identical link errors.** Both surface as `Undefined symbols for architecture arm64: "..._12___lang_stubsINtB4_7WrapperlENtNtCs..._4core5clone5Clone5cloneB4_", referenced from: ...duplicate... in lib__lang_stubs-XXX.rlib[N](...rcgu.o)`. The disambig `__lang_stubs` is correct in both cases — the difference is invisible from the link error alone. **The disambiguating check is `llvm-objdump -t` on the user_bin's post-LTO `.o` file:** if Sky's emitted symbol is `g F __TEXT,__text _<symbol>` (global), the symbol is correctly linkage-pinned and the chain breakage is upstream — investigate the share-generics gate, the augmented `upstream_monomorphizations_for` map, and the stub rlib's metadata-recording of the offending Rust intermediary. If the symbol is `l F __TEXT,__text _<symbol>` (local), LTO `internalize` demoted it — SMPLZ discipline is wrong (pin missing or using `@llvm.compiler.used` instead of `@llvm.used`). Future investigators hitting this error pattern: check the objdump first.
+
+**Investigation playbook for "Sky symbol disappeared somewhere in the LLVM pipeline".** When Sky-related symbols vanish (undefined-symbol link errors, mysterious runtime traps, or behavior that works at one opt-level but not another), the recipe that surfaced B15 generalizes:
+
+1. **Preserve intermediate artifacts.** Build with `RUSTFLAGS="-C save-temps"`. Rustc keeps every CGU's bitcode at every stage (pre-opt `.no-opt.bc`, post-opt-pre-LTO `.lto.input.bc`, final `.o`). They live in `<target>/debug/deps/`.
+
+2. **Identify Sky's CGU.** Sky uses `build_sky_cgu_name(tcx)` which embeds `sky.0` in the CGU name. Multiple CGUs are produced for the bin; only one is Sky's. The fastest filter: `llvm-dis -o - <each .no-opt.bc> | grep "@llvm.used\|@llvm.compiler.used"` — Sky's CGU is the one with the pin global.
+
+3. **Verify Sky's emission at the pre-opt stage.** `llvm-dis -o - <sky.cgu>.no-opt.bc | grep "^define"`. The expected set is `__toylang_main`, the per-fn internals (`__toylang_internal_*`), and the rustc-mangled extern wrappers (`_RNvXs_..._5cloneB4_` etc.). Missing entries here mean the emission code itself never ran; check `populate_toylang_instances_from_cgus` and `fill_module`.
+
+4. **Check post-LTO (or post-codegen for non-LTO) `.o` symbol table.** `llvm-objdump -t <post-lto.o> | grep -E "g     F|l     F"`. Compare what's `g F` (global, exportable) vs `l F` (local, internal). The shape of the demotion is the clue:
+   - All present as `g F`: the emission survived and the issue is upstream (disambig coordination, missing entries in upstream_monomorphizations_for, etc.).
+   - Present as `l F`: LTO `internalize` ran and demoted them. Check the `@llvm.used` global in the pre-LTO bitcode is correct (`@llvm.used`, not `@llvm.compiler.used`, and contains every rustc-visible symbol).
+   - Absent entirely: `GlobalDCE` removed them. Same fix — `@llvm.used` pin missing.
+
+5. **For LTO-specific issues, check both `lto = "thin"` and `"fat"`.** They run different internalize and DCE passes. A fixture clean at one but failing at the other is a strong hint about which pass is responsible. ThinLTO is less aggressive about internalize than fat; fat LTO is the canary for SMPLZ-class issues.
+
+This recipe found B15 in under an hour. Future "symbol disappeared" investigations should start here.
 
 ### 25.3 Category C: operational invariants
 
@@ -4431,6 +4450,7 @@ This chapter documents the cross-cutting invariants Sky's implementation must re
 | ATAFLBZ | Walks of `tcx.all_impls(...)` filter by `is_from_sky_stubs(self_type_did)`. |
 | ETASTZ | `build_generic_args_for_item` silently truncates excess Type args. |
 | NNGZ | Non-generic is the degenerate case of generic; don't branch on `type_params.is_empty()`. |
+| SMPLZ | Sky-emitted rustc-visible symbols must be pinned in `@llvm.used` (not `@llvm.compiler.used`) so LTO `internalize` doesn't demote linkage. |
 
 Each invariant is expanded in detail below.
 
@@ -4596,7 +4616,19 @@ Sky's source-level positive design principle (§1.5.5) elevated to arcanum form 
 
 **Cleanup:** when retiring a previously-fenced branch (because the consumer's mechanism now handles N=0 uniformly), remove the `arch-fence-allow` marker along with the branch.
 
-### 26.16 Cross-references
+### 26.16 SMPLZ (Sky Must Pin Linkage for External Refs)
+
+Any Sky-emitted symbol whose only callers live in OTHER compile units' machine code must be pinned in the `@llvm.used` LLVM global (not the weaker `@llvm.compiler.used`). Three LLVM passes would otherwise remove or rewrite it: `GlobalDCE` deletes, LTO `internalize` demotes linkage from External to Internal, and the linker dead-strips. The weaker `@llvm.compiler.used` blocks only the first; under `lto = "fat"` the demotion silently breaks cross-crate references.
+
+**Where:** every emission of a rustc-visible symbol in `toylangc/src/llvm_gen.rs`. Today funneled through `codegen_extern_wrapper` and pinned via `pin_in_llvm_used`. Future Sky emission paths (drop glue, vtable shims, async state machine `poll` impls, closure `Fn` impls) must route through the same pin or call it themselves.
+
+**Failure mode:** the resulting linker error is byte-identical to B14's share-generics-gate disambig mismatch — same surface symptom, completely different root cause. Disambiguating check: `llvm-objdump -t` on the post-LTO `.o`. `g F` means the chain is intact (B14-territory); `l F` means SMPLZ discipline broke (the pin is wrong or missing).
+
+**Detection:** `tests/integration_projects/opt_level_3_fat_lto_smoke/`. Built at `opt-level = "3" + lto = "fat"`; reverting `pin_in_llvm_used` to `@llvm.compiler.used` reproduces the bug.
+
+**Full arcana doc:** `docs/arcana/SkyMustPinLinkageForExternalRefs-SMPLZ.md`. Includes the investigation playbook for "Sky symbol disappeared somewhere in the LLVM pipeline" debugging (see §25.2 B15 too — the playbook is duplicated there inline).
+
+### 26.17 Cross-references
 
 - Section 1.5.5 — the positive form of NNGZ (Sky's design principle).
 - Section 5 — codegen path that respects ABI invariants.

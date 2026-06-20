@@ -1,0 +1,9 @@
+[project]
+name = "release_mode_thin_lto_smoke"
+source = "main.toylang"
+opt-level = "3"
+lto = "thin"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
+some_rust_lib = { path = "../some_rust_lib" }
