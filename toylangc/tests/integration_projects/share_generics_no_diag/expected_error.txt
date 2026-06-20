@@ -1,0 +1,4 @@
+error: -Z share-generics=no is unsupported on the consumer-language stub rlib
+The disambig coordination Sky's interop architecture relies on
+rust-interop-architecture.md
+share-generics being on at the stub rlib is what produces that metadata

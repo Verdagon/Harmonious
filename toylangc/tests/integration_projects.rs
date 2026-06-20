@@ -947,6 +947,68 @@ fn test_opt_level_3_fat_lto_smoke() { run_integration_project("opt_level_3_fat_l
 /// release-mode optimization.
 #[test] fn test_case6_app_o3() { run_integration_project("case6_app_o3"); }
 
+/// Diagnostic: verify the hard-error fires when a user explicitly sets
+/// `-Z share-generics=no` on the `__lang_stubs` stub rlib (the unsupported
+/// configuration that would silently produce confusing link errors at
+/// -O>=2 without the diagnostic). The facade's `LangDriver::config`
+/// should `exit(1)` with a clear error message pointing at the
+/// architecture doc.
+///
+/// Mechanism: build the share_generics_no_diag fixture with
+/// `RUSTFLAGS=-Z share-generics=no` exported. Cargo propagates this flag
+/// to every rustc invocation in the build graph; the __lang_stubs crate's
+/// `LangDriver::config` notices the explicit override and exits with
+/// the diagnostic. Test asserts: (a) the build fails, (b) stderr
+/// contains key phrases from the diagnostic.
+#[test]
+fn test_share_generics_no_diagnostic() {
+    let name = "share_generics_no_diag";
+    let project = projects_dir().join(name);
+    assert!(project.is_dir(), "fixture not found: {}", project.display());
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let cargo_target = shared_cargo_target_dir();
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            // The flag that should trigger the diagnostic on __lang_stubs.
+            .env("RUSTFLAGS", "-Z share-generics=no")
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
+
+    assert!(
+        !build_out.status.success(),
+        "{}: expected build failure under -Z share-generics=no, but \
+         toylangc succeeded. The diagnostic in LangDriver::config did \
+         not fire as expected.\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&build_out.stderr).to_string();
+    let expected = std::fs::read_to_string(project.join("expected_error.txt"))
+        .expect("cannot read expected_error.txt");
+    for line in expected.lines() {
+        if line.is_empty() { continue; }
+        assert!(
+            stderr.contains(line),
+            "{}: expected substring `{}` in build stderr, got:\n{}",
+            name, line, stderr,
+        );
+    }
+}
+
 #[test] fn test_arithmetic_sub_div() { run_integration_project("arithmetic_sub_div"); }
 #[test] fn test_vec_i32() { run_integration_project("vec_i32"); }
 #[test] fn test_single_field_struct() { run_integration_project("single_field_struct"); }
