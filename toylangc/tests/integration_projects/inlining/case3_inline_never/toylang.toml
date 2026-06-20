@@ -1,0 +1,9 @@
+[project]
+name = "case3_inline_never"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "3"
+lto = "thin"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

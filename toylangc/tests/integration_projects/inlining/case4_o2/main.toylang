@@ -1,0 +1,24 @@
+use std::clone::Clone
+use some_rust_lib::duplicate
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Clone for Widget {
+    fn clone(&self) -> Widget {
+        Widget { id: self.id }
+    }
+}
+
+fn id_of(w: &Widget) -> i32 {
+    w.id
+}
+
+fn main() {
+    let w = Widget { id: 42 };
+    let copy = duplicate<Widget>(&w);
+    println_i32(id_of(&copy));
+}

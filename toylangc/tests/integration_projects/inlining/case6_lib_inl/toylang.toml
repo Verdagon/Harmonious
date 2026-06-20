@@ -1,0 +1,4 @@
+[project]
+name = "case6_lib_inl"
+source = "main.toylang"
+opt-level = "3"

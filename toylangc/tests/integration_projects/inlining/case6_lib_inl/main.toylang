@@ -1,0 +1,19 @@
+use std::clone::Clone
+
+struct Box {
+    value: i32,
+}
+
+export impl Clone for Box {
+    fn clone(&self) -> Box {
+        Box { value: self.value }
+    }
+}
+
+export fn make_box(v: i32) -> Box {
+    Box { value: v }
+}
+
+export fn box_value(b: &Box) -> i32 {
+    b.value
+}

@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
+#[path = "common/inlining_harness.rs"]
+mod inlining_harness;
+
 // Duplicated here from `toylangc/src/main.rs`'s `TOYLANG_NIGHTLY` — integration
 // tests cannot import from a `[[bin]]`-only crate, so the pin is carried
 // independently. See HANDOFF-nightly-bump.md §3.2 and the `TOYLANG_NIGHTLY`
@@ -152,6 +155,82 @@ fn run_integration_project(name: &str) {
             "{}: expected '{}' in stdout, got:\n{}",
             name, line, stdout,
         );
+    }
+}
+
+/// Variant of `run_integration_project` for fixtures living under
+/// `tests/integration_projects/inlining/<name>/`. The project directory
+/// is the subdir but the cargo binary name is just `<name>` (since
+/// `[project] name` in the toml is the unqualified name). Keeps the
+/// 49-fixture inlining matrix out of the flat top-level dir.
+fn run_inlining_project(name: &str) {
+    let project = projects_dir().join("inlining").join(name);
+    assert!(
+        project.is_dir(),
+        "inlining project not found: {}",
+        project.display(),
+    );
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let cargo_target = shared_cargo_target_dir();
+
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
+    assert!(
+        build_out.status.success(),
+        "{} toylangc build failed:\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = cargo_target.join("debug").join(name);
+    assert!(
+        bin.exists(),
+        "{} expected binary at {}, found nothing",
+        name,
+        bin.display(),
+    );
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .unwrap_or_else(|e| panic!("{}: failed to spawn binary: {}", name, e));
+    assert!(
+        run.status.success(),
+        "{} binary exited non-zero:\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    let expected_path = project.join("expected_output.txt");
+    if expected_path.exists() {
+        let expected = std::fs::read_to_string(&expected_path)
+            .unwrap_or_else(|e| panic!("{}: cannot read expected_output.txt: {}", name, e));
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        for line in expected.lines() {
+            if line.is_empty() { continue; }
+            assert!(
+                stdout.contains(line),
+                "{}: expected '{}' in stdout, got:\n{}",
+                name, line, stdout,
+            );
+        }
     }
 }
 
@@ -709,108 +788,23 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 /// rustc-mangled consumer symbols at LTO time, so the binary runs and
 /// prints `50` like the non-LTO sibling.
 #[test] fn test_lto_smoke() {
+    // Smoke-only: confirms the project builds + runs at thin LTO +
+    // opt-level=3. The original `assert_sky_inlined_into_main` claim
+    // — that Sky's body inlines into Rust user_bin's main, constant-
+    // folding to `mov w8, #50` — was a vacuous pass historically (the
+    // `bl\t` check didn't match the `b\t` tail-jump LTO emits when
+    // Sky's body was blocked from inlining by `#[inline(never)]` on
+    // the stub source). Both the assertion bug and the underlying
+    // inlining gap were resolved during the F1 investigation
+    // (2026-06-20); the corrected disassembly assertions now live in
+    // `test_inline_case2_thin_lto` / `_fat_lto` (Priority A of the
+    // inlining matrix, bottom of this file).
     run_integration_project("lto_smoke");
-    // Tier 3 close-out: tighten the smoke test from "doesn't panic" to
-    // "cross-language inlining empirically verified." Disassemble the
-    // built binary's `lto_smoke::main` (the Rust user_bin entry point)
-    // and assert it contains NO `bl` instruction targeting a symbol
-    // whose name contains `__toylang_main` or `__toylang_internal`.
-    // Under `lto = "thin"` + `opt-level = 3`, ThinLTO inlines Sky's
-    // body across the user_bin → __lang_stubs crate boundary; the
-    // entire compute chain (Sky's `compute() -> 10 + 20*2`) constant-
-    // folds into `mov w8, #50` baked inside the Rust main. If the
-    // inlining ever regresses (e.g. function attributes drift, the
-    // single-symbol scheme breaks, `#![no_builtins]` stops excluding
-    // the stub rlib), this assertion fires with the actual `bl`
-    // instructions listed.
-    assert_sky_inlined_into_main("lto_smoke");
 }
 
-/// Disassemble `<binary>` with `llvm-objdump` and assert that the user_bin's
-/// Rust `main` function contains no `bl` instruction targeting a Sky symbol
-/// (`__toylang_main` or `__toylang_internal`). The presence of such a
-/// branch under `lto = "thin"` + `opt-level >= 1` means cross-language
-/// inlining failed — the build is correct but Sky's perf claim regressed.
-///
-/// `llvm-objdump` location: `$LLVM_SYS_211_PREFIX/bin/llvm-objdump`.
-/// `LLVM_SYS_211_PREFIX` is set by the test harness env already. If the
-/// tool is missing the test fails loudly rather than skipping, because
-/// silent skips defeat the architectural assertion.
-fn assert_sky_inlined_into_main(project_name: &str) {
-    let bin = shared_cargo_target_dir().join("debug").join(project_name);
-    assert!(bin.exists(), "binary not found at {}", bin.display());
-
-    let llvm_prefix = std::env::var("LLVM_SYS_211_PREFIX")
-        .expect("LLVM_SYS_211_PREFIX env not set — the test harness sets it; \
-                 if running cross-language inlining tests manually you must too");
-    let objdump = std::path::PathBuf::from(&llvm_prefix).join("bin").join("llvm-objdump");
-    assert!(
-        objdump.exists(),
-        "llvm-objdump not found at {} (expected from LLVM_SYS_211_PREFIX)",
-        objdump.display(),
-    );
-
-    let dump = Command::new(&objdump)
-        .args(["-d", "--no-show-raw-insn"])
-        .arg(&bin)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run llvm-objdump: {}", e));
-    assert!(
-        dump.status.success(),
-        "llvm-objdump failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&dump.stdout),
-        String::from_utf8_lossy(&dump.stderr),
-    );
-    let asm = String::from_utf8_lossy(&dump.stdout);
-
-    // Find the user_bin's `<...lto_smoke<hash>4main>:` block in the
-    // disassembly. The function-header pattern in llvm-objdump's output
-    // is `<addr> <symbol>:` at column 0. Once inside, walk lines until
-    // we hit the next function header. The rustc-mangled name embeds
-    // `<crate-name-len><crate-name>` and ends with `4main` (length of
-    // "main" = 4) for the binary's own `fn main()`.
-    let main_marker = format!("{}{}4main>:", project_name.len(), project_name);
-    let mut in_main = false;
-    let mut bl_violations: Vec<String> = Vec::new();
-    for line in asm.lines() {
-        if line.ends_with(":") && line.contains('<') {
-            // Function header. Entered or exited a function body.
-            if line.contains(&main_marker) {
-                in_main = true;
-                continue;
-            }
-            if in_main {
-                break;
-            }
-            continue;
-        }
-        if !in_main { continue; }
-        // Look for branch-link instructions targeting Sky symbols.
-        // Disassembly lines look like:
-        //   100002744:     	bl	0x100002bb4 <__RNvCsxxx_12___lang_stubs14___toylang_main>
-        let trimmed = line.trim_start();
-        if (trimmed.contains("bl\t") || trimmed.contains("bl ") || trimmed.contains(" b\t"))
-            && (line.contains("___toylang_main") || line.contains("__toylang_internal"))
-        {
-            bl_violations.push(line.to_string());
-        }
-    }
-    assert!(
-        in_main,
-        "{}: could not find `{}::main` function in disassembly — \
-         symbol-naming convention drift?",
-        project_name, project_name,
-    );
-    assert!(
-        bl_violations.is_empty(),
-        "{}: cross-language inlining regressed — \
-         `{}::main` still calls Sky symbols instead of having them inlined.\n\
-         Found:\n{}",
-        project_name,
-        project_name,
-        bl_violations.join("\n"),
-    );
-}
+// (Removed `assert_sky_inlined_into_main` — see test_lto_smoke's
+// comment for the history. Replacement assertions live in the
+// inlining matrix at the bottom of this file.)
 /// Phase 3 E.6: the first multi-toylang-crate integration test. case6_app
 /// (the binary) depends on case6_lib (a toylang library that exports
 /// `double_it`). The build exercises:
@@ -1713,3 +1707,492 @@ fn test_s5_sidecar_determinism() {
 #[test] fn test_t_of_r_layout() { run_integration_project_check_build_stderr("t_of_r_layout"); }
 #[test] fn test_tg_of_vec_layout() { run_integration_project_check_build_stderr("tg_of_vec_layout"); }
 #[test] fn test_tg_of_toypoint_layout() { run_integration_project_check_build_stderr("tg_of_toypoint_layout"); }
+
+// ============================================================================
+// Inlining matrix — see HANDOFF-discovery-synthesis-share-generics-inlining.md
+// Thread C. Validates Sky's user-visible perf promise that cross-language
+// boundaries inline at -O3 under LTO. Built on the shared
+// `inlining_harness` module.
+//
+// Naming: `test_inline_case<X>_<lto_mode>` for Priority A; `_inline`,
+// `_inline_always`, `_inline_never` suffix for Priority B; `_oN` for
+// Priority C; `_cgus_N` for Priority D. Fixtures live under
+// `tests/integration_projects/inlining/<name>/` to keep the matrix out
+// of the flat top-level fixture list.
+//
+// Per-case caller / boundary-callee semantics:
+//   - Rust-top cases (1a, 1b, 3, 5): user_bin's `main` is the Rust
+//     `rust_caller.rs`. Boundary callee = Sky's exported fn. We assert
+//     against the `___toylang_main` / `__toylang_internal` mangling
+//     fragments (same as test_lto_smoke).
+//   - Sky-top cases (2, 4, 6): user_bin's `main` is the auto-generated
+//     bin shim calling Sky's `__toylang_main`. At LTO Sky's body
+//     inlines INTO the shim; same fragments apply.
+//   - Cases 4/5/6 additionally have a Rust generic intermediary
+//     (`some_rust_lib::duplicate` / `some_rust_lib::make_vec_of_three`).
+//     At LTO those should also inline; we assert `some_rust_lib::` is
+//     absent in those cases' caller bodies at thin/fat LTO.
+
+// Sky-boundary detection. A `bl`/`b`/`call`/`callq` is a Sky-boundary
+// call iff the demangled CALLEE symbol's outer path (before any
+// `::<generic args>`) is a Sky-owned name:
+//   - starts with `__lang_stubs::` (rustc-mangled Sky exports like
+//     `__lang_stubs::add_one`, `__lang_stubs::__toylang_main`)
+//   - or equals/starts with `__toylang_main` / `__toylang_internal`
+//     (no-mangle Sky entries that survive without crate qualification)
+//
+// The selectivity matters because some Rust generics take Sky types as
+// type args (e.g. `some_rust_lib::duplicate::<__lang_stubs::Widget>`).
+// The symbol contains `__lang_stubs::` inside the generic args, but
+// the function path (`some_rust_lib::duplicate`) is NOT Sky-owned —
+// it's a Rust intermediary that happens to be instantiated over a Sky
+// type. A naive substring check would flag it; the outer-path check
+// correctly classifies it as non-Sky.
+
+/// Extract the demangled callee name from a disasm branch line.
+/// objdump format after demangling looks like:
+///   `100002558:    bl  0x100002540 <some_demangled::path::<GenericArg>>`
+/// The callee is the LAST balanced `<...>` block.
+fn extract_branch_target(line: &str) -> Option<&str> {
+    let last_lt = line.rfind('<')?;
+    let last_gt = line.rfind('>')?;
+    if last_gt <= last_lt { return None; }
+    // Caveat: nested generic args mean the outer `<...>` we want is
+    // not the LAST `<` (which would be the innermost generic arg).
+    // We need the OUTERMOST. Easiest way: scan forward tracking
+    // bracket depth.
+    let bytes = line.as_bytes();
+    let mut depth = 0;
+    let mut outer_start: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'<' {
+            if depth == 0 { outer_start = Some(i); }
+            depth += 1;
+        } else if b == b'>' {
+            depth -= 1;
+            if depth == 0 {
+                let start = outer_start?;
+                if i > start + 1 && i == bytes.len() - 1 {
+                    return std::str::from_utf8(&bytes[start + 1..i]).ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns true iff `demangled_target` (the contents inside the outer
+/// `<...>` of a branch line) is a call to a Sky-owned name. Strips
+/// any `::<generic args>` suffix before classifying.
+fn is_sky_boundary_target(demangled_target: &str) -> bool {
+    let path = demangled_target
+        .split_once("::<")
+        .map(|(head, _)| head)
+        .unwrap_or(demangled_target);
+    path.starts_with("__lang_stubs::")
+        || path.starts_with("__toylang_main")
+        || path.starts_with("__toylang_internal")
+}
+
+fn line_is_sky_branch(line: &str) -> bool {
+    let after_colon = match line.split_once(':') {
+        Some((_, rest)) => rest,
+        None => return false,
+    };
+    let mnemonic = match after_colon.split_whitespace().next() {
+        Some(m) => m,
+        None => return false,
+    };
+    if !matches!(mnemonic, "bl" | "b" | "call" | "callq") { return false; }
+    match extract_branch_target(line) {
+        Some(target) => is_sky_boundary_target(target),
+        None => false,
+    }
+}
+
+fn assert_no_sky_branch_in_main(project: &str) {
+    let ctx = inlining_harness::disassemble_binary(
+        project,
+        inlining_harness::Profile::Debug,
+    );
+    let main_needle = format!("{}::main", project);
+    let bodies = ctx.bodies_of(&main_needle);
+    assert!(
+        !bodies.is_empty(),
+        "{}: no function matching `{}` found in disassembly",
+        project, main_needle,
+    );
+    let mut violations: Vec<String> = Vec::new();
+    for body in bodies {
+        for line in body {
+            if line_is_sky_branch(line) {
+                violations.push(line.clone());
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "{}: expected `{}` to NOT branch to a Sky-owned symbol \
+         (Sky's body should have inlined), but found:\n{}",
+        project, main_needle, violations.join("\n"),
+    );
+}
+
+// Helper: assert that `<project>::main` DOES branch to at least one
+// Sky-owned symbol. Used at -O0 baselines to codify "no inlining at
+// -O0; Sky's body remains as a cross-crate call."
+fn assert_sky_branch_present_in_main(project: &str) {
+    let ctx = inlining_harness::disassemble_binary(
+        project,
+        inlining_harness::Profile::Debug,
+    );
+    let main_needle = format!("{}::main", project);
+    let bodies = ctx.bodies_of(&main_needle);
+    assert!(
+        !bodies.is_empty(),
+        "{}: no function matching `{}` found in disassembly — \
+         symbol-naming drift? Functions present:\n{}",
+        project,
+        main_needle,
+        ctx.functions
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let mut found = false;
+    'outer: for body in bodies {
+        for line in body {
+            if line_is_sky_branch(line) {
+                found = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        found,
+        "{}: expected `{}` to branch to a Sky-owned symbol (Sky's body \
+         should NOT be inlined), but none found. Either Sky's body was \
+         inlined (unexpected for this fixture) or symbol naming drifted.",
+        project, main_needle,
+    );
+}
+
+// ---- Priority A: 7 cases × 3 LTO modes at -O3 (21 fixtures) ----
+//
+// F1 investigation resolution (2026-06-20): the previous version of
+// these comments documented a "Sky-export LTO inlining gap" — the
+// matrix found that Sky-exported fns (case1a/2/4/6) didn't inline
+// across the crate boundary at thin/fat LTO even though architecturally
+// they should. Root cause traced to `#[inline(never)]` on the stub
+// source's wrapper fn emission (`toylangc/src/stub_gen.rs`). The
+// attribute's two historical rationales (share_generics gate trip,
+// MIR inliner leak protection) were both obsolete: patch 5 closes the
+// share_generics gate independently, and arch §F.1 explicitly calls
+// the MIR inliner concern phantom (the real fix is `#![no_builtins]`
+// + Path B single-symbol naming, both already in place). The B12
+// vanilla-rustc-cross-crate concern is gated by build.rs's
+// SKY_TOOLCHAIN_ACTIVE check in v1 and only acquires meaning when
+// v2's precompiled-bodies feature (§21.7) ships. Attribute removed;
+// LTO inlining now empirically works for every case.
+//
+// Sky GENERICS with a Rust-side type arg (case1b) inline cross-boundary
+// at every opt level + LTO mode — because Sky's `per_instance_mir`
+// emits the substituted body INTO the user_bin's CGU, where LLVM sees
+// it locally. (This was true before F1 too; case1b never hit the gap.)
+
+// Case 1a: Rust → Sky non-generic. Post-F1: Sky's body inlines
+// cross-crate at -O3 via rmeta-encoded MIR, regardless of LTO mode.
+#[test] fn test_inline_case1a_no_lto() {
+    run_inlining_project("case1a_no_lto");
+    assert_no_sky_branch_in_main("case1a_no_lto");
+}
+#[test] fn test_inline_case1a_thin_lto() {
+    run_inlining_project("case1a_thin_lto");
+    assert_no_sky_branch_in_main("case1a_thin_lto");
+}
+#[test] fn test_inline_case1a_fat_lto() {
+    run_inlining_project("case1a_fat_lto");
+    assert_no_sky_branch_in_main("case1a_fat_lto");
+}
+
+// Case 1b: Rust → Sky generic w/ Rust-defined T. Sky's
+// per_instance_mir emits the substituted body INTO user_bin → LLVM
+// inlines at -O3, even without LTO. (Worked pre-F1 too.)
+#[test] fn test_inline_case1b_no_lto() {
+    run_inlining_project("case1b_no_lto");
+    assert_no_sky_branch_in_main("case1b_no_lto");
+}
+#[test] fn test_inline_case1b_thin_lto() {
+    run_inlining_project("case1b_thin_lto");
+    assert_no_sky_branch_in_main("case1b_thin_lto");
+}
+#[test] fn test_inline_case1b_fat_lto() {
+    run_inlining_project("case1b_fat_lto");
+    assert_no_sky_branch_in_main("case1b_fat_lto");
+}
+
+// Case 2: Sky main → Rust library (extern "C" println). Post-F1:
+// Sky's main inlines into the bin shim's main at every -O3 mode.
+#[test] fn test_inline_case2_no_lto() {
+    run_inlining_project("case2_no_lto");
+    assert_no_sky_branch_in_main("case2_no_lto");
+}
+#[test] fn test_inline_case2_thin_lto() {
+    run_inlining_project("case2_thin_lto");
+    assert_no_sky_branch_in_main("case2_thin_lto");
+}
+#[test] fn test_inline_case2_fat_lto() {
+    run_inlining_project("case2_fat_lto");
+    assert_no_sky_branch_in_main("case2_fat_lto");
+}
+
+// Case 3: Rust → Sky generic → derived Rust Clone impl.
+//
+// MATRIX-SURFACED BUG (2026-06-20): all three -O3 variants fail to
+// link with `Undefined symbols: <case3_*::MyCounter as
+// core::clone::Clone>::clone`. The Sky generic `clone_it<MyCounter>`
+// (queued by Sky's per_instance_mir) needs `<MyCounter as Clone>::clone`
+// — but MyCounter is defined in user_bin (rust_caller.rs), and at
+// -O3 with `share_generics=false` at user_bin, this derived impl
+// method isn't emitted with the disambig the call site expects.
+// Different shape than the existing release-mode fix (which handles
+// Sky impl reached through Rust generic — opposite direction).
+//
+// TODO: investigate as a sibling of B14. May need a sixth fork patch
+// or a Sky-side `synthesize_upstream_monomorphizations` extension.
+// Ignored until then.
+#[test] #[ignore = "Case 3 at -O3: <user_bin::MyCounter as Clone>::clone disambig bug — sibling of B14"]
+fn test_inline_case3_no_lto() {
+    run_inlining_project("case3_no_lto");
+    assert_sky_branch_present_in_main("case3_no_lto");
+}
+#[test] #[ignore = "Case 3 at -O3: <user_bin::MyCounter as Clone>::clone disambig bug — sibling of B14"]
+fn test_inline_case3_thin_lto() {
+    run_inlining_project("case3_thin_lto");
+    assert_no_sky_branch_in_main("case3_thin_lto");
+}
+#[test] #[ignore = "Case 3 at -O3: <user_bin::MyCounter as Clone>::clone disambig bug — sibling of B14"]
+fn test_inline_case3_fat_lto() {
+    run_inlining_project("case3_fat_lto");
+    assert_no_sky_branch_in_main("case3_fat_lto");
+}
+
+// Case 4: Sky → Rust generic → Sky impl. Post-F1: Sky's main inlines
+// into the bin shim. The Rust generic intermediary `some_rust_lib::
+// duplicate::<Widget>` may or may not inline further — that's a
+// separate Rust-side LLVM inlining concern not gated by F1. Only
+// asserts on Sky-boundary inlining.
+#[test] fn test_inline_case4_no_lto() {
+    run_inlining_project("case4_no_lto");
+    assert_no_sky_branch_in_main("case4_no_lto");
+}
+#[test] fn test_inline_case4_thin_lto() {
+    run_inlining_project("case4_thin_lto");
+    assert_no_sky_branch_in_main("case4_thin_lto");
+}
+#[test] fn test_inline_case4_fat_lto() {
+    run_inlining_project("case4_fat_lto");
+    assert_no_sky_branch_in_main("case4_fat_lto");
+}
+
+// Case 5: Rust → Sky generic → Rust Vec intermediary. Vec involves
+// `__rust_alloc` etc. — not amenable to "no_some_rust_lib_branch"
+// blanket assertion (Vec's body retains alloc calls).
+//
+// MATRIX-SURFACED BUG (2026-06-20): all three -O3 variants fail to
+// link with `Undefined symbols: <alloc::vec::Vec<i64> as ...>::new`
+// and `::push` (disambig = user_bin). Same root-cause family as
+// case 3: Sky's `store_in_vec<i64>` references std Vec methods, but
+// at -O3 with share_generics=false at user_bin, the user_bin doesn't
+// emit them with the disambig the Sky-emitted call site expects.
+//
+// TODO: same investigation as case 3. Ignored until fixed.
+#[test] #[ignore = "Case 5 at -O3: <Vec<i64>>::{new,push} disambig bug — sibling of B14"]
+fn test_inline_case5_no_lto() {
+    run_inlining_project("case5_no_lto");
+    assert_sky_branch_present_in_main("case5_no_lto");
+}
+#[test] #[ignore = "Case 5 at -O3: <Vec<i64>>::{new,push} disambig bug — sibling of B14"]
+fn test_inline_case5_thin_lto() {
+    run_inlining_project("case5_thin_lto");
+    assert_no_sky_branch_in_main("case5_thin_lto");
+}
+#[test] #[ignore = "Case 5 at -O3: <Vec<i64>>::{new,push} disambig bug — sibling of B14"]
+fn test_inline_case5_fat_lto() {
+    run_inlining_project("case5_fat_lto");
+    assert_no_sky_branch_in_main("case5_fat_lto");
+}
+
+// Case 6: Sky → Rust → cross-Sky-crate (uses case6_lib_inl). Same
+// shape as case 4 with cross-Sky-crate trait impl.
+#[test] fn test_inline_case6_no_lto() {
+    run_inlining_project("case6_no_lto");
+    assert_no_sky_branch_in_main("case6_no_lto");
+}
+#[test] fn test_inline_case6_thin_lto() {
+    run_inlining_project("case6_thin_lto");
+    assert_no_sky_branch_in_main("case6_thin_lto");
+}
+#[test] fn test_inline_case6_fat_lto() {
+    run_inlining_project("case6_fat_lto");
+    assert_no_sky_branch_in_main("case6_fat_lto");
+}
+
+// ============================================================================
+// Priority B: 4 Rust-top cases × 3 #[inline] annotations on a Rust
+// caller wrapper at -O3 + thin LTO (12 fixtures).
+//
+// Sky source doesn't support `#[inline]` annotations (stub_gen emits
+// `#[inline(never)]` unconditionally on every Sky export — see
+// toylangc/src/stub_gen.rs:221). So Priority B can only meaningfully
+// vary the annotation on the RUST side. We insert a thin `wrap_<fn>`
+// wrapper in rust_caller.rs that calls into Sky's export and carry
+// the annotation on the wrapper. Tests assert main inlines through
+// the wrapper (or doesn't) per the annotation's intent.
+//
+// Sky-top cases (2, 4, 6) are SKIPPED in Priority B: there's no Rust
+// caller to annotate, and Sky source doesn't support `#[inline]`.
+// Closing this gap is its own thread (extend Sky frontend to honor
+// `#[inline]` attributes; see the open thread in
+// HANDOFF-discovery-synthesis-share-generics-inlining.md).
+//
+// Cases 3 and 5 inherit the release-mode disambig bug from Priority
+// A; their Priority B fixtures are also `#[ignore]`d under the
+// sibling-of-B14 marker.
+
+const PRIORITY_B_DISAMBIG_IGNORE: &str =
+    "Inherits case3/case5 disambig bug (sibling of B14) — same root cause as Priority A";
+
+// Helper: at -O3 + thin LTO, assert main does NOT call the wrapper
+// (wrapper inlined). Used for `#[inline]` and `#[inline(always)]`.
+fn assert_no_wrapper_branch(project: &str, wrapper_name: &str) {
+    let ctx = inlining_harness::disassemble_binary(
+        project,
+        inlining_harness::Profile::Debug,
+    );
+    let main_needle = format!("{}::main", project);
+    let wrapper_needle = format!("{}::{}", project, wrapper_name);
+    inlining_harness::assert_no_call_to_symbols_matching(&ctx, &main_needle, &wrapper_needle);
+}
+
+// Helper: at -O3 + thin LTO, assert main DOES call the wrapper
+// (#[inline(never)] honored). Reuses the OR-scan logic used for
+// SKY_BOUNDARY_FRAGMENTS but for a single required wrapper name.
+fn assert_wrapper_branch_present(project: &str, wrapper_name: &str) {
+    let ctx = inlining_harness::disassemble_binary(
+        project,
+        inlining_harness::Profile::Debug,
+    );
+    let main_needle = format!("{}::main", project);
+    let wrapper_needle = format!("{}::{}", project, wrapper_name);
+    inlining_harness::assert_call_to_symbol_matching(&ctx, &main_needle, &wrapper_needle);
+}
+
+// Case 1a: Rust → Sky non-generic
+#[test] fn test_inline_case1a_inline() {
+    run_inlining_project("case1a_inline");
+    assert_no_wrapper_branch("case1a_inline", "wrap_add_one");
+}
+#[test] fn test_inline_case1a_inline_always() {
+    run_inlining_project("case1a_inline_always");
+    assert_no_wrapper_branch("case1a_inline_always", "wrap_add_one");
+}
+#[test] fn test_inline_case1a_inline_never() {
+    run_inlining_project("case1a_inline_never");
+    assert_wrapper_branch_present("case1a_inline_never", "wrap_add_one");
+}
+
+// Case 1b: Rust → Sky generic w/ Rust-defined T
+#[test] fn test_inline_case1b_inline() {
+    run_inlining_project("case1b_inline");
+    assert_no_wrapper_branch("case1b_inline", "wrap_identity");
+}
+#[test] fn test_inline_case1b_inline_always() {
+    run_inlining_project("case1b_inline_always");
+    assert_no_wrapper_branch("case1b_inline_always", "wrap_identity");
+}
+#[test] fn test_inline_case1b_inline_never() {
+    run_inlining_project("case1b_inline_never");
+    assert_wrapper_branch_present("case1b_inline_never", "wrap_identity");
+}
+
+// Case 3: ignored — inherits disambig bug
+#[test] #[ignore = "Inherits case3 disambig bug — sibling of B14"]
+fn test_inline_case3_inline() {
+    let _ = PRIORITY_B_DISAMBIG_IGNORE;
+    run_inlining_project("case3_inline");
+    assert_no_wrapper_branch("case3_inline", "wrap_clone_it");
+}
+#[test] #[ignore = "Inherits case3 disambig bug — sibling of B14"]
+fn test_inline_case3_inline_always() {
+    run_inlining_project("case3_inline_always");
+    assert_no_wrapper_branch("case3_inline_always", "wrap_clone_it");
+}
+#[test] #[ignore = "Inherits case3 disambig bug — sibling of B14"]
+fn test_inline_case3_inline_never() {
+    run_inlining_project("case3_inline_never");
+    assert_wrapper_branch_present("case3_inline_never", "wrap_clone_it");
+}
+
+// Case 5: ignored — inherits disambig bug
+#[test] #[ignore = "Inherits case5 disambig bug — sibling of B14"]
+fn test_inline_case5_inline() {
+    run_inlining_project("case5_inline");
+    assert_no_wrapper_branch("case5_inline", "wrap_store");
+}
+#[test] #[ignore = "Inherits case5 disambig bug — sibling of B14"]
+fn test_inline_case5_inline_always() {
+    run_inlining_project("case5_inline_always");
+    assert_no_wrapper_branch("case5_inline_always", "wrap_store");
+}
+#[test] #[ignore = "Inherits case5 disambig bug — sibling of B14"]
+fn test_inline_case5_inline_never() {
+    run_inlining_project("case5_inline_never");
+    assert_wrapper_branch_present("case5_inline_never", "wrap_store");
+}
+
+// ============================================================================
+// Priority C: Case 4 opt-level sweep at no-LTO (5 fixtures).
+// Validates inlining behavior across opt-levels post-F1.
+//
+// -O0: no inlining → Sky's body remains as cross-crate `bl` baseline.
+// -O1/-O2/-Os/-Oz: rustc's cross-crate MIR inliner fires → Sky's body
+//   is expected to inline into main (no Sky-owned `bl`). Empirically
+//   confirmed for -O1+ post-F1.
+
+#[test] fn test_inline_case4_o0() {
+    run_inlining_project("case4_o0");
+    assert_sky_branch_present_in_main("case4_o0");
+}
+#[test] fn test_inline_case4_o1() {
+    run_inlining_project("case4_o1");
+    assert_no_sky_branch_in_main("case4_o1");
+}
+#[test] fn test_inline_case4_o2() {
+    run_inlining_project("case4_o2");
+    assert_no_sky_branch_in_main("case4_o2");
+}
+#[test] fn test_inline_case4_os() {
+    run_inlining_project("case4_os");
+    assert_no_sky_branch_in_main("case4_os");
+}
+#[test] fn test_inline_case4_oz() {
+    run_inlining_project("case4_oz");
+    assert_no_sky_branch_in_main("case4_oz");
+}
+
+// ============================================================================
+// Priority D: Case 4 codegen-units at -O3 + thin LTO (2 fixtures).
+// Validates that the inlining matrix's behavior is consistent across
+// codegen-units settings. Asserts Sky's body inlines through main at
+// both extremes now that F1 is resolved.
+
+#[test] fn test_inline_case4_cgus_1() {
+    run_inlining_project("case4_cgus_1");
+    assert_no_sky_branch_in_main("case4_cgus_1");
+}
+#[test] fn test_inline_case4_cgus_16() {
+    run_inlining_project("case4_cgus_16");
+    assert_no_sky_branch_in_main("case4_cgus_16");
+}

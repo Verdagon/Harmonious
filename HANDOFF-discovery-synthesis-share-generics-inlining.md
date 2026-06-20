@@ -11,27 +11,67 @@ trait-impl instances), §25.2 (the risk register, especially B14/B15), and
 threads is bug-fixing — they're refinement/investigation/expansion work.
 Release-mode (the previous handoff's bug) is fully resolved as of `08f350e`.
 
+**2026-06-20 progress note:** Thread C (inlining test matrix) **partially
+shipped** — harness + 40-fixture matrix landed across phases 1-5 in the
+working tree (uncommitted). 20 pass, 20 ignored with two documented
+findings (see "Thread C — closed-out work" below). Threads A and B are
+unchanged. Two new findings entered the docket:
+
+- **Finding F1: Sky-export LTO inlining gap** (`SKY_EXPORT_LTO_INLINING_FINDING`
+  in the test source). Sky-exported non-generic fns (cases 1a, 2, 4, 6) do NOT
+  inline cross-crate at thin/fat LTO because `stub_gen` emits `#[inline(never)]`
+  unconditionally on every export. Sky's body still constant-folds INTERNALLY,
+  but the bin shim tail-jumps (`b __lang_stubs::__toylang_main`) to reach it
+  rather than inlining the body. The original `test_lto_smoke` assertion was
+  **vacuously passing** — its `bl\t` pattern didn't catch the `b\t` tail-jump.
+- **Finding F2: case 3 / case 5 disambig bug at -O3** (sibling of B14). Rust
+  Clone-derived impl referenced from a Sky generic (`<MyCounter as Clone>::clone`,
+  `<Vec<i64>>::{new, push}`) fails to link at -O3 because user_bin doesn't emit
+  the impl method with the disambig the Sky call site expects. Opposite-direction
+  cousin of the case 4 release-mode fix (Sky impl reached through Rust generic).
+
+Both findings are documented in `toylangc/tests/integration_projects.rs` via
+search markers; the relevant fixtures are `#[ignore]`'d so the suite stays
+green.
+
 ---
 
 ## TL;DR
 
-Four open threads, interrelated. Roughly in order of risk-reduction value:
+Five open threads, interrelated. Roughly in order of risk-reduction value:
 
-1. **Inlining test matrix (Thread C)** — we have ONE inlining-verification
-   fixture (`test_lto_smoke`); the rest is hope. User wants this "way
-   overboard." Expect ~30-50 fixtures + a reusable disassembly-assertion
-   harness. Cost: ~10-15 hours. Likely catches real bugs.
-2. **Discovery/synthesis/filter machinery (Thread A)** — three Sky-side
+1. **Inlining test matrix (Thread C)** — ✅ **partially shipped 2026-06-20.**
+   Harness (`toylangc/tests/common/inlining_harness.rs`) + 40 fixtures across
+   `toylangc/tests/integration_projects/inlining/` + matrix tests in
+   `integration_projects.rs`. 20 pass / 20 ignored / 0 fail. Surfaced F1 + F2.
+   Remaining work: investigate F1 and F2 (now top-of-stack); optionally extend
+   matrix to cover Sky-side `#[inline]` syntax (requires Sky frontend work)
+   and Sky-top Priority B variants (blocked on same).
+2. **Finding F1 — Sky-export LTO inlining gap.** Highest-priority new
+   finding. Sky's user-visible perf promise is currently false for non-generic
+   Sky exports at LTO. Resolution choices: (a) relax `#[inline(never)]` on
+   stubs for the LTO-eligible subset (risk: re-opens the MIR inliner leak +
+   share_generics gate it was added to defeat), (b) keep the discipline and
+   document the one-instruction tail-jump cost as acceptable, (c) emit
+   alternate stub source per-export with an opt-in `[inline]` attribute Sky
+   frontend would honor. Cost: investigation ~1-2 days; implementation
+   depends on path.
+3. **Finding F2 — case 3 / case 5 disambig bug at -O3.** Real release-mode
+   link failure for Rust impl referenced from Sky generic. Sibling of B14.
+   May need a sixth fork patch or a Sky-side extension to
+   `synthesize_upstream_monomorphizations` to cover the opposite direction.
+   Cost: investigation ~1-2 days; implementation ~1-3 days.
+4. **Discovery/synthesis/filter machinery (Thread A)** — three Sky-side
    layers (capture-ship-replay, synthesize-upstream-monomorphizations,
    partition filter) coordinate to handle the F.13 cascade-timing
    problem. Investigate whether any can be pruned/eliminated, especially
    in light of the new release-mode fix's machinery. Cost: ~1-2 weeks
    for full investigation; partial pruning is hours.
-3. **share_generics handling (Thread B)** — current support is forced-on
+5. **share_generics handling (Thread B)** — current support is forced-on
    at `__lang_stubs`, hard-error if user disables it there, otherwise
    user choice. Decide if we should support/honor it differently in
    other configurations. Cost: ~1 day investigation + decision.
-4. **The "kill partition filter" sub-thread (Thread A.5)** — separable
+6. **The "kill partition filter" sub-thread (Thread A.5)** — separable
    from the rest. If the partition filter could be eliminated, both A.1
    (capture-ship-replay) and A.2 (synthesize-upstream-monomorphizations)
    dissolve naturally. Requires either an upstream RFC
@@ -39,8 +79,11 @@ Four open threads, interrelated. Roughly in order of risk-reduction value:
    mechanism. Cost: investigation ~3-5 days; implementation likely
    multi-week.
 
-Recommended order: **C, then A in priority order, then B**. C is most
-risk-reducing for Sky proper; A is hygiene; B is design-space exploration.
+Recommended order (updated 2026-06-20): **F1 → F2 → A → B**. F1 and F2
+became top-of-stack because the matrix surfaced them as real architectural
+gaps with user-visible consequences. A is hygiene; B is design-space
+exploration. C is largely shipped; pick it back up only if you want
+Sky-side `#[inline]` support OR Sky-top Priority B coverage.
 
 ---
 
@@ -409,7 +452,151 @@ We DON'T currently distinguish:
 
 ## Thread C: Inlining test matrix (the big one)
 
-### Current state
+### 2026-06-20 update: partially shipped
+
+What landed (uncommitted on the working tree):
+
+| Component | Path | Notes |
+|---|---|---|
+| Harness | `toylangc/tests/common/inlining_harness.rs` | `DisasmContext`, `disassemble_binary`, `assert_no_call_to_symbols_matching`, `assert_call_to_symbol_matching`. Demangles symbols via `rustc-demangle`. Extracts mnemonic via `line.split_once(':')` then first whitespace token — robust to address-prefix in objdump format. |
+| Dev-dep | `toylangc/Cargo.toml` | Added `rustc-demangle = "0.1"` to `[dev-dependencies]`. |
+| Fixtures | `toylangc/tests/integration_projects/inlining/` | 40 subdirectories. Sky source + optional `rust_caller.rs` + `toylang.toml` (with `opt-level`/`lto`/`codegen-units`/`features` knobs) + `expected_output.txt`. Plus shared `case6_lib_inl/` Sky lib used by case6 fixtures. |
+| Test entries | `toylangc/tests/integration_projects.rs` (end-of-file) | 40 `#[test] fn test_inline_*`. Helpers: `run_inlining_project`, `assert_no_sky_branch_in_main`, `assert_no_some_rust_lib_branch_in_main`, `assert_sky_branch_present_in_main`, `assert_no_wrapper_branch`, `assert_wrapper_branch_present`. |
+| Search markers | (in test source) | `SKY_EXPORT_LTO_INLINING_FINDING` (F1), "sibling of B14" (F2), `PRIORITY_B_DISAMBIG_IGNORE`. |
+
+Test tally (Priority A + B + C + D, 40 total + the ported `test_lto_smoke`):
+
+| Phase | Pass | Ignored | Why ignored |
+|---|---|---|---|
+| Priority A — 7 cases × 3 LTO modes at -O3 (21) | 7 | 14 | Sky-export LTO inlining gap (F1) and case3/case5 disambig bug (F2) |
+| Priority B — 4 Rust-top cases × 3 `#[inline]` variants on Rust wrapper at -O3+thin LTO (12) | 6 | 6 | case3/case5 inherit F2 |
+| Priority C — case 4 opt-level sweep (5) | 5 | 0 | — |
+| Priority D — case 4 codegen-units {1, 16} at -O3+thin LTO (2) | 2 | 0 | — |
+| `test_lto_smoke` (ported) | 1 | 0 | Reduced to smoke-only; assertion was vacuous (see F1) |
+| **Total** | **21** | **20** | |
+
+Two findings surfaced (carried to top-of-stack in the TL;DR):
+
+#### F1 — Sky-export LTO inlining gap
+
+At thin/fat LTO + -O3, cases 1a / 2 / 4 / 6 — every case where the user-bin
+boundary is a Sky-EXPORTED non-generic fn — do NOT inline cross-crate.
+Disassembly evidence: the bin's `main` is a single tail-jump
+`b __lang_stubs::__toylang_main` (or `bl __lang_stubs::add_one`); Sky's body
+exists and constant-folds internally (e.g. `lto_smoke` produces `mov w8, #50`
+inside Sky's `__toylang_main`), but the call doesn't get inlined into the
+shim.
+
+Root cause: `toylangc/src/stub_gen.rs:221` emits `#[inline(never)]`
+unconditionally on every Sky export. LLVM honors this during the ThinLTO/FatLTO
+IR linker pass. The `#[inline(never)]` was added for two reasons (per the
+in-source comment): (1) defeats `requires_caller_location_or_inline_never`
+at -O2/-O3 — the share_generics gate the release-mode fix targets; (2)
+prevents rustc's MIR inliner from leaking the `unreachable!()` stub body
+into callers. Both reasons are load-bearing, so relaxing the discipline
+isn't a free choice.
+
+Importantly: Sky GENERICS with a Rust-side type arg (case 1b) DO inline at
+every opt level — because Sky's `per_instance_mir` emits the substituted
+body INTO the user_bin's CGU, where LLVM sees it locally. The gap is
+specific to Sky exports.
+
+The original `test_lto_smoke` assertion was **vacuously passing**: its
+`trimmed.contains("bl\t")` check (now ported to the harness) didn't match
+the `b\t` tail-jump emitted at LTO. Multiple sessions thought the inlining
+promise was empirically verified; it wasn't.
+
+Resolution candidates (in roughly increasing ambition):
+- **(a)** Document the tail-jump cost as the cost of safety. One tail-jump
+  per Sky-export call is real but small; the discipline that produces it
+  closes a class of MIR-inliner / share_generics bugs. Update the perf
+  promise from "interop is free" to "interop costs one tail-jump per
+  Sky-export entry."
+- **(b)** Add a per-export opt-in attribute on Sky source (e.g.
+  `export #[inline] fn add_one(...)`). stub_gen reads it and OMITS
+  `#[inline(never)]` for that export. Requires Sky parser extension + a
+  decision about whether the share_generics gate / MIR inliner leak still
+  apply per-export. Smallest user-facing change with real fix value.
+- **(c)** Replace `#[inline(never)]` with `#[cold]` or a custom attribute
+  that defeats only the MIR inliner without LTO's IR inliner. Requires
+  understanding rustc's inliner-stage hierarchy better than this handoff
+  has investigated.
+
+Investigation entry points: `toylangc/src/stub_gen.rs` (the emission of
+`#[inline(never)]` and its rationale comments); `toylangc/tests/integration_projects.rs`
+(search `SKY_EXPORT_LTO_INLINING_FINDING` for the 6 fixtures that lock
+this in once it's resolved); `rust-interop-architecture.md` §F.13 / §8.9.5
+(the share_generics gate + MIR inliner story `#[inline(never)]` defeats).
+
+#### F2 — case 3 / case 5 disambig bug at -O3
+
+`Rust → Sky generic → Rust impl` (case 3, derived `Clone` on a user_bin-local
+struct) and `Rust → Sky → Rust generic intermediary` (case 5, `Vec`) both
+fail to LINK at -O3, every LTO mode. Linker errors:
+
+```
+case 3 fat LTO:
+  Undefined symbols: __RNvXCs..._13case3_fat_ltoNtB2_9MyCounter
+                       NtNtCs..._4core5clone5Clone5clone
+case 5 no LTO:
+  Undefined symbols: __RNvMNtCs..._5alloc3vecINtB2_3VecJE3new
+                       ...12case5_no_lto
+                     __RNvMsF_NtCs..._5alloc3vecINtB5_3VecJE4push
+                       ...12case5_no_lto
+```
+
+Root cause hypothesis (verify): Sky's `per_instance_mir` emits
+`__lang_stubs::clone_it<MyCounter>` (for case 3) into the user_bin's CGU.
+That body references `<MyCounter as Clone>::clone`. At -O3 with the user_bin
+at default `share_generics=false`, the user_bin's mono collector doesn't
+emit `<MyCounter as Clone>::clone` with the disambig the Sky-emitted call
+site expects — same gate that B14 targeted, but in the OPPOSITE direction
+(B14 was Sky impl reached through Rust generic; F2 is Rust impl reached
+through Sky generic).
+
+Same shape for case 5: `Vec::<i64>::new` / `::push` from `alloc::vec` are
+referenced from Sky's `store_in_vec<i64>` body emitted at user_bin, but
+not emitted with the disambig the call expects.
+
+Resolution candidates:
+- **(a)** Extend `synthesize_upstream_monomorphizations`
+  (`rustc-lang-facade/src/queries/upstream_monomorphization.rs`) to add
+  entries for `<consumer_T as RustTrait>::method` instances that Sky's
+  generic bodies reference. Sky knows the (def_id, args) tuple when its
+  `per_instance_mir` returns the body — capture and synthesize. Mirror of
+  the existing trait-impl synthesis but for Rust impls reached through
+  Sky bodies.
+- **(b)** Add a sixth fork patch that makes user_bin's mono collector
+  re-visit body items referenced by Sky-emitted bodies (so the
+  user_bin's normal mono emits the impl method with its own disambig).
+  Probably larger surface than (a).
+- **(c)** Force `share_generics=true` at user_bin too (via the
+  `LangDriver::config` heuristic) when Sky's machinery is active. Symmetry
+  with the `__lang_stubs` heuristic. Breaks pass-through invariant more
+  broadly than the existing heuristic.
+
+Investigation entry points: `toylangc/tests/integration_projects.rs`
+(search "sibling of B14" — 9 fixtures locked in this finding);
+`rust-interop-architecture.md` §25.2 B14 (the existing release-mode fix
+for the opposite direction);
+`rustc-lang-facade/src/queries/upstream_monomorphization.rs` (the synthesis
+site for path (a)).
+
+### What's still on the table for Thread C
+
+If/when F1 and F2 are resolved, the natural follow-ups for Thread C:
+- **Sky-side `#[inline]` syntax support.** Currently `stub_gen` emits
+  `#[inline(never)]` on every export with no override. Adding a Sky
+  parser-level attribute (e.g. `export #[inline] fn ...`) would unlock
+  Priority B coverage for Sky-top cases (2, 4, 6) — 9 additional fixtures.
+- **Cross-Sky-CGU inlining.** Deferred until Sky partitioning exists.
+- **Cross-rustc-version drift CI fence.** When a nightly bump changes
+  LLVM's inliner thresholds, the matrix may regress. Worth a CI job that
+  reports differences rather than failing hard.
+
+### Original Thread C plan (pre-2026-06-20) — preserved for context
+
+### Current state (pre-shipping)
 
 | Verified | Mechanism |
 |---|---|
@@ -417,6 +604,11 @@ We DON'T currently distinguish:
 | Sky-emitted stubs never MIR-inlined | `architecture_fence.rs` asserts `#[inline(never)]` on stubs in stub_gen output |
 
 That's it. Everything else is hopeful inference.
+
+> **Update (2026-06-20):** the first row was vacuously passing — see F1
+> above. The original `test_lto_smoke` `bl\t` substring check didn't match
+> the `b\t` tail-jump LLVM actually emitted. We've been operating on a
+> false belief.
 
 ### What the user wants
 

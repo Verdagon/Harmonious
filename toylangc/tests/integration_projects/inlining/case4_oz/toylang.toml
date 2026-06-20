@@ -1,0 +1,8 @@
+[project]
+name = "case4_oz"
+source = "main.toylang"
+opt-level = "z"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }
+some_rust_lib = { path = "../../some_rust_lib" }

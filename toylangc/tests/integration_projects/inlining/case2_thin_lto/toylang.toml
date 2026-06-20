@@ -1,0 +1,8 @@
+[project]
+name = "case2_thin_lto"
+source = "main.toylang"
+opt-level = "3"
+lto = "thin"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

@@ -1,0 +1,9 @@
+[project]
+name = "case1b_fat_lto"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "3"
+lto = "fat"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

@@ -202,23 +202,37 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             // rustc's LLVM backend never emits code for them. (Stage 4a/4b
             // retired `CODEGEN_SKIP_HOOK` in favor of this CGU-level filter.)
             //
-            // #[inline(never)] is mandatory on every consumer stub fn for two
-            // reasons:
-            //   (1) Trips `requires_caller_location_or_inline_never` in
-            //       `rustc_middle::ty::instance::Instance::upstream_monomorphization`,
-            //       bypassing the `!share_generics()` early-return that fires
-            //       at -O2/-O3. Without this, the v0 mangler picks
-            //       LOCAL_CRATE as the instantiating-crate disambig at release
-            //       builds, mismatching the stub rlib's emitted Rust
-            //       intermediaries (which baked __lang_stubs as the disambig).
-            //       Symptom without this attribute: undefined-symbol link
-            //       errors at -O>=2.
-            //   (2) Prevents rustc's MIR inliner from pulling the
-            //       `unreachable!()` body cross-crate into Rust callers,
-            //       which would silently substitute a trap for Sky's real
-            //       body when LTO is off.
+            // Historical note (F1 investigation 2026-06-20): this site (and
+            // the wrapper_fn + trait-impl-method sites below) previously
+            // emitted `#[inline(never)]`. The stated rationales were:
+            //   (1) Trip the `!share_generics()` early-return at -O>=2 so
+            //       the v0 mangler picks `__lang_stubs` as the disambig.
+            //   (2) Prevent rustc's MIR inliner from pulling the
+            //       `unreachable!()` body cross-crate into Rust callers.
+            // Both are obsolete under the current architecture:
+            //   (1) Patch 5 (consumer_lang_active query + gated escape in
+            //       Instance::upstream_monomorphization) + the __lang_stubs
+            //       share_generics heuristic close B14 directly. See arch
+            //       §25.2 B14 and §3.2 patch 5.
+            //   (2) Arch §F.1 explicitly calls this concern wrong: the
+            //       LTO inlining race is fixed at the symbol-resolution
+            //       layer via `#![no_builtins]` on the stub rlib (which
+            //       build.rs emits — see §6.2 / §F.3), not at the inliner.
+            // The remaining valid concern (arch §25.2 B12) is a vanilla
+            // Rust crate consuming a Sky stub rlib without the Sky toolchain
+            // — but v1 catches that case via build.rs's SKY_TOOLCHAIN_ACTIVE
+            // check (§21.4) before codegen. The B12 protection acquires
+            // meaning only under v2's opt-in precompiled-bodies feature
+            // (§21.7), which is years away. When that work begins,
+            // re-emit `#[inline(never)]` here (and at the two sites below)
+            // gated on a precompiled-rlib-mode flag.
+            //
+            // Empirical payoff for removing the attribute: Sky's body
+            // inlines into the user_bin's main at thin/fat LTO + -O3,
+            // matching the architecturally-promised "interop is free with
+            // LTO" perf claim. The inlining matrix's
+            // SKY_EXPORT_LTO_INLINING_FINDING markers retire.
             accessor_methods.push(quote! {
-                #[inline(never)]
                 pub fn #field_ident(&self) -> &#field_ty {
                     unreachable!()
                 }
@@ -323,15 +337,17 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         // N=0, producing `pub fn foo(…)` exactly as the prior non-generic
         // branch did.
         //
-        // #[inline(never)] is mandatory; see the accessor emission site
-        // above for the full rationale. Short version: bypasses the
-        // `!share_generics()` early-return in
-        // `Instance::upstream_monomorphization` so the disambig coordination
-        // works at -O2/-O3, AND blocks the MIR inliner from leaking
-        // `unreachable!()` into Rust callers.
+        // No `#[inline(never)]` — see the accessor emission site above
+        // for the full rationale (F1 investigation 2026-06-20). Both
+        // historical reasons are obsolete: patch 5 + the __lang_stubs
+        // share_generics heuristic close B14 (replacing reason 1), and
+        // arch §F.1 says `#[inline(never)]` was never the correct fix
+        // for the LTO inlining race (reason 2). The v2-precompiled-rlib
+        // concern (B12) is gated by build.rs's SKY_TOOLCHAIN_ACTIVE
+        // check in v1; restore the attribute (gated on a mode flag) when
+        // v2 work begins.
         let fn_generics = fn_generics_clause(&toy_fn.type_params);
         let wrapper: syn::Item = parse_quote! {
-            #[inline(never)]
             pub fn #wrapper_ident #fn_generics (#(#user_params),*) -> #ret {
                 unreachable!()
             }
@@ -433,10 +449,9 @@ pub fn generate(registry: &ToylangRegistry) -> String {
                 Some(ty) => resolved_type_to_syn(ty),
                 None => parse_quote!(()),
             };
-            // #[inline(never)] is mandatory; see the accessor emission site
-            // for the full rationale (share_generics gate + MIR inliner leak).
+            // No `#[inline(never)]` — see the accessor emission site
+            // for the full rationale (F1 investigation 2026-06-20).
             parse_quote! {
-                #[inline(never)]
                 fn #m_name(&self, #(#user_params),*) -> #ret {
                     unreachable!()
                 }
