@@ -901,6 +901,12 @@ fn assert_sky_inlined_into_main(project_name: &str) {
 /// Pair<i64,i32>) prove the args-list machinery doesn't assume single-T.
 #[test] fn test_case_generic_impl_block_two_params() { run_integration_project("case_generic_impl_block_two_params"); }
 
+/// Release-mode reproducer for the share_generics gate (HANDOFF doc).
+/// Same shape as case_generic_impl_block but built at opt-level = "3".
+/// Probes Sky's machinery against the gate `Instance::upstream_monomorphization`
+/// short-circuits when `share_generics()` is false at -O2/-O3.
+#[test] fn test_release_mode_smoke() { run_integration_project("release_mode_smoke"); }
+
 #[test] fn test_arithmetic_sub_div() { run_integration_project("arithmetic_sub_div"); }
 #[test] fn test_vec_i32() { run_integration_project("vec_i32"); }
 #[test] fn test_single_field_struct() { run_integration_project("single_field_struct"); }

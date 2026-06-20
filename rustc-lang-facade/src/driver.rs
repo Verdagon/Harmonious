@@ -66,6 +66,47 @@ impl rustc_driver::Callbacks for LangDriver {
         config.make_codegen_backend = Some(Box::new(|_opts, _target| {
             crate::codegen_wrapper::LangCodegenBackend::new()
         }));
+        // Force `share_generics = true` for Sky stub rlib compiles ONLY (crate
+        // name `lang_stubs_*`). At -O>=2, vanilla rustc defaults share-generics
+        // to `false`, which has the side effect of stopping the stub rlib's
+        // cstore metadata from recording cascade-emitted Rust generic monos
+        // (like `duplicate<Wrapper<i32>>`). Downstream user-bin compiles then
+        // see an empty `upstream_monomorphizations_for(duplicate)` map, so
+        // the patch-5 escape clause in `Instance::upstream_monomorphization`
+        // has nothing to consult, the mangler falls back to LOCAL_CRATE
+        // disambig, and link fails. Forcing share-generics ON at the stub
+        // rlib makes its metadata record the entries, downstream lookups
+        // find them, patch 5's escape kicks in, mangler picks `__lang_stubs`
+        // disambig, link succeeds.
+        //
+        // Gated on the toylangc crate-name convention so pure-Rust crates
+        // compiled via this rustc binary see byte-identical behavior to
+        // vanilla. Sky's eventual `skyc` orchestrator will use the same
+        // convention (or set `RUSTFLAGS=-Zshare-generics=yes` explicitly
+        // per-crate via cargo's `target.<triple>.rustflags` mechanism).
+        // Force `share_generics = true` for Sky stub rlib compiles. At
+        // -O>=2, vanilla rustc defaults share-generics to `false`, which
+        // suppresses the stub rlib's cstore metadata from recording the
+        // Rust generic monos the Sky cascade emitted (`duplicate<Wrapper<i32>>`
+        // etc.). Downstream user-bin compiles then find an empty
+        // `upstream_monomorphizations_for(...)` map, so the patch-5 escape
+        // clause in `Instance::upstream_monomorphization` has nothing to
+        // consult, the mangler falls back to LOCAL_CRATE disambig, and
+        // link fails. Forcing share-generics ON at the stub rlib makes
+        // metadata record the entries; downstream lookups find them; the
+        // augmented gate kicks in; mangler picks `__lang_stubs` disambig;
+        // link succeeds.
+        //
+        // Toylangc's convention names the stub rlib crate `__lang_stubs`.
+        // Sky proper will follow the same convention (the conventional
+        // marker is `__SKY_STUBS_MARKER` per arch §4.5/§6.3). Pure-Rust
+        // crates compiled through this rustc binary keep byte-identical
+        // behavior to vanilla because their crate name doesn't match.
+        if config.opts.crate_name.as_deref() == Some("__lang_stubs")
+            && config.opts.unstable_opts.share_generics.is_none()
+        {
+            config.opts.unstable_opts.share_generics = Some(true);
+        }
         // Phase 2 (inline-codegen plan): install the hook that submits
         // consumer-emitted bitcode modules into rustc's optimize → ThinLTO
         // → emission pipeline. Hook is a no-op until the consumer overrides

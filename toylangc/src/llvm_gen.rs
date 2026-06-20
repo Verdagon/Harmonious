@@ -2136,6 +2136,27 @@ pub fn fill_module<'tcx, 'ctx>(
     // LLVM's `functionsHaveCompatibleAttributes` check.
     apply_rust_compat_attributes(&ctx);
 
+    // Pin every Sky-emitted rustc-visible function in `@llvm.compiler.used` so
+    // LLVM's optimize pipeline (GlobalOpt + GlobalDCE) doesn't strip them at
+    // -O>=2. Functions like `<Wrapper<i32> as Clone>::clone` are emitted into
+    // Sky's CGU but referenced only from OTHER compile units (the stub rlib's
+    // `duplicate<Wrapper<i32>>` body calls them via the rustc-mangled name).
+    // Within Sky's CGU there is no user; without `llvm.compiler.used` the
+    // optimizer concludes they are dead and removes them, producing
+    // "Undefined symbols" at link time. The user_bin's `fn main()` references
+    // `__toylang_main` directly (via the bin shim's extern decl), so
+    // `__toylang_main` accidentally survived without this; the clones never
+    // did. Matches rustc's own discipline in `rustc_codegen_llvm::base`'s
+    // `create_used_variable_impl(c"llvm.compiler.used", ..)`. Using the
+    // `.compiler.` variant (vs `llvm.used`) means the linker is free to
+    // dead-strip; only the in-process optimizer is constrained.
+    let pinned: Vec<&str> = fn_items
+        .iter()
+        .filter(|f| f.instance.is_some())
+        .map(|f| f.extern_symbol.as_str())
+        .collect();
+    pin_in_compiler_used(&ctx, &pinned);
+
     let rust_symbols = ctx.rust_symbols.clone();
 
     // Approach B: no bitcode emission, no IR-text round-trip. rustc's
@@ -2231,5 +2252,69 @@ fn apply_rust_compat_attributes<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>) {
 // `codegen_extern_wrapper` pipeline via the synthesized `&self.field`
 // body. LLVM inlines the trivial wrapper at -O1 and above; pre-opt IR
 // carries the extra forwarding call but is bounded (one per field).
+
+/// Append the given function symbols to an `@llvm.compiler.used` array so
+/// LLVM's `GlobalOpt` + `GlobalDCE` passes don't strip them at -O>=2.
+///
+/// Why this is needed: Sky emits rustc-visible bodies (the rustc-mangled
+/// extern symbols for trait-impl methods etc.) into its own CGU. Their only
+/// callers are in OTHER compile units' bitcode (the stub rlib's
+/// `duplicate<Wrapper<T>>` body references `<Wrapper<T> as Clone>::clone`
+/// via the rustc-mangled name). Within Sky's CGU there is no internal use,
+/// so at -O>=2 LLVM's optimizer concludes the symbol is dead and removes
+/// it — even though its linkage is `External`. Sky's emission of
+/// `__toylang_main` survives this only by accident: the user_bin's
+/// auto-generated `fn main() { __toylang_main(); }` shim references it
+/// from inside the same compile unit, so LLVM sees a use.
+///
+/// rustc's own codegen pins symbols the same way; see
+/// `rustc_codegen_llvm::base`'s `create_used_variable_impl(c"llvm.compiler.used", ..)`.
+///
+/// We use `llvm.compiler.used` (not `llvm.used`) so the linker is still free
+/// to dead-strip unreachable globals at link time — only the in-process
+/// optimizer is constrained. This matches rustc's choice for the same
+/// scenario.
+///
+/// Pure declarations (functions with zero basic blocks) are skipped — they
+/// have no body to preserve. The symbol-name match silently no-ops if a
+/// listed name is absent from the module (a defensive guard; every name
+/// passed here should be present by construction).
+fn pin_in_compiler_used<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, names: &[&str]) {
+    use inkwell::module::Linkage;
+    use inkwell::values::BasicValueEnum;
+
+    if names.is_empty() {
+        return;
+    }
+
+    let ptr_ty = ctx.context.ptr_type(inkwell::AddressSpace::default());
+    let mut entries: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(f) = ctx.module.get_function(name) else { continue };
+        if f.count_basic_blocks() == 0 {
+            continue;
+        }
+        entries.push(f.as_global_value().as_pointer_value().into());
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let pointers: Vec<inkwell::values::PointerValue<'ctx>> = entries
+        .into_iter()
+        .map(|v| match v {
+            BasicValueEnum::PointerValue(p) => p,
+            _ => unreachable!("entries are built from as_pointer_value above"),
+        })
+        .collect();
+    let array_ty = ptr_ty.array_type(pointers.len() as u32);
+    let initializer = ptr_ty.const_array(&pointers);
+
+    let global = ctx.module.add_global(array_ty, None, "llvm.compiler.used");
+    global.set_linkage(Linkage::Appending);
+    global.set_section(Some("llvm.metadata"));
+    global.set_initializer(&initializer);
+}
 
 

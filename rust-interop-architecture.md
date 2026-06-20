@@ -717,14 +717,17 @@ The slab-pointer trick (representing comptime Sky values as integer slab address
 
 This is the Approach A constraint inherited from `dep-discovery-approaches.md`'s analysis: when the downstream substitutor (rustc's collector) cannot handle the value type, the upstream substitution (Sky's provider) must do it. Sky's compile-time metaprogramming makes Sky the only entity that can substitute Sky-typed comptime args correctly. Hence per_instance_mir, Instance-keyed.
 
-### 3.2 The four patches
+### 3.2 The five patches
 
-Sky's fork is four patches against vanilla nightly rustc. Three add the
+Sky's fork is five patches against vanilla nightly rustc. Three add the
 `per_instance_mir` query — identical in shape to erw's pre-stage-3
 fork. The fourth (added during toylang's Phase 4.5 / Session 15) adds
 an `extra_modules` hook on `ExtraBackendMethods` for inline codegen
-contribution. None modify rustc's behavior for vanilla compiles
-(default-empty / default-None providers preserve the pass-through
+contribution. The fifth (added during toylang's release-mode disambig
+fix) gates the share-generics escape in `Instance::upstream_monomorphization`
+on a new `consumer_lang_active(())` query whose default returns `false`.
+None modify rustc's behavior for vanilla compiles (default-empty /
+default-None / default-false providers preserve the pass-through
 invariant; see §4.4).
 
 **Patch 1: declare the query.** In `compiler/rustc_middle/src/query/mod.rs`, add a query declaration:
@@ -839,14 +842,69 @@ by construction. The earlier v1 bytes-as-interface shape (which had
 sub-patch) is retired; see §F.15 for the design history and §C.4 for
 the full shipping shape.
 
+**Patch 5: `consumer_lang_active` query + gated share-generics escape
+in `Instance::upstream_monomorphization`.** Three sites in
+`rustc_middle` and `rustc_mir_transform`:
+
+In `compiler/rustc_middle/src/query/mod.rs`, add a query declaration:
+
+```rust
+query consumer_lang_active(_: ()) -> bool {
+    desc { "computing consumer-language plugin activation for the local crate" }
+    cache_on_disk_if { false }
+}
+```
+
+In `compiler/rustc_mir_transform/src/lib.rs`, add the default provider
+(returns `false`):
+
+```rust
+providers.consumer_lang_active = |_tcx, _| false;
+```
+
+In `compiler/rustc_middle/src/ty/instance.rs::Instance::upstream_monomorphization`,
+gate the share-generics escape clause:
+
+```rust
+if !tcx.sess.opts.share_generics()
+    && tcx.codegen_fn_attrs(self.def_id()).inline != InlineAttr::Never
+    && !(tcx.consumer_lang_active(())
+        && match self.def {
+            InstanceKind::Item(def) => tcx
+                .upstream_monomorphizations_for(def)
+                .map(|monos| monos.contains_key(&self.args))
+                .unwrap_or(false),
+            _ => false,
+        })
+{
+    return None;
+}
+```
+
+Net effect: when a consumer-language plugin (Sky / toylang) has
+populated `upstream_monomorphizations_for` with an entry recording
+upstream crate ownership for an Instance, the v0 mangler's share-generics
+gate doesn't short-circuit — it consults the augmented map and picks
+the upstream's instantiating-crate disambig for the downstream call
+site. Without this, -O>=2 builds (where `share_generics()` defaults to
+`false`) silently fall back to LOCAL_CRATE disambig and the symbols
+mismatch at link time. Vanilla rustc behavior is preserved because the
+default provider returns `false`; pure-Rust pass-through compiles via
+Sky's rustc binary also preserve byte-identical behavior because Sky's
+facade-installed provider only returns `true` when an activation marker
+(`__SKY_STUBS_MARKER`) is detected at the local crate root OR among
+loaded extern crates. See §25 risk **B17** for the matching closed
+risk + the toylang `release_mode_smoke` regression fence.
+
 **Total patch surface:** approximately 50 lines for the
 `per_instance_mir` trio + ~100 lines for the `fill_extra_modules`
-hook + allocator trait = ~150 lines across 7 files. Each patch is
-small, structurally local, and follows established patterns in rustc's
-source. The patches collectively add two extension points that rustc's
-existing infrastructure (query macros, collector dispatch, the codegen
-backend trait) already accommodates structurally; the patches just
-connect the dots.
+hook + allocator trait + ~25 lines for the `consumer_lang_active`
+gated escape = ~175 lines across 9 files. Each patch is small,
+structurally local, and follows established patterns in rustc's
+source. The patches collectively add three extension points that
+rustc's existing infrastructure (query macros, collector dispatch, the
+codegen backend trait) already accommodates structurally; the patches
+just connect the dots.
 
 ### 3.3 Long-term: upstream as `adt_const_params`-extension or new query
 
@@ -4283,6 +4341,12 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 **B10 (Sky-specific). LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures.** **CLOSED — irrelevant under Approach B.** The failure trigger was Sky's prior pipeline (build Inkwell module → `write_bitcode_to_memory` → `ModuleLlvm::parse_from_tcx`). Approach B eliminates the serialization step entirely: Sky's IR lands directly in rustc's `LLVMModule`, then rides rustc's optimize → ThinLTO → emission pipeline as just another CGU. No `BitcodeWriter::writeModuleInfo` call happens in Sky's path. The historical IR-text round-trip workaround (formerly `llvm_gen::roundtrip_text_to_bitcode`) was retired in the Phase 4 migration. The upstream LLVM bug remains real but is no longer Sky-blocking; if Sky ever re-introduces a serialize/parse step (e.g. for cross-process module caching), the workaround can be revived from git history.
 
 **B11 (Sky-specific). Round-trip workaround scaling cost unmeasured.** **CLOSED — no round-trip occurs.** B11 was the meta-risk that B10's mitigation might scale poorly. With B10's mitigation retired (no bitcode is written, no IR text is printed, no parse happens), the question of round-trip cost at production scale is moot. The per-build cost contributed by Approach B is whatever Inkwell's direct IR construction already costs — the same path Sky was using to build the in-memory module before the round-trip, minus the round-trip itself. Memory pressure also returns to baseline (no triple-buffered original-module + IR-text + re-parsed-module peak).
+
+**B12 (Sky-specific). MIR inliner cross-crate inlinable leak on Sky export stubs.** **CLOSED architecturally** by the `#[inline(never)]` discipline applied to every Sky export stub in `stub_gen` (originally toylangc commit `82a9c4d`, then promoted to invariant). Generic Sky exports default to `cross_crate_inlinable = true`; rustc's `encoder.rs` exports their `optimized_mir` (the `unreachable!()` body) into rmeta; a downstream Rust crate compiled outside Sky's machinery could in principle inline the `unreachable!()` body into a Rust caller. `#[inline(never)]` makes `cross_crate_inlinable` return false, blocking the export. The same attribute also trips the share-generics escape clause in `Instance::upstream_monomorphization`, which is the same gate the patch-5 escape clause widens — for Sky-OWNED items, Option A's discipline already handles the disambig issue without consulting the patch-5 escape. See §6.6.5 / §26.x INVZ for the discipline.
+
+**B13 (Sky-specific). Sky's emitted rustc-visible symbols stripped by LLVM `GlobalOpt` + `GlobalDCE` at -O>=2.** **CLOSED architecturally** by pinning every Sky-emitted extern wrapper in `@llvm.compiler.used`. The discovery was: at user-bin compile, Sky's emitted `<Wrapper<T> as Clone>::clone` body has no in-module caller (the only references come from the stub rlib's `duplicate<Wrapper<T>>` body, which is in a different compile unit). LLVM's `GlobalOpt` pass internalizes globals with no in-module use, then `GlobalDCE` removes them. Sky's `__toylang_main` accidentally survived this because the user-bin's bin shim (`fn main() { __toylang_main(); }`) provided an in-module reference. The fix is the same `llvm.compiler.used` mechanism rustc uses for its own emissions; see `toylangc/src/llvm_gen.rs::pin_in_compiler_used`. Test fence: `test_release_mode_smoke` (the `release_mode_smoke` fixture at `opt-level = "3"`).
+
+**B14 (Sky-specific). v0 mangler instantiating-crate disambig mismatch at -O>=2 (`share_generics` defaults false).** **CLOSED** by the combination of (a) `consumer_lang_active(())` query + gated escape clause in `Instance::upstream_monomorphization` (rustc fork patch 5; see §3.2 patch 5), (b) forcing `share_generics = true` for Sky stub rlib compiles via `LangDriver::config` heuristic (gated on crate name `__lang_stubs`), and (c) Sky's existing `synthesize_upstream_monomorphizations` augmentation for consumer trait-impl methods plus rustc's default cstore-walk for Rust generic intermediaries (now populated because share-generics is on at the stub rlib). Symptoms before the fix: `cargo build --release` on any toylang/Sky fixture matching `case_generic_impl_block`'s shape (Sky-owned trait impl reached through a Rust generic intermediary) fails at link with undefined symbols mismatching on instantiating-crate disambig (`__lang_stubs` vs the bin's crate name). Pass-through preserved: vanilla rustc default provider returns `false`; pure-Rust crates compiled via Sky's rustc binary that don't match the `__lang_stubs` name and don't load a marker-bearing upstream both see byte-identical behavior to vanilla. Toylang reproducer + fence: `tests/integration_projects/release_mode_smoke/` + `test_release_mode_smoke`.
 
 ### 25.3 Category C: operational invariants
 

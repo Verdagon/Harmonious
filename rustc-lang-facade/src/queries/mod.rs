@@ -65,4 +65,61 @@ pub fn lang_override_queries(
     // synthesised trait-impl entries.
     providers.queries.upstream_monomorphizations =
         upstream_monomorphization::lang_upstream_monomorphizations;
+    // Patch 5 (Sky / release-mode disambig): gate-bypass for the
+    // share-generics escape in `Instance::upstream_monomorphization`. The
+    // forked rustc consults this query before consulting the augmented
+    // `upstream_monomorphizations_for` map. Returns true iff the local
+    // crate carries `__SKY_STUBS_MARKER`, so vanilla rustc AND pure-Rust
+    // pass-through compiles via this rustc binary see byte-identical
+    // behavior to the unpatched gate. See `instance.rs` (rustc fork
+    // patch 5) for the consuming code path.
+    providers.queries.consumer_lang_active = lang_consumer_lang_active;
+}
+
+/// Provider for the `consumer_lang_active` query (forked rustc patch 5).
+/// Returns `true` iff *any* loaded crate (LOCAL_CRATE or any upstream rlib
+/// pulled in via `extern crate`) carries `__SKY_STUBS_MARKER`. This covers
+/// three compile shapes:
+///
+/// - **Stub rlib compile.** LOCAL_CRATE itself is a Sky stub rlib with the
+///   marker → returns `true`. The stub rlib's mangler reads the augmented
+///   gate, picks the right disambig for upstream-monomorphized items.
+///
+/// - **User-bin compile.** LOCAL_CRATE is a plain Rust bin with no marker,
+///   BUT it depends on the Sky stub rlib (which has the marker). Walk
+///   `tcx.crates(())` to find the marker upstream → returns `true`. The
+///   user-bin's mangler then picks the upstream's disambig for the items
+///   the stub rlib emitted.
+///
+/// - **Pure-Rust crate compiled by this rustc binary.** No marker anywhere
+///   → returns `false`. Byte-identical pass-through preserved.
+///
+/// The default query provider returns `false`, so vanilla rustc never sees
+/// `true`. The facade installs this override on every compile.
+pub fn lang_consumer_lang_active<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    _: (),
+) -> bool {
+    use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE};
+    // Local crate first (covers stub rlib compiles).
+    if crate::is_from_lang_stubs(tcx, CRATE_DEF_ID.to_def_id()) {
+        return true;
+    }
+    // Walk upstream crates (covers user-bin and Sky-lib consumer compiles).
+    // `tcx.crates(())` returns every loaded extern crate, transitive deps
+    // included; for each, `is_from_lang_stubs` consults the cached marker
+    // check.
+    for &cnum in tcx.crates(()).iter() {
+        if cnum == LOCAL_CRATE {
+            continue;
+        }
+        // Construct a synthetic DefId for the crate root.
+        if crate::is_from_lang_stubs(
+            tcx,
+            rustc_hir::def_id::DefId { krate: cnum, index: rustc_hir::def_id::CRATE_DEF_INDEX },
+        ) {
+            return true;
+        }
+    }
+    false
 }
