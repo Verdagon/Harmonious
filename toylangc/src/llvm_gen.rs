@@ -2136,26 +2136,43 @@ pub fn fill_module<'tcx, 'ctx>(
     // LLVM's `functionsHaveCompatibleAttributes` check.
     apply_rust_compat_attributes(&ctx);
 
-    // Pin every Sky-emitted rustc-visible function in `@llvm.compiler.used` so
-    // LLVM's optimize pipeline (GlobalOpt + GlobalDCE) doesn't strip them at
-    // -O>=2. Functions like `<Wrapper<i32> as Clone>::clone` are emitted into
-    // Sky's CGU but referenced only from OTHER compile units (the stub rlib's
-    // `duplicate<Wrapper<i32>>` body calls them via the rustc-mangled name).
-    // Within Sky's CGU there is no user; without `llvm.compiler.used` the
-    // optimizer concludes they are dead and removes them, producing
-    // "Undefined symbols" at link time. The user_bin's `fn main()` references
-    // `__toylang_main` directly (via the bin shim's extern decl), so
-    // `__toylang_main` accidentally survived without this; the clones never
-    // did. Matches rustc's own discipline in `rustc_codegen_llvm::base`'s
-    // `create_used_variable_impl(c"llvm.compiler.used", ..)`. Using the
-    // `.compiler.` variant (vs `llvm.used`) means the linker is free to
-    // dead-strip; only the in-process optimizer is constrained.
+    // Pin every Sky-emitted rustc-visible function in `@llvm.used` so
+    // BOTH the in-process optimize pipeline AND the LTO internalize pass
+    // preserve them at -O>=2.
+    //
+    // Functions like `<Wrapper<i32> as Clone>::clone` are emitted into
+    // Sky's CGU but referenced only from OTHER compile units (the stub
+    // rlib's `duplicate<Wrapper<i32>>` body calls them via the rustc-
+    // mangled name). Within Sky's CGU there is no in-module caller.
+    //
+    // Three relevant LLVM passes try to remove or rewrite these:
+    //   1. `GlobalOpt`/`GlobalDCE` (non-LTO and LTO pre-merge): would
+    //      mark the function dead and remove it.
+    //   2. LTO `internalize`: would change `External` linkage to
+    //      `Internal` because no callers in the merged module reach it.
+    //   3. Linker dead-strip (-Wl,-dead_strip on macOS): would remove
+    //      the symbol entirely from the final binary.
+    //
+    // `@llvm.used` defeats all three. The earlier `@llvm.compiler.used`
+    // variant only defeats (1) — at non-LTO that was sufficient (no LTO
+    // internalize, no merge), but under fat LTO (2) ran and silently
+    // turned the symbol into a local definition. The stub rlib's
+    // external reference then went unresolved at the linker step.
+    //
+    // The cost of `llvm.used` over `llvm.compiler.used` is that the
+    // linker no longer dead-strips these symbols even when truly dead.
+    // For Sky's case the symbols are by construction reachable from
+    // other compile units (the entire point of emitting them is for
+    // cross-crate calls), so the linker would have kept them anyway.
+    // See rust-interop-architecture.md §25.2 B15 for the fat-LTO
+    // regression that motivated this; non-LTO and ThinLTO behave the
+    // same as before.
     let pinned: Vec<&str> = fn_items
         .iter()
         .filter(|f| f.instance.is_some())
         .map(|f| f.extern_symbol.as_str())
         .collect();
-    pin_in_compiler_used(&ctx, &pinned);
+    pin_in_llvm_used(&ctx, &pinned);
 
     let rust_symbols = ctx.rust_symbols.clone();
 
@@ -2253,33 +2270,40 @@ fn apply_rust_compat_attributes<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>) {
 // body. LLVM inlines the trivial wrapper at -O1 and above; pre-opt IR
 // carries the extra forwarding call but is bounded (one per field).
 
-/// Append the given function symbols to an `@llvm.compiler.used` array so
-/// LLVM's `GlobalOpt` + `GlobalDCE` passes don't strip them at -O>=2.
+/// Append the given function symbols to an `@llvm.used` array so LLVM's
+/// `GlobalOpt`/`GlobalDCE`, LTO `internalize`, and linker `-dead_strip`
+/// passes all preserve them, AND preserve their original linkage.
 ///
 /// Why this is needed: Sky emits rustc-visible bodies (the rustc-mangled
 /// extern symbols for trait-impl methods etc.) into its own CGU. Their only
 /// callers are in OTHER compile units' bitcode (the stub rlib's
 /// `duplicate<Wrapper<T>>` body references `<Wrapper<T> as Clone>::clone`
-/// via the rustc-mangled name). Within Sky's CGU there is no internal use,
-/// so at -O>=2 LLVM's optimizer concludes the symbol is dead and removes
-/// it — even though its linkage is `External`. Sky's emission of
-/// `__toylang_main` survives this only by accident: the user_bin's
-/// auto-generated `fn main() { __toylang_main(); }` shim references it
-/// from inside the same compile unit, so LLVM sees a use.
+/// via the rustc-mangled name). Within Sky's CGU there is no internal use.
 ///
-/// rustc's own codegen pins symbols the same way; see
-/// `rustc_codegen_llvm::base`'s `create_used_variable_impl(c"llvm.compiler.used", ..)`.
+/// Three relevant LLVM passes try to remove or rewrite these symbols:
+///   1. `GlobalOpt`/`GlobalDCE` at -O>=2 (non-LTO + LTO pre-merge).
+///   2. LTO `internalize`: changes External to Internal linkage when no
+///      callers in the merged module reach it (which would silently
+///      break cross-crate calls from the stub rlib).
+///   3. Linker dead-strip (`-Wl,-dead_strip` on macOS) at final link.
 ///
-/// We use `llvm.compiler.used` (not `llvm.used`) so the linker is still free
-/// to dead-strip unreachable globals at link time — only the in-process
-/// optimizer is constrained. This matches rustc's choice for the same
-/// scenario.
+/// `@llvm.used` defeats all three: passes (1) and (2) treat its entries
+/// as "must preserve including linkage"; the linker treats them as
+/// gc-roots. The weaker `@llvm.compiler.used` variant defeats only
+/// (1) — non-LTO and ThinLTO survive on it, but fat LTO trips (2)
+/// and the symbol becomes Local in the final `.o`, breaking the cross-
+/// crate reference at link time. Toylang's `opt_level_3_fat_lto_smoke`
+/// surfaced this empirically; see rust-interop-architecture.md §25.2 B15.
 ///
-/// Pure declarations (functions with zero basic blocks) are skipped — they
-/// have no body to preserve. The symbol-name match silently no-ops if a
-/// listed name is absent from the module (a defensive guard; every name
-/// passed here should be present by construction).
-fn pin_in_compiler_used<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, names: &[&str]) {
+/// Cost trade-off: linker no longer dead-strips these even when dead.
+/// For Sky's case the entries are by construction cross-crate-callable
+/// (the whole reason to emit them); the linker would have kept them
+/// anyway, so the trade is essentially free in practice.
+///
+/// Pure declarations (zero basic blocks) are skipped — they have no
+/// body to preserve. Missing-name lookups silently no-op as a defensive
+/// guard; by construction every listed name is present in the module.
+fn pin_in_llvm_used<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, names: &[&str]) {
     use inkwell::module::Linkage;
     use inkwell::values::BasicValueEnum;
 
@@ -2311,7 +2335,7 @@ fn pin_in_compiler_used<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, names: &[&str]) {
     let array_ty = ptr_ty.array_type(pointers.len() as u32);
     let initializer = ptr_ty.const_array(&pointers);
 
-    let global = ctx.module.add_global(array_ty, None, "llvm.compiler.used");
+    let global = ctx.module.add_global(array_ty, None, "llvm.used");
     global.set_linkage(Linkage::Appending);
     global.set_section(Some("llvm.metadata"));
     global.set_initializer(&initializer);

@@ -912,20 +912,14 @@ fn assert_sky_inlined_into_main(project_name: &str) {
 /// -O3 but not -O2 (or vice versa), this catches the asymmetry.
 #[test] fn test_opt_level_2_smoke() { run_integration_project("opt_level_2_smoke"); }
 
-/// Release-mode coverage at opt-level = "3" + lto = "fat". Fat LTO uses a
-/// different bitcode path through rustc's pipeline than ThinLTO; this
-/// fixture catches DCE / linkage interactions specific to fat-LTO's
-/// merged-module pass.
-///
-/// CURRENTLY FAILING: fat LTO drops Sky's emitted clone bodies despite
-/// the `@llvm.compiler.used` pin. The undefined-symbol error references
-/// `<Wrapper<i32> as Clone>::clone` from inside the stub rlib's body,
-/// with the correct `__lang_stubs` disambig (so the mangler chain is
-/// intact). Something in fat-LTO's bitcode-merge or internalize pipeline
-/// strips Sky's emission. Investigation pending. Tracking arch §25.2
-/// (would become B15).
-#[test] #[ignore = "fat LTO drops Sky's clone emission despite llvm.compiler.used; tracked as future B15"]
-fn test_opt_level_3_fat_lto_smoke() { run_integration_project("opt_level_3_fat_lto_smoke"); }
+/// Release-mode coverage at opt-level = "3" + lto = "fat". Fat LTO's
+/// `internalize` pass changes External linkage to Internal when no
+/// in-module callers reach a symbol, which silently broke cross-crate
+/// references from the stub rlib's body to Sky's emitted clone. Fixed
+/// by switching `pin_in_llvm_used` from `@llvm.compiler.used` (which
+/// only blocks DCE) to `@llvm.used` (which also blocks internalize +
+/// linker dead-strip). See arch §25.2 B15 + llvm_gen.rs's docs.
+#[test] fn test_opt_level_3_fat_lto_smoke() { run_integration_project("opt_level_3_fat_lto_smoke"); }
 
 /// Release-mode coverage at opt-level = "3" + codegen-units = 1. Forces
 /// all bodies into a single rustc CGU instead of the default split; the
