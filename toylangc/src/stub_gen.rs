@@ -201,7 +201,24 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             // override filters these accessor items out of the CGU slice so
             // rustc's LLVM backend never emits code for them. (Stage 4a/4b
             // retired `CODEGEN_SKIP_HOOK` in favor of this CGU-level filter.)
+            //
+            // #[inline(never)] is mandatory on every consumer stub fn for two
+            // reasons:
+            //   (1) Trips `requires_caller_location_or_inline_never` in
+            //       `rustc_middle::ty::instance::Instance::upstream_monomorphization`,
+            //       bypassing the `!share_generics()` early-return that fires
+            //       at -O2/-O3. Without this, the v0 mangler picks
+            //       LOCAL_CRATE as the instantiating-crate disambig at release
+            //       builds, mismatching the stub rlib's emitted Rust
+            //       intermediaries (which baked __lang_stubs as the disambig).
+            //       Symptom without this attribute: undefined-symbol link
+            //       errors at -O>=2.
+            //   (2) Prevents rustc's MIR inliner from pulling the
+            //       `unreachable!()` body cross-crate into Rust callers,
+            //       which would silently substitute a trap for Sky's real
+            //       body when LTO is off.
             accessor_methods.push(quote! {
+                #[inline(never)]
                 pub fn #field_ident(&self) -> &#field_ty {
                     unreachable!()
                 }
@@ -305,8 +322,16 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         // params is the degenerate case — `fn_generics_clause` is empty for
         // N=0, producing `pub fn foo(…)` exactly as the prior non-generic
         // branch did.
+        //
+        // #[inline(never)] is mandatory; see the accessor emission site
+        // above for the full rationale. Short version: bypasses the
+        // `!share_generics()` early-return in
+        // `Instance::upstream_monomorphization` so the disambig coordination
+        // works at -O2/-O3, AND blocks the MIR inliner from leaking
+        // `unreachable!()` into Rust callers.
         let fn_generics = fn_generics_clause(&toy_fn.type_params);
         let wrapper: syn::Item = parse_quote! {
+            #[inline(never)]
             pub fn #wrapper_ident #fn_generics (#(#user_params),*) -> #ret {
                 unreachable!()
             }
@@ -408,7 +433,10 @@ pub fn generate(registry: &ToylangRegistry) -> String {
                 Some(ty) => resolved_type_to_syn(ty),
                 None => parse_quote!(()),
             };
+            // #[inline(never)] is mandatory; see the accessor emission site
+            // for the full rationale (share_generics gate + MIR inliner leak).
             parse_quote! {
+                #[inline(never)]
                 fn #m_name(&self, #(#user_params),*) -> #ret {
                     unreachable!()
                 }
