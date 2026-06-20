@@ -1727,7 +1727,7 @@ fn test_s5_sidecar_determinism() {
 #[test] fn test_tg_of_toypoint_layout() { run_integration_project_check_build_stderr("tg_of_toypoint_layout"); }
 
 // ============================================================================
-// Inlining matrix — see HANDOFF-discovery-synthesis-share-generics-inlining.md
+// Inlining matrix — see handoff.md
 // Thread C. Validates Sky's user-visible perf promise that cross-language
 // boundaries inline at -O3 under LTO. Built on the shared
 // `inlining_harness` module.
@@ -2061,7 +2061,7 @@ fn assert_sky_branch_present_in_main(project: &str) {
 // caller to annotate, and Sky source doesn't support `#[inline]`.
 // Closing this gap is its own thread (extend Sky frontend to honor
 // `#[inline]` attributes; see the open thread in
-// HANDOFF-discovery-synthesis-share-generics-inlining.md).
+// handoff.md).
 //
 // Cases 3 and 5 inherit the release-mode disambig bug from Priority
 // A; their Priority B fixtures are also `#[ignore]`d under the

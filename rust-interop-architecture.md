@@ -4,8 +4,6 @@ This is the master design document for Sky's compiler architecture as it relates
 
 The architecture is deliberately opinionated. Where decisions have been made, this document states them as decisions; where alternatives were considered and rejected, the rejection is recorded with reasoning so a future reader can re-open the question with full context. The default reading posture is "Sky is committed to these decisions — change them only with deliberate cause."
 
-The companion artifact is the conversation log at `rust-interop-design-convo-log.md`, which contains the live derivation of every decision in this doc. When this document is unclear or appears to have skipped a step, the conversation log is the canonical source for the reasoning.
-
 ---
 
 ## Documents This References
@@ -16,7 +14,6 @@ This document is self-contained at the architectural level; it does not require 
 
 | Document | Path | Used where | Purpose |
 |---|---|---|---|
-| `rust-interop-design-convo-log.md` | repo root | preamble, §0, closing | Full conversation log that produced every locked decision in this document. The canonical source for "why was this decision made." |
 | `docs/usage/` | erw docs tree | §0.1 | Future Sky user-facing documentation. This document is the source-of-truth for what `docs/usage/` will eventually cover. |
 
 ### Inherited reasoning from erw (`rustc-lang-facade`)
@@ -6375,7 +6372,7 @@ all), then retired cleanly when Approach B landed.
 
 This is the master design document for Sky's compiler & Rust interop architecture. Total length: ~30 chapters, 6 appendices, approximately 100 pages.
 
-The decisions herein are the product of a long design conversation. The conversation log at `rust-interop-design-convo-log.md` is the canonical source for the reasoning behind each decision. When this document is unclear or appears to skip a step, the conversation log is the authoritative companion.
+The decisions herein are the product of a long design conversation, archived in commit history and across the `course-correct.md` / `future-architecture-investigations.md` summaries kept at the repo root.
 
 The implementation of Sky's compiler is anticipated to take 50-80 weeks for a focused engineer. The phasing in Section 28 lays out the recommended order. Sky 1.0 is targeted as the first stable release; pre-1.0 versions are pre-release with breaking changes allowed between minor versions.
 

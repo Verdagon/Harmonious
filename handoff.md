@@ -922,5 +922,45 @@ plus possibly new arcana entries if surprising patterns emerge).
 
 ---
 
+## Long-tail items inherited from `course-correct.md`
+
+`course-correct.md` (kept at repo root for the 20+ code-comment
+references like `course-correct.md item #N`) tracked 18 numbered
+"wrong-track patterns" that erw needed to flip to align with Sky's
+architecture. **16 of 18 are DONE.** Folding the two remaining items
+here so they're visible alongside the active threads:
+
+### Item #10 (PARTIAL) — `collect_generic_rust_deps` Instance-keyed body
+
+**Current state.** `collect_generic_rust_deps(LocalDefId) → Vec<(DefId, args-with-Params)>` was migrated to Instance-keyed input + Sky-side substitution per Approach A (commit-time documented at course-correct.md). The primary single-crate path landed. The cross-crate **effective-registry merging** (so a user_bin's compile can resolve Sky deps reaching across multiple Sky libs without each lib re-discovering independently) was deferred — labeled "E.5-style threading" in the course-correct snapshot.
+
+**Why it matters.** Today every Sky-active compile re-derives its dep registry from sidecars + local Temputs. For larger Sky projects with several Sky libs in the build graph, this is O(n²)-ish in the worst case. Effective-registry merging at the facade level would cache a merged universe across libs in a single compile.
+
+**Cost.** Not yet investigated rigorously. Probably ~1 day to design + implement, dependent on whether Sky proper or toylang is the driver.
+
+**Status under post-F1/F2 architecture.** Lower priority than it was — Sky's compile times haven't been a user pain point and the matrix work and F2 fix didn't surface this as a bottleneck. Keep on the list but not top-of-stack.
+
+### Item #13 (REMAINING) — wrapper-mode retirement
+
+**Current state.** toylangc still uses `RUSTC_WORKSPACE_WRAPPER` wrapper mode (`@MRRIWMZ` arcanum). At cargo invocation, toylangc's binary intercepts as the rustc wrapper, parses argv, re-reads `toylang.toml`, and dispatches to either a real rustc compile or its own driver. The arch doc explicitly calls this arcanum out as "one of two erw arcana with no Sky analog" because Sky's `rustc` is the forked rustc statically linked with the backend (§4.1) and is invoked directly by cargo via `rust-toolchain.toml`.
+
+**Why it persists.** The wrapper-mode dispatch is convenient for toylang because it lets the same binary play both "skyc orchestrator" and "rustc with consumer machinery" roles. Sky proper's distribution model splits these into two separate binaries (`skyc` + `rustc` — see arch §4.2). Until Sky proper's toolchain distribution is real, toylang has no place for the split.
+
+**Cost.** Significant restructuring of `toylangc/src/main.rs` (lines 39-55, 82-155 per the course-correct entry) — split the wrapper-mode dispatch and the orchestrator's argv handling. Probably ~2-3 days. Best done bundled with Sky's actual toolchain shipping work, since the split has to match Sky's distribution shape.
+
+**Status.** Deferred until Sky proper's toolchain phase begins. Operationally this is fine because the wrapper mode works; it's architecturally wrong-shape but functionally correct.
+
+### Other "what's NOT on the wrong track" items
+
+For completeness, the course-correct doc also documented patterns that were *direction-correct* but needed content changes — all subsequently landed:
+- `queries/layout.rs` opaque-with-size shape
+- `queries/drop_glue.rs` InstanceKind::DropGlue → synthetic body
+- `queries/upstream_monomorphizations_for.rs` force-local-mono
+- `abi_helpers.rs`, `mir_helpers.rs` inherited wholesale per §26.5–26.6
+
+If a future session is auditing the facade for cleanup opportunities, these four files were declared "right shape, content may evolve" — historically the boundary of what was actively re-architected.
+
+---
+
 — Previous engineer, via Claude Opus 4.7 (1M context),
   Claude-Session: https://claude.ai/code/session_014jTbwcznQUd4i89tbLMdAa
