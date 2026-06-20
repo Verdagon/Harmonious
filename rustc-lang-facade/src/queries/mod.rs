@@ -26,6 +26,7 @@
 //! `partition` removes consumer items from rustc's CGU slice before codegen
 //! dispatch sees them.
 
+pub mod cross_crate_inlinable;
 pub mod drop_glue;
 pub mod layout;
 pub mod partition;
@@ -52,6 +53,8 @@ pub fn lang_override_queries(
         providers.queries.collect_and_partition_mono_items,
         providers.queries.upstream_monomorphizations_for,
         providers.queries.upstream_monomorphizations,
+        providers.queries.cross_crate_inlinable,
+        providers.extern_queries.cross_crate_inlinable,
     );
 
     providers.queries.layout_of        = layout::lang_layout_of;
@@ -61,6 +64,16 @@ pub fn lang_override_queries(
     providers.queries.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
     providers.queries.upstream_monomorphizations_for =
         upstream_monomorphization::lang_upstream_monomorphizations_for;
+    // F2 fix (2026-06-20): force `cross_crate_inlinable` to false in
+    // Sky-active compiles so rustc emits real .o symbols rather than
+    // `available_externally` declarations. Sky's emitted call sites
+    // reference these symbols via direct LLVM calls and can't inline
+    // through rustc's IR-side inliner. See the override file for the
+    // full rationale.
+    providers.queries.cross_crate_inlinable =
+        cross_crate_inlinable::lang_cross_crate_inlinable;
+    providers.extern_queries.cross_crate_inlinable =
+        cross_crate_inlinable::lang_extern_cross_crate_inlinable;
     // Step 5: augment rustc's default-built whole-map with consumer
     // synthesised trait-impl entries.
     providers.queries.upstream_monomorphizations =

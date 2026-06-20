@@ -481,6 +481,10 @@ static DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR:
     OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsForFn> = OnceLock::new();
 static DEFAULT_UPSTREAM_MONOMORPHIZATIONS:
     OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsFn> = OnceLock::new();
+static DEFAULT_CROSS_CRATE_INLINABLE:
+    OnceLock<queries::cross_crate_inlinable::CrossCrateInlinableFn> = OnceLock::new();
+static DEFAULT_EXTERN_CROSS_CRATE_INLINABLE:
+    OnceLock<queries::cross_crate_inlinable::ExternCrossCrateInlinableFn> = OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<Box<dyn Any + Send + Sync>>> = OnceLock::new();
@@ -1121,6 +1125,10 @@ pub(crate) fn install_query_defaults(
         queries::upstream_monomorphization::UpstreamMonomorphizationsForFn,
     upstream_monomorphizations:
         queries::upstream_monomorphization::UpstreamMonomorphizationsFn,
+    cross_crate_inlinable:
+        queries::cross_crate_inlinable::CrossCrateInlinableFn,
+    extern_cross_crate_inlinable:
+        queries::cross_crate_inlinable::ExternCrossCrateInlinableFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
@@ -1128,6 +1136,23 @@ pub(crate) fn install_query_defaults(
     let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
     let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR.set(upstream_monomorphizations_for);
     let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS.set(upstream_monomorphizations);
+    let _ = DEFAULT_CROSS_CRATE_INLINABLE.set(cross_crate_inlinable);
+    let _ = DEFAULT_EXTERN_CROSS_CRATE_INLINABLE.set(extern_cross_crate_inlinable);
+}
+
+/// Accessor for the saved upstream `cross_crate_inlinable` provider.
+/// Used by the override to delegate when Sky machinery is dormant.
+pub fn default_cross_crate_inlinable() -> queries::cross_crate_inlinable::CrossCrateInlinableFn {
+    *DEFAULT_CROSS_CRATE_INLINABLE.get()
+        .expect("default_cross_crate_inlinable: not installed yet")
+}
+
+/// Accessor for the saved upstream extern `cross_crate_inlinable` provider.
+pub fn default_extern_cross_crate_inlinable()
+    -> queries::cross_crate_inlinable::ExternCrossCrateInlinableFn
+{
+    *DEFAULT_EXTERN_CROSS_CRATE_INLINABLE.get()
+        .expect("default_extern_cross_crate_inlinable: not installed yet")
 }
 
 #[cfg(test)]

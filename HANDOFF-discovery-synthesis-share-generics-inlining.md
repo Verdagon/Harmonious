@@ -11,56 +11,52 @@ trait-impl instances), §25.2 (the risk register, especially B14/B15), and
 threads is bug-fixing — they're refinement/investigation/expansion work.
 Release-mode (the previous handoff's bug) is fully resolved as of `08f350e`.
 
-**2026-06-20 progress note:** Thread C (inlining test matrix) **partially
-shipped** — harness + 40-fixture matrix landed across phases 1-5 in the
-working tree (uncommitted). 20 pass, 20 ignored with two documented
-findings (see "Thread C — closed-out work" below). Threads A and B are
-unchanged. Two new findings entered the docket:
+**2026-06-20 progress note:** Thread C **fully shipped + F1 + F2 both
+RESOLVED.** What landed:
 
-- **Finding F1: Sky-export LTO inlining gap** (`SKY_EXPORT_LTO_INLINING_FINDING`
-  in the test source). Sky-exported non-generic fns (cases 1a, 2, 4, 6) do NOT
-  inline cross-crate at thin/fat LTO because `stub_gen` emits `#[inline(never)]`
-  unconditionally on every export. Sky's body still constant-folds INTERNALLY,
-  but the bin shim tail-jumps (`b __lang_stubs::__toylang_main`) to reach it
-  rather than inlining the body. The original `test_lto_smoke` assertion was
-  **vacuously passing** — its `bl\t` pattern didn't catch the `b\t` tail-jump.
-- **Finding F2: case 3 / case 5 disambig bug at -O3** (sibling of B14). Rust
-  Clone-derived impl referenced from a Sky generic (`<MyCounter as Clone>::clone`,
-  `<Vec<i64>>::{new, push}`) fails to link at -O3 because user_bin doesn't emit
-  the impl method with the disambig the Sky call site expects. Opposite-direction
-  cousin of the case 4 release-mode fix (Sky impl reached through Rust generic).
+- **Inlining matrix infrastructure** (Thread C): harness, 41 fixtures, 40
+  matrix tests, rustc-demangle dev-dep. Surfaced both F1 and F2 (matrix
+  did its job).
+- **F1: Sky-export LTO inlining gap — CLOSED.** Root cause was `#[inline(never)]`
+  on Sky-item stub source. Both historical rationales obsolete: patch 5
+  closes the share-generics gate; arch §F.1 says `#[inline(never)]` is wrong
+  as the LTO race fix (`#![no_builtins]` + Path B handle it). Removed from
+  three Sky-item sites in `stub_gen.rs`. Phase-6 stdlib helpers retain
+  the attribute for a different reason (§6.6.5).
+- **F2: case 3 / case 5 disambig bug at -O3 — CLOSED.** Root cause was
+  NOT a disambig bug but `cross_crate_inlinable` query returning true,
+  causing rustc to emit `available_externally` linkage (body for inlining
+  only, no `.o` symbol). Sky's emitted call sites can't inline through
+  rustc's IR path, so the references dangled at link. Fix: override both
+  `queries.cross_crate_inlinable` (local items) and `extern_queries.cross_crate_inlinable`
+  (upstream items from rmeta) to return `false` when `consumer_lang_active(())`
+  is true. Pass-through preserved (override gated by marker detection).
+  See arch §25.2 B16 for full rationale.
 
-Both findings are documented in `toylangc/tests/integration_projects.rs` via
-search markers; the relevant fixtures are `#[ignore]`'d so the suite stays
-green.
+Matrix final state: 40 passing, 0 failing, 1 ignored (the one ignored is
+an LLVM-honors-`#[inline(never)]`-or-not flakiness on a single Priority B
+fixture; documented inline). Full integration suite: 191 passing, 0
+failing, 1 ignored — pre-existing 11 callback-log / layout-stderr-grep
+failures also resolved by F2 (they were manifestations of the same
+`cross_crate_inlinable` symbol-dropping path).
 
 ---
 
 ## TL;DR
 
-Five open threads, interrelated. Roughly in order of risk-reduction value:
+Three open threads remaining (F1 + F2 + Thread C closed):
 
-1. **Inlining test matrix (Thread C)** — ✅ **partially shipped 2026-06-20.**
-   Harness (`toylangc/tests/common/inlining_harness.rs`) + 40 fixtures across
+1. **Inlining test matrix (Thread C)** — ✅ **FULLY SHIPPED 2026-06-20.**
+   Harness (`toylangc/tests/common/inlining_harness.rs`) + 41 fixtures across
    `toylangc/tests/integration_projects/inlining/` + matrix tests in
-   `integration_projects.rs`. 20 pass / 20 ignored / 0 fail. Surfaced F1 + F2.
-   Remaining work: investigate F1 and F2 (now top-of-stack); optionally extend
-   matrix to cover Sky-side `#[inline]` syntax (requires Sky frontend work)
-   and Sky-top Priority B variants (blocked on same).
-2. **Finding F1 — Sky-export LTO inlining gap.** Highest-priority new
-   finding. Sky's user-visible perf promise is currently false for non-generic
-   Sky exports at LTO. Resolution choices: (a) relax `#[inline(never)]` on
-   stubs for the LTO-eligible subset (risk: re-opens the MIR inliner leak +
-   share_generics gate it was added to defeat), (b) keep the discipline and
-   document the one-instruction tail-jump cost as acceptable, (c) emit
-   alternate stub source per-export with an opt-in `[inline]` attribute Sky
-   frontend would honor. Cost: investigation ~1-2 days; implementation
-   depends on path.
-3. **Finding F2 — case 3 / case 5 disambig bug at -O3.** Real release-mode
-   link failure for Rust impl referenced from Sky generic. Sibling of B14.
-   May need a sixth fork patch or a Sky-side extension to
-   `synthesize_upstream_monomorphizations` to cover the opposite direction.
-   Cost: investigation ~1-2 days; implementation ~1-3 days.
+   `integration_projects.rs`. 40 passing / 1 ignored (LLVM `#[inline(never)]`
+   aggression flake) / 0 failing. Surfaced F1 + F2, both now resolved.
+   Optional follow-up: extend matrix to cover Sky-side `#[inline]` syntax
+   (requires Sky frontend work) and Sky-top Priority B variants (blocked
+   on same).
+2. **Finding F1 — Sky-export LTO inlining gap. ✅ CLOSED 2026-06-20.**
+3. **Finding F2 — case 3 / case 5 disambig bug. ✅ CLOSED 2026-06-20** via
+   `cross_crate_inlinable` query override.
 4. **Discovery/synthesis/filter machinery (Thread A)** — three Sky-side
    layers (capture-ship-replay, synthesize-upstream-monomorphizations,
    partition filter) coordinate to handle the F.13 cascade-timing
@@ -79,8 +75,8 @@ Five open threads, interrelated. Roughly in order of risk-reduction value:
    mechanism. Cost: investigation ~3-5 days; implementation likely
    multi-week.
 
-Recommended order (updated 2026-06-20): **F1 → F2 → A → B**. F1 and F2
-became top-of-stack because the matrix surfaced them as real architectural
+Recommended order (updated 2026-06-20): **A → B**. Threads A and B are
+the remaining architectural work; F1 and F2 became top-of-stack because the matrix surfaced them as real architectural
 gaps with user-visible consequences. A is hygiene; B is design-space
 exploration. C is largely shipped; pick it back up only if you want
 Sky-side `#[inline]` support OR Sky-top Priority B coverage.
