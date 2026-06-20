@@ -273,6 +273,12 @@ fn run_integration_project_check_callbacks(
             .env("LD_LIBRARY_PATH", sysroot_lib())
             .env("CARGO_TARGET_DIR", &cargo_target)
             .env("TOYLANG_LOG_PATH", &log_path)
+            // Disable incremental cache — these tests assert on Sky's
+            // callback firings (which go through rustc's per_instance_mir
+            // query). On a warm cache, rustc replays the query result
+            // from disk without invoking Sky's provider, leaving the
+            // log empty. Cold-cache builds reliably fire the callback.
+            .env("CARGO_INCREMENTAL", "0")
             .args(["build"])
             .output()
             .expect("failed to spawn toylangc")
@@ -376,6 +382,11 @@ fn collect_generic_rust_deps_firings(name: &str) -> Vec<(String, String)> {
             .env("LD_LIBRARY_PATH", sysroot_lib())
             .env("CARGO_TARGET_DIR", &cargo_target)
             .env("TOYLANG_LOG_PATH", &log_path)
+            // Disable incremental cache — see the explanation in
+            // `run_integration_project_check_callbacks`. Warm cache
+            // replays `per_instance_mir` from disk, skipping Sky's
+            // provider; cold-cache builds reliably fire the callback.
+            .env("CARGO_INCREMENTAL", "0")
             .args(["build"])
             .output()
             .expect("failed to spawn toylangc")
@@ -477,6 +488,13 @@ fn run_integration_project_check_build_stderr(name: &str) {
             .env("DYLD_LIBRARY_PATH", sysroot_lib())
             .env("LD_LIBRARY_PATH", sysroot_lib())
             .env("CARGO_TARGET_DIR", &cargo_target)
+            // Disable incremental cache — these tests assert on the
+            // `layout_of intercepted for: <Type>` eprintln emitted by
+            // Sky's `lang_layout_of` query override. On a warm cache,
+            // rustc replays the layout_of query result from disk without
+            // invoking Sky's provider, leaving the message absent from
+            // stderr. Cold-cache builds reliably fire the print.
+            .env("CARGO_INCREMENTAL", "0")
             .args(["build"])
             .output()
             .expect("failed to spawn toylangc")
