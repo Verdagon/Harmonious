@@ -79,3 +79,84 @@ fn no_unmarked_type_params_branch_in_discovery() {
         violations.join("\n  ")
     );
 }
+
+/// F1 protection fence (2026-06-20).
+///
+/// The F1 investigation removed `#[inline(never)]` from three Sky-item
+/// emission sites in `stub_gen.rs`: accessor methods, wrapper functions,
+/// and trait-impl methods. The attribute was historically attached to
+/// every Sky-item stub but its protections turned out to be obsolete
+/// (patch 5 closes the share-generics gate; arch §F.1 says it's the
+/// wrong layer for the LTO race fix; B12's vanilla-rustc concern is
+/// gated by build.rs in v1). Empirical: with the attribute present,
+/// Sky-export bodies didn't inline cross-crate at LTO — visible as
+/// `b __lang_stubs::__toylang_main` tail-jumps in user_bin's main.
+///
+/// This fence asserts that `stub_gen.rs` carries `#[inline(never)]`
+/// at exactly the count of known-good sites (today: 2 — the Phase-6
+/// stdlib helpers `__toylang_option_unwrap` and
+/// `__toylang_result_unwrap`, which retain the attribute for an
+/// unrelated reason per §6.6.5: stable-symbol concern).
+///
+/// If someone re-introduces `#[inline(never)]` on a Sky-item site
+/// without flipping the v2 precompiled-bodies trigger, this test
+/// fails with the count delta. The expected behavior at the v2
+/// trigger: re-introduce the attribute AND update this fence's
+/// expected count in the same change, so the discipline is visible
+/// in the PR.
+#[test]
+fn stub_gen_no_inline_never_on_sky_items() {
+    let path = "src/stub_gen.rs";
+    let src = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+
+    // Count `#[inline(never)]` occurrences inside `quote!` / `parse_quote!`
+    // bodies (the emission sites) vs in comments. We use a coarse
+    // heuristic: any line that contains `#[inline(never)]` and is NOT
+    // a comment counts.
+    let mut emission_sites: Vec<(usize, &str)> = Vec::new();
+    for (lineno, line) in src.lines().enumerate() {
+        let trimmed = line.trim_start();
+        // Skip comment lines (// or /// markers).
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if line.contains("#[inline(never)]") {
+            emission_sites.push((lineno + 1, line.trim()));
+        }
+    }
+
+    // The expected count: 2 Phase-6 stdlib helpers
+    // (`__toylang_option_unwrap`, `__toylang_result_unwrap`). When v2's
+    // opt-in precompiled-bodies feature (arch §21.7) is built, the
+    // Sky-item sites may re-introduce the attribute gated on a mode
+    // flag. At that time, update the expected count here in the same
+    // change as the stub_gen.rs change.
+    const F1_EXPECTED_INLINE_NEVER_SITES: usize = 2;
+
+    assert_eq!(
+        emission_sites.len(),
+        F1_EXPECTED_INLINE_NEVER_SITES,
+        "F1 protection: stub_gen.rs has {} `#[inline(never)]` emission \
+         site(s) but the F1 investigation locked in {} (Phase-6 stdlib \
+         helpers only).\n\n\
+         If a Sky-item site (accessor / wrapper / trait-impl method) \
+         re-introduced the attribute, REVERT — the attribute blocks \
+         LLVM's cross-language inliner from inlining Sky bodies through \
+         to Rust callers' main. The original rationales for the attribute \
+         on Sky-item stubs are obsolete: patch 5 closes the share-generics \
+         gate, arch §F.1 says it's the wrong layer for the LTO race fix, \
+         and B12's vanilla-rustc concern is gated by build.rs in v1.\n\n\
+         If this is the v2 precompiled-bodies feature (arch §21.7) being \
+         introduced, update F1_EXPECTED_INLINE_NEVER_SITES in this test \
+         to match the new count.\n\n\
+         Sites found:\n  {}",
+        emission_sites.len(),
+        F1_EXPECTED_INLINE_NEVER_SITES,
+        emission_sites
+            .iter()
+            .map(|(ln, l)| format!("{}:{}: {}", path, ln, l))
+            .collect::<Vec<_>>()
+            .join("\n  "),
+    );
+}
