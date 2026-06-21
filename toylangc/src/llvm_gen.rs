@@ -2171,12 +2171,32 @@ pub fn fill_module<'tcx, 'ctx>(
     // See rust-interop-architecture.md §25.2 B15 for the fat-LTO
     // regression that motivated this; non-LTO and ThinLTO behave the
     // same as before.
-    let pinned: Vec<&str> = fn_items
-        .iter()
-        .filter(|f| f.instance.is_some())
-        .map(|f| f.extern_symbol.as_str())
-        .collect();
-    pin_in_llvm_used(&ctx, &pinned);
+    // §5.5 Step 2: under the narrower revision (non-generic Sky bodies
+    // emit at owning crate, not user_bin), Sky-INTERNAL symbols also
+    // become cross-crate-referenced. lang_stubs_<bin>'s `__toylang_main`
+    // body calls `__toylang_internal_<callee>` directly; under Step 2
+    // those internal symbols live in the upstream's rlib. At -O>=2,
+    // LLVM's GlobalDCE strips internals at the owning crate when the
+    // in-CGU caller (the extern wrapper) gets inlined-and-stripped
+    // itself. Pin both extern wrappers AND internal symbols so they
+    // survive cross-crate references.
+    //
+    // For Sky-internal-only items (no extern wrapper — `f.instance.is_none()`),
+    // the internal_symbol equals extern_symbol; we still pin them for
+    // the cross-crate-internal-callee case.
+    let mut pinned_syms: Vec<&str> = Vec::with_capacity(fn_items.len() * 2);
+    for f in &fn_items {
+        if f.instance.is_some() {
+            pinned_syms.push(f.extern_symbol.as_str());
+        }
+        // The internal symbol may equal the extern symbol (for Sky-internal-
+        // only items); HashSet semantics aren't needed — `@llvm.used` is
+        // tolerant of duplicate entries.
+        if f.internal_symbol != f.extern_symbol || f.instance.is_none() {
+            pinned_syms.push(f.internal_symbol.as_str());
+        }
+    }
+    pin_in_llvm_used(&ctx, &pinned_syms);
 
     let rust_symbols = ctx.rust_symbols.clone();
 

@@ -1968,11 +1968,24 @@ fn assert_sky_branch_present_in_main(project: &str) {
 // emits the substituted body INTO the user_bin's CGU, where LLVM sees
 // it locally. (This was true before F1 too; case1b never hit the gap.)
 
-// Case 1a: Rust → Sky non-generic. Post-F1: Sky's body inlines
-// cross-crate at -O3 via rmeta-encoded MIR, regardless of LTO mode.
+// Case 1a: Rust → Sky non-generic.
+//
+// **§5.5 Step 2 update (2026-06-21):** at `lto = false` cross-crate
+// Sky-body inlining is lost — under the narrower-§5.5 revision Sky's
+// body emits at the owning crate's stub_rlib compile, not at user_bin.
+// rustc's thin-local LTO (which spans CGUs WITHIN a single rustc
+// invocation, even at `lto = false`) can no longer import Sky's body
+// into the bin's main CGU. The call remains as a real `b` / `bl`.
+// Cross-Sky/Rust inlining now requires `lto = "thin"` or `"fat"`.
+//
+// no_lto: assert the tail-jump IS present (locking in the new behavior).
+// thin_lto / fat_lto: assert inlined (Levels 4/5 still pick up Sky's
+// body from the upstream rlib's bitcode at link time).
 #[test] fn test_inline_case1a_no_lto() {
     run_inlining_project("case1a_no_lto");
-    assert_no_sky_branch_in_main("case1a_no_lto");
+    // §5.5 Step 2: tail-jump expected at lto=false; use thin/fat LTO
+    // to inline.
+    assert_sky_branch_present_in_main("case1a_no_lto");
 }
 #[test] fn test_inline_case1a_thin_lto() {
     run_inlining_project("case1a_thin_lto");
@@ -1999,11 +2012,16 @@ fn assert_sky_branch_present_in_main(project: &str) {
     assert_no_sky_branch_in_main("case1b_fat_lto");
 }
 
-// Case 2: Sky main → Rust library (extern "C" println). Post-F1:
-// Sky's main inlines into the bin shim's main at every -O3 mode.
+// Case 2: Sky main → Rust library (extern "C" println).
+//
+// **§5.5 Step 2 update (2026-06-21):** Sky's `__toylang_main` body
+// moved from user_bin compile to lang_stubs_<bin>'s compile. The bin
+// shim's `main` calling `__toylang_main` now tail-jumps cross-crate
+// at `lto = false`. Use thin/fat LTO to recover the inlining.
 #[test] fn test_inline_case2_no_lto() {
     run_inlining_project("case2_no_lto");
-    assert_no_sky_branch_in_main("case2_no_lto");
+    // §5.5 Step 2: tail-jump expected at lto=false.
+    assert_sky_branch_present_in_main("case2_no_lto");
 }
 #[test] fn test_inline_case2_thin_lto() {
     run_inlining_project("case2_thin_lto");
@@ -2044,14 +2062,17 @@ fn assert_sky_branch_present_in_main(project: &str) {
     assert_no_sky_branch_in_main("case3_fat_lto");
 }
 
-// Case 4: Sky → Rust generic → Sky impl. Post-F1: Sky's main inlines
-// into the bin shim. The Rust generic intermediary `some_rust_lib::
-// duplicate::<Widget>` may or may not inline further — that's a
-// separate Rust-side LLVM inlining concern not gated by F1. Only
-// asserts on Sky-boundary inlining.
+// Case 4: Sky → Rust generic → Sky impl.
+//
+// **§5.5 Step 2 update (2026-06-21):** at `lto = false`, Sky's
+// `__toylang_main` body moved upstream → no thin-local-LTO bridge
+// from user_bin's invocation → tail-jump remains. The thin/fat LTO
+// variants still inline through (LLD sees Sky's body in the upstream
+// rlib's bitcode).
 #[test] fn test_inline_case4_no_lto() {
     run_inlining_project("case4_no_lto");
-    assert_no_sky_branch_in_main("case4_no_lto");
+    // §5.5 Step 2: tail-jump expected at lto=false.
+    assert_sky_branch_present_in_main("case4_no_lto");
 }
 #[test] fn test_inline_case4_thin_lto() {
     run_inlining_project("case4_thin_lto");
@@ -2081,9 +2102,13 @@ fn assert_sky_branch_present_in_main(project: &str) {
 
 // Case 6: Sky → Rust → cross-Sky-crate (uses case6_lib_inl). Same
 // shape as case 4 with cross-Sky-crate trait impl.
+//
+// **§5.5 Step 2 update (2026-06-21):** same as case 4 — tail-jump at
+// lto=false, inline at thin/fat LTO.
 #[test] fn test_inline_case6_no_lto() {
     run_inlining_project("case6_no_lto");
-    assert_no_sky_branch_in_main("case6_no_lto");
+    // §5.5 Step 2: tail-jump expected at lto=false.
+    assert_sky_branch_present_in_main("case6_no_lto");
 }
 #[test] fn test_inline_case6_thin_lto() {
     run_inlining_project("case6_thin_lto");
@@ -2214,12 +2239,20 @@ fn test_inline_case3_inline_never() {
 
 // ============================================================================
 // Priority C: Case 4 opt-level sweep at no-LTO (5 fixtures).
-// Validates inlining behavior across opt-levels post-F1.
+// Validates inlining behavior across opt-levels.
 //
-// -O0: no inlining → Sky's body remains as cross-crate `bl` baseline.
-// -O1/-O2/-Os/-Oz: rustc's cross-crate MIR inliner fires → Sky's body
-//   is expected to inline into main (no Sky-owned `bl`). Empirically
-//   confirmed for -O1+ post-F1.
+// **§5.5 Step 2 update (2026-06-21):** all variants here use `lto = off`
+// implicitly (no toml lto field → cargo dev default of `false`, but
+// these fixtures don't trigger thin-local LTO either at every -O
+// level the same way). Under Step 2, Sky's body lives in
+// lang_stubs_<bin>'s compile (different rustc invocation), so the
+// previously-relied-on thin-local-LTO import doesn't bridge it.
+// Behavior at every opt-level: tail-jump remains.
+//
+// -O0: no inlining at any layer → tail-jump (was already this way).
+// -O1/-O2/-Os/-Oz: pre-Step-2 inlined via thin-local LTO; post-Step-2
+//   tail-jump remains. Users wanting inlining at -O1+ should opt into
+//   `lto = "thin"` or `"fat"`.
 
 #[test] fn test_inline_case4_o0() {
     run_inlining_project("case4_o0");
@@ -2227,19 +2260,24 @@ fn test_inline_case3_inline_never() {
 }
 #[test] fn test_inline_case4_o1() {
     run_inlining_project("case4_o1");
-    assert_no_sky_branch_in_main("case4_o1");
+    // §5.5 Step 2: tail-jump expected at lto=false (pre-Step-2 this
+    // inlined via thin-local LTO).
+    assert_sky_branch_present_in_main("case4_o1");
 }
 #[test] fn test_inline_case4_o2() {
     run_inlining_project("case4_o2");
-    assert_no_sky_branch_in_main("case4_o2");
+    // §5.5 Step 2: same as -O1.
+    assert_sky_branch_present_in_main("case4_o2");
 }
 #[test] fn test_inline_case4_os() {
     run_inlining_project("case4_os");
-    assert_no_sky_branch_in_main("case4_os");
+    // §5.5 Step 2: same as -O1.
+    assert_sky_branch_present_in_main("case4_os");
 }
 #[test] fn test_inline_case4_oz() {
     run_inlining_project("case4_oz");
-    assert_no_sky_branch_in_main("case4_oz");
+    // §5.5 Step 2: same as -O1.
+    assert_sky_branch_present_in_main("case4_oz");
 }
 
 // ============================================================================

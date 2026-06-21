@@ -82,6 +82,14 @@ pub type ExternCodegenFnAttrsFn = for<'tcx> fn(TyCtxt<'tcx>, DefId) -> CodegenFn
 /// `linkage = Some(AvailableExternally)` on consumer-defined items so
 /// rustc's LLVM backend emits IR (for cross-module inlining) but no `.o`
 /// symbol. The consumer's separately-emitted body becomes the sole def.
+///
+/// Per @SBMNBIZ, this is one of two sites that produce
+/// AvailableExternally bodies with `unreachable!()` terminators (the
+/// other is per_instance.rs's synthetic body). At every compile
+/// session where this override fires for an item, the consumer's
+/// fill_extra_modules MUST also emit the real body OR no caller of the
+/// symbol can exist in that session's IR — otherwise LLVM may inline
+/// the unreachable stub into a caller and cause UB.
 pub fn lang_codegen_fn_attrs<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,

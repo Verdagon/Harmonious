@@ -99,6 +99,15 @@ pub fn lang_per_instance_mir<'tcx>(
 /// `queries::codegen_fn_attrs` marks consumer items with `AvailableExternally`
 /// linkage so rustc's LLVM backend emits no `.o` symbol for them.
 ///
+/// Per @SBMNBIZ, this synthetic body's `Unreachable` terminator becomes
+/// an `AvailableExternally` LLVM function at codegen time. Same hazard
+/// as the stub source's `unreachable!()` body: if LLVM inlines it into
+/// a real caller, UB. Safety relies on either the consumer's
+/// fill_extra_modules emitting a real-body shadow at the same compile
+/// session, or no caller existing in that session's IR (per @F.13's
+/// is_reachable_non_generic gate at user_bin compile for upstream
+/// non-generic items).
+///
 /// This is the designated "fix site" per @SyMINCZ — the only mechanism in the
 /// codebase that forces rustc's mono collector to codegen a generic Rust
 /// `Instance` the consumer references. `tcx.symbol_name` and

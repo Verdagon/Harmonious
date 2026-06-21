@@ -12,6 +12,18 @@ not, read those first.
 threads is bug-fixing — they're refinement/investigation/expansion work.
 Release-mode (the previous handoff's bug) is fully resolved as of `08f350e`.
 
+**2026-06-21 progress note: §5.5 Step 2 (narrower-§5.5) SHIPPED with a documented LTO trade-off + new @SBMNBIZ arcanum.**
+
+Step 2 of the A.1+A.2+patch-5 retirement chain landed. Non-generic Sky bodies now emit at their owning crate's stub_rlib compile (via `consumer_fill_modules`'s extended populate path + eager-emit of local trait-impls). A.1.X (capture-ship-replay) retires for non-generic trait impls; A.1.Y (transitive-callee stash), A.2, and patch 5 stay (those address generic-instantiation concerns, which Step 3 will tackle).
+
+**Empirically-surfaced finding (the "thin-local LTO" mechanism):** the inlining matrix's `_no_lto` fixtures previously relied on a mechanism that wasn't documented in the arch doc — rustc's ThinLTO running BETWEEN its own CGUs WITHIN a single rustc invocation, even at `lto = false`. Cargo calls this "thin-local LTO" (per `lto = false`'s docs). Step 2 moves Sky's body to a different rustc invocation, so thin-local LTO can no longer bridge the call. **Decision (locked by user direction):** accept the trade-off; cross-Sky/Rust inlining now requires `lto = "thin"` or `"fat"`. Updated 8 matrix fixtures (case{1a,2,4,6}_no_lto + case4_o{1,2,s,z}) to assert tail-jump present rather than absent, codifying the new behavior. Documented in arch doc §F.16 (new subsection with the 5-levels-of-inlining table) and §26.17 (new @SBMNBIZ arcanum).
+
+**New arcanum: @SBMNBIZ ("Stub Body Must Not Be Inlined").** The Option 4 AvailableExternally pattern creates a potential UB hazard: if LLVM inlines the unreachable!() stub body into a real caller, the caller's continuation becomes unreachable → optimizer removes downstream code → UB. The discipline: at every compile session where rustc emits an AvailableExternally stub body, EITHER Sky's fill_extra_modules emits a real-body shadow (IR linker picks External over AvailableExternally), OR no caller exists in that session's IR (per @F.13's gate). Both conditions hold under Step 2; codified in `docs/arcana/StubBodyMustNotBeInlined-SBMNBIZ.md` and registered in §26's arcana table.
+
+Verification: 191/0/2 cold + warm. 2 ignored = pre-existing flake (`test_inline_case3_inline_never`, LLVM aggression on a single Priority B fixture) + DQ-D blocked fixture (`test_multi_sky_generic`, Sky-frontend type bug — Step 1 of the chain will unblock).
+
+---
+
 **2026-06-21 progress note: Option 4 SHIPPED.** Thread A's actionable
 half-day item landed. The `collect_and_partition_mono_items` override
 (formerly at `rustc-lang-facade/src/queries/partition.rs`, ~107 lines) is
@@ -216,6 +228,49 @@ fundamentally because of one architectural decision: §5.5's "all Sky
 bodies emit at user_bin." Reverse that decision and the cross-session
 bookkeeping dissolves.
 
+### Why §5.5 was locked the way it is — context from the design conversation
+
+§5.5's locked-everything-at-user_bin policy was **explicitly flagged as
+a starting-point simplification, with the optimization end-state being
+exactly the chain below.** Verbatim from the design conversation
+(`design-convo-log.md:16223`, the locked-decision discussion of the
+multi-rlib model):
+
+> "The harder question multi-rlib raises is *where compile-time evaluation
+> runs.* Cleanest model: comptime always evaluates at the top-level skyc
+> invocation (the final binary's compile). Sky libraries ship stubs +
+> Sky source for comptime-relevant items; users effectively recompile
+> generics at point of use. ... **You can complicate this later
+> (precompile-bodies-when-possible as an optimization), but starting
+> simple is right.**"
+
+And reinforced at `design-convo-log.md:16944`:
+
+> "If you wanted 'comptime runs once at lib_a's compile and the results
+> are baked into lib_a's rlib,' you'd need to enumerate every
+> instantiation Sky's downstream consumers will use — which is exactly
+> the pre-pass model that the seven-case taxonomy showed doesn't work
+> for bidirectional interop. Per_instance_mir at downstream-compile-time
+> is the right place for Sky's arbitrary-typed comptime."
+
+Distilled: §5.5's rationale is **about comptime**, not about a
+fundamental architectural correctness concern. The argument was that
+Sky's arbitrary-typed comptime needs concrete args (which only exist at
+downstream-compile time per the 7-case taxonomy), so comptime-dependent
+bodies have to emit downstream — and the simplification was to put
+*everything* downstream rather than discriminate comptime-dependent
+vs not.
+
+**Toylang has no comptime**, so 100% of toylang items are eligible for
+the "precompile-bodies-when-possible" optimization. For Sky proper, the
+discriminator becomes "does this item's body depend on comptime
+evaluation?" — comptime-dependent items keep emitting at downstream
+(per the original rationale); non-comptime-dependent items emit at
+their owning crate (per the optimization). The chain below applies
+directly to toylang and structurally to Sky's non-comptime items.
+
+### Structure of the chain
+
 The reversal can't happen in one step — the dependencies and verifiable-
 prerequisites partition into a chain. Each step is independently
 shippable and verifiable; each unlocks the next. None past Step 1
@@ -227,7 +282,7 @@ analysis, not a working prototype.
 | Step | Action | Effort | Retires | Gates on |
 |---|---|---|---|---|
 | 1 | Fix Sky-frontend `types_match` to bridge `RustType ↔ Struct` for cross-Sky-crate Sky types | ~0.5 day | Nothing directly — but unblocks DQ-D so Step 3 becomes empirically testable | None |
-| 2 | Ship narrower-§5.5 (non-generics only): codegen_fn_attrs override discriminates by `def_id.is_local()`, fill_extra_modules emits owned non-generic items at upstream | ~0.5-1 day | A.1's capture-ship-replay for non-generic trait impls (e.g., `<Box as Clone>::clone` in case6_lib) | None — can ship today, independent of Step 1 |
+| 2 | **SHIPPED 2026-06-21.** Narrower-§5.5 (non-generics only): consumer_fill_modules emits owned non-generic items at every compile session it owns (stub_rlib + user_bin both populate now); eager-emit of local non-generic trait_impls added; internal symbols also pinned in @llvm.used. **Actual cost: ~1 day** (vs ~0.5 estimated) — overshot because the thin-local LTO mechanism (arch §F.16) wasn't priced into the original plan, requiring 8 matrix fixtures to be flipped + the new @SBMNBIZ arcanum + arch doc updates. **Retires:** A.1.X for non-generic trait impls. **Documented trade-off:** cross-Sky/Rust inlining now requires `lto = "thin"` or `"fat"` (no thin-local LTO bridge across rustc invocations). | None — can ship today, independent of Step 1 |
 | 3 | Ship full §5.5 (generics included): same discrimination but per-Instance owning-crate lookup; generics emit at first-reachable site | ~3-5 days | A.1's capture-ship-replay entirely (discovery + emission converge); A.2 likely (External-linkage items recorded naturally in rmeta, R1's filter passes); patch 5 likely (share_generics natural map non-empty, gate's short-circuit doesn't bite); fork may shrink to 4 patches | Step 1 (so DQ-D is verifiable) |
 | 4 | Extend ReifyFnPointer technique in per_instance_mir to consumer→consumer generic deps | ~1-2 days | A.1's transitive consumer-callee stash (`walk_and_stash_internal_callees`) — rustc's collector discovers Sky-internal transitive callees via the synthesized body instead of via a Sky-side recursive walk | Independent — can land before or after Step 3 |
 
@@ -325,12 +380,18 @@ If the chain completes empirically, the cleanup is substantial:
 
 The architecture doc's §5.5 + §F.13 + §F.14 + §F.14.1 reduces from
 ~5 subsections explaining cross-session bookkeeping to a single short
-section stating "Sky's emission matches rustc's natural model; the
-discovery-vs-emission gap §F.13 used to describe was specific to the
-pre-Step-3 architecture and no longer applies." The risk register
-loses B17 (closed) and shrinks B14/B16. The fork drops to 4 patches.
-The handoff doc's Thread A section retires entirely or becomes a
-historical record.
+section stating "Sky's emission matches rustc's natural model for items
+without comptime dependencies; comptime-dependent items emit at the
+downstream consumer's compile per §5.5's original comptime-driven
+rationale." The risk register loses B17 (closed) and shrinks B14/B16.
+The fork drops to 4 patches. The handoff doc's Thread A section retires
+entirely or becomes a historical record.
+
+This is **the explicitly-anticipated optimization** from the design
+conversation, not a deviation from the locked architecture. §5.5's
+locking commentary said "you can complicate this later
+(precompile-bodies-when-possible as an optimization), but starting
+simple is right" — the chain above IS that complication.
 
 If the chain stalls partway (e.g., Step 1 reveals the Sky-frontend
 fix is bigger than expected, or Step 3's empirical verification

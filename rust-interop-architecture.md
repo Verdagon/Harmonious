@@ -4458,6 +4458,7 @@ This chapter documents the cross-cutting invariants Sky's implementation must re
 | ETASTZ | `build_generic_args_for_item` silently truncates excess Type args. |
 | NNGZ | Non-generic is the degenerate case of generic; don't branch on `type_params.is_empty()`. |
 | SMPLZ | Sky-emitted rustc-visible symbols must be pinned in `@llvm.used` (not `@llvm.compiler.used`) so LTO `internalize` doesn't demote linkage. |
+| SBMNBIZ | At any compile session where rustc emits an `AvailableExternally` `unreachable!()` stub body for a consumer item, either Sky's `fill_extra_modules` emits the real body so the IR linker picks it, or no caller of the symbol exists in that session's IR. Otherwise the unreachable body may be inlined → UB. |
 
 Each invariant is expanded in detail below.
 
@@ -4635,7 +4636,21 @@ Any Sky-emitted symbol whose only callers live in OTHER compile units' machine c
 
 **Full arcana doc:** `docs/arcana/SkyMustPinLinkageForExternalRefs-SMPLZ.md`. Includes the investigation playbook for "Sky symbol disappeared somewhere in the LLVM pipeline" debugging (see §25.2 B15 too — the playbook is duplicated there inline).
 
-### 26.17 Cross-references
+### 26.17 SBMNBIZ (Stub Body Must Not Be Inlined)
+
+`stub_gen` emits `pub fn foo() -> T { unreachable!() }` for every consumer export; the Option 4 `codegen_fn_attrs` override marks each such item with `AvailableExternally` linkage. Per_instance_mir's synthetic body (ReifyFnPointer casts + `Unreachable` terminator) lowers to the same shape. If LLVM ever inlines the unreachable body into a real caller, the result is undefined behavior: the caller's continuation becomes unreachable, the optimizer removes legitimate downstream code, and the program has UB if ever invoked. The failure is **silent** — no link error, no test crash from the build itself.
+
+**Discipline:** at every compile session where rustc emits an `AvailableExternally` stub body for a consumer item, EITHER (a) Sky's `fill_extra_modules` also emits the real body with `External` linkage in the same session (the IR linker picks External over AvailableExternally), OR (b) no callers of the symbol exist in that session's IR (so no inlining can occur). LLVM's IR linker rule (External wins same-symbol conflicts) is what makes (a) safe. @F.13's `is_reachable_non_generic` collector gate at user_bin compile is what gives us (b) for non-generic upstream items under §5.5 Step 2.
+
+**Where:** three coordinated sites maintain the invariant. `rustc-lang-facade/src/queries/codegen_fn_attrs.rs::lang_codegen_fn_attrs{,_extern}` produces the AvailableExternally stub bodies. `rustc-lang-facade/src/queries/per_instance.rs::build_dependency_body` produces the synthetic Unreachable-terminated body. `toylangc/src/llvm_gen.rs::fill_module` (gated by `toylangc/src/toylang/callbacks_impl.rs::consumer_fill_modules`) emits the real-body shadow at every compile session where a caller could exist.
+
+**Failure mode:** silent UB. Standard CI doesn't catch this from build status — only fixtures whose runtime behavior would detect inlined unreachable (e.g., the inlining matrix's stdout-checked fixtures, or any binary that runs to completion and produces an unexpected result).
+
+**Detection:** the inlining matrix at `toylangc/tests/integration_projects/inlining/` fences every bin's `main` containing `unsafe { __toylang_main(); }` against UB — if the stub body inlined into main, the binary would either trap (`udf`/`brk`) or constant-fold to nothing rather than producing the expected output. The 8 `_no_lto` matrix fixtures specifically lock in the §5.5 Step 2 behavior of "tail-jump present" (`b __lang_stubs::__toylang_main`); a successful UB-inducing inlining would replace the tail-jump with the unreachable body's expansion, which wouldn't match the expected disassembly shape.
+
+**Full arcana doc:** `docs/arcana/StubBodyMustNotBeInlined-SBMNBIZ.md`. Includes the safety-condition proofs for each of the compile-session shapes Sky uses (pre-Step-2 and post-Step-2).
+
+### 26.18 Cross-references
 
 - Section 1.5.5 — the positive form of NNGZ (Sky's design principle).
 - Section 5 — codegen path that respects ABI invariants.
@@ -6463,6 +6478,89 @@ The earlier guidance — *"treat bytes-as-interface as a v1 placeholder,
 not a stable endpoint"* — was followed: the v1 placeholder did its
 job during Phase 4.5 (proving the patch-4 + LTO pipeline worked at
 all), then retired cleanly when Approach B landed.
+
+#### F.16 Rustc's "thin-local LTO" between CGUs in a single invocation
+
+A previously-undocumented mechanism that's load-bearing for the
+"cross-Sky/Rust inlining works without LTO" perf property the inlining
+matrix has been testing since F1: **rustc runs LLVM's ThinLTO BETWEEN
+its own CGUs within a single rustc invocation, even when the user sets
+`lto = false`.** Cargo's documentation calls this "thin-local LTO":
+
+> `lto = false`: Performs "thin local LTO" which performs "thin" LTO
+> over the local crate's codegen units. No LTO is performed if codegen
+> units is 1 or opt-level is 0.
+
+Cargo's dev profile default is `lto = false`, so thin-local LTO is ON
+by default. Only an explicit `lto = "off"` disables it (along with all
+other LTO levels).
+
+**Discovery (2026-06-21).** The §5.5 Step 2 investigation surfaced this
+when attempting to retire A.1.X (capture-ship-replay) for non-generic
+trait impls. The inlining matrix's `_no_lto` fixtures asserted that
+the bin's `main` constant-folds Sky's body — a property nominally
+impossible without LTO at the cargo-visible layer. A `RUSTFLAGS="-C
+save-temps"` build of `case4_no_lto` on the pre-Step-2 baseline
+showed:
+
+- Sky's CGU (`case4_no_lto-<hash>.<sky-cgu-id>.no-opt.bc`) contains
+  the real body of `__toylang_main` with `External` linkage (emitted
+  via patch 4's `fill_extra_modules`).
+- The bin's main CGU's pre-opt IR has only a `declare void @__toylang_main`
+  (no body).
+- The bin's main CGU's `thin-lto-after-import.bc` contains
+  `define available_externally void @__toylang_main()` with Sky's
+  real body imported in. **This is the magic moment.**
+- The bin's main CGU's post-pass-manager IR shows `case4_no_lto::main`
+  constant-folded to `mov w8, #42` (Sky's body inlined and folded).
+
+The file naming (`thin-lto-*`) makes the mechanism visible at build
+time. The matrix's `_no_lto` fixtures were testing this thin-local
+LTO mechanism, not pure non-LTO behavior.
+
+**Why this matters for §5.5 Step 2 and beyond.** Thin-local LTO
+operates over the CGUs of a **single rustc invocation**. CGUs in
+DIFFERENT rustc invocations (= different crates) are isolated; the
+import pass cannot reach them. Under pre-Step-2 architecture, Sky's
+body was contributed via fill_extra_modules at the bin's user_bin
+invocation, so Sky's CGU and the bin's main CGU were peers in the
+same invocation — thin-local LTO bridged them. Under Step 2's
+narrower-§5.5 (non-generic Sky bodies move to upstream stub_rlib's
+invocation), Sky's body moves to a different rustc invocation —
+thin-local LTO no longer reaches it.
+
+**Step 2 trade-off, codified.** Under §5.5 Step 2, **cross-Sky/Rust
+body inlining requires explicit cross-crate LTO** (`lto = "thin"` or
+`lto = "fat"`). At `lto = false` (cargo dev profile default),
+cross-crate calls cross the language boundary via real tail-jumps
+(`b __lang_stubs::__toylang_main`). The 8 inlining matrix `_no_lto`
+fixtures were updated to assert this new behavior (tail-jump present)
+rather than the pre-Step-2 behavior (no tail-jump because of thin-local
+LTO inlining).
+
+**Five levels of inlining, summarized.** For future investigators
+debugging "why isn't this inlining" questions:
+
+| Level | Mechanism | Spans | Enabled at |
+|---|---|---|---|
+| 1 | rustc MIR inliner | one item | `mir-opt-level >= 1` (default at -O>=1) |
+| 2 | LLVM intra-CGU inliner | one CGU | -O>=1 |
+| 3 | rustc-internal thin-local LTO between CGUs | CGUs of one rustc invocation | -O>=1 + `codegen-units > 1` + `lto != "off"` |
+| 4 | Cross-crate ThinLTO | all rlibs | `lto = "thin"` |
+| 5 | Cross-crate FatLTO | all rlibs | `lto = "fat"` |
+
+Cargo's `lto = false` ≠ `lto = "off"`: `false` (dev default) leaves
+Level 3 ON; `"off"` (explicit) disables it.
+
+The user-facing promise post-Step-2 is: **for cross-Sky/Rust
+inlining, use `lto = "thin"` or `"fat"`. At `lto = false`, Sky calls
+cross the boundary via tail-jumps.** Most production builds opt into
+LTO anyway; the cost is felt only at dev builds, where compile time
+typically matters more than runtime perf.
+
+This finding is also surfaced as @SBMNBIZ in §26.17 (the AvailableExternally
+stub body must never be the inlinable winner, regardless of which level
+of inlining is active).
 
 ---
 

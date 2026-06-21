@@ -339,19 +339,29 @@ impl ToylangCallbacks {
     /// but its result is what we'd have ended up with anyway. Cached
     /// equals fresh equals correct.
     ///
-    /// Gated on `self.is_user_bin_compile` (Workstream A inversion): the
-    /// rlib compile no longer owns consumer codegen. The user-bin compile
-    /// is the sole codegen site. The rlib compile's `generate_and_compile`
-    /// short-circuits via `llvm_paths = None` before reaching this populate.
+    /// §5.5 narrower revision (Step 2 of A.1+A.2+patch-5 retirement chain):
+    /// each compile session emits the items its crate OWNS. The historical
+    /// "all Sky bodies emit at user_bin only" gate is retired; both
+    /// compile sessions populate, with filtering that routes each Instance
+    /// to the right session.
+    ///
+    /// - **Stub_rlib compile (`is_user_bin_compile = false`):** iterate the
+    ///   LOCAL registry only; emit local non-generic exports + accessors
+    ///   + non-generic trait-impl methods (uniformly: try empty-args
+    ///   substitution, accept if the resolved body has no remaining
+    ///   Params).
+    /// - **User-bin compile (`is_user_bin_compile = true`):** skip the
+    ///   registry walk entirely (LOCAL items emit at THIS package's
+    ///   stub_rlib compile; UPSTREAM items at their own stub_rlib
+    ///   compiles). Drain `discovered_trait_impl_instances` for entries
+    ///   with non-empty `concrete_args` only — those are generic
+    ///   instantiations whose concrete args originated at user_bin, so
+    ///   the owning crate couldn't pre-emit them.
     pub fn populate_toylang_instances_from_cgus<'tcx>(
         &self,
         state: &mut ToylangState,
         tcx: TyCtxt<'tcx>,
     ) {
-        if !self.is_user_bin_compile {
-            return;
-        }
-
         // Phase C: entry-point walk replacing the registry walk.
         //
         // Architecture: §20.4 ("Sky's codegen queue populated from entry
@@ -383,10 +393,17 @@ impl ToylangCallbacks {
         // inner walk-and-stash.
         let upstream_clones: Vec<crate::toylang::registry::ToylangRegistry> =
             state.upstream_registries.values().cloned().collect();
-        let registries: Vec<&crate::toylang::registry::ToylangRegistry> =
-            std::iter::once(self.registry.as_ref())
-                .chain(upstream_clones.iter())
-                .collect();
+        // §5.5 Step 2 (narrower): at stub_rlib compile, emit LOCAL items
+        // only — every upstream's items emit at THAT upstream's own
+        // stub_rlib compile (this same function in that rustc invocation).
+        // At user_bin compile, skip the registry walk entirely; only
+        // generic instantiations need user_bin codegen and they flow
+        // through the `discovered_trait_impl_instances` drain below.
+        let registries: Vec<&crate::toylang::registry::ToylangRegistry> = if self.is_user_bin_compile {
+            vec![]
+        } else {
+            vec![self.registry.as_ref()]
+        };
         for reg in registries {
             // Export free fns (and main).
             for (name, toy_fn) in &reg.functions {
@@ -501,6 +518,80 @@ impl ToylangCallbacks {
                     instance_args: vec![],
                 });
             }
+            // §5.5 Step 2 (narrower-§5.5): eagerly emit LOCAL trait-impl
+            // methods that are fully concrete at this compile (no impl-
+            // block-level type params, no method-level type params). This
+            // covers cases like `impl Clone for Box` in case6_lib where
+            // case6_lib has no `main`, so its `per_instance_mir` cascade
+            // never queues the method — but case6_lib still OWNS the body
+            // and must emit it for downstream compiles to link against.
+            //
+            // Uniform formulation (NNGZ-compliant): try empty-args
+            // substitution; if the substituted body has remaining Params
+            // (generic impl block or method-level type params), skip —
+            // discovery cascade at the using crate will provide concrete
+            // args via `discovered_trait_impl_instances` and the body
+            // emits at user_bin per Step 3. Non-generic impls fall out
+            // of the same path: empty substitution is identity, no
+            // Params remain, emit.
+            //
+            // The historical comment block above (lines ~441-451) retired
+            // a prior trait_impls populate channel on NNGZ grounds (it
+            // gated emission on whether the source had any type params).
+            // The Step 2 form here does NOT inspect the source's type
+            // params directly; it checks whether the SUBSTITUTED body
+            // still carries Params, which is the same uniform check used
+            // everywhere else in this function.
+            for toy_impl in &reg.trait_impls {
+                for method in &toy_impl.methods {
+                    if method.func.body.is_none() {
+                        continue;
+                    }
+                    // §5.5 Step 2 eager-emit gate.
+                    // `substitute_type_params` panics on any unresolved
+                    // Param, so the NNGZ-uniform "try identity subst,
+                    // accept if no Params remain" formulation isn't
+                    // available — substitute panics before returning.
+                    // Forced exception: gate eager-emit on the combined
+                    // impl-block + method-level params (per
+                    // `resolve_caller_from_instance` doc comment). Empty
+                    // means safe to substitute with empty args; non-empty
+                    // means we need concrete args from a cascade (Step 3).
+                    // arch-fence-allow: Approach-A substituted-vs-unsubstituted invariant
+                    if !method.func.type_params.is_empty() {
+                        continue;
+                    }
+                    let resolved_func = resolve_caller_from_type_args(
+                        &method.func,
+                        &std::collections::HashMap::new(),
+                    );
+                    let Some(stub_def_id) = crate::oracle::find_trait_impl_method_def_id(
+                        tcx,
+                        &toy_impl.trait_name,
+                        &toy_impl.self_type_name,
+                        &method.name,
+                    ) else { continue };
+                    let instance = ty::Instance::new_raw(stub_def_id, ty::GenericArgs::empty());
+                    let extern_symbol = compute_fn_symbol(&method.name, tcx, instance);
+                    if !state.walked_entry_points.insert(extern_symbol.clone()) {
+                        continue;
+                    }
+                    let internal_symbol = format!(
+                        "__toylang_internal__{}__{}__{}",
+                        toy_impl.self_type_name, toy_impl.trait_name, method.name,
+                    );
+                    state.toylang_instances.push(ToylangInstance {
+                        extern_symbol,
+                        internal_symbol,
+                        resolved_func: resolved_func.clone(),
+                        stub_def_id: Some(stub_def_id),
+                        instance_args: vec![],
+                    });
+                    walk_and_stash_internal_callees(
+                        tcx, reg, &resolved_func, &method.name, state,
+                    );
+                }
+            }
         }
         // Option B sidecar consumption — discovered trait-impl
         // monomorphizations from upstream stub rlib compiles. The stub-rlib
@@ -516,8 +607,26 @@ impl ToylangCallbacks {
         // `impl Clone for Box` may live in a different upstream registry
         // (case6_lib pattern) from where the discovery was captured (the
         // bin's own stub rlib captures the cascade that crosses crates).
+        //
+        // §5.5 Step 2 gate: this drain ONLY runs at user_bin compile —
+        // upstream sidecars' discoveries describe cascades that fired at
+        // OTHER crates' stub_rlib compiles. The owning crate (where the
+        // impl lives) eagerly emits non-generic trait-impl methods at
+        // ITS OWN stub_rlib compile (via the local trait_impls loop
+        // above). At user_bin we only need to emit instantiations that
+        // carry concrete args originating downstream — i.e. generic impls
+        // whose concrete args the upstream couldn't pre-emit without
+        // user_bin's source. Non-generic discoveries (empty
+        // `concrete_args`) are skipped: the owning crate's stub_rlib
+        // already produced the body.
+        if self.is_user_bin_compile {
         for upstream in &upstream_clones {
             for inst in &upstream.discovered_trait_impl_instances {
+                if inst.concrete_args.is_empty() {
+                    // §5.5 Step 2: fully-concrete impl method; owning
+                    // crate's stub_rlib emitted it. Skip.
+                    continue;
+                }
                 // Find the matching `ToyImpl` across all registries
                 // (cross-Sky-crate; case6_lib).
                 let mut toy_impl_found = None;
@@ -583,6 +692,7 @@ impl ToylangCallbacks {
                 );
             }
         }
+        } // end if self.is_user_bin_compile (discovered-instances drain gate, §5.5 Step 2)
     }
 }
 
@@ -1099,6 +1209,17 @@ impl LangCallbacks for ToylangCallbacks {
         // for IR emission, so we wrap the raw pointers in suppressed-Drop
         // Inkwell handles inside the closure. (Sky's planned codegen uses
         // C++ via FFI instead and skips the Inkwell wrap.)
+        //
+        // Per @SBMNBIZ, the real Sky bodies emitted here (External
+        // linkage) shadow the AvailableExternally stub bodies that rustc
+        // emits via the codegen_fn_attrs override and the per_instance_mir
+        // synthetic body. At every compile session where rustc emits an
+        // AvailableExternally body for a Sky item, a real body MUST also
+        // be emitted here OR no caller of the symbol may exist in this
+        // session's IR. Step 2's emission shift relies on @F.13's gate
+        // ensuring per_instance_mir doesn't fire for non-generic upstream
+        // items at user_bin compile — so the AvailableExternally body
+        // isn't emitted there either, and the empty IR pool is safe.
 
         let ts = state(s);
         ts.log.push(CallbackLog::GenerateAndCompile);
@@ -1185,12 +1306,20 @@ impl LangCallbacks for ToylangCallbacks {
                     bytes.len(),
                 );
             }
-            // Stub rlib compile: no Sky body to contribute; return without
-            // calling allocator.allocate().
-            return;
+            // §5.5 Step 2: sidecar capture done. Fall through to populate +
+            // fill_module — this stub_rlib compile now ALSO emits LOCAL
+            // non-generic Sky bodies so downstream compiles link against
+            // them naturally (vs the historical "everything emits at
+            // user_bin via A.1.X capture-ship-replay" pattern).
         }
 
         self.populate_toylang_instances_from_cgus(ts, tcx);
+
+        // No early-return on empty `toylang_instances`: the CGU walk in
+        // `llvm_gen::fill_module` independently discovers Case 1b generic
+        // toylang fns instantiated from Rust callers (e.g.
+        // `wrap<LocalRustType>` reached only via rustc's mono walker, not
+        // populate). Skipping fill_module here would lose those.
 
         // Same effective-registry construction as generate_and_compile.
         let effective_registry = {
