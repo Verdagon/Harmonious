@@ -740,6 +740,45 @@ fn crate_has_sky_marker(tcx: TyCtxt<'_>, cnum: rustc_span::def_id::CrateNum) -> 
     }
 }
 
+/// Is Sky machinery active in this compile?
+///
+/// Returns `true` iff *any* loaded crate (LOCAL_CRATE or any upstream
+/// rlib pulled in via `extern crate`) carries `__SKY_STUBS_MARKER`.
+/// Mirror of the historical `consumer_lang_active(())` rustc-fork
+/// query (patch 5), but implemented as an inline marker-walk so the
+/// fork patch can retire. Three compile shapes:
+///
+/// - **Stub rlib compile.** LOCAL_CRATE itself is a Sky stub rlib with
+///   the marker → returns `true`.
+/// - **User-bin compile.** LOCAL_CRATE is a plain Rust bin with no
+///   marker, but it depends on the Sky stub rlib (which has the
+///   marker). The crate-walk finds the marker upstream → returns `true`.
+/// - **Pure-Rust crate compiled by this rustc binary.** No marker
+///   anywhere → returns `false`. Byte-identical pass-through preserved.
+///
+/// Each individual marker-check is O(1) via `SKY_STUBS_CRATES`
+/// thread-local cache, so the overall cost is O(crates) per call —
+/// fast enough that no separate "is_sky_active" cache is needed today.
+/// If profiling later shows it's a hot path, add a second OnceLock
+/// caching the boolean result per-invocation.
+pub fn is_sky_active(tcx: TyCtxt<'_>) -> bool {
+    use rustc_hir::def_id::{CRATE_DEF_INDEX, DefId, LOCAL_CRATE};
+    // Local crate first (covers stub rlib compiles).
+    if is_from_lang_stubs(
+        tcx,
+        DefId { krate: LOCAL_CRATE, index: CRATE_DEF_INDEX },
+    ) {
+        return true;
+    }
+    // Walk upstream crates (covers user-bin and Sky-lib consumer compiles).
+    tcx.crates(()).iter().any(|&cnum| {
+        is_from_lang_stubs(
+            tcx,
+            DefId { krate: cnum, index: CRATE_DEF_INDEX },
+        )
+    })
+}
+
 /// Is this DefId a consumer-owned function whose real implementation
 /// comes from the consumer's backend `.o` rather than from rustc's
 /// codegen?

@@ -36,50 +36,34 @@ The full A.1+A.2+patch-5 retirement chain landed empirically. Three steps shippe
 
 The chain proved the §5.5 revision's payoff is **real but partial** vs the handoff's projection. A.1.X + A.2 retirement is genuine architectural cleanup. Patch 5 retention is honest. The "rustc-natural model" framing the design-conversation anticipated is now empirically validated for non-generic and discovery paths; comptime-dependent items (Sky proper's future concern, not toylang) are the remaining motivation for §5.5 as originally designed.
 
-### Patch 5 retirement (follow-up arc, ~half day)
+### Patch 5 retirement — INVESTIGATED + BLOCKED (2026-06-21)
 
-Post-chain analysis surfaced that patch 5 in the rustc fork CAN actually retire — it just requires a small refactor of the only consumer of `tcx.consumer_lang_active(())` plus a rustc-fork rebuild. The blocking observation in Step 3 (where disabling consumer_lang_active broke 11 case3/case5 fixtures) was a sibling-dependency, not architectural load-bearing.
+Attempted retirement: removed Sky's override of `consumer_lang_active` (made the default `false` provider win), kept the cross_crate_inlinable override using an inline `is_sky_active(tcx)` helper instead of `tcx.consumer_lang_active(())`. Tests: 3 case5 fixtures (`test_inline_case5_no_lto`/`_thin_lto`/`_fat_lto`) failed at RUNTIME with `unreachable!()` from the stub body. SBMNBIZ-style failure mode.
 
-**What's in patch 5 (3 sites in the fork):**
+**Root cause finding** — invalidates the earlier "Step 3 makes patch 5 a no-op" claim:
 
-1. Query declaration of `consumer_lang_active(()) -> bool` in `compiler/rustc_middle/src/query/mod.rs`.
-2. Default provider (returns `false`) in `compiler/rustc_mir_transform/src/lib.rs`.
-3. Gated share-generics escape clause in `Instance::upstream_monomorphization` (`compiler/rustc_middle/src/ty/instance.rs`).
+Patch 5's gated share-generics escape clause is load-bearing for **rustc's NATURAL `upstream_monomorphizations_for` map**, not just for Sky's A.2-synthesized entries. Rust generic items emitted at `__lang_stubs`'s share-generics-true compile (e.g., `Vec::<i32>::new`, `<MyCounter as Clone>::clone`) get recorded in rustc's natural map via the standard rmeta path. At the user_bin's share-generics-false compile, the gate's main condition (`!share_generics() && inline != Never`) returns `true` → would return `None` → mangler picks LOCAL_CRATE disambig → mismatch with where the body actually lives.
 
-Under Step 3, (3) is empirically a no-op — the augmented map is empty (A.2 disabled), so `contains_key` always returns false → same outcome as no-patch. (1)+(2) are infrastructure for the query.
+The patch 5 escape clause prevents this short-circuit by consulting `consumer_lang_active(())` and checking the natural map. Under Sky-active compiles, when the natural map has the entry, the escape fires → mangler picks the right upstream disambig.
 
-**The only caller** of `tcx.consumer_lang_active(())` is `rustc-lang-facade/src/queries/cross_crate_inlinable.rs` (the F2/B16 fix). It gates on "is Sky involved in this build?" — purely a marker-check question that can be answered by walking loaded crates directly:
+The Step-3 reasoning ("augmented map is empty so escape is a no-op") was right for SKY items (A.2 retired, no augmented entries). But for RUST items, the natural map has entries, and the escape clause is genuinely load-bearing.
 
-```rust
-// Inline replacement for `tcx.consumer_lang_active(())`:
-fn sky_is_active(tcx: TyCtxt<'_>) -> bool {
-    use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE};
-    if is_from_lang_stubs(tcx, CRATE_DEF_ID.to_def_id()) {
-        return true;
-    }
-    tcx.crates(()).iter().any(|&cnum| {
-        is_from_lang_stubs(tcx, DefId { krate: cnum, index: CRATE_DEF_INDEX })
-    })
-}
-```
+**What's load-bearing:**
+1. The fork patch in `Instance::upstream_monomorphization` (the gated escape clause) — prevents share-generics short-circuit for items rustc's natural map has entries for.
+2. Sky's facade-side `lang_consumer_lang_active` provider — returns `true` for Sky-active compiles so the escape clause fires.
+3. The query declaration + default provider in the fork — infrastructure for (2).
 
-The check is O(crates) per call, with each individual marker-check O(1) via the existing `SKY_STUBS_CRATES` thread-local cache.
+All three pieces stay. Fork stays at 5 patches.
 
-**Retirement steps:**
+**Sky-side cleanup that DID land (commit forthcoming):**
+- New `pub fn is_sky_active(tcx) -> bool` helper in `rustc-lang-facade/src/lib.rs` — consolidates the marker-walk logic.
+- `lang_consumer_lang_active` simplified to call `is_sky_active(tcx)` (was duplicating the same logic inline).
+- `lang_cross_crate_inlinable` + `lang_extern_cross_crate_inlinable` now call `crate::is_sky_active(tcx)` instead of `tcx.consumer_lang_active(())`. Cheaper (skip query plumbing); cleaner abstraction.
+- No fork changes.
 
-1. Add `is_sky_active(tcx) -> bool` helper to `rustc-lang-facade/src/lib.rs` — does the marker walk without going through the query.
-2. Update both `lang_cross_crate_inlinable` + `lang_extern_cross_crate_inlinable` in `cross_crate_inlinable.rs` to call the helper instead of `tcx.consumer_lang_active(())`.
-3. Remove `providers.queries.consumer_lang_active = lang_consumer_lang_active;` registration in `queries/mod.rs`. Delete the `lang_consumer_lang_active` function.
-4. Remove the fork patch 5 entirely — delete the query declaration in `rustc_middle/query/mod.rs`, the default provider in `rustc_mir_transform/lib.rs`, AND the gated escape clause in `rustc_middle/ty/instance.rs`. 3 sites in the rustc fork.
-5. Rebuild rustc-fork (~15-20 min per arch §3.4's bump-cost calibration).
-6. Update arch doc: §3.2 patches table goes from 5 patches to 4. §B.5 retires entirely (or moves to historical). §25.2 B14 closing context shifts to "obviated by Step 3 + cross_crate_inlinable's inline marker check". §F.14.1, §F.16, §26 references to patch 5 update.
-7. Update handoff: fork patch count drops to 4. This subsection retires (or moves to a "SHIPPED" archive).
+**Empirical wins:** 192/0/1 stays. Slightly less coupling between cross_crate_inlinable and the query system. Marker-walk logic exists in one place.
 
-**Coordination needed:** the rustc-fork edits live in `~/rust/compiler/{rustc_middle, rustc_mir_transform}`. Touching those + the rebuild is a step that needs explicit user authorization (rustc-fork rebuild is ~15-20 min and is the long pole of the work).
-
-**Verification:** the existing matrix (192/0/1) should hold post-retirement. Specifically watch case3/case5 fixtures (they're the ones that broke during the Step 3 A/B test when consumer_lang_active was disabled without the inline helper replacement).
-
-**Net win:** fork shrinks from 5 patches to 4. Cleaner long-term maintenance posture (one fewer patch to rebase per nightly bump). The infrastructure for the share-generics escape mechanism becomes available for re-introduction later if a future Sky requirement needs it; today nothing does.
+**Future-direction note:** if a future Sky/Sky-proper architecture relaxes the share-generics constraint at user_bin (e.g., force share_generics=true via a heuristic similar to the `__lang_stubs` heuristic), the gated escape clause could potentially retire. That's a separate investigation, not gated on §5.5 chain work.
 
 ---
 

@@ -104,63 +104,35 @@ pub fn lang_override_queries(
     // retirement.
     // providers.queries.upstream_monomorphizations =
     //     upstream_monomorphization::lang_upstream_monomorphizations;
-    // §5.5 Step 3 finding: consumer_lang_active stays — it's load-bearing
-    // for F2's `cross_crate_inlinable` override (B16) and for codegen_fn_attrs
-    // gating (Option 4). Patch 5's share-generics escape clause (which
-    // queries consumer_lang_active in the fork) is effectively a no-op
-    // under Step 3 because A.2's augmented map is empty (we disabled it),
-    // so the escape clause's `contains_key` always returns false → same
-    // as no-escape path. The fork patch 5 itself stays but as a no-op
-    // under Step 3. A future Sky-frontend cleanup might retire patch 5
-    // proper (one fewer fork patch); that's a separate cleanup not
-    // priced into this chain.
+    // Patch 5 (consumer_lang_active query + share-generics escape clause)
+    // STAYS. Empirical 2026-06-21 finding: the escape clause is load-bearing
+    // for RUSTC's NATURAL `upstream_monomorphizations_for` map (which has
+    // entries for Rust generic items like `Vec::<i32>::new` emitted at
+    // __lang_stubs's share-generics-true compile). At user_bin's
+    // share_generics=false compile, without the escape clause, the
+    // mangler short-circuits → picks LOCAL_CRATE disambig → mismatch
+    // with where the body actually lives. Symptom: case5 fixtures
+    // crash at runtime with `unreachable!()` from the stub body.
+    //
+    // The earlier "Step 3 makes patch 5 a no-op" claim was specific to
+    // A.2's augmented map for Sky trait-impl methods (which IS empty
+    // post-Step-3). For Rust items, rustc's natural map provides the
+    // entries and patch 5 is genuinely load-bearing.
+    //
+    // Implementation note: lang_consumer_lang_active now just calls
+    // crate::is_sky_active(tcx) — consolidates the marker-walk logic
+    // (previously duplicated). The provider remains so rustc-internal
+    // consumers (the fork's instance.rs gate) see the right value.
     providers.queries.consumer_lang_active = lang_consumer_lang_active;
 }
 
 /// Provider for the `consumer_lang_active` query (forked rustc patch 5).
-/// Returns `true` iff *any* loaded crate (LOCAL_CRATE or any upstream rlib
-/// pulled in via `extern crate`) carries `__SKY_STUBS_MARKER`. This covers
-/// three compile shapes:
-///
-/// - **Stub rlib compile.** LOCAL_CRATE itself is a Sky stub rlib with the
-///   marker → returns `true`. The stub rlib's mangler reads the augmented
-///   gate, picks the right disambig for upstream-monomorphized items.
-///
-/// - **User-bin compile.** LOCAL_CRATE is a plain Rust bin with no marker,
-///   BUT it depends on the Sky stub rlib (which has the marker). Walk
-///   `tcx.crates(())` to find the marker upstream → returns `true`. The
-///   user-bin's mangler then picks the upstream's disambig for the items
-///   the stub rlib emitted.
-///
-/// - **Pure-Rust crate compiled by this rustc binary.** No marker anywhere
-///   → returns `false`. Byte-identical pass-through preserved.
-///
-/// The default query provider returns `false`, so vanilla rustc never sees
-/// `true`. The facade installs this override on every compile.
+/// Identical semantics to `crate::is_sky_active(tcx)`; kept as a query
+/// shim until the rustc-fork patch 5 retirement lands (then this can
+/// delete along with the query declaration).
 pub fn lang_consumer_lang_active<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     _: (),
 ) -> bool {
-    use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE};
-    // Local crate first (covers stub rlib compiles).
-    if crate::is_from_lang_stubs(tcx, CRATE_DEF_ID.to_def_id()) {
-        return true;
-    }
-    // Walk upstream crates (covers user-bin and Sky-lib consumer compiles).
-    // `tcx.crates(())` returns every loaded extern crate, transitive deps
-    // included; for each, `is_from_lang_stubs` consults the cached marker
-    // check.
-    for &cnum in tcx.crates(()).iter() {
-        if cnum == LOCAL_CRATE {
-            continue;
-        }
-        // Construct a synthetic DefId for the crate root.
-        if crate::is_from_lang_stubs(
-            tcx,
-            rustc_hir::def_id::DefId { krate: cnum, index: rustc_hir::def_id::CRATE_DEF_INDEX },
-        ) {
-            return true;
-        }
-    }
-    false
+    crate::is_sky_active(tcx)
 }

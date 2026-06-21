@@ -64,11 +64,17 @@ pub type ExternCrossCrateInlinableFn = for<'tcx> fn(TyCtxt<'tcx>, DefId) -> bool
 /// Override for `providers.queries.cross_crate_inlinable` (local items).
 /// Returns `false` when Sky machinery is active; delegates to the default
 /// provider otherwise.
+///
+/// Patch 5 retirement (2026-06-21): switched from `tcx.consumer_lang_active(())`
+/// to the inline `crate::is_sky_active(tcx)` marker-walk helper. Same
+/// semantics, but doesn't require the consumer_lang_active rustc-fork
+/// query patch — that patch could not be retired while this query call
+/// was here.
 pub fn lang_cross_crate_inlinable<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
 ) -> bool {
-    if tcx.consumer_lang_active(()) {
+    if crate::is_sky_active(tcx) {
         return false;
     }
     crate::default_cross_crate_inlinable()(tcx, def_id)
@@ -82,7 +88,7 @@ pub fn lang_extern_cross_crate_inlinable<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
 ) -> bool {
-    if tcx.consumer_lang_active(()) {
+    if crate::is_sky_active(tcx) {
         return false;
     }
     crate::default_extern_cross_crate_inlinable()(tcx, def_id)
