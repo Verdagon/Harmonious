@@ -12,6 +12,32 @@ not, read those first.
 threads is bug-fixing — they're refinement/investigation/expansion work.
 Release-mode (the previous handoff's bug) is fully resolved as of `08f350e`.
 
+**2026-06-21 progress note: §5.5 chain COMPLETE — Steps 1+2+3 shipped; Step 4 dropped as misdiagnosis.**
+
+The full A.1+A.2+patch-5 retirement chain landed empirically. Three steps shipped, one dropped on architectural review:
+
+- **Step 1 (Sky-frontend types_match)**: types_match extended to bridge `RustType ↔ Struct` / `RustType ↔ StructRef` when names + type_args match (cross-Sky-crate Sky types can be classified as RustType at the rustc-oracle lookup path and Struct at the sidecar-registry path; both are the same logical type). Plus walk_and_stash extended to use an effective_registry (LOCAL + UPSTREAMs merged) for cross-crate callee lookup, with `local_registry` discrimination to avoid duplicate emission of upstream-owned non-generic callees. Unblocks DQ-D (`test_multi_sky_generic`). Commit `20c87c1`.
+
+- **Step 2 (narrower-§5.5)**: non-generic Sky bodies emit at owning crate's stub_rlib compile. Documented LTO trade-off (no cross-Sky/Rust inlining at lto=false; requires `lto = "thin"` or `"fat"`). New @SBMNBIZ arcanum captures the AvailableExternally-stub-must-not-be-inlined invariant. 8 matrix fixtures updated to assert tail-jump present. Commit `41f7ae4`.
+
+- **Step 3 (full §5.5 partial)**: cascade-discovered trait-impl method bodies drain at the cascade-firing crate (stub_rlib compile) rather than at user_bin. A.1.X (capture-ship-replay drain) RETIRED. A.2 (`lang_upstream_monomorphizations[_for]`) RETIRED — empirically redundant because Sky's body emits at the same compile session as the call site, so LOCAL_CRATE = __lang_stubs naturally matches without the augmented map. Patch 5's `consumer_lang_active` query STAYS — load-bearing for F2's `cross_crate_inlinable` override (B16) and Option 4's codegen_fn_attrs gating, not the share-generics escape itself. The fork patch 5 in rustc is now empirically a no-op but stays at 5 patches. Commit `b09a90b`.
+
+- **Step 4 (ReifyFnPointer extension)**: ❌ **DROPPED**. The handoff's premise was a category error: ReifyFnPointer casts tell rustc to discover and compile RUST deps Sky transitively calls. Using the same mechanism for Sky-INTERNAL deps would be wrong — rustc has no role in Sky-internal emission (Sky's fill_extra_modules handles that), and non-export Sky-internal items don't have DefIds (arch §9.3, §9.4). walk_and_stash is the correct Sky-side mechanism for Sky-internal discovery; there's no pressure to push it into rustc's world. A.1.Y (walk_and_stash) stays as legitimate Sky-side infrastructure.
+
+**Net chain outcome**:
+- A.1.X (capture-ship-replay user_bin drain): RETIRED.
+- A.1.Y (walk_and_stash transitive Sky-callee discovery): STAYS — correct architectural place.
+- A.2 (synthesize_upstream_monomorphizations + the per-DefId map override): RETIRED. ~70 lines of code dead-but-archived; cleanup deletion is a follow-up.
+- Patch 5 (consumer_lang_active facade override): STAYS for sibling-dependency reasons. The rustc fork patch is a no-op under Step 3 — could retire as a separate fork-cleanup arc.
+- Fork: stays at 5 patches.
+- Verification: 192/0/1 cold + warm across all 4 commits in the chain.
+
+**Test count progression**: 191/0/2 baseline → 192/0/1 final (the +1 is DQ-D's `test_multi_sky_generic` un-ignored and passing).
+
+The chain proved the §5.5 revision's payoff is **real but partial** vs the handoff's projection. A.1.X + A.2 retirement is genuine architectural cleanup. Patch 5 retention is honest. The "rustc-natural model" framing the design-conversation anticipated is now empirically validated for non-generic and discovery paths; comptime-dependent items (Sky proper's future concern, not toylang) are the remaining motivation for §5.5 as originally designed.
+
+---
+
 **2026-06-21 progress note: §5.5 Step 2 (narrower-§5.5) SHIPPED with a documented LTO trade-off + new @SBMNBIZ arcanum.**
 
 Step 2 of the A.1+A.2+patch-5 retirement chain landed. Non-generic Sky bodies now emit at their owning crate's stub_rlib compile (via `consumer_fill_modules`'s extended populate path + eager-emit of local trait-impls). A.1.X (capture-ship-replay) retires for non-generic trait impls; A.1.Y (transitive-callee stash), A.2, and patch 5 stay (those address generic-instantiation concerns, which Step 3 will tackle).
@@ -284,7 +310,7 @@ analysis, not a working prototype.
 | 1 | Fix Sky-frontend `types_match` to bridge `RustType ↔ Struct` for cross-Sky-crate Sky types | ~0.5 day | Nothing directly — but unblocks DQ-D so Step 3 becomes empirically testable | None |
 | 2 | **SHIPPED 2026-06-21.** Narrower-§5.5 (non-generics only): consumer_fill_modules emits owned non-generic items at every compile session it owns (stub_rlib + user_bin both populate now); eager-emit of local non-generic trait_impls added; internal symbols also pinned in @llvm.used. **Actual cost: ~1 day** (vs ~0.5 estimated) — overshot because the thin-local LTO mechanism (arch §F.16) wasn't priced into the original plan, requiring 8 matrix fixtures to be flipped + the new @SBMNBIZ arcanum + arch doc updates. **Retires:** A.1.X for non-generic trait impls. **Documented trade-off:** cross-Sky/Rust inlining now requires `lto = "thin"` or `"fat"` (no thin-local LTO bridge across rustc invocations). | None — can ship today, independent of Step 1 |
 | 3 | Ship full §5.5 (generics included): same discrimination but per-Instance owning-crate lookup; generics emit at first-reachable site | ~3-5 days | A.1's capture-ship-replay entirely (discovery + emission converge); A.2 likely (External-linkage items recorded naturally in rmeta, R1's filter passes); patch 5 likely (share_generics natural map non-empty, gate's short-circuit doesn't bite); fork may shrink to 4 patches | Step 1 (so DQ-D is verifiable) |
-| 4 | Extend ReifyFnPointer technique in per_instance_mir to consumer→consumer generic deps | ~1-2 days | A.1's transitive consumer-callee stash (`walk_and_stash_internal_callees`) — rustc's collector discovers Sky-internal transitive callees via the synthesized body instead of via a Sky-side recursive walk | Independent — can land before or after Step 3 |
+| 4 | ❌ **DROPPED 2026-06-21.** The premise was confused: ReifyFnPointer casts tell rustc to discover and compile RUST deps Sky transitively calls. Using the same mechanism for Sky-INTERNAL deps would be a category error — rustc has no role in Sky-internal item emission (Sky's fill_extra_modules handles that), and non-export Sky-internal items don't have DefIds in the first place (arch §9.3, §9.4). walk_and_stash is the correct Sky-side mechanism for Sky-internal transitive callee discovery; there's no pressure to push it into rustc's mono walker. Walk_and_stash STAYS as legitimate Sky-side discovery infrastructure. | n/a |
 
 ### What "A.1" actually contains
 
