@@ -92,26 +92,29 @@ Three open threads remaining (F1 + F2 + Thread C closed):
 4. **Discovery/synthesis/filter machinery (Thread A)** — three Sky-side
    layers (capture-ship-replay, synthesize-upstream-monomorphizations,
    partition filter) coordinate to handle the F.13 cascade-timing
-   problem. Investigate whether any can be pruned/eliminated, especially
-   in light of the new release-mode fix's machinery. Cost: ~1-2 weeks
-   for full investigation; partial pruning is hours.
+   problem. **Deep investigation (2026-06-20) surfaced 8 architectural
+   mechanisms** for retiring the partition filter (A.3). The actionable
+   recommendation is **Option 4 (codegen_fn_attrs → AvailableExternally)**
+   — a half-day fix that retires A.3 (~107 lines) without affecting
+   A.1/A.2. **A complete implementation guide is at "Option 4
+   implementation guide (for next session)" later in this doc.** Start
+   there if you're picking up Thread A.
 5. **share_generics handling (Thread B)** — current support is forced-on
    at `__lang_stubs`, hard-error if user disables it there, otherwise
    user choice. Decide if we should support/honor it differently in
    other configurations. Cost: ~1 day investigation + decision.
-6. **The "kill partition filter" sub-thread (Thread A.5)** — separable
-   from the rest. If the partition filter could be eliminated, both A.1
-   (capture-ship-replay) and A.2 (synthesize-upstream-monomorphizations)
-   dissolve naturally. Requires either an upstream RFC
-   (`#[codegen_backend_provides_body]`) or a Sky-side replacement
-   mechanism. Cost: investigation ~3-5 days; implementation likely
-   multi-week.
+6. **A.1/A.2 retirement (long-term, Option 8)** — only achievable via
+   `per_instance_mir` returning REAL bodies (Sky as a MIR emitter).
+   Substantial new component; retires patch 4 of the rustc fork too.
+   For Sky proper this is the architectural endgame, not immediate.
 
-Recommended order (updated 2026-06-20): **A → B**. Threads A and B are
-the remaining architectural work; F1 and F2 became top-of-stack because the matrix surfaced them as real architectural
-gaps with user-visible consequences. A is hygiene; B is design-space
-exploration. C is largely shipped; pick it back up only if you want
-Sky-side `#[inline]` support OR Sky-top Priority B coverage.
+Recommended order (updated 2026-06-20): **Option 4 (A.3 retirement) →
+B (share_generics) → Option 8 (long-term)**. Option 4 is the
+actionable half-day win — see its implementation guide below. F1 and
+F2 became top-of-stack because the matrix surfaced them as real
+architectural gaps with user-visible consequences. C is largely
+shipped; pick it back up only if you want Sky-side `#[inline]`
+support OR Sky-top Priority B coverage.
 
 ---
 
@@ -456,26 +459,6 @@ partition filter — listed in roughly increasing cost:
 | **Option 4 (AvailableExternally) — DO NOW** | A.3 only | ~half day prototype + verify; ~108 lines retire; F1 promise preserved |
 | **Option 8 (real-MIR per_instance_mir) — LATER** | A.1, A.2, A.3, AND patch 4 | Significant — full MIR emitter; long-term post-Sky-proper-MVP |
 
-Option 4 is the actionable win. Implementation sketch:
-
-```rust
-// New file: rustc-lang-facade/src/queries/codegen_fn_attrs.rs
-pub fn lang_codegen_fn_attrs<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-) -> CodegenFnAttrs {
-    let mut attrs = default_codegen_fn_attrs()(tcx, def_id);
-    if is_consumer_codegen_target(tcx, def_id.to_def_id()) {
-        attrs.linkage = Some(Linkage::AvailableExternally);
-    }
-    attrs
-}
-```
-
-Then delete `partition.rs`'s filter logic. The matrix should keep passing
-(F1's promise preserved); the `cross_crate_inlinable.rs` override (B16)
-stays — it's an independent fix.
-
 What the handoff's original Thread A claimed:
 - A.1 + A.2 + A.3 all dissolve under path (c). ❌ Wrong — path (c)
   doesn't actually buy LTO inlining for non-generic Sky exports.
@@ -486,13 +469,446 @@ What we actually know now:
 - A.2 (synthesize_upstream_monomorphizations) is genuinely load-bearing
   for Sky trait methods. Even Option 4 doesn't retire A.2.
 - A.3 (partition filter) CAN be retired via Option 4 today, at the cost
-  of one new query override (~80 lines).
+  of one new query override.
 
 So the actually-achievable architectural cleanup is more modest than
 the original handoff suggested: Option 4 retires A.3 but A.1 and A.2
-stay. ~150 lines of code retire (the partition filter + its tests).
+stay. ~107 lines of code retire (the partition filter file).
 Sky's architecture doc §F.13 stays accurate; §F.14 (why Approach C
 doesn't work) becomes purely historical.
+
+---
+
+## Option 4 implementation guide (for next session)
+
+This subsection is the complete how-to for retiring A.3 via Option 4.
+Treat it as a self-contained playbook. Estimated cost: half a day if
+the in-process inliner concern (see "Open question" below) doesn't
+bite; ~1 day if mitigation is needed.
+
+### What's actually happening today (mechanical detail)
+
+The collision Option 4 is going to defuse:
+
+1. **`stub_gen` emits Rust source** for every Sky-marked crate. For
+   `export fn add_one(x: i32) -> i32`, the stub source contains:
+   ```rust
+   pub fn add_one(x: i32) -> i32 { unreachable!() }
+   ```
+   See `toylangc/src/stub_gen.rs:333-342` for the wrapper-fn emission
+   site. (Pre-F1 this also had `#[inline(never)]`; that was removed
+   in commit `c4e8271`.)
+
+2. **Rustc compiles `__lang_stubs`** as ordinary Rust. By default it
+   would emit machine code for `add_one` — a `panic("unreachable")`
+   blob in a `.rcgu.o`. This is the body that competes with Sky's.
+
+3. **Sky's `fill_extra_modules` hook** (patch 4 of the fork) emits the
+   REAL body for `add_one` into a separate LLVM module. Same mangled
+   symbol name (per the Path B / single-symbol architecture, §F.2 in
+   arch doc), External linkage.
+
+4. **The partition filter (A.3)** intercepts the CGU list between
+   rustc's default partitioner and rustc's LLVM backend. It REMOVES
+   every Sky-defined item from the CGU list. Rustc's backend then
+   has nothing to codegen for those items → no `.o` from rustc →
+   no collision with Sky's `.o`.
+
+The filter is at `rustc-lang-facade/src/queries/partition.rs:59-107`.
+The whole file is 107 lines including comments. The retirement
+target.
+
+### Why Option 4 works
+
+LLVM has a linkage kind called `AvailableExternally`. Semantics: "the
+body of this function is present in the module **for inlining
+purposes only**. Do NOT emit it as a `.o` symbol. Assume someone else
+provides the symbol at link time."
+
+Set `attrs.linkage = Some(Linkage::AvailableExternally)` on every
+Sky-defined item's `CodegenFnAttrs`. Two effects:
+
+1. Rustc's partitioner sees `mono_item.explicit_linkage(tcx)` returns
+   `Some(AvailableExternally)` and short-circuits at
+   `rustc_monomorphize::partitioning.rs:749-751` — the item still
+   lands in a CGU, but the linkage decision is locked.
+
+2. Rustc's LLVM backend codegens the body but the resulting LLVM
+   function has `available_externally` linkage. LLVM's emit step
+   does NOT produce a `.o` symbol for `available_externally`
+   functions. The body exists in the IR for cross-module inlining
+   (LTO) but produces no machine code.
+
+Sky's `fill_extra_modules` still emits its real body with External
+linkage as usual. At link time, Sky's body is the sole definition;
+the linker resolves all references to it.
+
+No collision. No partition filter needed.
+
+### The rustc query you'll override
+
+```
+query codegen_fn_attrs(def_id: DefId) -> &'tcx CodegenFnAttrs {
+    desc { |tcx| "computing codegen attributes of `{}`", tcx.def_path_str(def_id) }
+    arena_cache
+    cache_on_disk_if { def_id.is_local() }
+    separate_provide_extern
+    feedable
+}
+```
+
+Source: `~/rust/compiler/rustc_middle/src/query/mod.rs` (search for
+"query codegen_fn_attrs").
+
+Important properties:
+- **`separate_provide_extern`**: there are TWO providers — one for
+  local items (`queries.codegen_fn_attrs`, takes `LocalDefId`) and one
+  for upstream items read from rmeta (`extern_queries.codegen_fn_attrs`,
+  takes `DefId`). Sky needs to override BOTH, just like the F2 fix
+  in `cross_crate_inlinable.rs` does. See that file for the pattern.
+- **`arena_cache`**: rustc wraps the provider to arena-allocate the
+  returned `CodegenFnAttrs` and serve it back as `&'tcx CodegenFnAttrs`.
+  Sky's provider returns by value; rustc handles the arena.
+- **`feedable`**: there's also a `tcx.feed_codegen_fn_attrs(...)` API
+  for direct injection. Not needed for Sky's use case — the query
+  override path is simpler.
+
+The default provider is at
+`~/rust/compiler/rustc_codegen_ssa/src/codegen_attrs.rs:fn codegen_fn_attrs`.
+It takes `LocalDefId` and returns `CodegenFnAttrs` by value.
+
+### Step-by-step implementation
+
+**Step 1 — Read these before touching code:**
+
+- `rustc-lang-facade/src/queries/cross_crate_inlinable.rs` — the F2
+  fix is the exact structural model for this override. Read the whole
+  file (it's ~90 lines). The new `codegen_fn_attrs.rs` will mirror its
+  shape almost identically.
+- `rustc-lang-facade/src/queries/mod.rs` lines 56-89 — see how
+  cross_crate_inlinable is wired into both `queries` and
+  `extern_queries`. New override follows the same pattern.
+- `rustc-lang-facade/src/lib.rs:1115-1145` — the
+  `install_query_defaults` function that saves the default providers.
+  Add two new parameters for codegen_fn_attrs (local + extern).
+- `rustc-lang-facade/src/queries/partition.rs` (107 lines, doomed) —
+  understand what you're deleting before you delete it.
+- `rustc-lang-facade/src/lib.rs:738-750` — the `is_consumer_codegen_target`
+  function. This is your filter predicate.
+
+**Step 2 — Create the override file.**
+
+New file: `rustc-lang-facade/src/queries/codegen_fn_attrs.rs`. Mirror
+the cross_crate_inlinable.rs shape:
+
+```rust
+//! `codegen_fn_attrs` query override — retires the A.3 partition filter
+//! by marking Sky-defined items with `AvailableExternally` linkage.
+//!
+//! ## The problem
+//!
+//! Sky's stub_gen emits `pub fn add_one(x: i32) -> i32 { unreachable!() }`
+//! for every Sky export. Rustc's default codegen would compile that
+//! body to machine code (a `panic("unreachable")` blob in `.rcgu.o`).
+//! Sky's `fill_extra_modules` hook (patch 4) emits the REAL body for
+//! the same symbol. Two `.o` files, same mangled symbol — link
+//! collision.
+//!
+//! Historical fix: the A.3 partition filter (in `queries/partition.rs`)
+//! removed Sky-defined items from rustc's CGU list before codegen, so
+//! rustc emitted no machine code for them. ~107 lines of "Sky censors
+//! rustc's pipeline."
+//!
+//! ## The fix (this file)
+//!
+//! Override `codegen_fn_attrs` to set
+//! `linkage = Some(Linkage::AvailableExternally)` on every Sky-defined
+//! item. LLVM emits the body for inlining purposes but produces no
+//! `.o` symbol. Sky's `fill_extra_modules` body becomes the sole `.o`
+//! definition; the linker resolves cleanly. No filter needed.
+//!
+//! The partitioner short-circuits at
+//! `rustc_monomorphize::partitioning.rs:749-751` when
+//! `mono_item.explicit_linkage(tcx)` returns Some, so this override
+//! is sufficient — no need to also mutate `MonoItemData.linkage`
+//! post-partition.
+//!
+//! ## Why this preserves pass-through
+//!
+//! Gated on `is_consumer_codegen_target` which only fires for items
+//! in marker-bearing crates. Pure-Rust crates compiled via Sky's rustc
+//! binary delegate to the default provider — byte-identical to vanilla.
+//!
+//! ## Why this preserves F1's LTO inlining promise
+//!
+//! `available_externally` linkage means the body IS in the IR, just
+//! not in the `.o`. LTO's IR linker can still inline the body across
+//! crate boundaries — that's the whole point of the linkage kind.
+//! F1's matrix (29+ thin/fat LTO assertions) should still pass.
+
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::ty::TyCtxt;
+use rustc_hir::attrs::Linkage;
+
+pub type CodegenFnAttrsFn = for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> CodegenFnAttrs;
+pub type ExternCodegenFnAttrsFn = for<'tcx> fn(TyCtxt<'tcx>, DefId) -> &'static CodegenFnAttrs;
+// ^ verify the extern signature against rustc source — `&'static` may need
+// to be `&'tcx` or similar; mirror what extern_queries.codegen_fn_attrs
+// actually wants in the nightly Sky is pinned to.
+
+pub fn lang_codegen_fn_attrs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+) -> CodegenFnAttrs {
+    let mut attrs = crate::default_codegen_fn_attrs()(tcx, def_id);
+    if crate::is_consumer_codegen_target(tcx, def_id.to_def_id()) {
+        attrs.linkage = Some(Linkage::AvailableExternally);
+    }
+    attrs
+}
+
+pub fn lang_extern_codegen_fn_attrs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+) -> &'tcx CodegenFnAttrs {
+    let default = crate::default_extern_codegen_fn_attrs()(tcx, def_id);
+    if !crate::is_consumer_codegen_target(tcx, def_id) {
+        return default;
+    }
+    // Clone, mutate, re-arena. Sky's items reached via rmeta also
+    // need AvailableExternally so their downstream consumers don't
+    // emit collision `.o`s either.
+    let mut owned = (*default).clone();
+    owned.linkage = Some(Linkage::AvailableExternally);
+    tcx.arena.alloc(owned)
+}
+```
+
+**Step 3 — Wire it into `queries/mod.rs`.**
+
+Mirror cross_crate_inlinable. Add `pub mod codegen_fn_attrs;` near
+the other module declarations. In `lang_override_queries`:
+
+```rust
+crate::install_query_defaults(
+    providers.queries.layout_of,
+    providers.queries.mir_shims,
+    providers.queries.symbol_name,
+    providers.queries.collect_and_partition_mono_items,  // ← keep this; the default partitioner still runs
+    providers.queries.upstream_monomorphizations_for,
+    providers.queries.upstream_monomorphizations,
+    providers.queries.cross_crate_inlinable,
+    providers.extern_queries.cross_crate_inlinable,
+    providers.queries.codegen_fn_attrs,           // NEW
+    providers.extern_queries.codegen_fn_attrs,    // NEW
+);
+
+// ... existing overrides ...
+
+// REMOVE THIS LINE (A.3 retirement):
+// providers.queries.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
+
+// ADD THESE (Option 4):
+providers.queries.codegen_fn_attrs =
+    codegen_fn_attrs::lang_codegen_fn_attrs;
+providers.extern_queries.codegen_fn_attrs =
+    codegen_fn_attrs::lang_extern_codegen_fn_attrs;
+```
+
+**Step 4 — Extend `install_query_defaults` in `lib.rs`.**
+
+Add two more parameters and two more `OnceLock`s. Pattern is identical
+to how cross_crate_inlinable's default got saved (~10 lines added in
+that commit). Also add `default_codegen_fn_attrs()` and
+`default_extern_codegen_fn_attrs()` accessors.
+
+**Step 5 — Remove `queries/partition.rs`.**
+
+Delete the file. Search for references:
+```
+grep -rn "queries::partition\|queries/partition\|lang_collect_and_partition_mono_items" \
+  rustc-lang-facade/ toylangc/
+```
+
+Update each site. The `default_collect_and_partition()` accessor at
+`rustc-lang-facade/src/lib.rs` is called from
+`toylangc/src/llvm_gen.rs::generate_with_tcx` to get the unfiltered
+CGU slice for Case 1b discovery. After Option 4, the CGU slice is
+unfiltered by default (no override) — the call site can either keep
+calling `default_collect_and_partition()` directly or just call
+`tcx.collect_and_partition_mono_items(())`. Verify which is correct
+by checking what `toylangc::llvm_gen` actually does with the slice.
+
+**Step 6 — Remove the partition module from `queries/mod.rs`.**
+
+Delete `pub mod partition;` and the `partition::` references. Also
+update the module doc-comment that mentions partition as one of the
+overrides (currently lines 1-27).
+
+**Step 7 — Build and test.**
+
+```
+export LLVM_SYS_211_PREFIX=/Users/verdagon/rust/build/aarch64-apple-darwin/ci-llvm
+cargo +rustc-fork build --manifest-path ./toylangc/Cargo.toml > ./tmp/option4.txt 2>&1
+echo "build exit=$?"
+```
+
+If build is clean, run the suite:
+```
+cargo +rustc-fork test --manifest-path ./toylangc/Cargo.toml > ./tmp/option4.txt 2>&1
+echo "test exit=$?"
+grep "test result" ./tmp/option4.txt
+```
+
+Expected: 191 passing, 0 failing, 1 ignored (same as the current
+baseline). Especially watch the inlining matrix (40 fixtures, all
+under `inlining/case*` names) — F1's promise lives there.
+
+### Open question to validate
+
+This is the one thing that could go wrong. The available_externally
+body is present in the IR for inlining. Within the stub_rlib's own
+compile, Sky's emitted `__lang_stubs::duplicate<Wrapper<i32>>` body
+references `__lang_stubs::add_one`. Could LLVM (or rustc's MIR
+inliner) inline the `unreachable!()` body into Sky's callers at
+codegen time?
+
+**LTO case (cross-module):** `#![no_builtins]` on stub rlibs (emitted
+by stub_gen — see `toylangc/src/build.rs:329`) excludes their bitcode
+from the LTO pool entirely. The available_externally body never
+reaches the LTO IR linker. Sky's emitted body (in a separately-attached
+LLVM module via patch 4) IS in the LTO pool. So LTO inlines Sky's
+body, not the stub's. Safe.
+
+**Non-LTO case (in-process inliner at stub_rlib compile):** rustc's
+MIR inliner runs at -O1+. It might pull the stub's `unreachable!()`
+body INTO Sky-defined callers within the same crate. If it does,
+those callers crash at runtime when reached.
+
+**How to verify quickly:** after Step 7's tests pass, manually check
+case 4 / case 6 binaries at -O3:
+```
+/Users/verdagon/rust/build/aarch64-apple-darwin/ci-llvm/bin/llvm-objdump \
+  -d --no-show-raw-insn \
+  toylangc/target/integration-projects-cache/debug/case4_thin_lto \
+  | awk '/<.*case4_thin_lto.*4main>:/,/^$/' | head -20
+```
+
+What you want to see: main constant-folds Sky's body (e.g. `mov w8,
+#42`) — same as today. If instead you see an `unreachable` trap or a
+`udf` instruction inside main's body, the MIR inliner pulled the
+stub's body. Mitigation:
+
+**If the MIR inliner bites:** re-introduce targeted `#[inline(never)]`
+on the stub source's body. The F1 fence
+(`toylangc/tests/architecture_fence.rs::stub_gen_no_inline_never_on_sky_items`)
+will fire — that's correct; bump
+`F1_EXPECTED_INLINE_NEVER_SITES` from `2` to whatever the new count
+is, and update the comment to point at "MIR inliner mitigation for
+Option 4." Verify the matrix's LTO assertions still pass (F1's
+original concern was the LLVM-side inliner; `#[inline(never)]` doesn't
+block LTO inlining of Sky's separately-emitted body because Sky's body
+isn't the one the attribute is on).
+
+The two concerns are independent:
+- F1 was: "stub source has #[inline(never)] → LLVM doesn't inline
+  Sky's body cross-crate at LTO." Cause: the noinline attribute
+  propagated to call-site decisions. F1 removed the attribute to fix
+  this.
+- Option 4 risk: "stub source has available_externally body → rustc
+  MIR inliner pulls stub's unreachable into Sky's callers in same
+  crate." Cause: the body is visible in IR.
+
+`#[inline(never)]` blocks the MIR inliner (rustc-internal, per-call-site).
+F1's concern was an LLVM-internal, per-call-site decision driven by
+function-attribute metadata. Re-introducing `#[inline(never)]` to fix
+Option 4's MIR-inliner risk MAY also re-introduce F1's LLVM-inliner
+risk — verify by running the matrix.
+
+**If both can't be reconciled:** abort Option 4 and document why.
+Path is still open via Option 6 (post-partition linkage mutation)
+which doesn't trigger this exact concern because it doesn't emit a
+body at all into the rustc-controlled CGU — it just changes the
+data record's linkage field.
+
+### Verification checklist
+
+Before declaring Option 4 done:
+
+- [ ] `queries/partition.rs` is deleted
+- [ ] `queries/codegen_fn_attrs.rs` is created
+- [ ] Both `queries.codegen_fn_attrs` and `extern_queries.codegen_fn_attrs`
+      are overridden
+- [ ] `install_query_defaults` saves the new defaults
+- [ ] `is_consumer_codegen_target` is the gating predicate (same one
+      that partition.rs used)
+- [ ] All 191 tests still pass (run twice for warm+cold cache, since
+      we just fixed that flake)
+- [ ] Inlining matrix LTO assertions all pass
+- [ ] Case 4 / case 6 disasm shows constant-folded values in main
+      (not `udf`/`unreachable`)
+- [ ] `test_release_mode_smoke` passes (the B14 fence — patch 5
+      shouldn't be affected but worth verifying)
+- [ ] Arch doc §F.14 marked "purely historical; A.3 retired via
+      Option 4 commit XXX"
+- [ ] Arch doc §25.2 gains B17 closing entry for partition filter
+      retirement
+- [ ] Handoff updated to mark Option 4 SHIPPED + retire this whole
+      implementation guide section
+
+### What stays (don't accidentally delete)
+
+These are commonly confused with A.3 but are separate:
+
+- **A.1 capture-ship-replay** (`toylangc/src/toylang/callbacks_impl.rs`
+  around line 1305, the `capture_discovered_trait_impl_instances` flow
+  + the sidecar populate drain). STAYS. The cascade still fires at
+  stub_rlib compile; Sky still needs to ship trait-impl Instances.
+- **A.2 synthesize_upstream_monomorphizations** (`rustc-lang-facade/src/queries/upstream_monomorphization.rs`).
+  STAYS. The augmented map is what makes the v0 mangler pick
+  `__lang_stubs` disambig for Sky trait methods.
+- **`cross_crate_inlinable` override** (`queries/cross_crate_inlinable.rs`,
+  shipped in F2 / B16). STAYS. This is an independent fix for a
+  different mechanism (rustc's normal cross_crate_inlinable produces
+  available_externally without Sky asking — F2 forces those to real
+  symbols because Sky's CALLERS reference them. Option 4 produces
+  available_externally for Sky's CALLEES because Sky doesn't want
+  rustc to emit them. Different direction, different override; both
+  needed.)
+- **Patch 4 (`extra_modules` hook)** in the rustc fork. STAYS. Sky's
+  body emission still goes through it; Option 4 just stops rustc from
+  emitting competing bodies.
+- **`#![no_builtins]`** on stub rlibs (in `toylangc/src/build.rs:329`).
+  STAYS. It's load-bearing for the LTO-pool exclusion.
+
+### Files you'll touch
+
+| Path | Action |
+|---|---|
+| `rustc-lang-facade/src/queries/codegen_fn_attrs.rs` | CREATE (~90 lines, mirror cross_crate_inlinable.rs) |
+| `rustc-lang-facade/src/queries/mod.rs` | Add module decl + 2 override wirings; REMOVE partition module decl + override wiring |
+| `rustc-lang-facade/src/lib.rs` | Add 2 OnceLocks + extend install_query_defaults signature + 2 accessor fns; consider whether `default_collect_and_partition()` accessor stays (depends on whether toylangc still calls it) |
+| `rustc-lang-facade/src/queries/partition.rs` | DELETE |
+| `toylangc/src/llvm_gen.rs` (search for `default_collect_and_partition`) | Verify the CGU walk for Case 1b discovery still works — either no change (if `tcx.collect_and_partition_mono_items` is fine without the override) or update to use the accessor |
+| `rust-interop-architecture.md` §F.13/§F.14/§5.3 | Update to reflect A.3 retirement |
+| `rust-interop-architecture.md` §25.2 | Add B17 "A.3 partition filter retired via Option 4" |
+| `handoff.md` | Mark Option 4 SHIPPED; retire this whole "Option 4 implementation guide" subsection |
+
+### One last gotcha
+
+The `cross_crate_inlinable` override (F2 / B16) interacts with
+`codegen_fn_attrs` in subtle ways — both decide linkage. The interaction
+to watch: `attrs.linkage = Some(AvailableExternally)` is set BEFORE
+rustc's downstream code consults `cross_crate_inlinable`. If rustc
+checks cross_crate_inlinable on items with explicit linkage already
+set, the result might be ignored (because the linkage is locked).
+That's probably fine — Sky's items would get AvailableExternally from
+this override regardless of what cross_crate_inlinable says about
+them. But if you see weird linkage discrepancies, this is the
+interaction to grep for. Search rustc source for sites that read
+both attrs (`grep -rn "cross_crate_inlinable\|explicit_linkage"
+~/rust/compiler/rustc_monomorphize/src/`).
 
 ---
 
