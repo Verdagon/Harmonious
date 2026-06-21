@@ -692,18 +692,8 @@ impl ToylangCallbacks {
 // trait method: wrapper mode's `build::write_stub_crate` calls
 // `stub_gen::generate` directly.
 
-/// Step 5 / Option B — record stashed in the facade-owned `SkyUniverse`
-/// at `on_sky_lib_loaded` time, read by
-/// `synthesize_upstream_monomorphizations`. The `crate_name` is captured
-/// here so the stateless synthesis can look up the upstream's `CrateNum`
-/// via `tcx.crates(())` without a side channel.
-struct StashedDiscovery {
-    crate_name: String,
-    self_type_name: String,
-    trait_name: String,
-    method_name: String,
-    concrete_args: Vec<crate::toylang::typed_ast::ResolvedType>,
-}
+// `StashedDiscovery` retired 2026-06-21 along with A.2 / the
+// SkyUniverse.discoveries push.
 
 impl LangCallbacks for ToylangCallbacks {
     fn create_state(&self) -> Box<dyn Any + Send + Sync> {
@@ -1067,22 +1057,12 @@ impl LangCallbacks for ToylangCallbacks {
         // queries. `populate_sky_universe_from_registry` writes both in
         // one pass.
         populate_sky_universe_from_registry(&registry);
-        // Step 5 / Option B: push the upstream's captured discoveries into
-        // the facade-owned SkyUniverse so the stateless
-        // `lang_upstream_monomorphizations_for` query override can
-        // synthesise the args→CrateNum map without re-locking
-        // MUTABLE_STATE (@GCMLZ).
-        rustc_lang_facade::with_sky_universe_mut(|u| {
-            for d in &registry.discovered_trait_impl_instances {
-                u.push_discovery(std::sync::Arc::new(StashedDiscovery {
-                    crate_name: crate_name.to_string(),
-                    self_type_name: d.self_type_name.clone(),
-                    trait_name: d.trait_name.clone(),
-                    method_name: d.method_name.clone(),
-                    concrete_args: d.concrete_args.clone(),
-                }));
-            }
-        });
+        // SkyUniverse.discoveries push retired 2026-06-21 along with A.2.
+        // The discovered_trait_impl_instances field still gets loaded into
+        // `ts.upstream_registries` via the deserialized registry below,
+        // but nothing reads it anymore (the user_bin drain retired in
+        // §5.5 Step 3). Field could be removed from the sidecar in a
+        // future cleanup.
         ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
 
@@ -1431,56 +1411,13 @@ impl LangCallbacks for ToylangCallbacks {
         });
     }
 
-    /// Step 5: stateless synthesis driver. Walks the discoveries stashed
-    /// in `SkyUniverse` (lock-free) and for each captured
-    /// `(self_type, trait, method, concrete_args)` quartet returns:
-    ///   - The DefId of the impl-method (looked up via
-    ///     `oracle::find_trait_impl_method_def_id` — filters on
-    ///     `is_from_lang_stubs` so name collisions with stdlib impls don't
-    ///     hijack — ATAFLBZ).
-    ///   - The concrete `GenericArgsRef`.
-    ///   - The upstream `CrateNum` matching the stashed `crate_name`.
-    /// The facade's whole-map override slots each record into the
-    /// `DefIdMap<UnordMap<...>>` rustc returns, augmenting the default.
-    fn synthesize_upstream_monomorphizations<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-    ) -> Vec<(rustc_hir::def_id::DefId, ty::GenericArgsRef<'tcx>, rustc_span::def_id::CrateNum)> {
-        let stash = rustc_lang_facade::sky_universe().discoveries_clone();
-        let mut records: Vec<(
-            rustc_hir::def_id::DefId,
-            ty::GenericArgsRef<'tcx>,
-            rustc_span::def_id::CrateNum,
-        )> = Vec::new();
-        for arc in &stash {
-            let Some(d) = arc.downcast_ref::<StashedDiscovery>() else { continue; };
-            // Look up the impl-method DefId from (self_type, trait, method).
-            let Some(def_id) = crate::oracle::find_trait_impl_method_def_id(
-                tcx, &d.trait_name, &d.self_type_name, &d.method_name,
-            ) else { continue; };
-            // Build GenericArgsRef from the stored ResolvedType list.
-            let rustc_type_args: Vec<ty::GenericArg<'tcx>> = d.concrete_args.iter()
-                .map(|a| ty::GenericArg::from(
-                    crate::oracle::resolved_to_rustc_ty(tcx, a)
-                ))
-                .collect();
-            let args = crate::oracle::build_generic_args_for_item(
-                tcx, def_id, &rustc_type_args,
-            );
-            // Map stashed `crate_name` to its `CrateNum`. `tcx.crates(())`
-            // returns all loaded upstream crates; match by name.
-            let mut crate_num: Option<rustc_span::def_id::CrateNum> = None;
-            for &c in tcx.crates(()).iter() {
-                if tcx.crate_name(c).as_str() == d.crate_name {
-                    crate_num = Some(c);
-                    break;
-                }
-            }
-            let Some(crate_num) = crate_num else { continue; };
-            records.push((def_id, args, crate_num));
-        }
-        records
-    }
+    // `synthesize_upstream_monomorphizations` (A.2) retired 2026-06-21.
+    // Under §5.5 Step 3, the cascade-firing crate emits trait-impl method
+    // bodies inline (in `consumer_fill_modules`'s !is_user_bin_compile
+    // branch); the call site at the same compile session naturally
+    // picks LOCAL_CRATE = __lang_stubs disambig, matching where the
+    // body lives. The augmented map this callback synthesized is no
+    // longer needed.
 }
 
 /// Strip Mach-O bitcode wrapper (20-byte header) if present, returning the

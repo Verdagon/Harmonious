@@ -5,12 +5,12 @@
 //! `per_instance_mir` (per-Instance synthetic dep-registering bodies for
 //! consumer fns), `symbol_name` (consumer symbol mapping),
 //! `codegen_fn_attrs` (AvailableExternally linkage for consumer items —
-//! retires the partition filter, see Option 4 / arch §F.14),
+//! retires the partition filter, see Option 4 / arch §F.14), and
 //! `cross_crate_inlinable` (forces real `.o` symbols for cross-crate
-//! inlinable items in consumer-active compiles — closes B16),
-//! `upstream_monomorphizations_for` (force local mono for consumer items
-//! under the two-crate architecture), and `upstream_monomorphizations`
-//! (augment with consumer trait-impl synthesised entries).
+//! inlinable items in consumer-active compiles — closes B16).
+//!
+//! `upstream_monomorphizations{_for}` overrides retired 2026-06-21 (A.2
+//! retirement under §5.5 Step 3 — see handoff.md).
 //!
 //! `per_instance_mir` is a custom query added by the rustc fork
 //! (`rust-interop-architecture.md` §3.2). It replaces the retired
@@ -40,7 +40,7 @@ pub mod drop_glue;
 pub mod layout;
 pub mod per_instance;
 pub mod symbol_name;
-pub mod upstream_monomorphization;
+// `upstream_monomorphization` module retired 2026-06-21 (A.2 retirement).
 
 /// Install query overrides. Called from `LangDriver::config`.
 pub fn lang_override_queries(
@@ -59,8 +59,6 @@ pub fn lang_override_queries(
         providers.queries.mir_shims,
         providers.queries.symbol_name,
         providers.queries.collect_and_partition_mono_items,
-        providers.queries.upstream_monomorphizations_for,
-        providers.queries.upstream_monomorphizations,
         providers.queries.cross_crate_inlinable,
         providers.extern_queries.cross_crate_inlinable,
         providers.queries.codegen_fn_attrs,
@@ -80,16 +78,8 @@ pub fn lang_override_queries(
         codegen_fn_attrs::lang_codegen_fn_attrs;
     providers.extern_queries.codegen_fn_attrs =
         codegen_fn_attrs::lang_extern_codegen_fn_attrs;
-    // §5.5 Step 3 A/B test: A.2 (lang_upstream_monomorphizations*) is
-    // suspected redundant under Step 3 because Sky's body for cross-
-    // crate trait-impl methods now emits at the cascade-firing crate's
-    // own compile (where the v0 mangler at both the call site AND the
-    // emission site uses LOCAL_CRATE = __lang_stubs as the disambig
-    // naturally; the augmented map was load-bearing only when Sky's
-    // body emitted at user_bin and the mangler had to be told the
-    // disambig). Re-enable if tests fail to re-prove load-bearing.
-    // providers.queries.upstream_monomorphizations_for =
-    //     upstream_monomorphization::lang_upstream_monomorphizations_for;
+    // A.2's `upstream_monomorphizations{_for}` overrides retired
+    // 2026-06-21 (§5.5 Step 3 — see handoff.md).
     // F2 fix (2026-06-20): force `cross_crate_inlinable` to false in
     // Sky-active compiles so rustc emits real .o symbols rather than
     // `available_externally` declarations. Sky's emitted call sites
@@ -100,10 +90,6 @@ pub fn lang_override_queries(
         cross_crate_inlinable::lang_cross_crate_inlinable;
     providers.extern_queries.cross_crate_inlinable =
         cross_crate_inlinable::lang_extern_cross_crate_inlinable;
-    // §5.5 Step 3 A/B test: see above. A.2 is disabled to verify
-    // retirement.
-    // providers.queries.upstream_monomorphizations =
-    //     upstream_monomorphization::lang_upstream_monomorphizations;
     // Patch 5 (consumer_lang_active query + share-generics escape clause)
     // STAYS. Empirical 2026-06-21 finding: the escape clause is load-bearing
     // for RUSTC's NATURAL `upstream_monomorphizations_for` map (which has
