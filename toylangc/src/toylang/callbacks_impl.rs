@@ -244,8 +244,35 @@ impl ToylangCallbacks {
         }
 
         let registry_name = if name == crate::oracle::TOYLANG_MAIN { "main" } else { name };
-        let toy_fn = self.registry.functions.get(registry_name)
-            .unwrap_or_else(|| panic!("[toylang] collect_generic_rust_deps: function '{}' not in registry", registry_name));
+        // §5.5 Step 1: build an effective registry merging local + all
+        // upstreams so callees defined in upstream Sky libs are found.
+        // Under cross-Sky-crate generic instantiation (DQ-D: dqd_app
+        // instantiates dqd_lib_a::wrap<dqd_lib_b::Thing>), the cascade
+        // at dqd_app's user_bin compile fires per_instance_mir for
+        // `wrap` whose def_id is in dqd_lib_a. dqd_app's local
+        // registry doesn't have `wrap`; we need to look it up in
+        // dqd_lib_a's upstream registry loaded via on_sky_lib_loaded.
+        // The recursive walker `collect_rust_deps_recursive` also
+        // looks up callees via `registry.functions.get`, so we pass
+        // the same merged registry there.
+        let effective_registry = {
+            let mut effective = (*self.registry).clone();
+            for upstream in state.upstream_registries.values() {
+                for (name, func) in &upstream.functions {
+                    effective.functions
+                        .entry(name.clone())
+                        .or_insert_with(|| func.clone());
+                }
+                for (name, st) in &upstream.structs {
+                    effective.structs
+                        .entry(name.clone())
+                        .or_insert_with(|| st.clone());
+                }
+            }
+            effective
+        };
+        let toy_fn = effective_registry.functions.get(registry_name)
+            .unwrap_or_else(|| panic!("[toylang] collect_generic_rust_deps: function '{}' not in local or upstream registries", registry_name));
 
         // Extern declarations (body-less) have no walkable body.
         if toy_fn.body.is_none() {
@@ -270,7 +297,7 @@ impl ToylangCallbacks {
         let mut cycle_guard: HashSet<String> = HashSet::new();
         cycle_guard.insert(extern_symbol);
         collect_rust_deps_recursive(
-            tcx, &self.registry, &resolved_caller, registry_name, &mut cycle_guard,
+            tcx, &effective_registry, &resolved_caller, registry_name, &mut cycle_guard,
         )
     }
 
@@ -393,6 +420,30 @@ impl ToylangCallbacks {
         // inner walk-and-stash.
         let upstream_clones: Vec<crate::toylang::registry::ToylangRegistry> =
             state.upstream_registries.values().cloned().collect();
+        // §5.5 Step 1: build an effective registry once (local + all
+        // upstreams) for `walk_and_stash_internal_callees` to use. This
+        // lets the recursive walker discover cross-Sky-crate Sky-internal
+        // callees (e.g., dqd_app's main calling dqd_lib_a::wrap<dqd_lib_b::Thing>;
+        // wrap isn't in dqd_app's local registry but IS in dqd_lib_a's
+        // upstream registry). Without the effective registry, walk_and_stash
+        // skips cross-crate Sky-internal callees → their bodies aren't
+        // emitted → link error.
+        let effective_registry = {
+            let mut effective = (*self.registry).clone();
+            for upstream in &upstream_clones {
+                for (name, func) in &upstream.functions {
+                    effective.functions
+                        .entry(name.clone())
+                        .or_insert_with(|| func.clone());
+                }
+                for (name, st) in &upstream.structs {
+                    effective.structs
+                        .entry(name.clone())
+                        .or_insert_with(|| st.clone());
+                }
+            }
+            effective
+        };
         // §5.5 Step 2 (narrower): at stub_rlib compile, emit LOCAL items
         // only — every upstream's items emit at THAT upstream's own
         // stub_rlib compile (this same function in that rustc invocation).
@@ -453,7 +504,11 @@ impl ToylangCallbacks {
                 });
                 // Transitive walk: surfaces non-export Sky callees + generic
                 // monomorphizations reachable from this root.
-                walk_and_stash_internal_callees(tcx, reg, toy_fn, name, state);
+                // §5.5 Step 1: walk via effective_registry so cross-Sky-crate
+                // callees are found (e.g., dqd_app main calling dqd_lib_a::wrap).
+                // local_registry is self.registry so walk_and_stash can
+                // discriminate owning-crate (Step 2's rule).
+                walk_and_stash_internal_callees(tcx, &effective_registry, self.registry.as_ref(), toy_fn, name, state);
             }
             // Trait-impl method monomorphizations flow uniformly through the
             // Option B discovered-instances loop below — captured at the
@@ -587,8 +642,10 @@ impl ToylangCallbacks {
                         stub_def_id: Some(stub_def_id),
                         instance_args: vec![],
                     });
+                    // §5.5 Step 1: use effective_registry for cross-crate callees.
                     walk_and_stash_internal_callees(
-                        tcx, reg, &resolved_func, &method.name, state,
+                        tcx, &effective_registry, self.registry.as_ref(),
+                        &resolved_func, &method.name, state,
                     );
                 }
             }
@@ -687,8 +744,11 @@ impl ToylangCallbacks {
                     stub_def_id: Some(stub_def_id),
                     instance_args: inst.concrete_args.clone(),
                 });
+                // §5.5 Step 1: effective_registry instead of just one upstream
+                // so cross-Sky-crate callees the impl body references are found.
                 walk_and_stash_internal_callees(
-                    tcx, upstream, &resolved_func, &inst.method_name, state,
+                    tcx, &effective_registry, self.registry.as_ref(),
+                    &resolved_func, &inst.method_name, state,
                 );
             }
         }
@@ -1782,9 +1842,19 @@ fn collect_rust_deps_recursive<'tcx>(
 /// transitively using `state.walked_entry_points` as persistent dedup so
 /// shared callees are stashed exactly once per compilation. Ignores Rust
 /// dependencies — those flow through `collect_rust_deps_recursive` instead.
+///
+/// §5.5 Step 1 + Step 2 interaction: `registry` is the EFFECTIVE
+/// registry (LOCAL + all UPSTREAMs merged) so cross-Sky-crate callees
+/// are found. `local_registry` is just LOCAL — used to discriminate
+/// "we own this callee" vs "upstream owns this callee". Under Step 2's
+/// owning-crate-emits rule, we skip emitting non-generic upstream-owned
+/// callees (they already live in their owning crate's stub_rlib.rlib);
+/// we still emit generic-with-concrete-args upstream-owned callees
+/// (those couldn't be pre-emitted upstream without the args).
 fn walk_and_stash_internal_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
+    local_registry: &ToylangRegistry,
     resolved_fn: &crate::toylang::registry::ToyFunction,
     fn_name: &str,
     state: &mut ToylangState,
@@ -1804,6 +1874,20 @@ fn walk_and_stash_internal_callees<'tcx>(
         };
         if callee_fn.body.is_none() {
             continue; // Extern fn — not our concern.
+        }
+        // §5.5 Step 1+2: discriminate owning-crate. If the callee is
+        // defined in an upstream Sky crate AND the call-site args are
+        // fully concrete from upstream's perspective, the upstream's
+        // stub_rlib compile has already eagerly emitted the body. Skip
+        // to avoid duplicate definitions (fat LTO catches duplicates
+        // with an IR linker error; non-LTO would silently pick one).
+        // Generic callees with downstream-supplied concrete args still
+        // emit here — the upstream couldn't pre-emit without knowing
+        // args.
+        let is_local_owned = local_registry.functions.contains_key(callee_name.as_str());
+        let upstream_could_have_emitted = type_args.is_empty(); // arch-fence-allow: Step 1/2 cross-crate emission discrimination — "could the upstream have pre-emitted this body?" falls out as "no args needed", i.e. the upstream's eager-emit path covers it.
+        if !is_local_owned && upstream_could_have_emitted {
+            continue;
         }
         let callee_symbol = compute_internal_symbol_from_type_args(callee_name, type_args);
         if state.walked_entry_points.insert(callee_symbol.clone()) {
@@ -1827,7 +1911,7 @@ fn walk_and_stash_internal_callees<'tcx>(
                 instance_args: type_args.clone(),
             });
             walk_and_stash_internal_callees(
-                tcx, registry, &resolved_callee, callee_name, state,
+                tcx, registry, local_registry, &resolved_callee, callee_name, state,
             );
         }
     }

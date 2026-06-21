@@ -157,16 +157,60 @@ pub fn resolve_struct_fields(ty: &ResolvedType, registry: &ToylangRegistry) -> R
     }
 }
 
-/// Semantic type equality. Handles StructRef vs Struct equivalence: both represent the same
-/// type, but StructRef is the parser's unresolved form and Struct is the resolved form with
-/// field_types filled in. The oracle produces StructRef (via rustc_ty_to_resolved_type) while
-/// the type resolver produces Struct (via resolve_struct_fields).
+/// Semantic type equality. Handles three equivalence classes for what
+/// is logically the same Sky type viewed through different lookup paths:
+///
+/// - `StructRef` (parser's unresolved form): produced by the parser from
+///   the source's type syntax before field types are resolved.
+/// - `Struct` (resolver's fully-resolved form): produced by
+///   `resolve_struct_fields` after walking the registry to fill in
+///   `field_types`. Also produced by the oracle for cross-crate Sky
+///   types when the sidecar registry has the full struct shape.
+/// - `RustType` (opaque external form): produced by
+///   `rustc_ty_to_resolved_type` when the type's `DefId` lives in a
+///   crate that exposes it via Rust's `pub use` path, even if the type
+///   is *semantically* a Sky struct (the cross-Sky-crate case
+///   surfaced by §5.5 Step 2's DQ-D fixture / `test_multi_sky_generic`).
+///
+/// All three forms with the same `name` and matching `type_args`
+/// represent the SAME logical type. The bridging here makes that
+/// equivalence explicit at the validator boundary so a Sky type
+/// reaching dqd_app through two routes (sidecar registry → `Struct`
+/// for the value of `make_thing(42)`; rustc oracle → `RustType` for the
+/// type argument of `wrap<Thing>`) compares equal.
+///
+/// Step 1 of the A.1+A.2+patch-5 retirement chain (handoff.md). Unblocks
+/// the DQ-D fixture so Step 3 (full §5.5 with generics) becomes
+/// empirically testable.
+///
+/// Correctness note: this duck-types `RustType` against `Struct`/`StructRef`
+/// by name + args, without consulting `SkyUniverse` to verify that the
+/// named identifier is in fact Sky-owned. A genuine Rust type
+/// happening to share a name with a Sky struct would be falsely
+/// conflated. In practice the name-resolver elsewhere in the frontend
+/// would reject such a collision earlier, so this validator-level
+/// bridging is safe.
 fn types_match(a: &ResolvedType, b: &ResolvedType) -> bool {
     match (a, b) {
         (ResolvedType::StructRef { name: na, type_args: ta },
          ResolvedType::Struct { name: nb, type_args: tb, .. }) |
         (ResolvedType::Struct { name: na, type_args: ta, .. },
          ResolvedType::StructRef { name: nb, type_args: tb }) => {
+            na == nb && ta.len() == tb.len()
+                && ta.iter().zip(tb).all(|(a, b)| types_match(a, b))
+        }
+        // Step 1: bridge RustType ↔ Struct/StructRef when names + args
+        // match. Cross-Sky-crate Sky types can be classified as RustType
+        // at one lookup site and Struct at another (DQ-D case); the
+        // logical type is the same.
+        (ResolvedType::RustType { name: na, type_args: ta },
+         ResolvedType::Struct { name: nb, type_args: tb, .. }) |
+        (ResolvedType::Struct { name: na, type_args: ta, .. },
+         ResolvedType::RustType { name: nb, type_args: tb }) |
+        (ResolvedType::RustType { name: na, type_args: ta },
+         ResolvedType::StructRef { name: nb, type_args: tb }) |
+        (ResolvedType::StructRef { name: na, type_args: ta },
+         ResolvedType::RustType { name: nb, type_args: tb }) => {
             na == nb && ta.len() == tb.len()
                 && ta.iter().zip(tb).all(|(a, b)| types_match(a, b))
         }

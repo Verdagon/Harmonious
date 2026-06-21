@@ -871,15 +871,15 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 /// `ArgTypeMismatch { func_name: "wrap", expected: RustType, got:
 /// Struct }`.
 ///
-/// The fix is probably a small extension to `types_match` to bridge
-/// `RustType ↔ Struct` when names + type_args match. Until that
-/// lands, this test exercises the build infrastructure (lib_a +
-/// lib_b stub rlibs compile successfully — that part of DQ-D works)
-/// but cannot reach per_instance_mir or the §5.5 emission question.
+/// **Unblocked 2026-06-21 by §5.5 Step 1** (`types_match` extended to
+/// bridge `RustType ↔ Struct` / `RustType ↔ StructRef` when names +
+/// type_args match — see `type_resolve.rs::types_match`). The fixture
+/// now exercises the full multi-Sky-crate generic instantiation path
+/// (lib_a defines `wrap<T>`, lib_b defines `Thing`, dqd_app
+/// instantiates `wrap<Thing>` with a `Thing` value).
 ///
-/// Expected output once unblocked: `42`.
+/// Expected output: `42`.
 #[test]
-#[ignore = "blocked on Sky-frontend types_match RustType↔Struct bridge"]
 fn test_multi_sky_generic() { run_integration_project("dqd_app"); }
 /// Phase 1 D / Case 1a: Rust program (top-level) calls a non-generic
 /// toylang function exported from `__lang_stubs`. Exercises:
