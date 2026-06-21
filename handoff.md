@@ -327,34 +327,57 @@ the original handoff. Each retires under a different step:
   redundant — discovery and emission live in the same compile.
 - **A.1.Y — Intra-compile transitive consumer-callee stash**
   (`walk_and_stash_internal_callees`). Recursively walks Sky's typed
-  AST to discover generic transitive Sky-internal callees that rustc's
-  mono walker can't see (because the stub's `unreachable!()` body has
-  no call structure to follow). **Retires under Step 4.** Mechanism:
-  if Sky's per_instance_mir synthetic body contains ReifyFnPointer
-  casts for consumer→consumer generic edges (the same technique already
-  used for consumer→Rust edges), rustc's collector follows them
-  naturally and discovers the transitive set.
+  AST to discover Sky-internal callees so Sky's `fill_extra_modules`
+  knows what bodies to emit. **STAYS — correct architectural place,
+  not retirable.** The original handoff's "retires under Step 4" claim
+  was a category error: per_instance_mir's synthetic-body ReifyFnPointer
+  casts are a one-way arrow Sky→rustc reporting RUST deps Sky
+  transitively calls (so rustc compiles them). Sky-internal items
+  aren't rustc's concern (Sky's fill_extra_modules handles them) and
+  non-export Sky-internal items don't have DefIds in the first place
+  (arch §9.3, §9.4) — you literally cannot ReifyFnPointer-cast them.
+  A.1.Y is intra-session, intra-Sky discovery for Sky's own emission
+  accounting; there's no architectural pressure to push it into rustc's
+  mono world. See the "per_instance_mir's one job" principle at the
+  top of the §5.5 chain progress note (line 15-ish): *"Sky's
+  per_instance_mir at mono time has one job: walk Sky's call graph to
+  report back the Rust things Sky transitively calls. Sky-internal
+  callees are not its concern."* Future forward-plans should anchor
+  on this principle to avoid resurrecting Step-4-shaped misdirected
+  proposals.
 
-### Full retirement scenario (Steps 1+2+3+4 all done)
+### Full retirement scenario (CORRECTED 2026-06-21 — Step 4 dropped)
 
-If the chain completes empirically, the cleanup is substantial:
+Original projection said Steps 1+2+3+4 would retire A.1, A.2, and patch
+5. The empirical outcome at commit 51b7221 is partial in reality —
+honest accounting below. The original "fully retires" claims are
+preserved struck-through for archive value; the [STATUS] notes show
+what actually happened.
 
-- **A.1 fully retires.** All ~hundreds of lines of capture/serialize/
-  deserialize/replay machinery + the recursive transitive-callee stash
-  delete. The cross-session bookkeeping that exists today purely to
-  bridge §5.5's discovery-vs-emission gap dissolves.
-- **A.2 likely retires.** `lang_upstream_monomorphizations` override
-  + `synthesize_upstream_monomorphizations` callback. Rustc's natural
-  rmeta path (via `exported_generic_symbols_provider_local`) records
-  External-linkage items; downstream's mangler finds them via the
-  natural `upstream_monomorphizations_for` lookup.
-- **Patch 5 likely retires.** The `consumer_lang_active`-gated
-  share-generics escape clause exists because the natural map is empty
-  at -O>=2; with the natural map populated (via Step 3's External
-  linkage on emitted-here items), the gate's short-circuit never
-  bites.
-- **Fork could shrink from 5 patches to 4.** Patch 5 is the candidate
-  for retirement.
+- ~~**A.1 fully retires.**~~ **A.1.X retires; A.1.Y stays correctly.**
+  A.1.X (cross-session capture-ship-replay) retires under Step 3 — the
+  cascade-firing crate drains its own discoveries inline. A.1.Y
+  (walk_and_stash_internal_callees) is intra-session intra-Sky
+  discovery for Sky's own emission accounting — correct architectural
+  place, was misdiagnosed in the original handoff as retirable. See
+  the A.1.Y description above and the "per_instance_mir's one job"
+  principle for the framing that prevents this misdiagnosis recurring.
+- **A.2 fully retires.** [STATUS: ✅ shipped] Under Step 3, Sky's
+  body emits at the same compile session as the rustc-side call site →
+  LOCAL_CRATE = `__lang_stubs` naturally matches without the augmented
+  map. Override is commented out at `queries/mod.rs:91-92` and `105-106`.
+- ~~**Patch 5 likely retires.**~~ **Patch 5's facade query
+  (`consumer_lang_active`) STAYS — load-bearing for F2/B16's
+  `cross_crate_inlinable` override + Option 4's `codegen_fn_attrs`
+  gating.** Patch 5 in the rustc fork stays but is a no-op under Step 3
+  because the augmented map is empty (A.2 disabled) → the gated escape
+  clause never fires. Could potentially retire as a separate
+  fork-cleanup arc; consumer_lang_active query itself stays.
+- ~~**Fork could shrink from 5 patches to 4.**~~ **Fork stays at 5
+  patches.** The gated share-generics escape in `Instance::upstream_monomorphization`
+  is the only patch 5 retirement candidate, and it's just dormant
+  rather than removable (the consumer_lang_active query that gates it
+  is load-bearing for other reasons).
 - **Architectural narrative simplifies dramatically.** Today's story is
   "Sky has three load-bearing bookkeeping layers because §5.5 forces
   emission at user_bin." After the chain: "Sky's emission matches
@@ -399,8 +422,10 @@ If the chain completes empirically, the cleanup is substantial:
    is bounded.
 3. **Step 3 third** (after Step 1 verifies DQ-D works). The big
    architectural cleanup. Gate on Step 1's empirical success.
-4. **Step 4 anywhere** (independent). ReifyFnPointer extension can
-   land independently as opportunistic cleanup.
+4. ~~**Step 4 anywhere** (independent). ReifyFnPointer extension can
+   land independently as opportunistic cleanup.~~ **DROPPED** —
+   category error per the corrected A.1.Y framing above. Don't propose
+   this kind of step in future plans.
 
 ### What success looks like (Thread A)
 
