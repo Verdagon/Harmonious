@@ -925,9 +925,9 @@ The upstream effort is *not* on Sky's critical path. Sky ships with the fork, ma
 
 ### 3.4 Fork maintenance budget
 
-The empirical baseline for fork maintenance is erw's pre-stage-3 experience: ~2-3 days per nightly bump for a 5-patch fork. Sky's fork is 4 patches (per_instance_mir trio + `extra_modules` hook), and one of them touches the mono collector (a churn-prone area). The realistic estimate:
+The empirical baseline for fork maintenance is erw's pre-stage-3 experience: ~2-3 days per nightly bump for a 5-patch fork. Sky's fork is 5 patches (per_instance_mir trio + `extra_modules` hook + `consumer_lang_active` gated share-generics escape), and one of them touches the mono collector (a churn-prone area). The realistic estimate:
 
-- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the four patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent. Patch 4 (`extra_modules` hook) touches `rustc_codegen_ssa::base::codegen_crate` and the coordinator pipeline in `back/write.rs` — the latter has historical churn risk because the codegen coordinator is a complex state machine; the rebase may take a half-day during the rare period when rustc restructures it. The debuginfo walker clamp (§10.4.5 / §25 B8) is no longer needed under the wrapper-as-field shape (§10.6) — the structural fix made the defensive patch obsolete.
+- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the five patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent. Patch 4 (`extra_modules` hook) touches `rustc_codegen_ssa::base::codegen_crate` and the coordinator pipeline in `back/write.rs` — the latter has historical churn risk because the codegen coordinator is a complex state machine; the rebase may take a half-day during the rare period when rustc restructures it. The debuginfo walker clamp (§10.4.5 / §25 B8) is no longer needed under the wrapper-as-field shape (§10.6) — the structural fix made the defensive patch obsolete.
 - **Per-bump cost: ~1 week for MIR construction churn.** This is independent of the fork — it's the cost of Sky's per_instance_mir provider building synthetic MIR bodies, which uses rustc-internal MIR construction APIs that drift. The empirical erw data point: 15 months of MIR drift was ~1 hour for erw's 6 sites. Sky's count is higher (every generic Sky function exported produces per_instance_mir output containing ReifyFnPointer casts), so the per-bump cost is larger, but the per-site cost is similar.
 - **Per-bump cost: ~1-2 days for ABI helpers drift.** PassMode variants, BackendRepr changes, layout-data shape shifts. Sky inherits erw's ABI helpers wholesale; the drift surface is identical.
 - **Per-bump cost: ~0.5-1 day for everything else.** Driver entry-point changes, Callbacks trait additions, layout query key shape, providers struct restructuring. All small, all mechanical.
@@ -952,7 +952,7 @@ The Sky toolchain itself is built against a specific upstream nightly (e.g., `ni
 1. **Decide to bump.** Triggered by a calendar event (~6 months since last bump) or by a forcing function (need a specific upstream feature, security update, etc.). Not triggered by chasing the latest nightly.
 2. **Pick the target nightly.** ~3 months old. This window lets ecosystem-adjacent projects (cranelift, miri, rust-analyzer) report any drift issues with the target nightly before Sky encounters them.
 3. **Snapshot.** Run the full test suite on the current pin. Record the test count.
-4. **Bump the rustc fork.** Rebase the four patches onto the target nightly. Build the forked rustc. Resolve any patch conflicts. Patch 4 (`extra_modules` hook) touches `base.rs::codegen_crate` and may take a half-day to rebase during periods when rustc restructures the codegen coordinator; the per_instance_mir trio is typically clean.
+4. **Bump the rustc fork.** Rebase the five patches onto the target nightly. Build the forked rustc. Resolve any patch conflicts. Patch 4 (`extra_modules` hook) touches `base.rs::codegen_crate` and may take a half-day to rebase during periods when rustc restructures the codegen coordinator; the per_instance_mir trio is typically clean.
 5. **Bump Sky.** Update Sky's `rust-toolchain.toml` to the new target. Run `cargo check` on Sky's compiler. Fix compilation errors (MIR construction drift, ABI helpers drift, etc.) in dedicated commits, each commit addressing one drift surface. The "one drift surface per commit" rule is for bisection — if a future bump reverts behavior, finding the commit that mattered is cleaner.
 6. **Test cold.** Wipe all caches. Run the full Sky test suite. Diagnose any test failures as either drift-related (fix the drift) or environmental (fix the harness).
 7. **Test warm.** Run the suite a second time. Catch incremental-compilation-related issues that only manifest on warm runs.
@@ -2800,7 +2800,7 @@ The recipe is deterministic: same Sky source, same comptime args → same recipe
 
 Sky's synthetic-items mechanism avoids the temptation of synthesizing new DefIds in rustc's namespace. The reason: synthesizing new DefIds would require additional fork patches to extend rustc's DefId allocator and item-loading machinery. The `SkyOpaqueType` wrapper approach is more elegant: all synthetic types share the wrapper's single DefId, parameterized by a const u64 typeid.
 
-The result: Sky's fork stays at the four patches in §3.2 (per_instance_mir trio + `extra_modules` hook). No additional fork machinery for synthetic items. The wrapper pattern handles everything via Sky's typeid table + sidecar.
+The result: Sky's fork stays at the five patches in §3.2 (per_instance_mir trio + `extra_modules` hook + `consumer_lang_active` gated share-generics escape). No additional fork machinery for synthetic items. The wrapper pattern handles everything via Sky's typeid table + sidecar.
 
 ### 13.10 Cross-references
 
@@ -4705,7 +4705,7 @@ This chapter describes the order in which Sky's implementation should be built. 
 **v1 scope (recommended phasing for the initial implementation):**
 
 **Phase 1: Fork + minimal codegen plugin (4-8 weeks).**
-- Apply the four fork patches: the three `per_instance_mir` patches + the `extra_modules` hook on `ExtraBackendMethods` (see §3.2).
+- Apply the five fork patches: the three `per_instance_mir` patches + the `extra_modules` hook on `ExtraBackendMethods` + the `consumer_lang_active` gated share-generics escape in `Instance::upstream_monomorphization` (see §3.2).
 - Build the Sky codegen backend as a CodegenBackend impl that wraps LlvmCodegenBackend.
 - Implement the marker-based per-crate activation.
 - Install the `extra_modules_hook` returning empty (no Sky-side bitcode contribution yet).
@@ -4944,7 +4944,7 @@ This chapter defines terms used throughout the document. Where a term is specifi
 
 **SkyOpaqueType<const T: u64> [Sky]** — A universal wrapper type pre-declared in Sky's stdlib. Used to represent Sky-side types that rustc shouldn't know about by name (non-exports in Rust generics, comptime-produced types, etc.).
 
-**Per_instance_mir [Sky, also erw]** — Sky's custom rustc query. Instance-keyed; Sky's provider returns a synthetic MIR body for each Sky Instance during rustc's monomorphization phase. Added via three of Sky's four fork patches (the fourth is the `extra_modules` hook for inline codegen contribution).
+**Per_instance_mir [Sky, also erw]** — Sky's custom rustc query. Instance-keyed; Sky's provider returns a synthetic MIR body for each Sky Instance during rustc's monomorphization phase. Added via three of Sky's five fork patches (the fourth is the `extra_modules` hook for inline codegen contribution; the fifth is the `consumer_lang_active` gated share-generics escape).
 
 **Approach A [Source: dep-discovery-approaches.md]** — Instance-keyed dep discovery; Sky substitutes args itself. Used by Sky.
 
@@ -5260,7 +5260,7 @@ fn main() {
 
 ### Appendix B. Reference: Fork Patches
 
-The four patches Sky maintains against vanilla nightly rustc. The per_instance_mir trio (B.1–B.3) adds Sky's Instance-keyed MIR query; the `extra_modules` hook (B.4) lets Sky's codegen contribute bitcode modules to rustc's pipeline. See §3.2 for full text and rationale.
+The five patches Sky maintains against vanilla nightly rustc. The per_instance_mir trio (B.1–B.3) adds Sky's Instance-keyed MIR query; the `extra_modules` hook (B.4) lets Sky's codegen contribute bitcode modules to rustc's pipeline; the `consumer_lang_active` gated share-generics escape (B.5) lets the v0 mangler consult Sky's augmented `upstream_monomorphizations_for` map at -O>=2 (closes B14). See §3.2 for full text and rationale.
 
 #### B.1 per_instance_mir query declaration
 
@@ -5367,9 +5367,13 @@ Total surface for patch 4: ~100 lines across 4 files. Default-no-op trait method
 
 **Approach B vs the earlier v1 bytes-as-interface shape.** The v1 patch 4 had `extra_modules() -> Vec<ModuleCodegen<M>>` and a `parse_from_tcx` sub-patch; Sky's emitter serialized Inkwell-built modules to bitcode bytes and rustc parsed them back. That shape worked but was interface-laziness — Sky's CGU context isn't migrating into rustc's, just being constructed and thrown away. Approach B eliminates the round-trip by having rustc own the LLVM resources and lend them to Sky via the allocator callback. Closes risks B9 (LLVM-binding version skew — structurally impossible), B10 (LLVM 21 BitcodeWriter bug — no bitcode is written), and B11 (round-trip scaling cost — no round-trip). See §F.15 for the design history.
 
-#### B.5 Future patch sites (if needed)
+#### B.5 `consumer_lang_active` gated share-generics escape (patch 5)
 
-Sky may add additional fork patches if specific risks materialize. The current patch list is locked at 4; additions require explicit justification and signoff. Section 25 covers risks that might warrant new patches; §25.2 B5 and B8 are examples of risks that turned out to be addressable architecturally without new patches.
+Three sites in `rustc_middle` and `rustc_mir_transform`. See §3.2 patch 5 for full text. The patch declares the `consumer_lang_active(()) -> bool` query (default provider returns `false`), then in `Instance::upstream_monomorphization` gates the existing `!share_generics()` early-return on `!(tcx.consumer_lang_active(()) && upstream_monomorphizations_for(def).contains_key(args))`. Vanilla rustc default-false provider preserves byte-identical pass-through; Sky's facade installs an override that returns `true` when `__SKY_STUBS_MARKER` is detected locally or upstream. Closes B14 (v0 mangler disambig mismatch at -O>=2).
+
+#### B.6 Future patch sites (if needed)
+
+Sky may add additional fork patches if specific risks materialize. The current patch list is locked at 5; additions require explicit justification and signoff. Section 25 covers risks that might warrant new patches; §25.2 B5 and B8 are examples of risks that turned out to be addressable architecturally without new patches.
 
 ### Appendix C. Reference: Sky Codegen Backend Methods
 

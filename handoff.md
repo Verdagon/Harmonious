@@ -12,33 +12,65 @@ threads is bug-fixing — they're refinement/investigation/expansion work.
 Release-mode (the previous handoff's bug) is fully resolved as of `08f350e`.
 
 **2026-06-20 progress note:** Thread C **fully shipped + F1 + F2 both
-RESOLVED.** What landed:
+RESOLVED + 11 pre-existing test failures retired + Thread A deep
+investigation surfaced 8 more options than originally documented.**
+What landed:
 
 - **Inlining matrix infrastructure** (Thread C): harness, 41 fixtures, 40
   matrix tests, rustc-demangle dev-dep. Surfaced both F1 and F2 (matrix
-  did its job).
+  did its job). Files: `toylangc/tests/common/inlining_harness.rs`,
+  `toylangc/tests/integration_projects/inlining/`, `toylangc/tests/integration_projects.rs`.
 - **F1: Sky-export LTO inlining gap — CLOSED.** Root cause was `#[inline(never)]`
   on Sky-item stub source. Both historical rationales obsolete: patch 5
   closes the share-generics gate; arch §F.1 says `#[inline(never)]` is wrong
   as the LTO race fix (`#![no_builtins]` + Path B handle it). Removed from
   three Sky-item sites in `stub_gen.rs`. Phase-6 stdlib helpers retain
-  the attribute for a different reason (§6.6.5).
+  the attribute for a different reason (§6.6.5). Protection fence shipped:
+  `toylangc/tests/architecture_fence.rs::stub_gen_no_inline_never_on_sky_items`
+  pins the count of `#[inline(never)]` emission sites at 2 (the Phase-6
+  helpers). If anyone re-introduces the attribute on a Sky-item site
+  without flipping the v2-precompiled-bodies trigger, the test fires.
 - **F2: case 3 / case 5 disambig bug at -O3 — CLOSED.** Root cause was
   NOT a disambig bug but `cross_crate_inlinable` query returning true,
   causing rustc to emit `available_externally` linkage (body for inlining
   only, no `.o` symbol). Sky's emitted call sites can't inline through
-  rustc's IR path, so the references dangled at link. Fix: override both
+  rustc's IR path, so the references dangled at link. Fix: new query override
+  at `rustc-lang-facade/src/queries/cross_crate_inlinable.rs` covering both
   `queries.cross_crate_inlinable` (local items) and `extern_queries.cross_crate_inlinable`
-  (upstream items from rmeta) to return `false` when `consumer_lang_active(())`
+  (upstream items from rmeta) — returns `false` when `consumer_lang_active(())`
   is true. Pass-through preserved (override gated by marker detection).
   See arch §25.2 B16 for full rationale.
+- **11 pre-existing test failures — CLOSED.** The callback-log family
+  (test_diamond_call_pattern, test_generic_deep_walk, etc.) and the
+  layout-stderr family (test_point_layout, test_t_of_r_layout, etc.)
+  were all the same cold-vs-warm-cache issue. Rustc's on-disk incremental
+  cache replays `per_instance_mir` and `layout_of` query results from
+  disk on warm cache, skipping Sky's provider invocation — the callback
+  log stays empty; the `layout_of intercepted for: <Type>` eprintln
+  doesn't fire. Fix: set `CARGO_INCREMENTAL=0` in the three helpers
+  (`run_integration_project_check_callbacks`,
+  `run_integration_project_check_build_stderr`,
+  `collect_generic_rust_deps_firings`). Cold AND warm runs now pass
+  reliably.
 
 Matrix final state: 40 passing, 0 failing, 1 ignored (the one ignored is
 an LLVM-honors-`#[inline(never)]`-or-not flakiness on a single Priority B
 fixture; documented inline). Full integration suite: 191 passing, 0
-failing, 1 ignored — pre-existing 11 callback-log / layout-stderr-grep
-failures also resolved by F2 (they were manifestations of the same
-`cross_crate_inlinable` symbol-dropping path).
+failing, 1 ignored — clean baseline both cold and warm.
+
+**Thread A deep investigation (2026-06-20)** surfaced 8 architectural
+options for retiring the partition filter (A.3) beyond the 3 paths the
+original handoff documented. The single most promising is **Option 4 —
+override `codegen_fn_attrs` to set `linkage = Some(AvailableExternally)`
+on Sky-export stubs.** Rustc emits IR (for inlining) but no `.o` symbol;
+Sky's `fill_extra_modules` body wins. No partition filter needed; existing
+`#![no_builtins]` blocks LTO inliner from pulling `unreachable!()`; F1's
+LTO inlining promise preserved. **~half day to prototype + verify.**
+~108 lines of `partition.rs` retire. A.1 + A.2 stay (different concerns).
+For full A.1+A.2+A.3 retirement, Option 8 (per_instance_mir returns
+real MIR via a toylang→MIR emitter) is the long-term endgame — substantial
+new component, plan for post-Sky-proper-MVP. See "Thread A — deep
+investigation findings" below for the full menu of 8 options.
 
 ---
 
@@ -342,7 +374,7 @@ c) **Sky-side compile-time stub-source rewrite** — at stub_gen time,
 3. Compare path (c) against path (b) (upstream RFC for
    `#[exclude_body_from_lto]`) on architectural cleanness.
 
-### Recommended sequence for Thread A
+### Recommended sequence for Thread A (original, pre-deep-investigation)
 
 1. **First: verify the current claims** (~half day). Confirm A.1 and
    A.2 conclusions with empirical logging. Confirm A.3's necessity by
@@ -354,6 +386,113 @@ c) **Sky-side compile-time stub-source rewrite** — at stub_gen time,
    (verify, then delete). A.2 stays only for Sky trait methods. Lots
    of Sky-side code retires. The architecture doc §F.13/§F.14/§8.9.5
    collapses significantly.
+
+### Thread A — deep investigation findings (2026-06-20)
+
+The original 3 paths (a/b/c) above turn out to be incomplete. A deeper
+investigation surfaced **8 architectural mechanisms** for retiring the
+partition filter — listed in roughly increasing cost:
+
+**Mechanism family — Suppress rustc's stub-body codegen**
+
+- **(1) `#![no_codegen]` sibling attribute (upstream RFC).** Smaller
+  RFC than path (a). `#![no_builtins]` already handles the LTO case
+  by excluding the rlib bitcode from the LTO pool. A sibling
+  `#![no_codegen]` attribute that does for `.o`/ELF what `no_builtins`
+  does for LTO — per-crate rather than per-function (Path b was
+  per-function).
+- **(2) Per-item `#[linkage = "..."]` via stub_gen.** Rejected
+  historically because `#![feature(linkage)]` is a crate-root attribute
+  that leaks. **The rejection no longer applies to Sky** — Sky's stubs
+  are in their own rlib, so the feature flag stays inside skyc-generated
+  code. From `docs/reasoning/rustc-fork-design-space.md` Part 3.
+- **(3) `#[no_mangle]` non-generic shim layer.** Non-generic `pub fn`
+  with `#[no_mangle]` always gets external linkage. Works on stable
+  Rust, no fork, no feature gate. Only addresses non-generics — doesn't
+  help generics or trait-impl methods.
+
+**Mechanism family — Linkage-based without filtering**
+
+- **(4) Override `codegen_fn_attrs` to set `linkage = Some(AvailableExternally)`
+  on Sky-export stubs. ⭐ RECOMMENDED.** Rustc emits IR (for inlining)
+  but no `.o` symbol. Sky's `fill_extra_modules` body wins. No partition
+  filter needed. The `mono_item.explicit_linkage(tcx)` fast-path at
+  `rustc_monomorphize::partitioning.rs:749-751` short-circuits when
+  linkage is explicit. Risk (cross-module inliner pulling
+  `unreachable!()` into callers) is mitigated by existing `#![no_builtins]`
+  for LTO and by available_externally semantics for non-LTO.
+  **No new fork patch needed — `codegen_fn_attrs` is overridable.**
+- **(5) Same as (4) but with `linkage = Some(WeakAny)`.** Sky's
+  strong-linkage body wins at link. Stub's weak body still emits
+  ~10-20 bytes per export but is dead at link. No filter needed.
+  Crude but always-correct.
+- **(6) Post-partition linkage mutation pattern (already proven for
+  Phase 6 wrappers).** The erw codebase already mutates
+  `MonoItemData.linkage` post-partition for Phase 6 generic wrappers.
+  Generalize this pattern to mutate Sky-export stubs to
+  `AvailableExternally` or `WeakODR` linkage instead of filtering them
+  out. **The mechanism is already in production for a related case.**
+
+**Mechanism family — per_instance_mir variants**
+
+- **(7) per_instance_mir returns a TRAMPOLINE body.** Stub's
+  `unreachable!()` body replaced (at codegen time) with `extern "C"`
+  call to Sky's real implementation symbol. Rustc emits a thin
+  trampoline that tail-calls into Sky's `.o`. Cost: doubles symbol
+  count. Works for non-generics; breaks for generics (no `extern "C"`
+  generics). Could be hybrid (trampoline for non-generics, current
+  path for generics).
+- **(8) per_instance_mir returns the REAL body (path (e) of original
+  handoff).** Cleanest long-term: Sky lowers Sky source directly to
+  rustc MIR. The infrastructure exists — `mir_helpers.rs` already
+  builds real `Call`-based MIR for drop glue. Cost: substantial new
+  component (full toylang→MIR emitter); retires patch 4 of the fork
+  too. For Sky proper this is the architectural endgame.
+
+### Updated recommended sequence for Thread A
+
+| Path | Retires | Cost |
+|---|---|---|
+| **Option 4 (AvailableExternally) — DO NOW** | A.3 only | ~half day prototype + verify; ~108 lines retire; F1 promise preserved |
+| **Option 8 (real-MIR per_instance_mir) — LATER** | A.1, A.2, A.3, AND patch 4 | Significant — full MIR emitter; long-term post-Sky-proper-MVP |
+
+Option 4 is the actionable win. Implementation sketch:
+
+```rust
+// New file: rustc-lang-facade/src/queries/codegen_fn_attrs.rs
+pub fn lang_codegen_fn_attrs<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+) -> CodegenFnAttrs {
+    let mut attrs = default_codegen_fn_attrs()(tcx, def_id);
+    if is_consumer_codegen_target(tcx, def_id.to_def_id()) {
+        attrs.linkage = Some(Linkage::AvailableExternally);
+    }
+    attrs
+}
+```
+
+Then delete `partition.rs`'s filter logic. The matrix should keep passing
+(F1's promise preserved); the `cross_crate_inlinable.rs` override (B16)
+stays — it's an independent fix.
+
+What the handoff's original Thread A claimed:
+- A.1 + A.2 + A.3 all dissolve under path (c). ❌ Wrong — path (c)
+  doesn't actually buy LTO inlining for non-generic Sky exports.
+
+What we actually know now:
+- A.1 (capture-ship-replay) is genuinely load-bearing as long as the
+  cascade fires at stub_rlib compile. Even Option 4 doesn't retire A.1.
+- A.2 (synthesize_upstream_monomorphizations) is genuinely load-bearing
+  for Sky trait methods. Even Option 4 doesn't retire A.2.
+- A.3 (partition filter) CAN be retired via Option 4 today, at the cost
+  of one new query override (~80 lines).
+
+So the actually-achievable architectural cleanup is more modest than
+the original handoff suggested: Option 4 retires A.3 but A.1 and A.2
+stay. ~150 lines of code retire (the partition filter + its tests).
+Sky's architecture doc §F.13 stays accurate; §F.14 (why Approach C
+doesn't work) becomes purely historical.
 
 ---
 
