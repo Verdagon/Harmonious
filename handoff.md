@@ -36,6 +36,51 @@ The full A.1+A.2+patch-5 retirement chain landed empirically. Three steps shippe
 
 The chain proved the §5.5 revision's payoff is **real but partial** vs the handoff's projection. A.1.X + A.2 retirement is genuine architectural cleanup. Patch 5 retention is honest. The "rustc-natural model" framing the design-conversation anticipated is now empirically validated for non-generic and discovery paths; comptime-dependent items (Sky proper's future concern, not toylang) are the remaining motivation for §5.5 as originally designed.
 
+### Patch 5 retirement (follow-up arc, ~half day)
+
+Post-chain analysis surfaced that patch 5 in the rustc fork CAN actually retire — it just requires a small refactor of the only consumer of `tcx.consumer_lang_active(())` plus a rustc-fork rebuild. The blocking observation in Step 3 (where disabling consumer_lang_active broke 11 case3/case5 fixtures) was a sibling-dependency, not architectural load-bearing.
+
+**What's in patch 5 (3 sites in the fork):**
+
+1. Query declaration of `consumer_lang_active(()) -> bool` in `compiler/rustc_middle/src/query/mod.rs`.
+2. Default provider (returns `false`) in `compiler/rustc_mir_transform/src/lib.rs`.
+3. Gated share-generics escape clause in `Instance::upstream_monomorphization` (`compiler/rustc_middle/src/ty/instance.rs`).
+
+Under Step 3, (3) is empirically a no-op — the augmented map is empty (A.2 disabled), so `contains_key` always returns false → same outcome as no-patch. (1)+(2) are infrastructure for the query.
+
+**The only caller** of `tcx.consumer_lang_active(())` is `rustc-lang-facade/src/queries/cross_crate_inlinable.rs` (the F2/B16 fix). It gates on "is Sky involved in this build?" — purely a marker-check question that can be answered by walking loaded crates directly:
+
+```rust
+// Inline replacement for `tcx.consumer_lang_active(())`:
+fn sky_is_active(tcx: TyCtxt<'_>) -> bool {
+    use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE};
+    if is_from_lang_stubs(tcx, CRATE_DEF_ID.to_def_id()) {
+        return true;
+    }
+    tcx.crates(()).iter().any(|&cnum| {
+        is_from_lang_stubs(tcx, DefId { krate: cnum, index: CRATE_DEF_INDEX })
+    })
+}
+```
+
+The check is O(crates) per call, with each individual marker-check O(1) via the existing `SKY_STUBS_CRATES` thread-local cache.
+
+**Retirement steps:**
+
+1. Add `is_sky_active(tcx) -> bool` helper to `rustc-lang-facade/src/lib.rs` — does the marker walk without going through the query.
+2. Update both `lang_cross_crate_inlinable` + `lang_extern_cross_crate_inlinable` in `cross_crate_inlinable.rs` to call the helper instead of `tcx.consumer_lang_active(())`.
+3. Remove `providers.queries.consumer_lang_active = lang_consumer_lang_active;` registration in `queries/mod.rs`. Delete the `lang_consumer_lang_active` function.
+4. Remove the fork patch 5 entirely — delete the query declaration in `rustc_middle/query/mod.rs`, the default provider in `rustc_mir_transform/lib.rs`, AND the gated escape clause in `rustc_middle/ty/instance.rs`. 3 sites in the rustc fork.
+5. Rebuild rustc-fork (~15-20 min per arch §3.4's bump-cost calibration).
+6. Update arch doc: §3.2 patches table goes from 5 patches to 4. §B.5 retires entirely (or moves to historical). §25.2 B14 closing context shifts to "obviated by Step 3 + cross_crate_inlinable's inline marker check". §F.14.1, §F.16, §26 references to patch 5 update.
+7. Update handoff: fork patch count drops to 4. This subsection retires (or moves to a "SHIPPED" archive).
+
+**Coordination needed:** the rustc-fork edits live in `~/rust/compiler/{rustc_middle, rustc_mir_transform}`. Touching those + the rebuild is a step that needs explicit user authorization (rustc-fork rebuild is ~15-20 min and is the long pole of the work).
+
+**Verification:** the existing matrix (192/0/1) should hold post-retirement. Specifically watch case3/case5 fixtures (they're the ones that broke during the Step 3 A/B test when consumer_lang_active was disabled without the inline helper replacement).
+
+**Net win:** fork shrinks from 5 patches to 4. Cleaner long-term maintenance posture (one fewer patch to rebase per nightly bump). The infrastructure for the share-generics escape mechanism becomes available for re-introduction later if a future Sky requirement needs it; today nothing does.
+
 ---
 
 **2026-06-21 progress note: §5.5 Step 2 (narrower-§5.5) SHIPPED with a documented LTO trade-off + new @SBMNBIZ arcanum.**
