@@ -1,14 +1,18 @@
 //! Query override installation.
 //!
 //! Rustc's compilation is driven by a demand-driven query system. We override
-//! six providers: `layout_of` (type layout), `mir_shims` (drop glue),
+//! these providers: `layout_of` (type layout), `mir_shims` (drop glue),
 //! `per_instance_mir` (per-Instance synthetic dep-registering bodies for
 //! consumer fns), `symbol_name` (consumer symbol mapping),
-//! `collect_and_partition_mono_items` (CGU filtering), and
+//! `codegen_fn_attrs` (AvailableExternally linkage for consumer items —
+//! retires the partition filter, see Option 4 / arch §F.14),
+//! `cross_crate_inlinable` (forces real `.o` symbols for cross-crate
+//! inlinable items in consumer-active compiles — closes B16),
 //! `upstream_monomorphizations_for` (force local mono for consumer items
-//! under the two-crate architecture).
+//! under the two-crate architecture), and `upstream_monomorphizations`
+//! (augment with consumer trait-impl synthesised entries).
 //!
-//! `per_instance_mir` is a custom query added by the 3-patch rustc fork
+//! `per_instance_mir` is a custom query added by the rustc fork
 //! (`rust-interop-architecture.md` §3.2). It replaces the retired
 //! `optimized_mir` override (Approach B) per `course-correct.md` item #1.
 //! The default rustc provider returns `None`; this facade override returns
@@ -22,14 +26,18 @@
 //! `per_instance_mir` override replaces those bodies during monomorphization
 //! with a synthetic body mentioning each transitive Rust dep via
 //! `ReifyFnPointer` so rustc's collector queues them; the consumer's own
-//! backend provides the real definitions. The partitioner override in
-//! `partition` removes consumer items from rustc's CGU slice before codegen
-//! dispatch sees them.
+//! backend provides the real definitions. The `codegen_fn_attrs` override
+//! marks those consumer items with `AvailableExternally` linkage so rustc's
+//! LLVM backend emits no `.o` symbol for them, leaving the consumer's
+//! `fill_extra_modules` body (rustc fork patch 4) as the sole def at link
+//! time. This replaces the prior CGU-list filter (formerly
+//! `queries::partition::lang_collect_and_partition_mono_items`), see arch
+//! §F.14 for the retirement rationale.
 
+pub mod codegen_fn_attrs;
 pub mod cross_crate_inlinable;
 pub mod drop_glue;
 pub mod layout;
-pub mod partition;
 pub mod per_instance;
 pub mod symbol_name;
 pub mod upstream_monomorphization;
@@ -55,13 +63,23 @@ pub fn lang_override_queries(
         providers.queries.upstream_monomorphizations,
         providers.queries.cross_crate_inlinable,
         providers.extern_queries.cross_crate_inlinable,
+        providers.queries.codegen_fn_attrs,
+        providers.extern_queries.codegen_fn_attrs,
     );
 
     providers.queries.layout_of        = layout::lang_layout_of;
     providers.queries.mir_shims        = drop_glue::lang_mir_shims;
     providers.queries.per_instance_mir = per_instance::lang_per_instance_mir;
     providers.queries.symbol_name      = symbol_name::lang_symbol_name;
-    providers.queries.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
+    // Option 4 / arch §F.14 (2026-06-20): mark consumer-defined items with
+    // `AvailableExternally` linkage so rustc's LLVM backend emits no `.o`
+    // symbol for them. The consumer's `fill_extra_modules` body is the sole
+    // `.o` def at link time. Retires the prior `collect_and_partition_mono_items`
+    // override that filtered consumer items out of the CGU list (~107 lines).
+    providers.queries.codegen_fn_attrs =
+        codegen_fn_attrs::lang_codegen_fn_attrs;
+    providers.extern_queries.codegen_fn_attrs =
+        codegen_fn_attrs::lang_extern_codegen_fn_attrs;
     providers.queries.upstream_monomorphizations_for =
         upstream_monomorphization::lang_upstream_monomorphizations_for;
     // F2 fix (2026-06-20): force `cross_crate_inlinable` to false in

@@ -215,9 +215,11 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             //       share_generics heuristic close B14 directly. See arch
             //       §25.2 B14 and §3.2 patch 5.
             //   (2) Arch §F.1 explicitly calls this concern wrong: the
-            //       LTO inlining race is fixed at the symbol-resolution
-            //       layer via `#![no_builtins]` on the stub rlib (which
-            //       build.rs emits — see §6.2 / §F.3), not at the inliner.
+            //       LTO inlining race was fixed structurally by Option 4's
+            //       AvailableExternally linkage on consumer items. The
+            //       earlier `#![no_builtins]` belt-and-suspenders mechanism
+            //       was retired 2026-06-21 (§5.5 Round 2 E2 — matrix passes
+            //       cleanly without it).
             // The remaining valid concern (arch §25.2 B12) is a vanilla
             // Rust crate consuming a Sky stub rlib without the Sky toolchain
             // — but v1 catches that case via build.rs's SKY_TOOLCHAIN_ACTIVE

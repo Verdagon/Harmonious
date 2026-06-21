@@ -1,0 +1,25 @@
+// DQ-D / multi-Sky-library generic case.
+// dqd_app: top-level binary that instantiates lib_a's generic wrap<T>
+// with lib_b's Thing type. NEITHER LIB has seen this instantiation —
+// it can only be discovered at dqd_app's compile.
+//
+// This is the novel architectural case for the proposed §5.5 revision:
+// the body of `wrap<Thing>` and `unwrap<Thing>` and `Wrapper<Thing>`'s
+// drop glue must be emittable somewhere despite lib_a not having
+// participated in the discovery.
+
+use dqd_lib_a::Wrapper
+use dqd_lib_a::wrap
+use dqd_lib_a::unwrap
+use dqd_lib_b::Thing
+use dqd_lib_b::make_thing
+use dqd_lib_b::thing_value
+
+fn println_i32(x: i32)
+
+fn main() {
+    let t = make_thing(42);
+    let w = wrap<Thing>(t);
+    let inner = unwrap<Thing>(w);
+    println_i32(thing_value(&inner));
+}

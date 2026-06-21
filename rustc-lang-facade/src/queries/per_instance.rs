@@ -14,9 +14,10 @@
 //!
 //! The returned synthetic body terminates with `Unreachable` and is never
 //! executed — the consumer's own `.o` supplies the real definition at link
-//! time, and the partitioner override in `queries::partition` removes
-//! consumer items from rustc's CGU slice so rustc's codegen dispatch never
-//! sees them.
+//! time, and the `codegen_fn_attrs` override in `queries::codegen_fn_attrs`
+//! marks consumer items with `AvailableExternally` linkage so rustc's LLVM
+//! backend emits no `.o` symbol for them (Option 4 / arch §F.14 retired the
+//! prior CGU-list filter).
 //!
 //! **Approach A vs B.** This is Approach A (Instance-keyed; the provider sees
 //! `instance.args` directly). Under Sky's design, the substitution that
@@ -94,9 +95,9 @@ pub fn lang_per_instance_mir<'tcx>(
 /// collector discovers them) and terminates with `Unreachable`.
 ///
 /// The body is never executed — the consumer's `.o` provides the real
-/// implementation at link time, and the partitioner override in
-/// `queries::partition` filters consumer items out of rustc's CGU slice
-/// before codegen dispatch sees them.
+/// implementation at link time, and the `codegen_fn_attrs` override in
+/// `queries::codegen_fn_attrs` marks consumer items with `AvailableExternally`
+/// linkage so rustc's LLVM backend emits no `.o` symbol for them.
 ///
 /// This is the designated "fix site" per @SyMINCZ — the only mechanism in the
 /// codebase that forces rustc's mono collector to codegen a generic Rust

@@ -1,0 +1,16 @@
+// DQ-D / multi-Sky-library generic case.
+// lib_a: defines a generic Sky function `wrap<T>` and the `Wrapper<T>` struct.
+// No trait impls. No Sky-internal instantiations — lib_a has NEVER monomorphized
+// Wrapper<Thing> at compile time; only dqd_app's compile reaches that instance.
+
+struct Wrapper<T> {
+    inner: T,
+}
+
+export fn wrap<T>(x: T) -> Wrapper<T> {
+    Wrapper<T> { inner: x }
+}
+
+export fn unwrap<T>(w: Wrapper<T>) -> T {
+    w.inner
+}

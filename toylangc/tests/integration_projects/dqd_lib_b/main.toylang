@@ -1,0 +1,15 @@
+// DQ-D / multi-Sky-library generic case.
+// lib_b: defines a non-generic Sky struct `Thing`.
+// lib_b has no knowledge of lib_a's Wrapper<T>.
+
+struct Thing {
+    value: i32,
+}
+
+export fn make_thing(v: i32) -> Thing {
+    Thing { value: v }
+}
+
+export fn thing_value(t: &Thing) -> i32 {
+    t.value
+}

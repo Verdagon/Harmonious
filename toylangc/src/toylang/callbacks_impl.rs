@@ -1107,10 +1107,19 @@ impl LangCallbacks for ToylangCallbacks {
         // reach disk. Mirrors generate_and_compile's behavior. Runs in BOTH
         // user-bin and rlib compile (rlib has no Sky body codegen but still
         // emits log entries).
+        //
+        // §5.5 Round 2 V7/DQ-J: every entry is tagged with `[compile=rlib]`
+        // or `[compile=userbin]` so tests can discriminate which compile
+        // produced which entry. Defensive against any future change that
+        // causes both compiles to fire entries with the same Debug shape
+        // (e.g., a §5.5 revision that moves more frontend work to rlib).
+        // Today entries with identical shapes between compiles would silently
+        // collide; tagging forces them apart by structural prefix.
         if let Ok(path) = std::env::var("TOYLANG_LOG_PATH") {
             use std::fs::OpenOptions;
             use std::io::Write;
-            let lines: Vec<String> = ts.log.iter().map(|entry| format!("{:?}", entry)).collect();
+            let tag = if self.is_user_bin_compile { "[compile=userbin] " } else { "[compile=rlib] " };
+            let lines: Vec<String> = ts.log.iter().map(|entry| format!("{}{:?}", tag, entry)).collect();
             let mut blob = lines.join("\n");
             blob.push('\n');
             let mut f = OpenOptions::new()

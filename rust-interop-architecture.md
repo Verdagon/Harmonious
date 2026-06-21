@@ -304,6 +304,8 @@ This subsection records what Sky is *not* — design choices that have been cons
 
 **Sky does not support unsized generic arguments outside specific reference patterns.** Sky inherits erw's `@UTAIRZ` pattern: unsized types (`str`, `[u8]`, `[T]` for non-`Sized` `T`) appear only as the inner type of a reference. Sky source cannot have a `T: ?Sized` generic in arbitrary position; it can have `&G T: ?Sized` references with specific size-known concrete instantiations.
 
+**Sky does not surrender LLVM output control to rustc's codegen pipeline.** Sky's LLVM backend (Inkwell-based, contributed via patch 4's `fill_extra_modules` hook — see §5, §F.15) owns every byte of Sky-emitted LLVM IR. This is non-negotiable. It enables Sky to guarantee codegen quality, ABI discipline (`@ACRTFDZ`/`@TCHAPZ`), pin discipline (`@SMPLZ`), and emission-shape stability across rustc bumps. Designs that lower Sky source to rustc MIR and let rustc's codegen produce the bodies — periodically proposed as a "long-term simplification" because they would retire the discovery/synthesis machinery — are **rejected permanently** for this reason. Sky's frontend never emits rustc MIR for Sky-defined bodies; per_instance_mir returns synthetic dep-registering bodies (see §19), but the real bodies come from Sky's own LLVM backend, full stop.
+
 Many of these "does not do" entries are recovered through specific designed mechanisms — Sky doesn't unwind but Result is rich enough for error handling, Sky doesn't cancel by drop but channel-based cancellation is composable. The point of this subsection is not to enumerate Sky's limitations as a sales criticism but to make explicit the boundaries of the design space so future contributors know which questions are settled.
 
 ---
@@ -890,7 +892,7 @@ default provider returns `false`; pure-Rust pass-through compiles via
 Sky's rustc binary also preserve byte-identical behavior because Sky's
 facade-installed provider only returns `true` when an activation marker
 (`__SKY_STUBS_MARKER`) is detected at the local crate root OR among
-loaded extern crates. See §25 risk **B17** for the matching closed
+loaded extern crates. See §25 risk **B14** for the matching closed
 risk + the toylang `release_mode_smoke` regression fence.
 
 **Total patch surface:** approximately 50 lines for the
@@ -1190,6 +1192,8 @@ fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
 OK this needs more care. The intended mechanism is:
 
 **Sky overrides `collect_and_partition_mono_items` via `Config::override_queries`, like erw does.** The override delegates to the saved-default partitioner, then filters Sky items out before returning. Rustc's downstream code (including the LLVM backend's CGU iteration) only ever sees the filtered list — Sky items don't exist from rustc's downstream perspective.
+
+> **Update (Option 4, 2026-06-21):** the partition-filter override was retired in favor of a `codegen_fn_attrs` override that sets `linkage = Some(Linkage::AvailableExternally)` on consumer-defined items. Same outcome (rustc emits no `.o` symbol for Sky-defined items, consumer's `fill_extra_modules` body is the sole def at link) via a smaller surface (~107 lines of partition-filtering code retired). See §F.14.1 for the full rationale. The mechanism described in this section remains architecturally informative — it's a structurally-valid alternative, just heavier than `AvailableExternally` linkage — but is no longer the shipping design.
 
 ```rust
 fn lang_collect_and_partition_mono_items<'tcx>(
@@ -4351,6 +4355,8 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B16 (Sky-specific). `cross_crate_inlinable` items emitted as `available_externally` linkage at -O>=1 — Sky's emitted call sites can't resolve.** **CLOSED architecturally** by an override of the `cross_crate_inlinable` query (both `queries.cross_crate_inlinable` for local items and `extern_queries.cross_crate_inlinable` for upstream items read from rmeta) that returns `false` when `consumer_lang_active(())` returns `true`. Symptoms before the fix: at -O>=1, Sky's `__lang_stubs::clone_it<UserBinType>` body references `<UserBinType as RustTrait>::method` (the user-bin's derived impl). Rustc's default `cross_crate_inlinable = true` (auto-attracted by `#[derive(Clone)]` etc.) makes rustc emit such items with LLVM `available_externally` linkage — body present in IR for inlining, no `.o` symbol produced. Normal Rust callers inline via LLVM's IR inliner, satisfying the reference. Sky's emitted call sites go through direct LLVM call instructions and don't engage rustc's IR-level inlining, so the symbol reference dangles at link. Same root cause for upstream items (e.g. `<Vec<i64>>::new` in case 5 fixtures) — rmeta-encoded `cross_crate_inlinable` value carries the same flag, override applies symmetrically via `extern_queries`. Pass-through preserved: `consumer_lang_active(())` returns `false` for pure-Rust crates (no marker anywhere), so the override delegates to the default provider. Cost in Sky-active compiles: marginal code-size increase (cross-crate-inlinable items get real `.o` symbols rather than `available_externally`), no semantic effect. The fix replaces what was previously documented as a "sibling-of-B14" gap (matrix-tracked as 12 ignored fixtures: case 3 / case 5 across LTO modes + Priority B annotation variants). The link errors looked superficially similar to B14 (undefined symbol with user-bin disambig) but had a completely different mechanism — B14 was about WHICH disambig the v0 mangler picked at the call site; B16 is about WHETHER rustc emits a real symbol at the definition. Test fence: the un-ignored case 3 / case 5 fixtures in the inlining matrix.
 
+**B17 (Sky-specific). Partition filter as an architectural mechanism for the consumer-emits-bodies / rustc-emits-bodies collision.** **CLOSED architecturally via Option 4 (2026-06-21)** by replacing the `collect_and_partition_mono_items` override with a `codegen_fn_attrs` override that sets `linkage = Some(Linkage::AvailableExternally)` on every consumer-defined item. Background: Sky's `stub_gen` emits `pub fn foo() { unreachable!() }` for every export. Rustc's default codegen would compile each body to a `panic("unreachable")` blob, producing a competing `.o` symbol next to the consumer's `fill_extra_modules` body (rustc fork patch 4). The historical fix (~107 lines in `rustc-lang-facade/src/queries/partition.rs`) walked rustc's CGU list after the default partitioner and removed every consumer-defined item before the LLVM backend saw it. Option 4's replacement: rustc emits the body as `AvailableExternally` (LLVM IR-only, no `.o` symbol), so the partition-filter is unnecessary. The partitioner short-circuits at `rustc_monomorphize::partitioning::mono_item_linkage_and_visibility` when `mono_item.explicit_linkage(tcx)` returns Some, which it does via the override (`codegen_fn_attrs` → `codegen_instance_attrs` → `explicit_linkage`). Pass-through preserved: override gated by `is_consumer_codegen_target` which only fires for items in marker-bearing crates. F1's LTO inlining promise preserved: `AvailableExternally` bodies still participate in LTO IR linker pool; the inlining matrix's 40 fixtures verified post-Option-4 that case 1a/2/4/6 main bodies still constant-fold (`mov w8, #42`) cross-crate. A.1 (capture-ship-replay) and A.2 (`synthesize_upstream_monomorphizations`) remain load-bearing — Option 4 only retires A.3. Test fence: the inlining matrix + the existing 191-test integration suite. See §F.14.1 for the full retirement rationale + the open-question check on the MIR inliner not pulling `unreachable!()` into Sky's callers within the stub_rlib compile.
+
 **B14 and B15 produce byte-identical link errors.** Both surface as `Undefined symbols for architecture arm64: "..._12___lang_stubsINtB4_7WrapperlENtNtCs..._4core5clone5Clone5cloneB4_", referenced from: ...duplicate... in lib__lang_stubs-XXX.rlib[N](...rcgu.o)`. The disambig `__lang_stubs` is correct in both cases — the difference is invisible from the link error alone. **The disambiguating check is `llvm-objdump -t` on the user_bin's post-LTO `.o` file:** if Sky's emitted symbol is `g F __TEXT,__text _<symbol>` (global), the symbol is correctly linkage-pinned and the chain breakage is upstream — investigate the share-generics gate, the augmented `upstream_monomorphizations_for` map, and the stub rlib's metadata-recording of the offending Rust intermediary. If the symbol is `l F __TEXT,__text _<symbol>` (local), LTO `internalize` demoted it — SMPLZ discipline is wrong (pin missing or using `@llvm.compiler.used` instead of `@llvm.used`). Future investigators hitting this error pattern: check the objdump first.
 
 **Investigation playbook for "Sky symbol disappeared somewhere in the LLVM pipeline".** When Sky-related symbols vanish (undefined-symbol link errors, mysterious runtime traps, or behavior that works at one opt-level but not another), the recipe that surfaced B15 generalizes:
@@ -5856,20 +5862,42 @@ directly. Tier 3 #9's `default_symbol_name()` helper is the pattern.
 
 Path B is the canonical design — §6.2 + §9.6 describe it.
 
-#### F.3 `#![no_builtins]` on stub rlibs
+#### F.3 `#![no_builtins]` on stub rlibs — RETIRED 2026-06-21
 
-Tied to F.2. Even with single-symbol naming, the stub rlib's `.rcgu.o`
-sections still carry the `unreachable!()` body (rustc has to compile
-the source to *something*). Under `lto = "thin"`, LLD's LTO machinery
-pulls that bitcode into the IR linker pool unless the rlib opts out.
-`#![no_builtins]` is the canonical opt-out — same one
-`compiler_builtins` uses for its arithmetic primitives. The rlib's
-`.o`s still link normally (so the rlib still satisfies typecheck
-lookups), but its bitcode doesn't enter LTO's pool. Sky's bitcode is
-the sole def of the symbol; LTO inlines Sky's body cleanly.
+**Status: RETIRED.** This subsection documents the historical mechanism
+for archive value; the attribute is no longer emitted by toylang's
+`stub_gen.rs::generate`.
 
-One sentence at the stub rlib's crate root. Toylang's
-`stub_gen.rs::generate` prepends it. Sky's `skyc` should do the same.
+**Original (pre-Option-4) rationale:** Even with single-symbol naming
+(F.2), the stub rlib's `.rcgu.o` sections still carried `unreachable!()`
+bodies (rustc had to compile the source to *something*). Under
+`lto = "thin"`, LLD's LTO machinery pulled that bitcode into the IR
+linker pool unless the rlib opted out. `#![no_builtins]` was the
+canonical opt-out — same one `compiler_builtins` uses — so the rlib's
+bitcode never entered LTO's pool and Sky's bitcode was the sole def
+of the symbol.
+
+**Why it's obsolete:** Option 4 (shipped 2026-06-21; arch §F.14.1)
+overrides `codegen_fn_attrs` to set explicit `AvailableExternally`
+linkage on Sky-defined items. LLVM's IR linker unambiguously prefers
+the `External`-linkage real body (from `fill_extra_modules`) over the
+`AvailableExternally` placeholder (from rustc's normal compile of the
+stub source), regardless of whether both end up in the same LTO pool.
+The defensive `#![no_builtins]` layer became redundant once linkage
+disambiguated the bodies directly.
+
+**Empirical verification (Round 2 E2, 2026-06-21):** Removed
+`#![no_builtins]` from `toylangc/src/build.rs`. Full inlining matrix
+(39 fixtures × no_lto/thin_lto/fat_lto) passed; full integration suite
+passed 317/0/1; `llvm-objdump` confirmed zero `udf`/`brk` traps in
+Sky callers across every Sky-export fixture.
+
+**If a future nightly rustc bump reintroduces a similar collision:**
+the place to start is to verify (a) Sky's `codegen_fn_attrs` override
+still produces `Some(AvailableExternally)` for Sky items, and (b)
+LLVM still honors the External-over-AvailableExternally preference
+at the IR linker. If both hold and the bug returns, restoring
+`#![no_builtins]` is a one-line emit in `build.rs`.
 
 #### F.4 Patch (c) — synchronous submission BEFORE async codegen
 
@@ -6274,6 +6302,72 @@ fire there for the rest of the system to function. The "lib compiles
 produce rlib + sidecar only" guidance in §5.5 reads as a rule about
 *Sky-emitted bodies*, not about *rust-emitted bodies the Sky cascade
 queues*. The qualifier in §5.5 makes this explicit.
+
+##### F.14.1 Partition filter retirement (Option 4, 2026-06-21)
+
+The "A.3 partition filter" — the `collect_and_partition_mono_items`
+override that removed consumer-defined items from rustc's CGU list
+before LLVM codegen — was retired and replaced by a `codegen_fn_attrs`
+override that sets `linkage = Some(Linkage::AvailableExternally)` on
+every consumer-defined item. Net effect: rustc's LLVM backend emits
+the body for cross-module inlining (LTO IR) but produces no `.o`
+symbol; the consumer's `fill_extra_modules` body (rustc fork patch 4)
+is the sole `.o` definition at link time.
+
+**What this retires vs what it doesn't.** Per the Thread A deep
+investigation (handoff "Thread A — deep investigation findings"), only
+A.3 retires. A.1 (capture-ship-replay) and A.2
+(`synthesize_upstream_monomorphizations`) remain load-bearing:
+
+- **A.1** is needed because the `per_instance_mir` cascade still
+  fires at stub_rlib compile (F.13 is unaffected by Option 4 — the
+  `is_reachable_non_generic` gate is rustc's own behavior, not Sky's).
+  Sky still needs to capture trait-impl Instances surfaced by the
+  cascade and ship them via sidecar to user_bin.
+- **A.2** is needed because the augmented `upstream_monomorphizations`
+  map is what makes the v0 mangler pick `__lang_stubs` as the
+  instantiating-crate disambig for Sky trait methods.
+
+Both stay; only the CGU-list filter is gone (~107 lines retired from
+`rustc-lang-facade/src/queries/partition.rs`, file deleted).
+
+**Why this preserves F1's LTO inlining promise.** `AvailableExternally`
+means the body IS in the IR pool, just not in the `.o`. LTO's IR
+linker can still inline through it. The actual body LTO sees is the
+one the consumer's `fill_extra_modules` hook contributed (single-symbol
+architecture per §F.2). The stub's `unreachable!()` body is excluded
+from the LTO pool via `#![no_builtins]` on stub rlibs (§F.3). The
+inlining test matrix (40 fixtures across the 7-case taxonomy × 3 LTO
+modes × opt-level + codegen-units variants) verified post-Option 4
+that case 1a / 2 / 4 / 6 main bodies still constant-fold (`mov w8,
+#42`) rather than tail-jumping to a Sky symbol.
+
+**Interaction with the F2 / B16 `cross_crate_inlinable` override.** The
+two overrides target opposite directions and don't conflict. F2 forces
+`cross_crate_inlinable` to false in consumer-active compiles so rustc
+emits real `.o` symbols for items Sky's emitted call sites reference
+(e.g. `<Vec<i64>>::new` for case 5). Option 4 sets explicit
+`AvailableExternally` linkage on consumer-defined items so rustc
+emits no `.o` for items Sky's `fill_extra_modules` will emit. Both
+gate on `consumer_lang_active(())` / `is_consumer_codegen_target` and
+preserve byte-identical pass-through for pure-Rust crates.
+
+**What was empirically tested.** All 191 integration tests + the 40
+inlining matrix fixtures + 106 unit tests pass cold and warm after
+Option 4. Open-question check: the MIR inliner does not pull the
+`unreachable!()` body into Sky-defined callers within the stub_rlib
+compile — no `udf`/`brk` instructions appear in any matrix-fixture's
+main; Sky's body inlines through cleanly. The risk discussed in the
+handoff's "Open question to validate" did not materialize.
+
+A one-time cache-shape gotcha hit during the migration: rustc's
+incremental cache rejects post-Option-4 `codegen_fn_attrs` results
+with `Found unstable fingerprints` when the prior build's cache had
+the un-overridden value. Mitigation: wipe the
+`target/integration-projects-cache` directory once after pulling
+Option 4 in. Subsequent runs are stable (`CARGO_INCREMENTAL=0` in the
+three test helpers from the F2-era 11-failures fix keeps it solid
+across cold/warm).
 
 #### F.15 Patch 4 design history: from bytes-in to Approach B
 

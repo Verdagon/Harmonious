@@ -1,0 +1,10 @@
+[project]
+name = "dqd_app"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
+
+[toylang-dependencies]
+dqd_lib_a = { path = "../dqd_lib_a" }
+dqd_lib_b = { path = "../dqd_lib_b" }

@@ -1,0 +1,3 @@
+[project]
+name = "dqd_lib_b"
+source = "main.toylang"

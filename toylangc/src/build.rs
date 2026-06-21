@@ -313,20 +313,22 @@ fn write_stub_crate(
     let stubs = crate::stub_gen::generate(&registry);
 
     let mut stubs_with_features = String::new();
-    // Path B / Phase 4.5 touch point 5: exclude the stub rlib from ThinLTO's
-    // IR linker pool. Without this, LTO sees the stub rlib's `unreachable!()`
-    // bodies as candidate definitions for the rustc-mangled consumer symbols
-    // alongside Sky's real bodies (contributed via patch (c) at the user_bin
-    // compile), and the IR linker non-deterministically picks the wrong one —
-    // user reports `arithmetic` panicking with `unreachable!()` under
-    // `lto = "thin"`. `#![no_builtins]` is rustc's canonical per-crate LTO
-    // exclusion mechanism (the same one `compiler_builtins` uses): the stub
-    // rlib's `.rcgu.o`s still link normally (so the rlib still serves its
-    // typecheck role) but its bitcode never enters the LTO module pool.
-    // Cross-language inlining is unaffected — Sky's bodies live in user_bin's
-    // bitcode and Rust deps' bodies live in their own rlibs; both participate
-    // in LTO independently.
-    stubs_with_features.push_str("#![no_builtins]\n\n");
+    // `#![no_builtins]` on stub rlibs was retired 2026-06-21 per the §5.5
+    // revision investigation (Round 2 E2). It was originally added as a
+    // belt-and-suspenders LTO-pool exclusion: under Path B / single-symbol
+    // architecture, the stub rlib's `unreachable!()` bodies and Sky's real
+    // bodies shared the same rustc-mangled symbol, and `#![no_builtins]`
+    // kept the stub rlib's bitcode out of the LTO IR linker pool so LLVM
+    // couldn't non-deterministically pick the wrong def. Post-Option-4
+    // (2026-06-21), Sky-defined items carry explicit `AvailableExternally`
+    // linkage via the `codegen_fn_attrs` override, which makes LLVM
+    // unambiguously prefer Sky's `External`-linkage real body over the
+    // stub's `AvailableExternally` placeholder regardless of LTO pool
+    // composition. E2's empirical verification: full inlining matrix
+    // (39 fixtures × no_lto/thin/fat) passes without `#![no_builtins]`,
+    // full integration suite passes 317/0/1, llvm-objdump confirms zero
+    // `udf`/`brk` traps in Sky callers. If the matrix ever regresses
+    // after a nightly rustc bump, this comment is the place to start.
     for feat in &manifest.project.features {
         stubs_with_features.push_str(&format!("#![feature({})]\n", feat));
     }

@@ -1996,19 +1996,20 @@ pub fn fill_module<'tcx, 'ctx>(
 
     // Walk MonoItems for accessor methods (still discovered via rustc).
     // Regular toylang functions come from state.toylang_instances instead.
-    // Tier 3 #3 Phase 2: re-call the upstream partition default to get
-    // the UNFILTERED CGU slice. The facade's `lang_collect_and_partition_mono_items`
-    // override (queries/partition.rs) filters consumer items so rustc
-    // doesn't try to codegen them as Rust functions, but we still need
-    // the unfiltered list here to discover Case 1b generic toylang fns
-    // instantiated from Rust callers (`__lang_stubs::wrap::<LocalThing>(42)`
-    // from a `rust_caller.rs`). The previous lifetime-erased
-    // `upstream_cgus` stash retired with `cgu_stash.rs`; calling the
-    // saved default fn pointer directly bypasses the in-memory query
-    // cache (which would return the filtered result) and gives us a
-    // true `'tcx`-bound slice with no unsafe pointer manipulation.
-    // Cost: re-runs the mono collector once; negligible for toylang
-    // fixtures, linear in crate size for larger Sky projects.
+    // We re-call the saved upstream partition provider to walk the CGU
+    // slice for Case 1b generic toylang fns instantiated from Rust
+    // callers (`__lang_stubs::wrap::<LocalThing>(42)` from a
+    // `rust_caller.rs`). Historically (pre-Option 4) the facade overrode
+    // `collect_and_partition_mono_items` to filter consumer items out of
+    // rustc's CGU list, and this call bypassed the in-memory cache to
+    // get the unfiltered slice. Option 4 (arch §F.14, 2026-06-20) retired
+    // that override — `codegen_fn_attrs` now marks consumer items with
+    // `AvailableExternally` linkage instead, so rustc emits no `.o`
+    // symbol for them but they still appear in the CGU list. The walk
+    // below now sees consumer items naturally (the `is_consumer_codegen_target`
+    // checks downstream skip them); we keep the upstream-default call
+    // so the saved fn pointer remains the single source of truth even
+    // if a future override is added back.
     let partitions = rustc_lang_facade::default_collect_and_partition()(tcx, ());
     let cgus = partitions.codegen_units;
     for cgu in cgus.iter() {

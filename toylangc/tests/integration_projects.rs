@@ -78,6 +78,20 @@ fn projects_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration_projects")
 }
 
+/// Strip the `[compile=rlib] ` or `[compile=userbin] ` prefix that
+/// `callbacks_impl::consumer_fill_modules` prepends to each entry in
+/// the TOYLANG_LOG_PATH file (per §5.5 Round 2 V7/DQ-J defensive
+/// tagging). Returns the original line unchanged if no prefix matches.
+fn strip_compile_tag(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix("[compile=rlib] ") {
+        rest
+    } else if let Some(rest) = line.strip_prefix("[compile=userbin] ") {
+        rest
+    } else {
+        line
+    }
+}
+
 /// Build a project under `tests/integration_projects/<name>/` via
 /// `toylangc build`, run the produced binary, and assert its stdout
 /// contains every line from `expected_output.txt` (line-wise contains
@@ -423,13 +437,14 @@ fn collect_generic_rust_deps_firings(name: &str) -> Vec<(String, String)> {
     });
 
     // Each CollectGenericRustDeps line looks like:
-    //   CollectGenericRustDeps { name: "wrap", args_fingerprint: "[i32]" }
+    //   [compile=userbin] CollectGenericRustDeps { name: "wrap", args_fingerprint: "[i32]" }
+    // (compile-tag prefix added by §5.5 Round 2 V7/DQ-J; strip before parsing.)
     // We parse with a tolerant pattern — anything between the quoted fields
     // is captured verbatim. Avoid pulling in a regex dep; the format is fixed
     // by the Debug derive on CallbackLog and lives in toylangc itself.
     let mut out = Vec::new();
     for line in log.lines() {
-        let line = line.trim();
+        let line = strip_compile_tag(line.trim());
         let Some(rest) = line.strip_prefix("CollectGenericRustDeps { name: \"") else {
             continue;
         };
@@ -835,6 +850,37 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 ///   - the @GCMLZ re-entrance bypass via thread-local state pointer (E.6.C)
 /// Expected output: `42` (from `double_it(21) = 21 * 2`).
 #[test] fn test_case6_basic_multi_crate() { run_integration_project("case6_app"); }
+/// DQ-D / multi-Sky-library generic case (§5.5 revision investigation,
+/// Round 2 E1, ported to main 2026-06-21). Two Sky libraries that have
+/// never seen each other's types:
+///   - dqd_lib_a defines a generic `wrap<T>` and `Wrapper<T>` struct
+///   - dqd_lib_b defines a non-generic `Thing` struct
+///   - dqd_app instantiates `wrap<Thing>(make_thing(42))`, calls `unwrap`,
+///     reads back the value via `thing_value`.
+///
+/// **Status: ignored, blocked on a SKY-FRONTEND type-classification bug
+/// (unrelated to §5.5 emission policy).** When `dqd_app` calls
+/// `wrap<Thing>(t)`, the validator classifies the type argument `Thing`
+/// as `RustType { name: "Thing" }` (because dqd_lib_b's stub rlib makes
+/// Thing visible via Rust's `pub use` path) but classifies the value
+/// `t` (returned by `make_thing`) as `Struct { name: "Thing",
+/// field_types: [I32] }` (because dqd_lib_b's sidecar registry knows
+/// Thing's full Sky structure). The `types_match` predicate at
+/// `toylangc/src/toylang/type_resolve.rs:164` bridges `StructRef ↔
+/// Struct` but NOT `RustType ↔ Struct`, so validation fails with
+/// `ArgTypeMismatch { func_name: "wrap", expected: RustType, got:
+/// Struct }`.
+///
+/// The fix is probably a small extension to `types_match` to bridge
+/// `RustType ↔ Struct` when names + type_args match. Until that
+/// lands, this test exercises the build infrastructure (lib_a +
+/// lib_b stub rlibs compile successfully — that part of DQ-D works)
+/// but cannot reach per_instance_mir or the §5.5 emission question.
+///
+/// Expected output once unblocked: `42`.
+#[test]
+#[ignore = "blocked on Sky-frontend types_match RustType↔Struct bridge"]
+fn test_multi_sky_generic() { run_integration_project("dqd_app"); }
 /// Phase 1 D / Case 1a: Rust program (top-level) calls a non-generic
 /// toylang function exported from `__lang_stubs`. Exercises:
 ///   - `[project.rust_caller]` manifest field
@@ -1340,10 +1386,11 @@ fn test_s4_sidecar_load_smoke() {
         .unwrap_or_else(|e| panic!("callback log not written at {}: {}", log_path.display(), e));
 
     // The Debug print of `OnSkyLibLoaded` looks like:
-    //   OnSkyLibLoaded { crate_name: "__lang_stubs", n_structs: 0, n_functions: N }
-    // We do a structured prefix match — same pattern as the existing
-    // `CollectGenericRustDeps` parsing in `collect_generic_rust_deps_firings`.
-    let entry_line = log.lines().map(str::trim).find(|line| {
+    //   [compile=userbin] OnSkyLibLoaded { crate_name: "__lang_stubs", n_structs: 0, n_functions: N }
+    // The `[compile=rlib]/[compile=userbin]` prefix is added by
+    // callbacks_impl::consumer_fill_modules per §5.5 Round 2 V7/DQ-J.
+    // `strip_compile_tag` removes it so the structured prefix match still works.
+    let entry_line = log.lines().map(str::trim).map(strip_compile_tag).find(|line| {
         line.starts_with("OnSkyLibLoaded { crate_name: \"__lang_stubs\"")
     }).unwrap_or_else(|| {
         panic!(
@@ -1433,8 +1480,9 @@ fn test_oracle_cross_crate_extern_fn_lookup() {
         .unwrap_or_else(|e| panic!("callback log not written at {}: {}", log_path.display(), e));
 
     // Parse the OracleCrossCrateProbe entry. Debug format:
-    //   OracleCrossCrateProbe { resolved: N, total: M }
-    let entry = log.lines().map(str::trim).find(|line| {
+    //   [compile=...] OracleCrossCrateProbe { resolved: N, total: M }
+    // (compile-tag prefix added by §5.5 Round 2 V7/DQ-J; strip before matching.)
+    let entry = log.lines().map(str::trim).map(strip_compile_tag).find(|line| {
         line.starts_with("OracleCrossCrateProbe ")
     }).unwrap_or_else(|| {
         panic!(
@@ -1532,8 +1580,9 @@ fn test_phase2_const_u64_round_trip() {
 
     // Find the Phase2RoundTripProbe entry. Debug format includes
     // `opaque_def_id_found: <bool>`, `encoded_typeid: <int>`,
-    // `decoded_typeid: <Option<u64>>`.
-    let entry = log.lines().map(str::trim).find(|line| {
+    // `decoded_typeid: <Option<u64>>`. Compile-tag prefix added by
+    // §5.5 Round 2 V7/DQ-J; strip before matching.
+    let entry = log.lines().map(str::trim).map(strip_compile_tag).find(|line| {
         line.starts_with("Phase2RoundTripProbe ")
     }).unwrap_or_else(|| {
         panic!(

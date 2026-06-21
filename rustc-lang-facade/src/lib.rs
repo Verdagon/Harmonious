@@ -41,6 +41,13 @@ pub mod queries;
 // longer need CGU discovery at all (Phase 1c synthesises them at
 // populate time via `synthesize_accessor_pairs`). Architecture
 // risks.md §B5 closed.
+//
+// Option 4 (arch §F.14, 2026-06-20): the `collect_and_partition_mono_items`
+// override that used to filter consumer items out of the CGU list is also
+// retired. The saved upstream provider is still preserved so
+// `default_collect_and_partition()` keeps working unchanged for callers;
+// it just no longer differs from `tcx.collect_and_partition_mono_items(())`
+// because no override is installed.
 
 use rustc_codegen_llvm::ModuleLlvm;
 use rustc_codegen_ssa::traits::ExtraModuleAllocator;
@@ -469,14 +476,27 @@ unsafe impl Sync for FacadeConfig {}
 /// Immutable config (callbacks + vtable). Set once, never changes.
 static CONFIG: OnceLock<FacadeConfig> = OnceLock::new();
 
+/// Type alias for the saved upstream `collect_and_partition_mono_items`
+/// provider. Used by the `default_collect_and_partition()` accessor. The
+/// override was retired in Option 4 (arch §F.14, 2026-06-20); the saved
+/// default is preserved so consumers (notably `toylangc::llvm_gen` and
+/// `toylangc::toylang::callbacks_impl::capture_discovered_trait_impl_instances`)
+/// can re-call the upstream provider directly when they need the CGU
+/// slice for their own walks — `tcx.collect_and_partition_mono_items(())`
+/// also works and returns the same result now that no override is installed,
+/// but the accessor avoids any incremental-cache shape surprises.
+pub type CollectAndPartitionFn = for<'tcx> fn(
+    rustc_middle::ty::TyCtxt<'tcx>,
+    (),
+) -> rustc_middle::mir::mono::MonoItemPartitions<'tcx>;
+
 /// Default query providers saved from rustc. Set once, never changes.
 static DEFAULT_LAYOUT_OF: OnceLock<queries::layout::LayoutOfFn> = OnceLock::new();
 static DEFAULT_MIR_SHIMS: OnceLock<queries::drop_glue::MirShimsFn> = OnceLock::new();
 static DEFAULT_SYMBOL_NAME: OnceLock<queries::symbol_name::SymbolNameFn> = OnceLock::new();
 // No DEFAULT_PER_INSTANCE_MIR: the upstream default returns None unconditionally
 // (see comment near `default_collect_and_partition`).
-static DEFAULT_COLLECT_AND_PARTITION: OnceLock<queries::partition::CollectAndPartitionFn> =
-    OnceLock::new();
+static DEFAULT_COLLECT_AND_PARTITION: OnceLock<CollectAndPartitionFn> = OnceLock::new();
 static DEFAULT_UPSTREAM_MONOMORPHIZATIONS_FOR:
     OnceLock<queries::upstream_monomorphization::UpstreamMonomorphizationsForFn> = OnceLock::new();
 static DEFAULT_UPSTREAM_MONOMORPHIZATIONS:
@@ -485,6 +505,10 @@ static DEFAULT_CROSS_CRATE_INLINABLE:
     OnceLock<queries::cross_crate_inlinable::CrossCrateInlinableFn> = OnceLock::new();
 static DEFAULT_EXTERN_CROSS_CRATE_INLINABLE:
     OnceLock<queries::cross_crate_inlinable::ExternCrossCrateInlinableFn> = OnceLock::new();
+static DEFAULT_CODEGEN_FN_ATTRS:
+    OnceLock<queries::codegen_fn_attrs::CodegenFnAttrsFn> = OnceLock::new();
+static DEFAULT_EXTERN_CODEGEN_FN_ATTRS:
+    OnceLock<queries::codegen_fn_attrs::ExternCodegenFnAttrsFn> = OnceLock::new();
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<Box<dyn Any + Send + Sync>>> = OnceLock::new();
@@ -985,7 +1009,7 @@ pub fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
 /// `upstream_cgus` stash. Cost: re-runs the mono collector once per
 /// build (negligible for toylang fixtures, linear in crate size for
 /// larger Sky projects).
-pub fn default_collect_and_partition() -> queries::partition::CollectAndPartitionFn {
+pub fn default_collect_and_partition() -> CollectAndPartitionFn {
     *DEFAULT_COLLECT_AND_PARTITION
         .get()
         .expect("default collect_and_partition_mono_items not saved")
@@ -1098,17 +1122,19 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         },
     });
     let _ = MUTABLE_STATE.set(std::sync::Mutex::new(consumer_state));
-    // Stage 4c retired `VISIBILITY_OVERRIDE_HOOK`: the partitioner override
-    // in `queries::partition` now forces `(External, Default)` directly on
-    // `__lang_stubs` items' `MonoItemData`. rustc_codegen_llvm reads the
-    // linkage straight from the CGU struct at emission time and never
-    // re-derives it, so the plugin-applied override survives to the final
-    // `.o` — no fork hook needed.
+    // Stage 4c retired `VISIBILITY_OVERRIDE_HOOK`: under the post-Workstream-A
+    // model the binary compile codegens every consumer item locally, so the
+    // Phase-6 generic wrappers in `__lang_stubs` no longer cross a crate
+    // boundary at link time and can keep rustc's default `Hidden` linkage.
     //
-    // Stage 4b retired `CODEGEN_SKIP_HOOK`: the partitioner override in
-    // `queries::partition` removes consumer items from rustc's CGU slice
-    // before codegen dispatch ever sees them, so the hook is unreachable.
-    // Fork patch 3 is deleted alongside this commit.
+    // Stage 4b retired `CODEGEN_SKIP_HOOK`: the partitioner override
+    // (formerly `queries::partition`) removed consumer items from rustc's
+    // CGU slice before codegen dispatch ever saw them, so the hook was
+    // unreachable. Option 4 (arch §F.14, 2026-06-20) then retired the
+    // partitioner override itself; the `codegen_fn_attrs` override now
+    // marks consumer items with `AvailableExternally` linkage so rustc's
+    // LLVM backend emits no `.o` symbol for them, and the consumer's
+    // `fill_extra_modules` body (patch 4) is the sole def at link.
 }
 
 /// Save the original query providers. Phase 2 of globals init.
@@ -1120,7 +1146,7 @@ pub(crate) fn install_query_defaults(
     layout_of: queries::layout::LayoutOfFn,
     mir_shims: queries::drop_glue::MirShimsFn,
     symbol_name: queries::symbol_name::SymbolNameFn,
-    collect_and_partition: queries::partition::CollectAndPartitionFn,
+    collect_and_partition: CollectAndPartitionFn,
     upstream_monomorphizations_for:
         queries::upstream_monomorphization::UpstreamMonomorphizationsForFn,
     upstream_monomorphizations:
@@ -1129,6 +1155,10 @@ pub(crate) fn install_query_defaults(
         queries::cross_crate_inlinable::CrossCrateInlinableFn,
     extern_cross_crate_inlinable:
         queries::cross_crate_inlinable::ExternCrossCrateInlinableFn,
+    codegen_fn_attrs:
+        queries::codegen_fn_attrs::CodegenFnAttrsFn,
+    extern_codegen_fn_attrs:
+        queries::codegen_fn_attrs::ExternCodegenFnAttrsFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
@@ -1138,6 +1168,8 @@ pub(crate) fn install_query_defaults(
     let _ = DEFAULT_UPSTREAM_MONOMORPHIZATIONS.set(upstream_monomorphizations);
     let _ = DEFAULT_CROSS_CRATE_INLINABLE.set(cross_crate_inlinable);
     let _ = DEFAULT_EXTERN_CROSS_CRATE_INLINABLE.set(extern_cross_crate_inlinable);
+    let _ = DEFAULT_CODEGEN_FN_ATTRS.set(codegen_fn_attrs);
+    let _ = DEFAULT_EXTERN_CODEGEN_FN_ATTRS.set(extern_codegen_fn_attrs);
 }
 
 /// Accessor for the saved upstream `cross_crate_inlinable` provider.
@@ -1153,6 +1185,23 @@ pub fn default_extern_cross_crate_inlinable()
 {
     *DEFAULT_EXTERN_CROSS_CRATE_INLINABLE.get()
         .expect("default_extern_cross_crate_inlinable: not installed yet")
+}
+
+/// Accessor for the saved upstream `codegen_fn_attrs` provider (local items).
+/// Used by the Option 4 override to delegate before mutating linkage on
+/// consumer-defined items. See `queries::codegen_fn_attrs` for the override.
+pub fn default_codegen_fn_attrs() -> queries::codegen_fn_attrs::CodegenFnAttrsFn {
+    *DEFAULT_CODEGEN_FN_ATTRS.get()
+        .expect("default_codegen_fn_attrs: not installed yet")
+}
+
+/// Accessor for the saved upstream extern `codegen_fn_attrs` provider
+/// (items decoded from rmeta). Used symmetrically to the local accessor.
+pub fn default_extern_codegen_fn_attrs()
+    -> queries::codegen_fn_attrs::ExternCodegenFnAttrsFn
+{
+    *DEFAULT_EXTERN_CODEGEN_FN_ATTRS.get()
+        .expect("default_extern_codegen_fn_attrs: not installed yet")
 }
 
 #[cfg(test)]
