@@ -406,10 +406,6 @@ impl Parser {
             // in the public `parse` entry point after `parse_program`
             // returns; empty here is fine.
             accessor_pairs: Vec::new(),
-            // Option B sidecar capture: populated by
-            // `capture_discovered_trait_impl_instances` at the stub-rlib
-            // `consumer_emit_modules` gate, not at parse time.
-            discovered_trait_impl_instances: Vec::new(),
         })
     }
 

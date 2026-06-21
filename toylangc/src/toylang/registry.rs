@@ -68,21 +68,12 @@ pub struct ToylangRegistry {
     /// but everything below the source surface is unified.
     #[serde(default)]
     pub accessor_pairs: Vec<(String, String)>,
-    /// Concrete trait-impl method monomorphizations discovered by the
-    /// stub_rlib compile's mono walker (via Sky's `per_instance_mir`
-    /// cascade). Captured in `consumer_emit_modules`, then drained
-    /// INLINE at the same compile session (§5.5 Step 3, 2026-06-21) to
-    /// emit the bodies at the cascade-firing crate's own rlib.
-    ///
-    /// `#[serde(skip)]`: the field is in-memory-only as of Step 3 — the
-    /// drain happens at the capture site, downstream compiles don't
-    /// need the data. The historical "ship via sidecar to user_bin's
-    /// drain" mechanism (A.1.X / Option B) retired with Step 3.
-    /// Cleanup: this field could be removed entirely once the inline
-    /// drain in `consumer_fill_modules` is refactored to use a local
-    /// Vec instead of mutating a registry field.
-    #[serde(skip)]
-    pub discovered_trait_impl_instances: Vec<DiscoveredTraitImplInstance>,
+    // `discovered_trait_impl_instances` field retired 2026-06-21
+    // (post-§5.5 Step 3 cleanup). Replaced by a local `Vec` in
+    // `consumer_fill_modules` populated by
+    // `collect_consumer_trait_impl_instances`. The data is purely
+    // in-process, single-compile-session; no need for it to live on
+    // the registry.
 }
 
 /// One concrete trait-impl monomorphization the stub rlib's mono walker

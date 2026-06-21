@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 
 use rustc_lang_facade::{LangCallbacks, MonomorphizeTypeResult};
-use crate::toylang::registry::ToylangRegistry;
+use crate::toylang::registry::{DiscoveredTraitImplInstance, ToylangRegistry};
 
 /// Tier 3 #7.2: populate the facade's `SkyUniverse` from a `ToylangRegistry`.
 /// Called from both the upstream-sidecar load path (`on_sky_lib_loaded`) and
@@ -380,10 +380,9 @@ impl ToylangCallbacks {
     /// - **User-bin compile (`is_user_bin_compile = true`):** skip the
     ///   registry walk entirely (LOCAL items emit at THIS package's
     ///   stub_rlib compile; UPSTREAM items at their own stub_rlib
-    ///   compiles). Drain `discovered_trait_impl_instances` for entries
-    ///   with non-empty `concrete_args` only — those are generic
-    ///   instantiations whose concrete args originated at user_bin, so
-    ///   the owning crate couldn't pre-emit them.
+    ///   compiles). Cascade-discovered trait-impl methods are emitted
+    ///   inline at the cascade-firing crate's `consumer_fill_modules`
+    ///   (§5.5 Step 3, post-A.1.X-retirement), not here.
     pub fn populate_toylang_instances_from_cgus<'tcx>(
         &self,
         state: &mut ToylangState,
@@ -447,9 +446,9 @@ impl ToylangCallbacks {
         // §5.5 Step 2 (narrower): at stub_rlib compile, emit LOCAL items
         // only — every upstream's items emit at THAT upstream's own
         // stub_rlib compile (this same function in that rustc invocation).
-        // At user_bin compile, skip the registry walk entirely; only
-        // generic instantiations need user_bin codegen and they flow
-        // through the `discovered_trait_impl_instances` drain below.
+        // At user_bin compile, skip the registry walk entirely; cascade-
+        // discovered trait-impl methods were already emitted inline at
+        // the cascade-firing crate's `consumer_fill_modules`.
         let registries: Vec<&crate::toylang::registry::ToylangRegistry> = if self.is_user_bin_compile {
             vec![]
         } else {
@@ -584,11 +583,11 @@ impl ToylangCallbacks {
             // Uniform formulation (NNGZ-compliant): try empty-args
             // substitution; if the substituted body has remaining Params
             // (generic impl block or method-level type params), skip —
-            // discovery cascade at the using crate will provide concrete
-            // args via `discovered_trait_impl_instances` and the body
-            // emits at user_bin per Step 3. Non-generic impls fall out
-            // of the same path: empty substitution is identity, no
-            // Params remain, emit.
+            // the discovery cascade at the using crate will surface
+            // concrete args, and the body emits inline at THAT cascade-
+            // firing crate's `consumer_fill_modules`. Non-generic impls
+            // fall out of the same path: empty substitution is identity,
+            // no Params remain, emit.
             //
             // The historical comment block above (lines ~441-451) retired
             // a prior trait_impls populate channel on NNGZ grounds (it
@@ -651,14 +650,11 @@ impl ToylangCallbacks {
             }
         }
         // §5.5 Step 3: the historical user_bin drain of upstream
-        // sidecars' `discovered_trait_impl_instances` retired here.
-        // Cascade-firing crates (stub_rlibs) now drain their own
-        // discoveries inline in `consumer_fill_modules`'s
-        // !is_user_bin_compile branch — bodies emit at the same
-        // compile session that captured them, so no cross-session
-        // ship-and-replay is needed. The sidecar discoveries list is
-        // still written (for diagnostic / future tooling use) but is
-        // no longer load-bearing for emission.
+        // sidecars' cascade-discovered trait-impl Instances retired
+        // here. Cascade-firing crates (stub_rlibs) now emit those
+        // bodies inline in `consumer_fill_modules`'s !is_user_bin_compile
+        // branch — bodies are produced at the same compile session
+        // that captured them, no cross-session ship-and-replay needed.
     }
 }
 
@@ -1057,12 +1053,6 @@ impl LangCallbacks for ToylangCallbacks {
         // queries. `populate_sky_universe_from_registry` writes both in
         // one pass.
         populate_sky_universe_from_registry(&registry);
-        // SkyUniverse.discoveries push retired 2026-06-21 along with A.2.
-        // The discovered_trait_impl_instances field still gets loaded into
-        // `ts.upstream_registries` via the deserialized registry below,
-        // but nothing reads it anymore (the user_bin drain retired in
-        // §5.5 Step 3). Field could be removed from the sidecar in a
-        // future cleanup.
         ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
 
@@ -1198,42 +1188,31 @@ impl LangCallbacks for ToylangCallbacks {
         }
 
         if !self.is_user_bin_compile {
-            // Stub rlib compile: no Sky `.o` (Workstream A), but THIS is the
-            // window where rustc's mono walker has completed its cascade
-            // from Sky's `per_instance_mir` synthetic bodies — so concrete
-            // monomorphizations like `<Wrapper<i32> as Clone>::clone`
-            // appear in the unfiltered partition. Capture them into the
-            // registry and overwrite the sidecar so the downstream binary
-            // compile can:
-            //   (a) pick them up at populate (Sky emits the body), and
-            //   (b) synthesise `upstream_monomorphizations_for` so rustc's
-            //       v0 mangler picks `__lang_stubs` as the
-            //       instantiating-crate disambig (matching the stub rlib's
-            //       `duplicate<Wrapper<i32>>` body's reference).
+            // Stub rlib compile. The mono walker has completed its
+            // cascade from Sky's `per_instance_mir` synthetic bodies, so
+            // concrete monomorphizations like `<Wrapper<i32> as Clone>::clone`
+            // are visible in the unfiltered partition. §5.5 Step 3:
+            // collect those Sky-owned trait-impl Instances and emit
+            // their bodies INLINE in this same compile session — the
+            // cascade-firing crate's stub_rlib owns the emission.
             //
             // Done HERE, not at `after_rust_analysis`, because
-            // `default_collect_and_partition` triggers mono walk which
-            // re-enters `collect_generic_rust_deps` — @GCMLZ. The mutex
-            // is owned by `after_rust_analysis`'s trampoline; we're inside
-            // `consumer_emit_modules`'s trampoline which already owns it
-            // exclusively, and mono walk has long since completed.
+            // `default_collect_and_partition` triggers a mono walk
+            // which would re-enter `collect_generic_rust_deps` and
+            // deadlock per @GCMLZ. The mutex is owned by
+            // `after_rust_analysis`'s trampoline; we're inside
+            // `consumer_emit_modules`'s trampoline which already owns
+            // it exclusively, and mono walk has long since completed.
+            let discoveries = collect_consumer_trait_impl_instances(tcx);
+
+            // Sidecar bookkeeping — write the upstream-visible registry
+            // metadata (struct layouts, fn names, typeid table). The
+            // sidecar's role is type-info for downstream's
+            // `on_sky_lib_loaded` (populate_sky_universe_from_registry).
+            // Trait-impl discoveries are NOT shipped (A.1.X retired);
+            // they're emitted inline at this compile session below.
             let mut effective_registry: ToylangRegistry = (*self.registry).clone();
-            capture_discovered_trait_impl_instances(tcx, &mut effective_registry);
-            // Sort for sidecar byte-determinism (see registry doc).
-            effective_registry.discovered_trait_impl_instances.sort_by(|a, b| {
-                let arg_key = |args: &Vec<crate::toylang::typed_ast::ResolvedType>| -> String {
-                    args.iter()
-                        .map(crate::oracle::resolved_type_to_mangled_name)
-                        .collect::<Vec<_>>()
-                        .join("__")
-                };
-                (&a.self_type_name, arg_key(&a.concrete_args), &a.trait_name, &a.method_name).cmp(
-                    &(&b.self_type_name, arg_key(&b.concrete_args), &b.trait_name, &b.method_name),
-                )
-            });
             effective_registry.populate_typeid_table();
-            // Overwrite the sidecar written by `after_rust_analysis` —
-            // same path, now carrying discoveries.
             let sidecar_path = tcx.output_filenames(()).with_extension("sky-meta");
             let bytes = crate::sidecar::serialize_sidecar(&effective_registry)
                 .unwrap_or_else(|e| panic!("[toylang] sidecar (post-discovery) serialize failed: {}", e));
@@ -1246,34 +1225,25 @@ impl LangCallbacks for ToylangCallbacks {
             });
             if std::env::var("TOYLANG_LOG_PATH").is_ok() {
                 eprintln!(
-                    "[toylang] rewrote sidecar with {} discovered trait-impl instance(s): {} ({} bytes)",
-                    effective_registry.discovered_trait_impl_instances.len(),
+                    "[toylang] sidecar written with {} discovered trait-impl instance(s) emitted inline: {} ({} bytes)",
+                    discoveries.len(),
                     sidecar_path.display(),
                     bytes.len(),
                 );
             }
-            // §5.5 Step 3: drain the cascade-discovered trait-impl
-            // instances HERE (at the stub_rlib compile that captured
-            // them), not at user_bin. This retires A.1.X — the
-            // capture-ship-replay layer the prior architecture used to
-            // bridge cascade firing (always at a stub_rlib compile per
-            // F.13) and Sky body emission (under §5.5 the same compile
-            // session now). The discovered instances become
-            // ToylangInstances pushed to state; fill_module emits the
-            // bodies into THIS rlib's .o. Downstream compiles link
-            // against them naturally — no sidecar-mediated drain at
-            // user_bin needed.
+
+            // Drain the collected discoveries — push a ToylangInstance
+            // per concrete monomorphization so `fill_module` emits each
+            // body into THIS rlib's `.o`. Downstream compiles link
+            // against them naturally; no sidecar-mediated drain at
+            // user_bin needed (A.1.X retired in §5.5 Step 3).
             //
-            // Note: state.upstream_registries[<other stub_rlib>]'s own
-            // discoveries (from THAT crate's cascade) were already
-            // drained at THAT crate's own compile under this same rule.
-            // We don't re-drain them here.
-            //
-            // upstream_clones is a snapshot; constructed here to avoid
-            // recomputing the merge for each entry's impl lookup.
+            // Snapshot upstream_clones once outside the loop; the
+            // cross-Sky-crate impl lookup (case6_lib pattern) walks all
+            // loaded registries to find the matching ToyImpl.
             let upstream_clones_for_drain: Vec<crate::toylang::registry::ToylangRegistry> =
                 ts.upstream_registries.values().cloned().collect();
-            for inst in &effective_registry.discovered_trait_impl_instances {
+            for inst in &discoveries {
                 // Find the matching ToyImpl across all registries
                 // (cross-Sky-crate; case6_lib pattern).
                 let mut toy_impl_found = None;
@@ -1423,24 +1393,23 @@ impl LangCallbacks for ToylangCallbacks {
 /// Strip Mach-O bitcode wrapper (20-byte header) if present, returning the
 /// raw bitcode that rustc's `LLVMRustParseBitcodeForLTO` accepts.
 /// Option B sidecar capture (called at the stub-rlib `consumer_emit_modules`
-/// gate). Walks the unfiltered partition for trait-impl method Instances and
-/// records `(self_type, trait, method, concrete_args)` tuples into the
-/// registry's `discovered_trait_impl_instances` list. The downstream binary
-/// compile uses these for:
-///   (a) populate, to push a `ToylangInstance` per discovered
-///       monomorphization so Sky emits the body; and
-///   (b) `lang_upstream_monomorphizations_for` synthesis (Step 5), so
-///       rustc's v0 mangler picks `__lang_stubs` as the
-///       instantiating-crate disambig.
+/// Walks the unfiltered partition (via `default_collect_and_partition`,
+/// bypassing Sky's CGU overrides) and returns the consumer-owned
+/// trait-impl method monomorphizations rustc's mono cascade surfaced.
 ///
-/// Calls `default_collect_and_partition` (bypasses the in-memory query
-/// cache that would return Sky's filtered result); see partition.rs and
-/// Tier 3 #3 for the same pattern.
-fn capture_discovered_trait_impl_instances<'tcx>(
+/// §5.5 Step 3 architecture (post-2026-06-21): the returned list is
+/// consumed immediately by the inline drain in `consumer_fill_modules`
+/// within the SAME compile session — the data never crosses a process
+/// or crate boundary. This is purely a walk-and-extract of in-process
+/// mono data, not a communication channel; the historical sidecar
+/// "ship → user_bin replay" path retired with A.1.X.
+///
+/// Sorted deterministically by (self_type_name, args, trait_name,
+/// method_name) so emission order is stable across builds.
+fn collect_consumer_trait_impl_instances<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
-    registry: &mut ToylangRegistry,
-) {
-    use crate::toylang::registry::DiscoveredTraitImplInstance;
+) -> Vec<DiscoveredTraitImplInstance> {
+    let mut out: Vec<DiscoveredTraitImplInstance> = Vec::new();
     let partitions = rustc_lang_facade::default_collect_and_partition()(tcx, ());
     for cgu in partitions.codegen_units.iter() {
         for (&mono_item, _) in cgu.items() {
@@ -1469,7 +1438,7 @@ fn capture_discovered_trait_impl_instances<'tcx>(
                 .filter_map(|a| a.as_type())
                 .map(|ty| crate::oracle::rustc_ty_to_resolved_type(tcx, ty))
                 .collect();
-            registry.discovered_trait_impl_instances.push(DiscoveredTraitImplInstance {
+            out.push(DiscoveredTraitImplInstance {
                 self_type_name,
                 trait_name,
                 method_name,
@@ -1477,6 +1446,18 @@ fn capture_discovered_trait_impl_instances<'tcx>(
             });
         }
     }
+    // Deterministic emission order across builds.
+    let arg_key = |args: &Vec<crate::toylang::typed_ast::ResolvedType>| -> String {
+        args.iter()
+            .map(crate::oracle::resolved_type_to_mangled_name)
+            .collect::<Vec<_>>()
+            .join("__")
+    };
+    out.sort_by(|a, b| {
+        (&a.self_type_name, arg_key(&a.concrete_args), &a.trait_name, &a.method_name)
+            .cmp(&(&b.self_type_name, arg_key(&b.concrete_args), &b.trait_name, &b.method_name))
+    });
+    out
 }
 
 /// Build a deterministic Sky CGU name that won't clash with rustc's own CGUs.

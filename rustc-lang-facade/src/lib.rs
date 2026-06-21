@@ -457,7 +457,7 @@ static CONFIG: OnceLock<FacadeConfig> = OnceLock::new();
 /// provider. Used by the `default_collect_and_partition()` accessor. The
 /// override was retired in Option 4 (arch §F.14, 2026-06-20); the saved
 /// default is preserved so consumers (notably `toylangc::llvm_gen` and
-/// `toylangc::toylang::callbacks_impl::capture_discovered_trait_impl_instances`)
+/// `toylangc::toylang::callbacks_impl::collect_consumer_trait_impl_instances`)
 /// can re-call the upstream provider directly when they need the CGU
 /// slice for their own walks — `tcx.collect_and_partition_mono_items(())`
 /// also works and returns the same result now that no override is installed,
