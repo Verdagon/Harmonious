@@ -80,8 +80,16 @@ pub fn lang_override_queries(
         codegen_fn_attrs::lang_codegen_fn_attrs;
     providers.extern_queries.codegen_fn_attrs =
         codegen_fn_attrs::lang_extern_codegen_fn_attrs;
-    providers.queries.upstream_monomorphizations_for =
-        upstream_monomorphization::lang_upstream_monomorphizations_for;
+    // §5.5 Step 3 A/B test: A.2 (lang_upstream_monomorphizations*) is
+    // suspected redundant under Step 3 because Sky's body for cross-
+    // crate trait-impl methods now emits at the cascade-firing crate's
+    // own compile (where the v0 mangler at both the call site AND the
+    // emission site uses LOCAL_CRATE = __lang_stubs as the disambig
+    // naturally; the augmented map was load-bearing only when Sky's
+    // body emitted at user_bin and the mangler had to be told the
+    // disambig). Re-enable if tests fail to re-prove load-bearing.
+    // providers.queries.upstream_monomorphizations_for =
+    //     upstream_monomorphization::lang_upstream_monomorphizations_for;
     // F2 fix (2026-06-20): force `cross_crate_inlinable` to false in
     // Sky-active compiles so rustc emits real .o symbols rather than
     // `available_externally` declarations. Sky's emitted call sites
@@ -92,18 +100,20 @@ pub fn lang_override_queries(
         cross_crate_inlinable::lang_cross_crate_inlinable;
     providers.extern_queries.cross_crate_inlinable =
         cross_crate_inlinable::lang_extern_cross_crate_inlinable;
-    // Step 5: augment rustc's default-built whole-map with consumer
-    // synthesised trait-impl entries.
-    providers.queries.upstream_monomorphizations =
-        upstream_monomorphization::lang_upstream_monomorphizations;
-    // Patch 5 (Sky / release-mode disambig): gate-bypass for the
-    // share-generics escape in `Instance::upstream_monomorphization`. The
-    // forked rustc consults this query before consulting the augmented
-    // `upstream_monomorphizations_for` map. Returns true iff the local
-    // crate carries `__SKY_STUBS_MARKER`, so vanilla rustc AND pure-Rust
-    // pass-through compiles via this rustc binary see byte-identical
-    // behavior to the unpatched gate. See `instance.rs` (rustc fork
-    // patch 5) for the consuming code path.
+    // §5.5 Step 3 A/B test: see above. A.2 is disabled to verify
+    // retirement.
+    // providers.queries.upstream_monomorphizations =
+    //     upstream_monomorphization::lang_upstream_monomorphizations;
+    // §5.5 Step 3 finding: consumer_lang_active stays — it's load-bearing
+    // for F2's `cross_crate_inlinable` override (B16) and for codegen_fn_attrs
+    // gating (Option 4). Patch 5's share-generics escape clause (which
+    // queries consumer_lang_active in the fork) is effectively a no-op
+    // under Step 3 because A.2's augmented map is empty (we disabled it),
+    // so the escape clause's `contains_key` always returns false → same
+    // as no-escape path. The fork patch 5 itself stays but as a no-op
+    // under Step 3. A future Sky-frontend cleanup might retire patch 5
+    // proper (one fewer fork patch); that's a separate cleanup not
+    // priced into this chain.
     providers.queries.consumer_lang_active = lang_consumer_lang_active;
 }
 

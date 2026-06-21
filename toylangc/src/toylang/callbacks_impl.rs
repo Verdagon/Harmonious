@@ -650,109 +650,15 @@ impl ToylangCallbacks {
                 }
             }
         }
-        // Option B sidecar consumption — discovered trait-impl
-        // monomorphizations from upstream stub rlib compiles. The stub-rlib
-        // mono walker surfaced these concrete instantiations (e.g.
-        // `<Wrapper<i32> as Clone>::clone` reached via the
-        // `duplicate<Wrapper<T>>` cascade) via Sky's `per_instance_mir`.
-        // Sky's bitcode at user-bin compile must emit the body so the
-        // linker resolves the stub rlib's reference to it.
-        //
-        // Iterates ONLY upstream registries — the local registry has no
-        // discoveries (those come from the upstream's stub-rlib compile,
-        // not the binary's own typing pass). Cross-registry impl lookup:
-        // `impl Clone for Box` may live in a different upstream registry
-        // (case6_lib pattern) from where the discovery was captured (the
-        // bin's own stub rlib captures the cascade that crosses crates).
-        //
-        // §5.5 Step 2 gate: this drain ONLY runs at user_bin compile —
-        // upstream sidecars' discoveries describe cascades that fired at
-        // OTHER crates' stub_rlib compiles. The owning crate (where the
-        // impl lives) eagerly emits non-generic trait-impl methods at
-        // ITS OWN stub_rlib compile (via the local trait_impls loop
-        // above). At user_bin we only need to emit instantiations that
-        // carry concrete args originating downstream — i.e. generic impls
-        // whose concrete args the upstream couldn't pre-emit without
-        // user_bin's source. Non-generic discoveries (empty
-        // `concrete_args`) are skipped: the owning crate's stub_rlib
-        // already produced the body.
-        if self.is_user_bin_compile {
-        for upstream in &upstream_clones {
-            for inst in &upstream.discovered_trait_impl_instances {
-                if inst.concrete_args.is_empty() {
-                    // §5.5 Step 2: fully-concrete impl method; owning
-                    // crate's stub_rlib emitted it. Skip.
-                    continue;
-                }
-                // Find the matching `ToyImpl` across all registries
-                // (cross-Sky-crate; case6_lib).
-                let mut toy_impl_found = None;
-                for r in std::iter::once(self.registry.as_ref()).chain(upstream_clones.iter()) {
-                    if let Some(found) = r.trait_impls.iter().find(|imp| {
-                        imp.self_type_name == inst.self_type_name
-                            && imp.trait_name == inst.trait_name
-                    }) {
-                        toy_impl_found = Some(found);
-                        break;
-                    }
-                }
-                let Some(toy_impl) = toy_impl_found else { continue; };
-                let Some(method) = toy_impl.methods.iter().find(|m| m.name == inst.method_name)
-                    else { continue; };
-                let Some(stub_def_id) = crate::oracle::find_trait_impl_method_def_id(
-                    tcx, &inst.trait_name, &inst.self_type_name, &inst.method_name,
-                ) else { continue; };
-                // Build Instance with the captured concrete args so the
-                // rustc-default mangler produces the same name the stub
-                // rlib's `duplicate<...>` body references.
-                let rustc_type_args: Vec<ty::GenericArg<'tcx>> = inst.concrete_args.iter()
-                    .map(|a| ty::GenericArg::from(
-                        crate::oracle::resolved_to_rustc_ty(tcx, a)
-                    ))
-                    .collect();
-                let args = crate::oracle::build_generic_args_for_item(
-                    tcx, stub_def_id, &rustc_type_args,
-                );
-                let instance = ty::Instance::new_raw(stub_def_id, args);
-                let extern_symbol = compute_fn_symbol(&inst.method_name, tcx, instance);
-                if !state.walked_entry_points.insert(extern_symbol.clone()) {
-                    continue;
-                }
-                // Sky-internal name qualified by `(self, trait, method, args)`
-                // so the body matches uniquely across instantiations.
-                let mut internal_symbol = format!(
-                    "__toylang_internal__{}__{}__{}",
-                    inst.self_type_name, inst.trait_name, inst.method_name,
-                );
-                for arg in &inst.concrete_args {
-                    internal_symbol.push_str("__");
-                    internal_symbol.push_str(&crate::oracle::resolved_type_to_mangled_name(arg));
-                }
-                // Substitute the method body using the captured concrete
-                // args. `resolve_caller_from_instance` zips
-                // `method.func.type_params` (impl-block params + method-level
-                // params, in source order) against `instance.args.types()`
-                // and substitutes throughout the body. For N=0 (non-generic
-                // impl) the zip is empty → identity substitution → body
-                // unchanged. CLAUDE.md compiler law: the same code path
-                // handles non-generic and generic uniformly.
-                let resolved_func = resolve_caller_from_instance(&method.func, instance, tcx);
-                state.toylang_instances.push(ToylangInstance {
-                    extern_symbol,
-                    internal_symbol,
-                    resolved_func: resolved_func.clone(),
-                    stub_def_id: Some(stub_def_id),
-                    instance_args: inst.concrete_args.clone(),
-                });
-                // §5.5 Step 1: effective_registry instead of just one upstream
-                // so cross-Sky-crate callees the impl body references are found.
-                walk_and_stash_internal_callees(
-                    tcx, &effective_registry, self.registry.as_ref(),
-                    &resolved_func, &inst.method_name, state,
-                );
-            }
-        }
-        } // end if self.is_user_bin_compile (discovered-instances drain gate, §5.5 Step 2)
+        // §5.5 Step 3: the historical user_bin drain of upstream
+        // sidecars' `discovered_trait_impl_instances` retired here.
+        // Cascade-firing crates (stub_rlibs) now drain their own
+        // discoveries inline in `consumer_fill_modules`'s
+        // !is_user_bin_compile branch — bodies emit at the same
+        // compile session that captured them, so no cross-session
+        // ship-and-replay is needed. The sidecar discoveries list is
+        // still written (for diagnostic / future tooling use) but is
+        // no longer load-bearing for emission.
     }
 }
 
@@ -1366,11 +1272,104 @@ impl LangCallbacks for ToylangCallbacks {
                     bytes.len(),
                 );
             }
+            // §5.5 Step 3: drain the cascade-discovered trait-impl
+            // instances HERE (at the stub_rlib compile that captured
+            // them), not at user_bin. This retires A.1.X — the
+            // capture-ship-replay layer the prior architecture used to
+            // bridge cascade firing (always at a stub_rlib compile per
+            // F.13) and Sky body emission (under §5.5 the same compile
+            // session now). The discovered instances become
+            // ToylangInstances pushed to state; fill_module emits the
+            // bodies into THIS rlib's .o. Downstream compiles link
+            // against them naturally — no sidecar-mediated drain at
+            // user_bin needed.
+            //
+            // Note: state.upstream_registries[<other stub_rlib>]'s own
+            // discoveries (from THAT crate's cascade) were already
+            // drained at THAT crate's own compile under this same rule.
+            // We don't re-drain them here.
+            //
+            // upstream_clones is a snapshot; constructed here to avoid
+            // recomputing the merge for each entry's impl lookup.
+            let upstream_clones_for_drain: Vec<crate::toylang::registry::ToylangRegistry> =
+                ts.upstream_registries.values().cloned().collect();
+            for inst in &effective_registry.discovered_trait_impl_instances {
+                // Find the matching ToyImpl across all registries
+                // (cross-Sky-crate; case6_lib pattern).
+                let mut toy_impl_found = None;
+                for r in std::iter::once(self.registry.as_ref()).chain(upstream_clones_for_drain.iter()) {
+                    if let Some(found) = r.trait_impls.iter().find(|imp| {
+                        imp.self_type_name == inst.self_type_name
+                            && imp.trait_name == inst.trait_name
+                    }) {
+                        toy_impl_found = Some(found);
+                        break;
+                    }
+                }
+                let Some(toy_impl) = toy_impl_found else { continue };
+                let Some(method) = toy_impl.methods.iter().find(|m| m.name == inst.method_name)
+                    else { continue };
+                let Some(stub_def_id) = crate::oracle::find_trait_impl_method_def_id(
+                    tcx, &inst.trait_name, &inst.self_type_name, &inst.method_name,
+                ) else { continue };
+                let rustc_type_args: Vec<ty::GenericArg<'tcx>> = inst.concrete_args.iter()
+                    .map(|a| ty::GenericArg::from(
+                        crate::oracle::resolved_to_rustc_ty(tcx, a)
+                    ))
+                    .collect();
+                let args = crate::oracle::build_generic_args_for_item(
+                    tcx, stub_def_id, &rustc_type_args,
+                );
+                let instance = ty::Instance::new_raw(stub_def_id, args);
+                let extern_symbol = compute_fn_symbol(&inst.method_name, tcx, instance);
+                if !ts.walked_entry_points.insert(extern_symbol.clone()) {
+                    continue;
+                }
+                let mut internal_symbol = format!(
+                    "__toylang_internal__{}__{}__{}",
+                    inst.self_type_name, inst.trait_name, inst.method_name,
+                );
+                for arg in &inst.concrete_args {
+                    internal_symbol.push_str("__");
+                    internal_symbol.push_str(&crate::oracle::resolved_type_to_mangled_name(arg));
+                }
+                let resolved_func = resolve_caller_from_instance(&method.func, instance, tcx);
+                // Build an effective registry for walk_and_stash to use
+                // (covers cross-Sky-crate impl-body callees).
+                let effective_for_walk = {
+                    let mut effective = (*self.registry).clone();
+                    for upstream in &upstream_clones_for_drain {
+                        for (name, func) in &upstream.functions {
+                            effective.functions
+                                .entry(name.clone())
+                                .or_insert_with(|| func.clone());
+                        }
+                        for (name, st) in &upstream.structs {
+                            effective.structs
+                                .entry(name.clone())
+                                .or_insert_with(|| st.clone());
+                        }
+                    }
+                    effective
+                };
+                ts.toylang_instances.push(ToylangInstance {
+                    extern_symbol,
+                    internal_symbol,
+                    resolved_func: resolved_func.clone(),
+                    stub_def_id: Some(stub_def_id),
+                    instance_args: inst.concrete_args.clone(),
+                });
+                walk_and_stash_internal_callees(
+                    tcx, &effective_for_walk, self.registry.as_ref(),
+                    &resolved_func, &inst.method_name, ts,
+                );
+            }
             // §5.5 Step 2: sidecar capture done. Fall through to populate +
-            // fill_module — this stub_rlib compile now ALSO emits LOCAL
-            // non-generic Sky bodies so downstream compiles link against
-            // them naturally (vs the historical "everything emits at
-            // user_bin via A.1.X capture-ship-replay" pattern).
+            // fill_module — this stub_rlib compile now emits LOCAL
+            // non-generic Sky bodies + the cascade-discovered trait-impl
+            // method bodies (Step 3 just above) so downstream compiles
+            // link against them naturally (vs the historical "everything
+            // emits at user_bin via A.1.X capture-ship-replay" pattern).
         }
 
         self.populate_toylang_instances_from_cgus(ts, tcx);
