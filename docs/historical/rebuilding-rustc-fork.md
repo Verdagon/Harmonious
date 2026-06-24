@@ -13,29 +13,42 @@ cd ~/rust
 python3 x.py dist rustc-dev 2>&1 | tee /tmp/erw-rustc-build.txt
 
 # 2. Untar and install into the stage2 sysroot.
+#    NOTE: replace the version string with whatever `ls ~/rust/build/dist/`
+#    reports (e.g. `1.95.0-dev` as of 2026-06-24, `1.86.0-dev` historically).
 cd /tmp
-rm -rf rustc-dev-1.86.0-dev-aarch64-apple-darwin
-tar xzf ~/rust/build/dist/rustc-dev-1.86.0-dev-aarch64-apple-darwin.tar.gz
-cd rustc-dev-1.86.0-dev-aarch64-apple-darwin
+rm -rf rustc-dev-1.95.0-dev-aarch64-apple-darwin
+tar xzf ~/rust/build/dist/rustc-dev-1.95.0-dev-aarch64-apple-darwin.tar.gz
+cd rustc-dev-1.95.0-dev-aarch64-apple-darwin
 bash install.sh --prefix=$HOME/rust/build/host/stage2
 
 # 3. Strip the rustc-src dump (otherwise stage2 lib/rustlib/rustc-src
 #    gets giant and confuses some tooling).
 rm -rf $HOME/rust/build/host/stage2/lib/rustlib/rustc-src
 
-# 4. Build the stage2 standard library.
+# 4. Build the stage2 standard library + rustdoc.
+#    Building rustdoc here (rather than as a separate step) keeps it
+#    out of the "step 4 wipes step 2's work" trap — `x.py build
+#    library` and `x.py build src/tools/rustdoc` are independent
+#    targets, but both need to be built together at stage 2 so the
+#    sysroot ends up with both stdlib AND rustdoc installed. Without
+#    rustdoc, `cargo test --workspace` exits with non-zero when it
+#    reaches the doctest step ("'rustdoc' is not installed for the
+#    custom toolchain 'rustc-fork'") even though all real tests pass.
 cd ~/rust
-python3 x.py build library --stage 2
+python3 x.py build --stage 2 library src/tools/rustdoc
 
 # 5. REINSTALL rustc-dev. The library build in step 4 wipes
 #    lib/rustlib/<target>/lib/librustc_*.rmeta. Without this second
 #    install, cargo +rustc-fork build fails with 50+ "can't find crate
 #    for `rustc_abi`" errors.
-cd /tmp/rustc-dev-1.86.0-dev-aarch64-apple-darwin
+cd /tmp/rustc-dev-1.95.0-dev-aarch64-apple-darwin
 bash install.sh --prefix=$HOME/rust/build/host/stage2
 ```
 
-After all five steps, `cargo +rustc-fork build -p toylangc` will work.
+After all five steps, `cargo +rustc-fork build -p toylangc` works AND
+`cargo test --workspace` exits 0 (with the rustdoc-based doctest step
+finding 0 tests to run — the `///` comments in `rustc-lang-facade`
+are illustrative blocks, not runnable examples).
 
 ## Things that look like shortcuts but aren't
 
@@ -80,13 +93,17 @@ hides the real visibility constraint and surprises the next reader.
 ## Verifying the install worked
 
 ```bash
-ls $HOME/rust/build/host/stage2/bin/rustc                              # binary
+ls $HOME/rust/build/host/stage2/bin/rustc                              # rustc binary
+ls $HOME/rust/build/host/stage2/bin/rustdoc                            # rustdoc binary (added 2026-06-24)
 ls $HOME/rust/build/host/stage2/lib/rustlib/aarch64-apple-darwin/lib/ \
    | grep rustc_abi                                                    # rustc-dev libs
+rustup run rustc-fork rustdoc --version                                # smoke-test rustdoc
 ```
 
-Both must exist. If either is missing, repeat steps 2 and 5
-respectively.
+All four must succeed. If the rustc binary is missing, repeat step 1.
+If `librustc_abi*` is missing from rustlib, repeat step 5. If rustdoc
+is missing, repeat step 4 (with `src/tools/rustdoc` in the build
+target list).
 
 ## Time budget
 
