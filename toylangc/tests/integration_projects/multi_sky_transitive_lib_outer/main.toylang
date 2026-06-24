@@ -1,0 +1,23 @@
+// Multi-Sky-crate transitive fixture: outer Sky lib.
+// Wraps the inner lib's Counter with bump-N convenience helpers. The
+// bin imports only this lib; the inner lib is reached transitively.
+
+use multi_sky_transitive_lib_inner::Counter
+use multi_sky_transitive_lib_inner::make_counter
+use multi_sky_transitive_lib_inner::bump
+use multi_sky_transitive_lib_inner::counter_value
+
+export fn fresh_counter() -> Counter {
+    make_counter(0)
+}
+
+export fn bump_three(c: Counter) -> Counter {
+    let c1 = bump(c);
+    let c2 = bump(c1);
+    let c3 = bump(c2);
+    c3
+}
+
+export fn read(c: &Counter) -> i32 {
+    counter_value(c)
+}

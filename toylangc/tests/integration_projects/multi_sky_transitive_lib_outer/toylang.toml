@@ -1,0 +1,6 @@
+[project]
+name = "multi_sky_transitive_lib_outer"
+source = "main.toylang"
+
+[toylang-dependencies]
+multi_sky_transitive_lib_inner = { path = "../multi_sky_transitive_lib_inner" }

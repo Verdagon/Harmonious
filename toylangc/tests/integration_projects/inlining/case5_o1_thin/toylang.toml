@@ -1,0 +1,11 @@
+[project]
+name = "case5_o1_thin"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "1"
+lto = "thin"
+codegen-units = 16
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

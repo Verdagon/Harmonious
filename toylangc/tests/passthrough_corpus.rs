@@ -179,3 +179,77 @@ fn passthrough_hello_runtime_identical() {
         );
     }
 }
+
+// Category 2 pass-through corpus expansion (test expansion plan in
+// handoff.md). Each fixture exercises a different pure-Rust codegen
+// pattern that Sky's machinery could plausibly disturb if its query
+// overrides leaked into pure-Rust compiles. Runtime-output identity
+// (not byte identity) per the deviation noted in the file header.
+
+/// Shared body for an additional pass-through fixture. Wraps the
+/// toolchain-installed check + build + run + behaviour-diff.
+fn passthrough_runtime_identical(fixture_subdir: &str, label_prefix: &str) {
+    if !toolchain_installed(VANILLA_TOOLCHAIN) {
+        eprintln!(
+            "SKIP: vanilla toolchain {} not installed",
+            VANILLA_TOOLCHAIN
+        );
+        return;
+    }
+    if !toolchain_installed(FORK_TOOLCHAIN) {
+        eprintln!(
+            "SKIP: fork toolchain {} not installed",
+            FORK_TOOLCHAIN
+        );
+        return;
+    }
+
+    let fixture = Path::new("tests/passthrough_fixtures").join(fixture_subdir);
+    assert!(
+        fixture.exists(),
+        "fence must run from the toylangc crate root (looking for ./{})",
+        fixture.display()
+    );
+
+    let vanilla_bin = build_with_toolchain(
+        &fixture, VANILLA_TOOLCHAIN, &format!("{}-vanilla", label_prefix));
+    let fork_bin = build_with_toolchain(
+        &fixture, FORK_TOOLCHAIN, &format!("{}-fork", label_prefix));
+
+    let (vanilla_code, vanilla_stdout, vanilla_stderr) = run_binary(&vanilla_bin);
+    let (fork_code, fork_stdout, fork_stderr) = run_binary(&fork_bin);
+
+    if vanilla_code != fork_code
+        || vanilla_stdout != fork_stdout
+        || vanilla_stderr != fork_stderr
+    {
+        panic!(
+            "Pass-through fence ({}): rustc-fork output differs from vanilla.\n\
+             vanilla exit: {:?}\n  fork exit:    {:?}\n\
+             vanilla stdout: {}\n  fork stdout:    {}\n\
+             vanilla stderr: {}\n  fork stderr:    {}",
+            fixture_subdir,
+            vanilla_code,
+            fork_code,
+            vanilla_stdout,
+            fork_stdout,
+            vanilla_stderr,
+            fork_stderr,
+        );
+    }
+}
+
+#[test]
+fn passthrough_generics_heavy_runtime_identical() {
+    passthrough_runtime_identical("generics_heavy", "generics-heavy");
+}
+
+#[test]
+fn passthrough_trait_dispatch_runtime_identical() {
+    passthrough_runtime_identical("trait_dispatch", "trait-dispatch");
+}
+
+#[test]
+fn passthrough_closures_iters_runtime_identical() {
+    passthrough_runtime_identical("closures_iters", "closures-iters");
+}

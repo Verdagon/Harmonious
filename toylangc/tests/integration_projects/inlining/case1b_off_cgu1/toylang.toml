@@ -1,0 +1,10 @@
+[project]
+name = "case1b_off_cgu1"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "3"
+lto = "off"
+codegen-units = 1
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

@@ -1,0 +1,5 @@
+use std::clone::Clone
+
+export fn clone_it<T>(x: &T) -> T {
+    Clone::clone(x)
+}

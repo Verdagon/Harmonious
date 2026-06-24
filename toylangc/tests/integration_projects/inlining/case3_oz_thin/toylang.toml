@@ -1,0 +1,10 @@
+[project]
+name = "case3_oz_thin"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "z"
+lto = "thin"
+codegen-units = 16
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

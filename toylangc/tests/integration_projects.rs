@@ -246,6 +246,51 @@ fn run_inlining_project(name: &str) {
             );
         }
     }
+
+    // Category 1 SBMNBIZ fence: every inlining-matrix binary that ran
+    // to completion (i.e. didn't already panic + fail the test above)
+    // gets a structural check that `<crate>::main` doesn't contain
+    // `udf`/`brk` traps or branches to `core::panicking::panic` — both
+    // of which would indicate the stub's `unreachable!()` body got
+    // inlined into main. Defense-in-depth on top of the runtime check.
+    // See handoff's "Test expansion plan" Category 1.
+    inlining_harness::assert_no_inlined_unreachable_in_main(name);
+
+    // Category 6 SMPLZ fence: assert `__toylang_main` exists with
+    // External linkage in the final binary. Catches GlobalDCE / LTO
+    // `internalize` regressions that would silently strip or demote
+    // Sky's main entry-point symbol (B13 / B15 / SMPLZ failure modes).
+    //
+    // Gated on Sky-TOP cases (where Sky source has `fn main()` and the
+    // stub_gen emits `__toylang_main`): case2, case4, case6, plus
+    // historic `lto_smoke`/`release_mode_smoke`. Rust-top cases
+    // (case1a, case1b, case3, case5) have Sky source with no `fn main`
+    // — no `__toylang_main` symbol to check. (Per-fixture-specific
+    // SMPLZ assertions for Rust-top cases would need to know what Sky
+    // export each fixture has; deferred until that level of coverage
+    // is judged necessary.)
+    let is_sky_top = name.starts_with("case2_")
+        || name.starts_with("case4_")
+        || name.starts_with("case6_")
+        || name == "case2" || name == "case4" || name == "case6"
+        || name == "lto_smoke" || name == "release_mode_smoke";
+    if is_sky_top {
+        inlining_harness::assert_sky_symbol_externally_visible(name, "__toylang_main");
+    }
+
+    // B17 silent-collision fence: assert that every consumer-emitted
+    // symbol in the binary has exactly one definition. Catches
+    // regressions where rustc and Sky's `fill_extra_modules` both
+    // emit a real body for the same symbol — under Option 4 +
+    // patch 5 this never happens (codegen_fn_attrs stamps consumer
+    // items AvailableExternally so they're IR-only), but a future
+    // partitioner restructure (B2 reactivation) or a Sky-side
+    // emitter bug could silently re-introduce the collision. This
+    // fence catches it as a hard test failure rather than as a
+    // mysterious runtime behavior. Cheap (single llvm-objdump -t
+    // run per fixture); applied uniformly across the matrix. See
+    // handoff.md "What needs to land first" item Tier-1.4.
+    inlining_harness::assert_consumer_symbols_uniquely_defined(name);
 }
 
 /// Build a project with `TOYLANG_LOG_PATH` set to a per-test file; after
@@ -881,6 +926,20 @@ fn test_and_higher_precedence_than_or() { run_integration_project("and_higher_pr
 /// Expected output: `42`.
 #[test]
 fn test_multi_sky_generic() { run_integration_project("dqd_app"); }
+
+/// Multi-Sky-crate transitive-use fixture (Category 3 of the test
+/// expansion plan, 2026-06-21). Three Sky crates form a chain:
+/// `multi_sky_transitive_lib_inner` defines a Counter; `…_lib_outer`
+/// imports the inner lib and exposes convenience wrappers (bump_three
+/// etc.) on top; `multi_sky_transitive_app` (the bin) imports ONLY
+/// the outer lib. The inner lib's items are reached transitively
+/// through the outer lib's function bodies — exercises Sky's
+/// cross-Sky-crate symbol resolution + sidecar loading for items
+/// the bin never directly names.
+///
+/// Expected output: `3` (counter bumped three times).
+#[test]
+fn test_multi_sky_transitive() { run_integration_project("multi_sky_transitive_app"); }
 /// Phase 1 D / Case 1a: Rust program (top-level) calls a non-generic
 /// toylang function exported from `__lang_stubs`. Exercises:
 ///   - `[project.rust_caller]` manifest field
@@ -2293,4 +2352,753 @@ fn test_inline_case3_inline_never() {
 #[test] fn test_inline_case4_cgus_16() {
     run_inlining_project("case4_cgus_16");
     assert_no_sky_branch_in_main("case4_cgus_16");
+}
+
+// ============================================================================
+// Tier 1 expanded matrix: 7 cases × 4 LTO modes × 2 codegen-units = 56
+// fixtures. All at -O3. Added 2026-06-21 as part of the patch-5 retirement
+// preparation. The matrix locks in the expected inlining behavior across
+// every meaningful (LTO, cgu) cell so a patch-5 retirement regression
+// (or any future codegen-pipeline change) shows up as named test failures.
+//
+// Assertion rules (consistent across all 7 cases):
+//   - lto="thin" or lto="fat": Sky body inlined into main (no sky branch).
+//   - lto=default (cargo "false") or lto="off": tail-jump expected
+//     (post-Step-2; cross-Sky/Rust inlining requires explicit LTO opt-in).
+//
+// codegen-units variation: 1 vs 16. Should NOT change inlining outcome
+// under post-Step-2 (Sky body lives in a different rustc invocation; cgu
+// affects only the bin's own internal layout, not cross-crate visibility).
+//   - 1: minimum partitioning; everything in one CGU.
+//   - 16: cargo release default; multiple CGUs.
+//
+// Generated by /tmp/gen_inlining_matrix.sh (one-time generator; future
+// expansions of the matrix can re-run with extended dimensions).
+
+#[test] fn test_inline_case1a_nolto_cgu1() {
+    run_inlining_project("case1a_nolto_cgu1");
+    assert_sky_branch_present_in_main("case1a_nolto_cgu1");
+}
+#[test] fn test_inline_case1a_nolto_cgu16() {
+    run_inlining_project("case1a_nolto_cgu16");
+    assert_sky_branch_present_in_main("case1a_nolto_cgu16");
+}
+#[test] fn test_inline_case1a_off_cgu1() {
+    run_inlining_project("case1a_off_cgu1");
+    assert_sky_branch_present_in_main("case1a_off_cgu1");
+}
+#[test] fn test_inline_case1a_off_cgu16() {
+    run_inlining_project("case1a_off_cgu16");
+    assert_sky_branch_present_in_main("case1a_off_cgu16");
+}
+#[test] fn test_inline_case1a_thin_cgu1() {
+    run_inlining_project("case1a_thin_cgu1");
+    assert_no_sky_branch_in_main("case1a_thin_cgu1");
+}
+#[test] fn test_inline_case1a_thin_cgu16() {
+    run_inlining_project("case1a_thin_cgu16");
+    assert_no_sky_branch_in_main("case1a_thin_cgu16");
+}
+#[test] fn test_inline_case1a_fat_cgu1() {
+    run_inlining_project("case1a_fat_cgu1");
+    assert_no_sky_branch_in_main("case1a_fat_cgu1");
+}
+#[test] fn test_inline_case1a_fat_cgu16() {
+    run_inlining_project("case1a_fat_cgu16");
+    assert_no_sky_branch_in_main("case1a_fat_cgu16");
+}
+#[test] fn test_inline_case1b_nolto_cgu1() {
+    run_inlining_project("case1b_nolto_cgu1");
+    // Rust-top + cargo `lto = false`: Sky generic's body is mono'd at
+    // user_bin (same invocation as main). Thin-local LTO (§F.16 Level 3)
+    // bridges Sky's CGU to main's CGU within the invocation → INLINED.
+    assert_no_sky_branch_in_main("case1b_nolto_cgu1");
+}
+#[test] fn test_inline_case1b_nolto_cgu16() {
+    run_inlining_project("case1b_nolto_cgu16");
+    // Rust-top + cargo `lto = false`: Sky generic's body is mono'd at
+    // user_bin (same invocation as main). Thin-local LTO (§F.16 Level 3)
+    // bridges Sky's CGU to main's CGU within the invocation → INLINED.
+    assert_no_sky_branch_in_main("case1b_nolto_cgu16");
+}
+#[test] fn test_inline_case1b_off_cgu1() {
+    run_inlining_project("case1b_off_cgu1");
+    assert_sky_branch_present_in_main("case1b_off_cgu1");
+}
+#[test] fn test_inline_case1b_off_cgu16() {
+    run_inlining_project("case1b_off_cgu16");
+    assert_sky_branch_present_in_main("case1b_off_cgu16");
+}
+#[test] fn test_inline_case1b_thin_cgu1() {
+    run_inlining_project("case1b_thin_cgu1");
+    assert_no_sky_branch_in_main("case1b_thin_cgu1");
+}
+#[test] fn test_inline_case1b_thin_cgu16() {
+    run_inlining_project("case1b_thin_cgu16");
+    assert_no_sky_branch_in_main("case1b_thin_cgu16");
+}
+#[test] fn test_inline_case1b_fat_cgu1() {
+    run_inlining_project("case1b_fat_cgu1");
+    assert_no_sky_branch_in_main("case1b_fat_cgu1");
+}
+#[test] fn test_inline_case1b_fat_cgu16() {
+    run_inlining_project("case1b_fat_cgu16");
+    assert_no_sky_branch_in_main("case1b_fat_cgu16");
+}
+#[test] fn test_inline_case2_nolto_cgu1() {
+    run_inlining_project("case2_nolto_cgu1");
+    assert_sky_branch_present_in_main("case2_nolto_cgu1");
+}
+#[test] fn test_inline_case2_nolto_cgu16() {
+    run_inlining_project("case2_nolto_cgu16");
+    assert_sky_branch_present_in_main("case2_nolto_cgu16");
+}
+#[test] fn test_inline_case2_off_cgu1() {
+    run_inlining_project("case2_off_cgu1");
+    assert_sky_branch_present_in_main("case2_off_cgu1");
+}
+#[test] fn test_inline_case2_off_cgu16() {
+    run_inlining_project("case2_off_cgu16");
+    assert_sky_branch_present_in_main("case2_off_cgu16");
+}
+#[test] fn test_inline_case2_thin_cgu1() {
+    run_inlining_project("case2_thin_cgu1");
+    assert_no_sky_branch_in_main("case2_thin_cgu1");
+}
+#[test] fn test_inline_case2_thin_cgu16() {
+    run_inlining_project("case2_thin_cgu16");
+    assert_no_sky_branch_in_main("case2_thin_cgu16");
+}
+#[test] fn test_inline_case2_fat_cgu1() {
+    run_inlining_project("case2_fat_cgu1");
+    assert_no_sky_branch_in_main("case2_fat_cgu1");
+}
+#[test] fn test_inline_case2_fat_cgu16() {
+    run_inlining_project("case2_fat_cgu16");
+    assert_no_sky_branch_in_main("case2_fat_cgu16");
+}
+#[test] fn test_inline_case3_nolto_cgu1() {
+    run_inlining_project("case3_nolto_cgu1");
+    // Rust-top + cargo `lto = false`: Sky generic's body is mono'd at
+    // user_bin (same invocation as main). Thin-local LTO (§F.16 Level 3)
+    // bridges Sky's CGU to main's CGU within the invocation → INLINED.
+    assert_no_sky_branch_in_main("case3_nolto_cgu1");
+}
+#[test] fn test_inline_case3_nolto_cgu16() {
+    run_inlining_project("case3_nolto_cgu16");
+    // Rust-top + cargo `lto = false`: Sky generic's body is mono'd at
+    // user_bin (same invocation as main). Thin-local LTO (§F.16 Level 3)
+    // bridges Sky's CGU to main's CGU within the invocation → INLINED.
+    assert_no_sky_branch_in_main("case3_nolto_cgu16");
+}
+#[test] fn test_inline_case3_off_cgu1() {
+    run_inlining_project("case3_off_cgu1");
+    assert_sky_branch_present_in_main("case3_off_cgu1");
+}
+#[test] fn test_inline_case3_off_cgu16() {
+    run_inlining_project("case3_off_cgu16");
+    assert_sky_branch_present_in_main("case3_off_cgu16");
+}
+#[test] fn test_inline_case3_thin_cgu1() {
+    run_inlining_project("case3_thin_cgu1");
+    assert_no_sky_branch_in_main("case3_thin_cgu1");
+}
+#[test] fn test_inline_case3_thin_cgu16() {
+    run_inlining_project("case3_thin_cgu16");
+    assert_no_sky_branch_in_main("case3_thin_cgu16");
+}
+#[test] fn test_inline_case3_fat_cgu1() {
+    run_inlining_project("case3_fat_cgu1");
+    assert_no_sky_branch_in_main("case3_fat_cgu1");
+}
+#[test] fn test_inline_case3_fat_cgu16() {
+    run_inlining_project("case3_fat_cgu16");
+    assert_no_sky_branch_in_main("case3_fat_cgu16");
+}
+#[test] fn test_inline_case4_nolto_cgu1() {
+    run_inlining_project("case4_nolto_cgu1");
+    assert_sky_branch_present_in_main("case4_nolto_cgu1");
+}
+#[test] fn test_inline_case4_nolto_cgu16() {
+    run_inlining_project("case4_nolto_cgu16");
+    assert_sky_branch_present_in_main("case4_nolto_cgu16");
+}
+#[test] fn test_inline_case4_off_cgu1() {
+    run_inlining_project("case4_off_cgu1");
+    assert_sky_branch_present_in_main("case4_off_cgu1");
+}
+#[test] fn test_inline_case4_off_cgu16() {
+    run_inlining_project("case4_off_cgu16");
+    assert_sky_branch_present_in_main("case4_off_cgu16");
+}
+#[test] fn test_inline_case4_thin_cgu1() {
+    run_inlining_project("case4_thin_cgu1");
+    assert_no_sky_branch_in_main("case4_thin_cgu1");
+}
+#[test] fn test_inline_case4_thin_cgu16() {
+    run_inlining_project("case4_thin_cgu16");
+    assert_no_sky_branch_in_main("case4_thin_cgu16");
+}
+#[test] fn test_inline_case4_fat_cgu1() {
+    run_inlining_project("case4_fat_cgu1");
+    assert_no_sky_branch_in_main("case4_fat_cgu1");
+}
+#[test] fn test_inline_case4_fat_cgu16() {
+    run_inlining_project("case4_fat_cgu16");
+    assert_no_sky_branch_in_main("case4_fat_cgu16");
+}
+#[test] fn test_inline_case5_nolto_cgu1() {
+    run_inlining_project("case5_nolto_cgu1");
+    // Rust-top + cargo `lto = false`: Sky generic's body is mono'd at
+    // user_bin (same invocation as main). Thin-local LTO (§F.16 Level 3)
+    // bridges Sky's CGU to main's CGU within the invocation → INLINED.
+    assert_no_sky_branch_in_main("case5_nolto_cgu1");
+}
+#[test] fn test_inline_case5_nolto_cgu16() {
+    run_inlining_project("case5_nolto_cgu16");
+    // Rust-top + cargo `lto = false`: Sky generic's body is mono'd at
+    // user_bin (same invocation as main). Thin-local LTO (§F.16 Level 3)
+    // bridges Sky's CGU to main's CGU within the invocation → INLINED.
+    assert_no_sky_branch_in_main("case5_nolto_cgu16");
+}
+#[test] fn test_inline_case5_off_cgu1() {
+    run_inlining_project("case5_off_cgu1");
+    assert_sky_branch_present_in_main("case5_off_cgu1");
+}
+#[test] fn test_inline_case5_off_cgu16() {
+    run_inlining_project("case5_off_cgu16");
+    assert_sky_branch_present_in_main("case5_off_cgu16");
+}
+#[test] fn test_inline_case5_thin_cgu1() {
+    run_inlining_project("case5_thin_cgu1");
+    assert_no_sky_branch_in_main("case5_thin_cgu1");
+}
+#[test] fn test_inline_case5_thin_cgu16() {
+    run_inlining_project("case5_thin_cgu16");
+    assert_no_sky_branch_in_main("case5_thin_cgu16");
+}
+#[test] fn test_inline_case5_fat_cgu1() {
+    run_inlining_project("case5_fat_cgu1");
+    assert_no_sky_branch_in_main("case5_fat_cgu1");
+}
+#[test] fn test_inline_case5_fat_cgu16() {
+    run_inlining_project("case5_fat_cgu16");
+    assert_no_sky_branch_in_main("case5_fat_cgu16");
+}
+#[test] fn test_inline_case6_nolto_cgu1() {
+    run_inlining_project("case6_nolto_cgu1");
+    assert_sky_branch_present_in_main("case6_nolto_cgu1");
+}
+#[test] fn test_inline_case6_nolto_cgu16() {
+    run_inlining_project("case6_nolto_cgu16");
+    assert_sky_branch_present_in_main("case6_nolto_cgu16");
+}
+#[test] fn test_inline_case6_off_cgu1() {
+    run_inlining_project("case6_off_cgu1");
+    assert_sky_branch_present_in_main("case6_off_cgu1");
+}
+#[test] fn test_inline_case6_off_cgu16() {
+    run_inlining_project("case6_off_cgu16");
+    assert_sky_branch_present_in_main("case6_off_cgu16");
+}
+#[test] fn test_inline_case6_thin_cgu1() {
+    run_inlining_project("case6_thin_cgu1");
+    assert_no_sky_branch_in_main("case6_thin_cgu1");
+}
+#[test] fn test_inline_case6_thin_cgu16() {
+    run_inlining_project("case6_thin_cgu16");
+    assert_no_sky_branch_in_main("case6_thin_cgu16");
+}
+#[test] fn test_inline_case6_fat_cgu1() {
+    run_inlining_project("case6_fat_cgu1");
+    assert_no_sky_branch_in_main("case6_fat_cgu1");
+}
+#[test] fn test_inline_case6_fat_cgu16() {
+    run_inlining_project("case6_fat_cgu16");
+    assert_no_sky_branch_in_main("case6_fat_cgu16");
+}
+
+// ============================================================================
+// Tier 1 opt-level matrix: 7 cases × 6 opt-levels × 2 LTO modes = 84
+// fixtures. codegen-units = 16 (cargo release default) throughout.
+// Added 2026-06-21 as Category 5 of the test expansion plan.
+//
+// Assertion rules per cell:
+//   - opt=0: no inlining regardless of LTO (LLVM inliner effectively
+//     disabled at -O0); assert tail-jump (sky branch present).
+//   - opt>=1 + lto=thin: cross-crate ThinLTO; Sky body inlines into
+//     main regardless of which case. Assert no sky branch.
+//   - opt>=1 + lto=nolto (cargo "false" default):
+//     * Sky-top cases (1a, 2, 4, 6): Sky's __toylang_main body lives
+//       in __lang_stubs (different rustc invocation per Step 2). No
+//       cross-invocation LTO → tail-jump.
+//     * Rust-top cases (1b, 3, 5): Sky's generic body mono'd at
+//       user_bin (same invocation). Thin-local LTO bridges →
+//       inlined.
+//
+// Generated by toylangc/tests/scripts/gen_opt_level_matrix.sh.
+
+#[test] fn test_inline_case1a_o0_nolto() {
+    run_inlining_project("case1a_o0_nolto");
+    assert_sky_branch_present_in_main("case1a_o0_nolto");
+}
+#[test] fn test_inline_case1a_o0_thin() {
+    run_inlining_project("case1a_o0_thin");
+    assert_sky_branch_present_in_main("case1a_o0_thin");
+}
+#[test] fn test_inline_case1a_o1_nolto() {
+    run_inlining_project("case1a_o1_nolto");
+    assert_sky_branch_present_in_main("case1a_o1_nolto");
+}
+#[test] fn test_inline_case1a_o1_thin() {
+    run_inlining_project("case1a_o1_thin");
+    assert_no_sky_branch_in_main("case1a_o1_thin");
+}
+#[test] fn test_inline_case1a_o2_nolto() {
+    run_inlining_project("case1a_o2_nolto");
+    assert_sky_branch_present_in_main("case1a_o2_nolto");
+}
+#[test] fn test_inline_case1a_o2_thin() {
+    run_inlining_project("case1a_o2_thin");
+    assert_no_sky_branch_in_main("case1a_o2_thin");
+}
+#[test] fn test_inline_case1a_o3_nolto() {
+    run_inlining_project("case1a_o3_nolto");
+    assert_sky_branch_present_in_main("case1a_o3_nolto");
+}
+#[test] fn test_inline_case1a_o3_thin() {
+    run_inlining_project("case1a_o3_thin");
+    assert_no_sky_branch_in_main("case1a_o3_thin");
+}
+#[test] fn test_inline_case1a_os_nolto() {
+    run_inlining_project("case1a_os_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case1a_os_thin() {
+    run_inlining_project("case1a_os_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case1a_oz_nolto() {
+    run_inlining_project("case1a_oz_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case1a_oz_thin() {
+    run_inlining_project("case1a_oz_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case1b_o0_nolto() {
+    run_inlining_project("case1b_o0_nolto");
+    assert_sky_branch_present_in_main("case1b_o0_nolto");
+}
+#[test] fn test_inline_case1b_o0_thin() {
+    run_inlining_project("case1b_o0_thin");
+    assert_sky_branch_present_in_main("case1b_o0_thin");
+}
+#[test] fn test_inline_case1b_o1_nolto() {
+    run_inlining_project("case1b_o1_nolto");
+    assert_no_sky_branch_in_main("case1b_o1_nolto");
+}
+#[test] fn test_inline_case1b_o1_thin() {
+    run_inlining_project("case1b_o1_thin");
+    assert_no_sky_branch_in_main("case1b_o1_thin");
+}
+#[test] fn test_inline_case1b_o2_nolto() {
+    run_inlining_project("case1b_o2_nolto");
+    assert_no_sky_branch_in_main("case1b_o2_nolto");
+}
+#[test] fn test_inline_case1b_o2_thin() {
+    run_inlining_project("case1b_o2_thin");
+    assert_no_sky_branch_in_main("case1b_o2_thin");
+}
+#[test] fn test_inline_case1b_o3_nolto() {
+    run_inlining_project("case1b_o3_nolto");
+    assert_no_sky_branch_in_main("case1b_o3_nolto");
+}
+#[test] fn test_inline_case1b_o3_thin() {
+    run_inlining_project("case1b_o3_thin");
+    assert_no_sky_branch_in_main("case1b_o3_thin");
+}
+#[test] fn test_inline_case1b_os_nolto() {
+    run_inlining_project("case1b_os_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case1b_os_thin() {
+    run_inlining_project("case1b_os_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case1b_oz_nolto() {
+    run_inlining_project("case1b_oz_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case1b_oz_thin() {
+    run_inlining_project("case1b_oz_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case2_o0_nolto() {
+    run_inlining_project("case2_o0_nolto");
+    assert_sky_branch_present_in_main("case2_o0_nolto");
+}
+#[test] fn test_inline_case2_o0_thin() {
+    run_inlining_project("case2_o0_thin");
+    assert_sky_branch_present_in_main("case2_o0_thin");
+}
+#[test] fn test_inline_case2_o1_nolto() {
+    run_inlining_project("case2_o1_nolto");
+    assert_sky_branch_present_in_main("case2_o1_nolto");
+}
+#[test] fn test_inline_case2_o1_thin() {
+    run_inlining_project("case2_o1_thin");
+    assert_no_sky_branch_in_main("case2_o1_thin");
+}
+#[test] fn test_inline_case2_o2_nolto() {
+    run_inlining_project("case2_o2_nolto");
+    assert_sky_branch_present_in_main("case2_o2_nolto");
+}
+#[test] fn test_inline_case2_o2_thin() {
+    run_inlining_project("case2_o2_thin");
+    assert_no_sky_branch_in_main("case2_o2_thin");
+}
+#[test] fn test_inline_case2_o3_nolto() {
+    run_inlining_project("case2_o3_nolto");
+    assert_sky_branch_present_in_main("case2_o3_nolto");
+}
+#[test] fn test_inline_case2_o3_thin() {
+    run_inlining_project("case2_o3_thin");
+    assert_no_sky_branch_in_main("case2_o3_thin");
+}
+#[test] fn test_inline_case2_os_nolto() {
+    run_inlining_project("case2_os_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case2_os_thin() {
+    run_inlining_project("case2_os_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case2_oz_nolto() {
+    run_inlining_project("case2_oz_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case2_oz_thin() {
+    run_inlining_project("case2_oz_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent. No
+    // inlining assertion — only correctness. See handoff open item.
+}
+#[test] fn test_inline_case3_o0_nolto() {
+    run_inlining_project("case3_o0_nolto");
+    assert_sky_branch_present_in_main("case3_o0_nolto");
+}
+#[test] fn test_inline_case3_o0_thin() {
+    run_inlining_project("case3_o0_thin");
+    assert_sky_branch_present_in_main("case3_o0_thin");
+}
+#[test] fn test_inline_case3_o1_nolto() {
+    run_inlining_project("case3_o1_nolto");
+    assert_no_sky_branch_in_main("case3_o1_nolto");
+}
+#[test] fn test_inline_case3_o1_thin() {
+    run_inlining_project("case3_o1_thin");
+    assert_no_sky_branch_in_main("case3_o1_thin");
+}
+#[test] fn test_inline_case3_o2_nolto() {
+    run_inlining_project("case3_o2_nolto");
+    assert_no_sky_branch_in_main("case3_o2_nolto");
+}
+#[test] fn test_inline_case3_o2_thin() {
+    run_inlining_project("case3_o2_thin");
+    assert_no_sky_branch_in_main("case3_o2_thin");
+}
+#[test] fn test_inline_case3_o3_nolto() {
+    run_inlining_project("case3_o3_nolto");
+    assert_no_sky_branch_in_main("case3_o3_nolto");
+}
+#[test] fn test_inline_case3_o3_thin() {
+    run_inlining_project("case3_o3_thin");
+    assert_no_sky_branch_in_main("case3_o3_thin");
+}
+#[test] fn test_inline_case3_os_nolto() {
+    run_inlining_project("case3_os_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case3_os_thin() {
+    run_inlining_project("case3_os_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case3_oz_nolto() {
+    run_inlining_project("case3_oz_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case3_oz_thin() {
+    run_inlining_project("case3_oz_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case4_o0_nolto() {
+    run_inlining_project("case4_o0_nolto");
+    assert_sky_branch_present_in_main("case4_o0_nolto");
+}
+#[test] fn test_inline_case4_o0_thin() {
+    run_inlining_project("case4_o0_thin");
+    assert_sky_branch_present_in_main("case4_o0_thin");
+}
+#[test] fn test_inline_case4_o1_nolto() {
+    run_inlining_project("case4_o1_nolto");
+    assert_sky_branch_present_in_main("case4_o1_nolto");
+}
+#[test] fn test_inline_case4_o1_thin() {
+    run_inlining_project("case4_o1_thin");
+    assert_no_sky_branch_in_main("case4_o1_thin");
+}
+#[test] fn test_inline_case4_o2_nolto() {
+    run_inlining_project("case4_o2_nolto");
+    assert_sky_branch_present_in_main("case4_o2_nolto");
+}
+#[test] fn test_inline_case4_o2_thin() {
+    run_inlining_project("case4_o2_thin");
+    assert_no_sky_branch_in_main("case4_o2_thin");
+}
+#[test] fn test_inline_case4_o3_nolto() {
+    run_inlining_project("case4_o3_nolto");
+    assert_sky_branch_present_in_main("case4_o3_nolto");
+}
+#[test] fn test_inline_case4_o3_thin() {
+    run_inlining_project("case4_o3_thin");
+    assert_no_sky_branch_in_main("case4_o3_thin");
+}
+#[test] fn test_inline_case4_os_nolto() {
+    run_inlining_project("case4_os_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case4_os_thin() {
+    run_inlining_project("case4_os_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case4_oz_nolto() {
+    run_inlining_project("case4_oz_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case4_oz_thin() {
+    run_inlining_project("case4_oz_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent. No
+    // inlining assertion — only correctness. See handoff open item.
+}
+#[test] fn test_inline_case5_o0_nolto() {
+    run_inlining_project("case5_o0_nolto");
+    assert_sky_branch_present_in_main("case5_o0_nolto");
+}
+#[test] fn test_inline_case5_o0_thin() {
+    run_inlining_project("case5_o0_thin");
+    assert_sky_branch_present_in_main("case5_o0_thin");
+}
+#[test] fn test_inline_case5_o1_nolto() {
+    run_inlining_project("case5_o1_nolto");
+    assert_no_sky_branch_in_main("case5_o1_nolto");
+}
+#[test] fn test_inline_case5_o1_thin() {
+    run_inlining_project("case5_o1_thin");
+    assert_no_sky_branch_in_main("case5_o1_thin");
+}
+#[test] fn test_inline_case5_o2_nolto() {
+    run_inlining_project("case5_o2_nolto");
+    assert_no_sky_branch_in_main("case5_o2_nolto");
+}
+#[test] fn test_inline_case5_o2_thin() {
+    run_inlining_project("case5_o2_thin");
+    assert_no_sky_branch_in_main("case5_o2_thin");
+}
+#[test] fn test_inline_case5_o3_nolto() {
+    run_inlining_project("case5_o3_nolto");
+    assert_no_sky_branch_in_main("case5_o3_nolto");
+}
+#[test] fn test_inline_case5_o3_thin() {
+    run_inlining_project("case5_o3_thin");
+    assert_no_sky_branch_in_main("case5_o3_thin");
+}
+#[test] fn test_inline_case5_os_nolto() {
+    run_inlining_project("case5_os_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case5_os_thin() {
+    run_inlining_project("case5_os_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case5_oz_nolto() {
+    run_inlining_project("case5_oz_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case5_oz_thin() {
+    run_inlining_project("case5_oz_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case6_o0_nolto() {
+    run_inlining_project("case6_o0_nolto");
+    assert_sky_branch_present_in_main("case6_o0_nolto");
+}
+#[test] fn test_inline_case6_o0_thin() {
+    run_inlining_project("case6_o0_thin");
+    assert_sky_branch_present_in_main("case6_o0_thin");
+}
+#[test] fn test_inline_case6_o1_nolto() {
+    run_inlining_project("case6_o1_nolto");
+    assert_sky_branch_present_in_main("case6_o1_nolto");
+}
+#[test] fn test_inline_case6_o1_thin() {
+    run_inlining_project("case6_o1_thin");
+    assert_no_sky_branch_in_main("case6_o1_thin");
+}
+#[test] fn test_inline_case6_o2_nolto() {
+    run_inlining_project("case6_o2_nolto");
+    assert_sky_branch_present_in_main("case6_o2_nolto");
+}
+#[test] fn test_inline_case6_o2_thin() {
+    run_inlining_project("case6_o2_thin");
+    assert_no_sky_branch_in_main("case6_o2_thin");
+}
+#[test] fn test_inline_case6_o3_nolto() {
+    run_inlining_project("case6_o3_nolto");
+    assert_sky_branch_present_in_main("case6_o3_nolto");
+}
+#[test] fn test_inline_case6_o3_thin() {
+    run_inlining_project("case6_o3_thin");
+    assert_no_sky_branch_in_main("case6_o3_thin");
+}
+#[test] fn test_inline_case6_os_nolto() {
+    run_inlining_project("case6_os_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case6_os_thin() {
+    run_inlining_project("case6_os_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case6_oz_nolto() {
+    run_inlining_project("case6_oz_nolto");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent
+    // (size-conscious inliner may or may not inline depending on
+    // call-site context). No inlining assertion — only correctness
+    // (binary runs to expected output, verified inside
+    // run_inlining_project). See handoff "Revisit -Os/-Oz matrix
+    // inlining assertions" open item.
+}
+#[test] fn test_inline_case6_oz_thin() {
+    run_inlining_project("case6_oz_thin");
+    // -Os/-Oz inlining behavior is LLVM-heuristic-dependent. No
+    // inlining assertion — only correctness. See handoff open item.
 }

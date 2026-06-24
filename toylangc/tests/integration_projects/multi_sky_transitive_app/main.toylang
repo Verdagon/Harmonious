@@ -1,0 +1,18 @@
+// Multi-Sky-crate transitive fixture: top-level bin.
+// Uses the outer Sky lib which internally uses the inner Sky lib.
+// The bin's import list mentions ONLY the outer lib; the inner lib's
+// items (Counter, make_counter, bump, counter_value) get reached
+// transitively through outer's exports.
+
+use multi_sky_transitive_lib_outer::fresh_counter
+use multi_sky_transitive_lib_outer::bump_three
+use multi_sky_transitive_lib_outer::read
+
+fn println_i32(x: i32)
+
+fn main() {
+    let c0 = fresh_counter();
+    let c3 = bump_three(c0);
+    let v = read(&c3);
+    println_i32(v);
+}

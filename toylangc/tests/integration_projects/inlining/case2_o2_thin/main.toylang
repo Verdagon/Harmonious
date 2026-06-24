@@ -1,0 +1,11 @@
+fn println_i32(x: i32)
+
+fn compute() -> i32 {
+    let a = 10;
+    let b = 20;
+    a + b * 2
+}
+
+fn main() {
+    println_i32(compute());
+}

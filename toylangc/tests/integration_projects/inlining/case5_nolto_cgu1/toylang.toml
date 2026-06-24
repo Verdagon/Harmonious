@@ -1,0 +1,10 @@
+[project]
+name = "case5_nolto_cgu1"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "3"
+codegen-units = 1
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

@@ -1,0 +1,9 @@
+[project]
+name = "multi_sky_transitive_app"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../test_helpers" }
+
+[toylang-dependencies]
+multi_sky_transitive_lib_outer = { path = "../multi_sky_transitive_lib_outer" }

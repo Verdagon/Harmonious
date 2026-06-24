@@ -1,0 +1,9 @@
+[project]
+name = "case2_fat_cgu1"
+source = "main.toylang"
+opt-level = "3"
+lto = "fat"
+codegen-units = 1
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

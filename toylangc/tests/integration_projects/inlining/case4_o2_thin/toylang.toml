@@ -1,0 +1,10 @@
+[project]
+name = "case4_o2_thin"
+source = "main.toylang"
+opt-level = "2"
+lto = "thin"
+codegen-units = 16
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }
+some_rust_lib = { path = "../../some_rust_lib" }

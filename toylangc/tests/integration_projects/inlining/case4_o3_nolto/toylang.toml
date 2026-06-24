@@ -1,0 +1,9 @@
+[project]
+name = "case4_o3_nolto"
+source = "main.toylang"
+opt-level = "3"
+codegen-units = 16
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }
+some_rust_lib = { path = "../../some_rust_lib" }

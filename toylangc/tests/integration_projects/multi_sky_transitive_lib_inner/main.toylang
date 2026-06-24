@@ -1,0 +1,20 @@
+// Multi-Sky-crate transitive fixture: inner Sky lib.
+// Defines a non-generic Sky function used by the outer Sky lib
+// (NOT by the bin). The bin imports only the outer lib; this inner
+// lib is reached transitively through outer's function bodies.
+
+struct Counter {
+    value: i32,
+}
+
+export fn make_counter(initial: i32) -> Counter {
+    Counter { value: initial }
+}
+
+export fn bump(c: Counter) -> Counter {
+    Counter { value: c.value + 1 }
+}
+
+export fn counter_value(c: &Counter) -> i32 {
+    c.value
+}

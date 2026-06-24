@@ -1,0 +1,8 @@
+[project]
+name = "case2_oz_nolto"
+source = "main.toylang"
+opt-level = "z"
+codegen-units = 16
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

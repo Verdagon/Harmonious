@@ -1,0 +1,10 @@
+use std::alloc::Global
+use std::vec::Vec
+
+export fn store_in_vec<T>(x: T) -> usize {
+    let v = Vec::new<T, Global>();
+    v.push(x);
+    v.push(x);
+    v.push(x);
+    v.len()
+}
