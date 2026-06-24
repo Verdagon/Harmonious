@@ -1,1965 +1,1549 @@
-# Handoff: Discovery/synthesis machinery + share_generics + inlining coverage
+# Sky Architecture Review (Rounds 1–3, 2026-06-23) — Implementation Handoff
 
-**Who this is for:** the next engineer (probably you, fresh-session) picking up the remaining
-investigation threads. Assumes you've read
-[`rust-interop-architecture.md`](rust-interop-architecture.md) at least once,
-particularly §F.13 (cascade-fires-at-stub-rlib), §F.14.1 (Option 4 partition
-filter retirement), §8.9.5 (discovered trait-impl instances), §25.2 (the
-risk register, especially B14/B15/B16/B17), and §26.16 (SMPLZ arcanum). If
-not, read those first.
+**Source conversation:** the full three-round review exchange that inspired this handoff is archived at [`./convo-with-rustc.md`](./convo-with-rustc.md). This document is the distillation; the conversation is the rationale at full fidelity if you ever need it.
 
-**Status:** open threads identified during session 2026-06-19/20. None of these
-threads is bug-fixing — they're refinement/investigation/expansion work.
-Release-mode (the previous handoff's bug) is fully resolved as of `08f350e`.
+**Read this section first.** Below the major `=====` separator is prior-session history (mostly shipped work) — useful context but lower priority than what's in this section.
 
-**2026-06-21 progress note: §5.5 chain COMPLETE — Steps 1+2+3 shipped; Step 4 dropped as misdiagnosis.**
-
-The full A.1+A.2+patch-5 retirement chain landed empirically. Three steps shipped, one dropped on architectural review:
-
-- **Step 1 (Sky-frontend types_match)**: types_match extended to bridge `RustType ↔ Struct` / `RustType ↔ StructRef` when names + type_args match (cross-Sky-crate Sky types can be classified as RustType at the rustc-oracle lookup path and Struct at the sidecar-registry path; both are the same logical type). Plus walk_and_stash extended to use an effective_registry (LOCAL + UPSTREAMs merged) for cross-crate callee lookup, with `local_registry` discrimination to avoid duplicate emission of upstream-owned non-generic callees. Unblocks DQ-D (`test_multi_sky_generic`). Commit `20c87c1`.
-
-- **Step 2 (narrower-§5.5)**: non-generic Sky bodies emit at owning crate's stub_rlib compile. Documented LTO trade-off (no cross-Sky/Rust inlining at lto=false; requires `lto = "thin"` or `"fat"`). New @SBMNBIZ arcanum captures the AvailableExternally-stub-must-not-be-inlined invariant. 8 matrix fixtures updated to assert tail-jump present. Commit `41f7ae4`.
-
-- **Step 3 (full §5.5 partial)**: cascade-discovered trait-impl method bodies drain at the cascade-firing crate (stub_rlib compile) rather than at user_bin. A.1.X (capture-ship-replay drain) RETIRED. A.2 (`lang_upstream_monomorphizations[_for]`) RETIRED — empirically redundant because Sky's body emits at the same compile session as the call site, so LOCAL_CRATE = __lang_stubs naturally matches without the augmented map. Patch 5's `consumer_lang_active` query STAYS — load-bearing for F2's `cross_crate_inlinable` override (B16) and Option 4's codegen_fn_attrs gating, not the share-generics escape itself. The fork patch 5 in rustc is now empirically a no-op but stays at 5 patches. Commit `b09a90b`.
-
-- **Step 4 (ReifyFnPointer extension)**: ❌ **DROPPED**. The handoff's premise was a category error: ReifyFnPointer casts tell rustc to discover and compile RUST deps Sky transitively calls. Using the same mechanism for Sky-INTERNAL deps would be wrong — rustc has no role in Sky-internal emission (Sky's fill_extra_modules handles that), and non-export Sky-internal items don't have DefIds (arch §9.3, §9.4). walk_and_stash is the correct Sky-side mechanism for Sky-internal discovery; there's no pressure to push it into rustc's world. A.1.Y (walk_and_stash) stays as legitimate Sky-side infrastructure.
-
-**Net chain outcome**:
-- A.1.X (capture-ship-replay user_bin drain): RETIRED.
-- A.1.Y (walk_and_stash transitive Sky-callee discovery): STAYS — correct architectural place.
-- A.2 (synthesize_upstream_monomorphizations + the per-DefId map override): RETIRED. ~70 lines of code dead-but-archived; cleanup deletion is a follow-up.
-- Patch 5 (consumer_lang_active facade override): STAYS for sibling-dependency reasons. The rustc fork patch is a no-op under Step 3 — could retire as a separate fork-cleanup arc.
-- Fork: stays at 5 patches.
-- Verification: 192/0/1 cold + warm across all 4 commits in the chain.
-
-**Test count progression**: 191/0/2 baseline → 192/0/1 final (the +1 is DQ-D's `test_multi_sky_generic` un-ignored and passing).
-
-The chain proved the §5.5 revision's payoff is **real but partial** vs the handoff's projection. A.1.X + A.2 retirement is genuine architectural cleanup. Patch 5 retention is honest. The "rustc-natural model" framing the design-conversation anticipated is now empirically validated for non-generic and discovery paths; comptime-dependent items (Sky proper's future concern, not toylang) are the remaining motivation for §5.5 as originally designed.
-
-### Patch 5 retirement — INVESTIGATED + BLOCKED (2026-06-21)
-
-Attempted retirement: removed Sky's override of `consumer_lang_active` (made the default `false` provider win), kept the cross_crate_inlinable override using an inline `is_sky_active(tcx)` helper instead of `tcx.consumer_lang_active(())`. Tests: 3 case5 fixtures (`test_inline_case5_no_lto`/`_thin_lto`/`_fat_lto`) failed at RUNTIME with `unreachable!()` from the stub body. SBMNBIZ-style failure mode.
-
-**Root cause finding** — invalidates the earlier "Step 3 makes patch 5 a no-op" claim:
-
-Patch 5's gated share-generics escape clause is load-bearing for **rustc's NATURAL `upstream_monomorphizations_for` map**, not just for Sky's A.2-synthesized entries. Rust generic items emitted at `__lang_stubs`'s share-generics-true compile (e.g., `Vec::<i32>::new`, `<MyCounter as Clone>::clone`) get recorded in rustc's natural map via the standard rmeta path. At the user_bin's share-generics-false compile, the gate's main condition (`!share_generics() && inline != Never`) returns `true` → would return `None` → mangler picks LOCAL_CRATE disambig → mismatch with where the body actually lives.
-
-The patch 5 escape clause prevents this short-circuit by consulting `consumer_lang_active(())` and checking the natural map. Under Sky-active compiles, when the natural map has the entry, the escape fires → mangler picks the right upstream disambig.
-
-The Step-3 reasoning ("augmented map is empty so escape is a no-op") was right for SKY items (A.2 retired, no augmented entries). But for RUST items, the natural map has entries, and the escape clause is genuinely load-bearing.
-
-**What's load-bearing:**
-1. The fork patch in `Instance::upstream_monomorphization` (the gated escape clause) — prevents share-generics short-circuit for items rustc's natural map has entries for.
-2. Sky's facade-side `lang_consumer_lang_active` provider — returns `true` for Sky-active compiles so the escape clause fires.
-3. The query declaration + default provider in the fork — infrastructure for (2).
-
-All three pieces stay. Fork stays at 5 patches.
-
-**Sky-side cleanup that DID land (commit forthcoming):**
-- New `pub fn is_sky_active(tcx) -> bool` helper in `rustc-lang-facade/src/lib.rs` — consolidates the marker-walk logic.
-- `lang_consumer_lang_active` simplified to call `is_sky_active(tcx)` (was duplicating the same logic inline).
-- `lang_cross_crate_inlinable` + `lang_extern_cross_crate_inlinable` now call `crate::is_sky_active(tcx)` instead of `tcx.consumer_lang_active(())`. Cheaper (skip query plumbing); cleaner abstraction.
-- No fork changes.
-
-**Empirical wins:** 192/0/1 stays. Slightly less coupling between cross_crate_inlinable and the query system. Marker-walk logic exists in one place.
-
-**Future-direction note:** if a future Sky/Sky-proper architecture relaxes the share-generics constraint at user_bin (e.g., force share_generics=true via a heuristic similar to the `__lang_stubs` heuristic), the gated escape clause could potentially retire. That's a separate investigation, not gated on §5.5 chain work.
+This section captures everything that came out of a three-round design-review exchange on `rust-interop-architecture.md` conducted 2026-06-23, plus the implementation work it commits us to. We've closed the review exchange and are pivoting to implementation. Round 4 with the reviewer happens after we have empirical data + implementation surprises in hand.
 
 ---
 
-**2026-06-21 progress note: §5.5 Step 2 (narrower-§5.5) SHIPPED with a documented LTO trade-off + new @SBMNBIZ arcanum.**
+## What this handoff is for
 
-Step 2 of the A.1+A.2+patch-5 retirement chain landed. Non-generic Sky bodies now emit at their owning crate's stub_rlib compile (via `consumer_fill_modules`'s extended populate path + eager-emit of local trait-impls). A.1.X (capture-ship-replay) retires for non-generic trait impls; A.1.Y (transitive-callee stash), A.2, and patch 5 stay (those address generic-instantiation concerns, which Step 3 will tackle).
+You are picking up the transition from "design exchange concluded" to "Sky's actual architecture implemented in the toylang reference + ready for Sky proper."
 
-**Empirically-surfaced finding (the "thin-local LTO" mechanism):** the inlining matrix's `_no_lto` fixtures previously relied on a mechanism that wasn't documented in the arch doc — rustc's ThinLTO running BETWEEN its own CGUs WITHIN a single rustc invocation, even at `lto = false`. Cargo calls this "thin-local LTO" (per `lto = false`'s docs). Step 2 moves Sky's body to a different rustc invocation, so thin-local LTO can no longer bridge the call. **Decision (locked by user direction):** accept the trade-off; cross-Sky/Rust inlining now requires `lto = "thin"` or `"fat"`. Updated 8 matrix fixtures (case{1a,2,4,6}_no_lto + case4_o{1,2,s,z}) to assert tail-jump present rather than absent, codifying the new behavior. Documented in arch doc §F.16 (new subsection with the 5-levels-of-inlining table) and §26.17 (new @SBMNBIZ arcanum).
+The review exchange surfaced many architectural improvements over the doc as written. Most of them are NOT yet in the codebase. Many of them have NOT been validated empirically. Some of them reverse decisions that ARE in the codebase. Your job is to:
 
-**New arcanum: @SBMNBIZ ("Stub Body Must Not Be Inlined").** The Option 4 AvailableExternally pattern creates a potential UB hazard: if LLVM inlines the unreachable!() stub body into a real caller, the caller's continuation becomes unreachable → optimizer removes downstream code → UB. The discipline: at every compile session where rustc emits an AvailableExternally stub body, EITHER Sky's fill_extra_modules emits a real-body shadow (IR linker picks External over AvailableExternally), OR no caller exists in that session's IR (per @F.13's gate). Both conditions hold under Step 2; codified in `docs/arcana/StubBodyMustNotBeInlined-SBMNBIZ.md` and registered in §26's arcana table.
+1. **Build the empirical baseline first** — toylang has zero drop tests today; you need to fix that before doing any of the migration work.
+2. **Run the perf bench** — single most important data point that calibrates whether several major architectural decisions actually deliver the UX they're supposed to.
+3. **Land the architectural migrations** in dependency order — they touch each other; do them out of order and you'll churn.
+4. **Update the doc** to reflect the decisions — the design doc is currently the pre-review state.
+5. **Come back with data** — round 4 with the reviewer is the natural next exchange once you have bench numbers + implementation surprises.
 
-Verification: 191/0/2 cold + warm. 2 ignored = pre-existing flake (`test_inline_case3_inline_never`, LLVM aggression on a single Priority B fixture) + DQ-D blocked fixture (`test_multi_sky_generic`, Sky-frontend type bug — Step 1 of the chain will unblock).
+The total work is ~6-10 weeks for a focused engineer, weighted heavily toward implementation rather than design.
 
----
+## Audience
 
-**2026-06-21 progress note: Option 4 SHIPPED.** Thread A's actionable
-half-day item landed. The `collect_and_partition_mono_items` override
-(formerly at `rustc-lang-facade/src/queries/partition.rs`, ~107 lines) is
-retired; replaced by a `codegen_fn_attrs` override at
-`rustc-lang-facade/src/queries/codegen_fn_attrs.rs` (~95 lines) that sets
-`linkage = Some(Linkage::AvailableExternally)` on consumer-defined items.
-Same outcome (rustc emits no `.o` symbol for Sky-defined items; consumer's
-`fill_extra_modules` body is the sole def at link), smaller surface, more
-architecturally consistent with the per-item rather than per-CGU pattern
-the rest of the facade uses. Verification: all 191 integration tests + 40
-inlining matrix fixtures + 106 unit tests pass cold and warm. Open-question
-check passed: the MIR inliner does not pull `unreachable!()` into Sky's
-callers within the stub_rlib compile — case 1a/2/4/6 main bodies still
-constant-fold (`mov w8, #42`) cross-crate at every LTO mode + -O3. One-time
-gotcha hit: rustc's incremental cache `Found unstable fingerprints` after
-the migration; wipe `toylangc/target/integration-projects-cache` once.
-Updated arch doc: §F.14.1 (new subsection), §25.2 B17 (new entry), §5.3
-(update note pointing at §F.14.1), §3.2 patch 5 fix (stale B17 reference
-→ B14). A.1 (capture-ship-replay) and A.2 (`synthesize_upstream_monomorphizations`)
-remain load-bearing as expected — Option 4 only retires A.3.
+You should be comfortable with:
+- Rust at the systems-programming level (lifetimes, traits, generics, FFI, unsafe).
+- Rustc internals at the rustc_private level: queries, providers, MIR, mono collector, codegen backends. You don't need to be expert but you need to be able to read the source and follow the dispatch chain.
+- LLVM at the API level: contexts, modules, function types, linkage, basic IR construction. Inkwell is what we use; familiarity helps.
+- Cargo: workspaces, profiles, build scripts, `RUSTC_WORKSPACE_WRAPPER`.
 
-**2026-06-21 progress note: §5.5 revision investigation (Rounds 1+2 +
-manual DQ-D probe). Outcome: revision DEFERRED; 3 small wins shipped;
-1 Round 1 finding RETRACTED.**
+If you don't have rustc-internals background, plan ~1 week of orientation reading: the architecture doc, the existing facade code under `rustc-lang-facade/src/queries/`, and the toylang reference implementation under `toylangc/src/`.
 
-A two-round multi-agent investigation explored revising §5.5 (the locked
-"all Sky bodies emit at user_bin compile" policy) to instead match rustc's
-natural emission model (each Instance emits at the crate where it's first
-reachable as a concrete Instance). The motivation: retire A.1+A.2's
-discovery-vs-emission-site bookkeeping.
+## Prerequisites — read in this order
 
-What landed from this investigation:
+1. **`rust-interop-architecture.md`** in full. It's ~5800 lines. Three to five hours. Don't skip — this section assumes you've read it.
+2. **The decisions log in this handoff section** — captures EVERY architectural commitment from the review exchange, including ones that reverse what's currently in the doc.
+3. **`rustc-lang-facade/src/lib.rs`** — the facade entry point. Most of what you'll touch is plumbed here.
+4. **`rustc-lang-facade/src/queries/`** — the query overrides. After elimination of mir_shims and symbol_name, you'll be removing files here; understand what's there first.
+5. **`toylangc/src/stub_gen.rs`** — the stub source generator. You'll be modifying this substantially.
+6. **`toylangc/src/llvm_gen.rs`** — Sky's LLVM emission. You'll touch this for cdylib and for the bench scaffolding.
+7. **`toylangc/tests/integration_projects/`** — sample fixtures. You'll be adding ~10 drop-related fixtures here.
 
-- **`#![no_builtins]` retirement** — `toylangc/src/build.rs:329` no longer
-  emits the attribute on stub rlibs. Empirically verified safe by Round 2
-  E2: full matrix passes without it (LLVM IR linker already prefers Sky's
-  External-linkage body over the AvailableExternally placeholder
-  unambiguously post-Option-4). Arch §F.3 marked RETIRED with archive
-  context. Net: one less defensive belt-and-suspenders mechanism.
+If you're picking up cold from someone else, also skim `tmp/claude-conversation-2026-06-23-836f2993.md` — the full review-exchange transcript. It's ~10,800 lines but the actual content is roughly half that (the user pasted some long articles in for context). The decisions in this handoff are the distillation; the transcript is the rationale at full fidelity if you ever need it.
 
-- **Callback log per-compile tagging** — `callbacks_impl.rs::consumer_fill_modules`
-  now prefixes each TOYLANG_LOG_PATH entry with `[compile=rlib]` or
-  `[compile=userbin]`. Defensive against any future change that causes
-  both compiles to emit duplicate-shaped entries. Test parsers updated
-  to strip the prefix via a `strip_compile_tag` helper.
+## Status as of writing (2026-06-23)
 
-- **Round 1 D1 finding RETRACTED.** Round 1's destructive probe claimed
-  "A.2 is dead weight — 210 tests pass without it." Round 2's V3 + E3
-  re-ran with proper cache discipline (full wipe of BOTH
-  `target/integration-projects-cache/` AND per-fixture `.toylang-build/`)
-  and showed disabling A.2 produces 8 deterministic link failures in
-  generic-impl-block fixtures. A.2 IS load-bearing. Round 1's "all pass"
-  was a cache-staleness artifact.
+**Closed:**
+- The review exchange itself. Three rounds. Reviewer signed off; expecting round 4 only after we bring back bench numbers + implementation surprises.
+- All architectural decisions documented below.
 
-What the investigation confirmed about the locked design:
+**Not yet started (your work):**
+- All implementation in this section. Nothing has shifted in the codebase as a result of the review exchange.
 
-- **A.1 (capture-ship-replay) is structurally irreducible** under the
-  locked architecture (E5: disabling breaks 5 fixtures — generic
-  transitive consumer→consumer callees can't be discovered by rustc's
-  mono walker through `unreachable!()` bodies).
-- **A.2 + patch 5 are independently load-bearing** (E3: 8 fixtures need
-  A.2, 28 need patch 5, 6 need both). The fork CANNOT shrink from 5 to
-  4 patches via this route.
-- **D2's claim that toylangc emits Sky bodies at stub_rlib is refuted
-  for main** (V1a + V1b + V2a + V2b all independently confirmed: the
-  `is_user_bin_compile` gate at `callbacks_impl.rs:1124` cleanly
-  short-circuits before any IR emission at rlib compile).
-
-Why the §5.5 revision itself is deferred:
-
-The novel architectural case the revision opens — cross-Sky-library
-generic instantiation where lib_a defines `wrap<T>`, lib_b defines a
-type `Thing`, and dqd_app calls `wrap<Thing>(make_thing(42))` — was
-constructed as a new fixture (`dqd_app/`, `dqd_lib_a/`, `dqd_lib_b/`
-under `tests/integration_projects/`) and surfaced a SKY-FRONTEND
-type-classification bug, UNRELATED to §5.5's emission policy:
-
-```
-function 'main': ArgTypeMismatch {
-  func_name: "wrap",
-  expected: RustType { name: "Thing", type_args: [] },
-  got: Struct { name: "Thing", field_types: [I32] }
-}
-```
-
-When dqd_app references `Thing` as a type argument to `wrap<Thing>`,
-the validator classifies it as `RustType` (because dqd_lib_b's stub
-rlib exposes Thing via Rust's `pub use` path). When dqd_app receives
-the value from `make_thing(42)`, the validator classifies it as
-`Struct` (because dqd_lib_b's sidecar registry knows Thing's full
-Sky structure). The `types_match` predicate at
-`toylangc/src/toylang/type_resolve.rs:164` bridges `StructRef ↔
-Struct` but NOT `RustType ↔ Struct`, so validation fails before
-per_instance_mir or any §5.5-related machinery is reached.
-
-The fixture (`test_multi_sky_generic`) is committed with `#[ignore]`
-and a detailed comment so future investigators have a ready probe.
-The Sky-frontend fix is small (extend `types_match` to bridge
-`RustType ↔ Struct` when names + type_args match), but it's outside
-the §5.5 scope and not load-bearing for any current user-visible
-behavior.
-
-**Recommendation for any future §5.5 revision attempt:** fix the
-Sky-frontend type-classification bug first (so DQ-D is even runnable),
-then re-run the empirical investigation. The investigation framework
-(workflows + structured findings + paired verifiers + worktree
-isolation) is reusable — see `/private/tmp/claude-501/.../tasks/wklgsxl9j.output`
-for Round 2's full 15 findings and synthesis verdict.
-
-**Investigation-quality lessons** (general, beyond §5.5):
-- Always wipe BOTH the shared cache AND per-fixture `.toylang-build/`
-  before destructive probes. Round 1's D1 didn't wipe `.toylang-build/`
-  and produced a totally wrong conclusion.
-- Worktree-isolated agents may be branched from old revisions — pair
-  with the agent itself verifying the worktree's commit SHA against
-  main before drawing architectural conclusions. Round 2's E4 produced
-  contradictory findings vs V1/V2 because it was in a pre-Phase-3
-  worktree (DQ-I unresolved).
-- For load-bearing claims, pair two independent verifiers writing
-  to a shared schema. Round 2's V1a/V1b and V2a/V2b paired verifier
-  pattern caught D2's miscategorization cleanly.
-
-**2026-06-20 progress note:** Thread C **fully shipped + F1 + F2 both
-RESOLVED + 11 pre-existing test failures retired + Thread A deep
-investigation surfaced 8 more options than originally documented.**
-What landed:
-
-- **Inlining matrix infrastructure** (Thread C): harness, 41 fixtures, 40
-  matrix tests, rustc-demangle dev-dep. Surfaced both F1 and F2 (matrix
-  did its job). Files: `toylangc/tests/common/inlining_harness.rs`,
-  `toylangc/tests/integration_projects/inlining/`, `toylangc/tests/integration_projects.rs`.
-- **F1: Sky-export LTO inlining gap — CLOSED.** Root cause was `#[inline(never)]`
-  on Sky-item stub source. Both historical rationales obsolete: patch 5
-  closes the share-generics gate; arch §F.1 says `#[inline(never)]` is wrong
-  as the LTO race fix (`#![no_builtins]` + Path B handle it). Removed from
-  three Sky-item sites in `stub_gen.rs`. Phase-6 stdlib helpers retain
-  the attribute for a different reason (§6.6.5). Protection fence shipped:
-  `toylangc/tests/architecture_fence.rs::stub_gen_no_inline_never_on_sky_items`
-  pins the count of `#[inline(never)]` emission sites at 2 (the Phase-6
-  helpers). If anyone re-introduces the attribute on a Sky-item site
-  without flipping the v2-precompiled-bodies trigger, the test fires.
-- **F2: case 3 / case 5 disambig bug at -O3 — CLOSED.** Root cause was
-  NOT a disambig bug but `cross_crate_inlinable` query returning true,
-  causing rustc to emit `available_externally` linkage (body for inlining
-  only, no `.o` symbol). Sky's emitted call sites can't inline through
-  rustc's IR path, so the references dangled at link. Fix: new query override
-  at `rustc-lang-facade/src/queries/cross_crate_inlinable.rs` covering both
-  `queries.cross_crate_inlinable` (local items) and `extern_queries.cross_crate_inlinable`
-  (upstream items from rmeta) — returns `false` when `consumer_lang_active(())`
-  is true. Pass-through preserved (override gated by marker detection).
-  See arch §25.2 B16 for full rationale.
-- **11 pre-existing test failures — CLOSED.** The callback-log family
-  (test_diamond_call_pattern, test_generic_deep_walk, etc.) and the
-  layout-stderr family (test_point_layout, test_t_of_r_layout, etc.)
-  were all the same cold-vs-warm-cache issue. Rustc's on-disk incremental
-  cache replays `per_instance_mir` and `layout_of` query results from
-  disk on warm cache, skipping Sky's provider invocation — the callback
-  log stays empty; the `layout_of intercepted for: <Type>` eprintln
-  doesn't fire. Fix: set `CARGO_INCREMENTAL=0` in the three helpers
-  (`run_integration_project_check_callbacks`,
-  `run_integration_project_check_build_stderr`,
-  `collect_generic_rust_deps_firings`). Cold AND warm runs now pass
-  reliably.
-
-Matrix final state: 40 passing, 0 failing, 1 ignored (the one ignored is
-an LLVM-honors-`#[inline(never)]`-or-not flakiness on a single Priority B
-fixture; documented inline). Full integration suite: 191 passing, 0
-failing, 1 ignored — clean baseline both cold and warm.
-
-**Thread A deep investigation (2026-06-20)** surfaced 8 architectural
-options for retiring the partition filter (A.3) beyond the 3 paths the
-original handoff documented. The single most promising is **Option 4 —
-override `codegen_fn_attrs` to set `linkage = Some(AvailableExternally)`
-on Sky-export stubs.** Rustc emits IR (for inlining) but no `.o` symbol;
-Sky's `fill_extra_modules` body wins. No partition filter needed; existing
-`#![no_builtins]` blocks LTO inliner from pulling `unreachable!()`; F1's
-LTO inlining promise preserved. **~half day to prototype + verify.**
-~108 lines of `partition.rs` retire. A.1 + A.2 stay (different concerns).
-For full A.1+A.2+A.3 retirement: **no viable path** under Sky's locked
-architecture. The historical Option 8 sketched per_instance_mir returning
-real MIR via a Sky→rustc-MIR emitter; that approach is **rejected
-permanently** because it surrenders Sky's control of LLVM output to
-rustc's codegen pipeline. Sky's design (arch §5, §F.15) requires Sky's
-LLVM backend to own emission directly via patch 4 — that's a load-bearing
-property, not an accidental layering. A.1 and A.2 stay; the next
-meaningful step on Thread A is either incremental hygiene (audit A.2 for
-redundant synthesis entries; consolidate the three predicates into one
-"Sky-owned set") or accepting that the discovery/synthesis machinery is
-the permanent cost of keeping LLVM control. See "Thread A — deep
-investigation findings" for the full menu and the Option 8 rejection
-rationale.
-
----
-
-## Forward plan: retire A.1 + A.2 + patch 5 entirely
-
-This section sketches the hoped-for endgame for Thread A. The §5.5
-investigation surfaced that ALL of A.1 (capture-ship-replay + transitive
-consumer-callee stash), A.2 (synthesize_upstream_monomorphizations),
-and patch 5 (consumer_lang_active gated share-generics escape) exist
-fundamentally because of one architectural decision: §5.5's "all Sky
-bodies emit at user_bin." Reverse that decision and the cross-session
-bookkeeping dissolves.
-
-### Why §5.5 was locked the way it is — context from the design conversation
-
-§5.5's locked-everything-at-user_bin policy was **explicitly flagged as
-a starting-point simplification, with the optimization end-state being
-exactly the chain below.** Verbatim from the design conversation
-(`design-convo-log.md:16223`, the locked-decision discussion of the
-multi-rlib model):
-
-> "The harder question multi-rlib raises is *where compile-time evaluation
-> runs.* Cleanest model: comptime always evaluates at the top-level skyc
-> invocation (the final binary's compile). Sky libraries ship stubs +
-> Sky source for comptime-relevant items; users effectively recompile
-> generics at point of use. ... **You can complicate this later
-> (precompile-bodies-when-possible as an optimization), but starting
-> simple is right.**"
-
-And reinforced at `design-convo-log.md:16944`:
-
-> "If you wanted 'comptime runs once at lib_a's compile and the results
-> are baked into lib_a's rlib,' you'd need to enumerate every
-> instantiation Sky's downstream consumers will use — which is exactly
-> the pre-pass model that the seven-case taxonomy showed doesn't work
-> for bidirectional interop. Per_instance_mir at downstream-compile-time
-> is the right place for Sky's arbitrary-typed comptime."
-
-Distilled: §5.5's rationale is **about comptime**, not about a
-fundamental architectural correctness concern. The argument was that
-Sky's arbitrary-typed comptime needs concrete args (which only exist at
-downstream-compile time per the 7-case taxonomy), so comptime-dependent
-bodies have to emit downstream — and the simplification was to put
-*everything* downstream rather than discriminate comptime-dependent
-vs not.
-
-**Toylang has no comptime**, so 100% of toylang items are eligible for
-the "precompile-bodies-when-possible" optimization. For Sky proper, the
-discriminator becomes "does this item's body depend on comptime
-evaluation?" — comptime-dependent items keep emitting at downstream
-(per the original rationale); non-comptime-dependent items emit at
-their owning crate (per the optimization). The chain below applies
-directly to toylang and structurally to Sky's non-comptime items.
-
-### Structure of the chain
-
-The reversal can't happen in one step — the dependencies and verifiable-
-prerequisites partition into a chain. Each step is independently
-shippable and verifiable; each unlocks the next. None past Step 1
-is empirically verified; the chain is projected from architectural
-analysis, not a working prototype.
-
-### The chain
-
-| Step | Action | Effort | Retires | Gates on |
-|---|---|---|---|---|
-| 1 | Fix Sky-frontend `types_match` to bridge `RustType ↔ Struct` for cross-Sky-crate Sky types | ~0.5 day | Nothing directly — but unblocks DQ-D so Step 3 becomes empirically testable | None |
-| 2 | **SHIPPED 2026-06-21.** Narrower-§5.5 (non-generics only): consumer_fill_modules emits owned non-generic items at every compile session it owns (stub_rlib + user_bin both populate now); eager-emit of local non-generic trait_impls added; internal symbols also pinned in @llvm.used. **Actual cost: ~1 day** (vs ~0.5 estimated) — overshot because the thin-local LTO mechanism (arch §F.16) wasn't priced into the original plan, requiring 8 matrix fixtures to be flipped + the new @SBMNBIZ arcanum + arch doc updates. **Retires:** A.1.X for non-generic trait impls. **Documented trade-off:** cross-Sky/Rust inlining now requires `lto = "thin"` or `"fat"` (no thin-local LTO bridge across rustc invocations). | None — can ship today, independent of Step 1 |
-| 3 | Ship full §5.5 (generics included): same discrimination but per-Instance owning-crate lookup; generics emit at first-reachable site | ~3-5 days | A.1's capture-ship-replay entirely (discovery + emission converge); A.2 likely (External-linkage items recorded naturally in rmeta, R1's filter passes); patch 5 likely (share_generics natural map non-empty, gate's short-circuit doesn't bite); fork may shrink to 4 patches | Step 1 (so DQ-D is verifiable) |
-| 4 | ❌ **DROPPED 2026-06-21.** The premise was confused: ReifyFnPointer casts tell rustc to discover and compile RUST deps Sky transitively calls. Using the same mechanism for Sky-INTERNAL deps would be a category error — rustc has no role in Sky-internal item emission (Sky's fill_extra_modules handles that), and non-export Sky-internal items don't have DefIds in the first place (arch §9.3, §9.4). walk_and_stash is the correct Sky-side mechanism for Sky-internal transitive callee discovery; there's no pressure to push it into rustc's mono walker. Walk_and_stash STAYS as legitimate Sky-side discovery infrastructure. | n/a |
-
-### What "A.1" actually contains
-
-A.1 has two mechanistically-distinct pieces, conflated under one name in
-the original handoff. Each retires under a different step:
-
-- **A.1.X — Cross-session capture-ship-replay**
-  (`capture_discovered_trait_impl_instances` + sidecar serialization +
-  `on_sky_lib_loaded` deserialization + populate-time drain).
-  Captures trait-impl Instances at stub_rlib compile, ships via sidecar,
-  drains at user_bin to emit. **Retires under Step 2 for non-generic
-  items; retires entirely under Step 3.** Mechanism: when Sky emits at
-  the discovering crate (not user_bin), the cross-session bridge is
-  redundant — discovery and emission live in the same compile.
-- **A.1.Y — Intra-compile transitive consumer-callee stash**
-  (`walk_and_stash_internal_callees`). Recursively walks Sky's typed
-  AST to discover Sky-internal callees so Sky's `fill_extra_modules`
-  knows what bodies to emit. **STAYS — correct architectural place,
-  not retirable.** The original handoff's "retires under Step 4" claim
-  was a category error: per_instance_mir's synthetic-body ReifyFnPointer
-  casts are a one-way arrow Sky→rustc reporting RUST deps Sky
-  transitively calls (so rustc compiles them). Sky-internal items
-  aren't rustc's concern (Sky's fill_extra_modules handles them) and
-  non-export Sky-internal items don't have DefIds in the first place
-  (arch §9.3, §9.4) — you literally cannot ReifyFnPointer-cast them.
-  A.1.Y is intra-session, intra-Sky discovery for Sky's own emission
-  accounting; there's no architectural pressure to push it into rustc's
-  mono world. See the "per_instance_mir's one job" principle at the
-  top of the §5.5 chain progress note (line 15-ish): *"Sky's
-  per_instance_mir at mono time has one job: walk Sky's call graph to
-  report back the Rust things Sky transitively calls. Sky-internal
-  callees are not its concern."* Future forward-plans should anchor
-  on this principle to avoid resurrecting Step-4-shaped misdirected
-  proposals.
-
-### Full retirement scenario (CORRECTED 2026-06-21 — Step 4 dropped)
-
-Original projection said Steps 1+2+3+4 would retire A.1, A.2, and patch
-5. The empirical outcome at commit 51b7221 is partial in reality —
-honest accounting below. The original "fully retires" claims are
-preserved struck-through for archive value; the [STATUS] notes show
-what actually happened.
-
-- ~~**A.1 fully retires.**~~ **A.1.X retires; A.1.Y stays correctly.**
-  A.1.X (cross-session capture-ship-replay) retires under Step 3 — the
-  cascade-firing crate drains its own discoveries inline. A.1.Y
-  (walk_and_stash_internal_callees) is intra-session intra-Sky
-  discovery for Sky's own emission accounting — correct architectural
-  place, was misdiagnosed in the original handoff as retirable. See
-  the A.1.Y description above and the "per_instance_mir's one job"
-  principle for the framing that prevents this misdiagnosis recurring.
-- **A.2 fully retires.** [STATUS: ✅ shipped] Under Step 3, Sky's
-  body emits at the same compile session as the rustc-side call site →
-  LOCAL_CRATE = `__lang_stubs` naturally matches without the augmented
-  map. Override is commented out at `queries/mod.rs:91-92` and `105-106`.
-- ~~**Patch 5 likely retires.**~~ **Patch 5's facade query
-  (`consumer_lang_active`) STAYS — load-bearing for F2/B16's
-  `cross_crate_inlinable` override + Option 4's `codegen_fn_attrs`
-  gating.** Patch 5 in the rustc fork stays but is a no-op under Step 3
-  because the augmented map is empty (A.2 disabled) → the gated escape
-  clause never fires. Could potentially retire as a separate
-  fork-cleanup arc; consumer_lang_active query itself stays.
-- ~~**Fork could shrink from 5 patches to 4.**~~ **Fork stays at 5
-  patches.** The gated share-generics escape in `Instance::upstream_monomorphization`
-  is the only patch 5 retirement candidate, and it's just dormant
-  rather than removable (the consumer_lang_active query that gates it
-  is load-bearing for other reasons).
-- **Architectural narrative simplifies dramatically.** Today's story is
-  "Sky has three load-bearing bookkeeping layers because §5.5 forces
-  emission at user_bin." After the chain: "Sky's emission matches
-  rustc's natural model — each item emits where it's first reachable.
-  No cross-session bookkeeping needed."
-
-### Honest caveats
-
-- **Nothing past Step 1 is empirically verified.** Round 2's E1 was
-  blocked from testing DQ-D (worktree-93-commits-behind issue). My
-  attempt to run the DQ-D fixture from main surfaced the Sky-frontend
-  `RustType ↔ Struct` bug at validation time, which fires before any
-  §5.5-related machinery. So the entire chain past Step 1 is
-  architectural projection, not empirical proof.
-- **A.2 and patch 5 retirement under Step 3 is "likely", not "proven".**
-  R1's finding about the rmeta filter was specifically about
-  AvailableExternally linkage. Under Step 3, items the owning crate
-  emits would carry External linkage, so R1's filter passes — but
-  there may be other rustc-internal paths I haven't audited that
-  also affect whether the natural map populates correctly. Empirical
-  verification with the inlining matrix + integration suite is the
-  judgment call, not analysis.
-- **The Sky-frontend fix (Step 1) is small but might surface
-  cascading issues.** `types_match` is a load-bearing predicate. A
-  naive extension to bridge `RustType ↔ Struct` could affect other
-  call sites (Rust trait dispatch on Rust-classified types, FFI
-  signatures, etc.). The fix shape needs review, not just a five-line
-  patch.
-- **Steps 2 and 4 are independent of each other and of Step 1.**
-  Either can land first; their wins are independent. Step 2 also
-  serves as a "narrower revision still works" empirical check that
-  builds confidence for Step 3.
-
-### Recommended ordering
-
-1. **Step 2 first** (today, independent). Real bounded win. Validates
-   the codegen_fn_attrs is-local discriminator pattern. Cleaner
-   narrative even if the rest of the chain stalls.
-2. **Step 1 second** (after Step 2). Small bounded fix that unblocks
-   DQ-D verification. If `types_match`'s extension is harder than it
-   looks, this is where we find out — and the cost of the discovery
-   is bounded.
-3. **Step 3 third** (after Step 1 verifies DQ-D works). The big
-   architectural cleanup. Gate on Step 1's empirical success.
-4. ~~**Step 4 anywhere** (independent). ReifyFnPointer extension can
-   land independently as opportunistic cleanup.~~ **DROPPED** —
-   category error per the corrected A.1.Y framing above. Don't propose
-   this kind of step in future plans.
-
-### What success looks like (Thread A)
-
-The architecture doc's §5.5 + §F.13 + §F.14 + §F.14.1 reduces from
-~5 subsections explaining cross-session bookkeeping to a single short
-section stating "Sky's emission matches rustc's natural model for items
-without comptime dependencies; comptime-dependent items emit at the
-downstream consumer's compile per §5.5's original comptime-driven
-rationale." The risk register loses B17 (closed) and shrinks B14/B16.
-The fork drops to 4 patches. The handoff doc's Thread A section retires
-entirely or becomes a historical record.
-
-This is **the explicitly-anticipated optimization** from the design
-conversation, not a deviation from the locked architecture. §5.5's
-locking commentary said "you can complicate this later
-(precompile-bodies-when-possible as an optimization), but starting
-simple is right" — the chain above IS that complication.
-
-If the chain stalls partway (e.g., Step 1 reveals the Sky-frontend
-fix is bigger than expected, or Step 3's empirical verification
-surfaces unexpected breakage), the partial wins from Steps 2 + 4
-still ship and the chain documents the deferral cleanly for a future
-investigator.
+**In flight from prior sessions (independent of this exchange):**
+- Patch 5 retirement (shipped 2026-06-22 per the historical section below).
+- Thread B (share_generics support boundary) — open, lower priority than the new work.
 
 ---
 
 ## TL;DR
 
-Closed (no action needed): F1, F2, Thread C, Option 4 (A.3 retirement).
+If you only have time to read 200 words, here it is:
 
-One open thread remaining:
+The review exchange committed us to **17 architectural changes**, most importantly: eliminate the `mir_shims` query override (drop becomes a normal generic Sky function call), eliminate the `symbol_name` override (live no-op), replace the partition filter predicate with a `#[skyc::emit_consumer_body]` tool attribute, ship Sky's backend as a **cdylib** instead of statically linked, use **`#[repr(C)]` function-pointer struct** instead of `&mut dyn Trait` across the cdylib FFI boundary, retire the slab-pointer-as-u64 surface in favor of **content-hash const args** (u128 with collision detection), introduce **per-view ref types** `SkyRef<T, V>` with `V ∈ {Frozen, Mutable}` for Send/'static honesty at the Rust boundary, narrow `#[may_dangle]` policy to a **syntactic rule** (T appears only behind pointer indirection), and force `cache_on_disk_if(false)` on every Sky-overridden query.
 
-1. **share_generics handling (Thread B)** — current support is forced-on
-   at `__lang_stubs`, hard-error if user disables it there, otherwise
-   user choice. Decide if we should support/honor it differently in
-   other configurations. Cost: ~1 day investigation + decision. Lowest
-   urgency: no current user pain, just design-space hygiene.
+Critical caveat: **toylang has zero drop tests**, so the mir_shims elimination has no empirical baseline. **Build fixtures FIRST**, validate baseline under current model, THEN do the migration with fixtures as the regression suite.
 
-A.1 (capture-ship-replay) and A.2 (synthesize_upstream_monomorphizations)
-are the permanent cost of keeping Sky's LLVM control. The historically
-considered "Option 8" (Sky → rustc-MIR emitter) is **rejected** — Sky's
-backend must own LLVM emission directly via patch 4 (arch §5, §F.15); we
-do not surrender that to rustc's codegen pipeline. A.1+A.2 stay.
+**Implementation order, top 5:**
 
-Already shipped this arc:
+1. Build the drop integration fixtures under CURRENT mir_shims model. Pass them. ~1-2 weeks.
+2. Run the **perf bench** (add(a,b) × lto modes + O0/O1 + .text size). Single most important deliverable; the reviewer asked us to lead round 4 with it. ~1 day.
+3. Tool attribute infrastructure + partition predicate migration. ~2-3 days.
+4. mir_shims + symbol_name elimination, with fixtures as regression suite. ~1-2 weeks.
+5. cdylib build system + patch 4 rev 3 (function-pointer struct). ~1 week.
 
-- **Inlining test matrix (Thread C)** — ✅ **SHIPPED 2026-06-20.** 40
-  passing / 1 ignored (LLVM `#[inline(never)]` aggression flake) / 0
-  failing across `toylangc/tests/integration_projects/inlining/`. Surfaced
-  F1 + F2; remained as the verification fence for Option 4.
-- **Finding F1 — Sky-export LTO inlining gap. ✅ CLOSED 2026-06-20.**
-- **Finding F2 — case 3 / case 5 disambig bug. ✅ CLOSED 2026-06-20** via
-  `cross_crate_inlinable` query override.
-- **Option 4 — A.3 partition filter retirement. ✅ CLOSED 2026-06-21** via
-  `codegen_fn_attrs` override setting `AvailableExternally` linkage. New
-  file at `rustc-lang-facade/src/queries/codegen_fn_attrs.rs`; deleted
-  file at `rustc-lang-facade/src/queries/partition.rs`. Arch §F.14.1, §25.2
-  B17. The "Option 4 implementation guide" below is preserved as design
-  history for reference; the work is done.
-
-Recommended next priority if you have time: **Thread B** (share_generics)
-since it's bounded and clean. Optional Thread C follow-up: extend matrix
-to cover Sky-side `#[inline]` syntax (requires Sky frontend work) and
-Sky-top Priority B variants (blocked on same). For Thread A, the remaining
-hygiene work (audit A.2 redundancy; consolidate Sky-owned-set predicates)
-is opportunistic — pick it up next time someone touches those files. Do
-NOT pursue Sky → rustc-MIR emission paths: that surrenders LLVM control,
-which is a locked architectural property.
+**Round 4 deliverables** (when you come back to the reviewer): perf bench numbers first, then cache_on_disk_if audit results, then drop fixture outcomes, then mir_shims elimination empirical validation, then implementation surprises grouped by where they surfaced.
 
 ---
 
-## Prerequisites you must internalize
+## The review-exchange story
 
-### Background fact 1: F.13 — the cascade fires at stub rlib, not user-bin
+Three rounds across one focused day.
 
-At user_bin compile, rustc's mono collector at
-`rustc_monomorphize::collector::collect_used_items` gates on:
+**Round 1**: reviewer asked 31 questions across 11 categories (fork patches, stub rlib, types, groups, marker traits, comptime, async, cascade timing, distribution, operational discipline, rustc-interaction subtleties). I worked through each one; the user weighed in on the substantive ones. Some were "the doc is correct, here's why"; some surfaced doc errors (Sky's groups described as runtime arenas when they're actually compile-time; §12.2's "honest 'static" claim was overstated); some surfaced promising alternatives we adopted (per-view ref types for Send/Sync honesty; u128 typeids instead of u64; content-addressed naming).
 
-```rust
-if tcx.is_reachable_non_generic(def_id)
-   || instance.upstream_monomorphization(tcx).is_some()
-{
-    return false;  // skip walking
-}
-```
+**Round 2**: reviewer pushbacks. Several round-1 answers were too soft; some had real holes. They pushed us to be honest about: backend pluralism being the actual load-bearing reason for owning LLVM bytes (not "MIR can't express it" which is mostly false); the cdylib FFI shape's real failure modes; the `#[may_dangle]` discipline being narrower than I'd framed it; symbol_name override being a live no-op worth killing; the `is_consumer_codegen_target` predicate being unspec'd.
 
-For Sky's `__toylang_main` (non-generic, lives in upstream `__lang_stubs`),
-`is_reachable_non_generic` returns true → the collector **never calls
-`per_instance_mir`** for `__toylang_main` at user_bin time. The cascade
-that would discover `duplicate<Wrapper<i32>>` and `<Wrapper<i32> as
-Clone>::clone` therefore fires **only at the stub rlib compile.**
+**Round 3** (this is where most of the major decisions crystallized): the user's "drop is just a normal generic function call" insight unlocked the **mir_shims elimination** — the single largest architectural simplification from the entire exchange. We ran an 8-agent investigation to validate; it converged on "yes, the simplification works." Reviewer pushed back on the verification's theoretical nature (toylang doesn't actually test drop), the partition filter predicate's lack of explicit specification, the `#[may_dangle]` policy being too permissive, and four cdylib-related details. We adopted all the pushbacks. Then four follow-up questions from us on the new commitments (may_dangle auto-inference, cdylib FFI shape, SkyRef coherence, Pin discipline through Drop bridge), and the reviewer's brief final note on the cache_on_disk_if audit list.
 
-Consequences:
-- The stub rlib compile must capture discoveries Sky needs.
-- The user_bin compile must consume them out-of-band (sidecar).
-- This entire scaffolding (capture-ship-replay + synthesize +
-  partition filter) exists because of this one rustc-collector
-  behavior.
+**Net architectural changes from the exchange:** see the Decisions Log below. Net doc-correction work: see the Doc Update Plan.
 
-### Background fact 2: the three Sky-side coordination layers
+**Net empirical gaps surfaced:** toylang has zero drop tests; nothing has ever validated the mir_shims override (or the proposed replacement) end-to-end; the "no inlining without LTO" perf model hasn't been measured.
 
-| Layer | File | Purpose |
-|---|---|---|
-| **A.1 Capture-ship-replay** | `toylangc/src/toylang/callbacks_impl.rs::capture_discovered_trait_impl_instances` (line 1305) + `populate_toylang_instances_from_cgus` (the `for upstream in &upstream_clones` loop, line 519) | Carries SKY-OWNED trait method discoveries from stub rlib to user-bin. Solves: user-bin can't re-run the cascade. |
-| **A.2 Synthesize-upstream-monomorphizations** | `rustc-lang-facade/src/queries/upstream_monomorphization.rs::lang_upstream_monomorphizations` | Augments rustc's default-built `upstream_monomorphizations_for` map with Sky trait-impl entries. Solves: rustc's default map is empty for these items (because of A.3). |
-| **A.3 Partition filter** | `rustc-lang-facade/src/queries/partition.rs::lang_collect_and_partition_mono_items` | Removes Sky-defined items from rustc's CGU list so the LLVM backend doesn't try to codegen `unreachable!()` bodies. Solves: rustc would otherwise compile the stub source's `unreachable!()` into machine code that competes with Sky's real bodies. |
-
-These are linked: A.3 makes A.2 necessary; A.2 only works because A.1
-populated the data. Pulling out one link affects the others.
-
-### Background fact 3: the new release-mode fixes (already shipped)
-
-For context on what changed recently:
-- **Patch 5** (in `~/rust/compiler/rustc_middle/src/ty/instance.rs`):
-  added `consumer_lang_active(())` query + gated escape clause in
-  `Instance::upstream_monomorphization`. Lets the v0 mangler consult
-  the augmented map even at -O>=2 (where share_generics defaults
-  false).
-- **`__lang_stubs` heuristic** in `LangDriver::config`: forces
-  share_generics=true for the stub rlib compile, so its cstore
-  metadata records cascade-emitted Rust generic intermediaries (like
-  `duplicate<Wrapper<i32>>`). Downstream user-bin compiles find these
-  via rustc's standard `upstream_monomorphizations_for` lookup, no
-  Sky synthesis needed.
-- **SMPLZ pinning** via `pin_in_llvm_used` in
-  `toylangc/src/llvm_gen.rs`: pins every Sky-emitted rustc-visible
-  symbol in `@llvm.used` so LLVM optimize/LTO doesn't strip or
-  demote them.
-
-These work TOGETHER. None of them retire A.1, A.2, or A.3 — but they
-do change what work each layer does in subtle ways. See Thread A for
-details.
+**Net relationship change with the reviewer:** they're invested in the architecture being right; they want bench data before further design discussion. The relationship is collaborative and substantive; future rounds will be high-value if we bring data.
 
 ---
 
-## Thread A: Discovery/synthesis/filter machinery investigation
+## Decisions log — every architectural commitment from the exchange
 
-### The big-picture question
+For each decision: **WHAT** (the commitment), **WHY** (the load-bearing reason), **ALTERNATIVES CONSIDERED** (and why rejected), **IMPLEMENTATION NOTES** (what code touches), **GOTCHAS** (what to watch out for), and **DOC IMPACT** (which arch-doc sections need updating).
 
-Can any of A.1, A.2, A.3 be pruned, simplified, or eliminated entirely?
+### Decision 1: Eliminate the `mir_shims` query override
 
-### Sub-question A.1: Is capture-ship-replay still load-bearing?
+**WHAT.** Remove the `mir_shims` override entirely. Drop becomes a normal generic Sky function call from Rust. Sky's stub_gen emits standard `impl Drop` bridges that call a generic `__sky_drop_X<T>(self as *mut _)`. The `__sky_drop_X<T>` function is itself a generic Sky function with `unreachable!()` placeholder body; `per_instance_mir` provides the per-T body via Sky's standard machinery.
 
-**What it does today:**
-- At stub rlib's `consumer_emit_modules` time (post-cascade): walks the
-  unfiltered partition for `MonoItem::Fn(instance)` entries, filters by
-  `is_consumer_trait_impl_method`, writes records into
-  `registry.discovered_trait_impl_instances` (a vec of
-  `DiscoveredTraitImplInstance { self_type_name, trait_name,
-  method_name, concrete_args }`).
-- Writes the registry into the sidecar via `serialize_sidecar`.
-- At user_bin's `on_sky_lib_loaded` time: deserializes, pushes each
-  discovery into `SkyUniverse.discoveries`.
-- At user_bin's `populate_toylang_instances_from_cgus` time: drains
-  every upstream's discoveries into `state.toylang_instances`. Sky's
-  `fill_module` emits a body per instance.
+**WHY.** Drop is not architecturally special; it's just a function that the language sometimes auto-calls. The user's insight in round 3 — "destructors are not special; mir_shims overrides an entire rustc mechanism when we could just bridge through standard Rust trait dispatch" — collapsed the special-case machinery into the general mechanism. The mir_shims override was a category mistake: treating drop as a thing that needs its own emission path when it actually fits perfectly into the existing per_instance_mir path.
 
-**Why it might be load-bearing or not:**
+The 8-agent investigation confirmed the simplification works:
+- Field auto-drop is a no-op for Sky stub types (they're ZST-only).
+- Rustc's collector walks drop generically through the same path it uses for any other call.
+- Cross-crate generic drop works under §5.5's rules (mono'd at user_bin).
+- Const-generic SkyOpaqueType drop works via plain `pub fn __sky_drop_opaque<const T: u128>`.
+- Linear types + async futures + Pin/Unpin + vtable dispatch all preserved.
+- The current mir_shims override is already partially vestigial — no integration test exercises it; the override's `consumer_struct_name` lookup ignores type args, making generic Sky types indistinguishable per-T at today's `mir_shims` layer. The proposed per_instance_mir approach is STRICTLY MORE CAPABLE than what's being replaced.
 
-Today it's clearly load-bearing. Sky's emission of clone bodies at
-user_bin compile requires knowing which (self_type, trait, args) tuples
-exist. The user_bin's collector can't tell us (F.13). The stub rlib
-compile knows.
+**ALTERNATIVES CONSIDERED.**
+- Keep mir_shims (current). Rejected: extra query override, special-case machinery, less capable per-T than per_instance_mir for generic types.
+- Standard Drop impl with per-T iteration in Rust source (e.g., Vec's drop iterates elements). Rejected: leaks opacity (Rust source sees Sky's internals).
+- Runtime dispatch via typeid (universal Drop impl + dispatch in Sky's runtime). Rejected: per-drop overhead; mir_shims via per_instance_mir gives compile-time per-T specialization.
 
-The question is whether a different mechanism could replace it. Two
-candidates:
+**IMPLEMENTATION NOTES.**
+- `rustc-lang-facade/src/queries/drop_glue.rs`: DELETE.
+- `rustc-lang-facade/src/queries/mod.rs`: remove `mir_shims` from the providers registration.
+- `toylangc/src/stub_gen.rs`: add Drop impl emission for Sky types with cleanup needs.
+  - For non-generic Sky types: `impl Drop for X { fn drop(&mut self) { unsafe { __sky_drop_X(self as *mut _); } } }` plus `pub fn __sky_drop_X(p: *mut X) { unreachable!() }`.
+  - For generic Sky types: `impl<T...> Drop for X<T...> { fn drop(&mut self) { unsafe { __sky_drop_X::<T...>(self as *mut _); } } }` plus `pub fn __sky_drop_X<T...>(p: *mut X<T...>) { unreachable!() }`.
+  - Stdlib containers (SkyVec, SkyMap, SkyChannel, etc. — when they exist): apply `#[may_dangle]` per Decision 12.
+- `toylangc/src/llvm_gen.rs`: extend the per_instance_mir-driven emission to handle `__sky_drop_X::<T>` instances. The per-T body should call drop_in_place on owned captured fields (where applicable) and do Sky-side cleanup.
+- For closures and async (Decision 11 covers details): same pattern.
+- For linear types (Decision 12): the `__sky_drop_X` body invokes `sky_runtime_panic` + `abort()` for strict_linear types; runs normal cleanup for `#[rust_droppable]` types.
 
-- **Could rustc's default cstore mechanism tell us?** Today no, because
-  Sky's partition filter (A.3) prevents the stub rlib's metadata from
-  recording these items. If A.3 were eliminated, rustc would record
-  them naturally and the user_bin's collector would learn about them
-  via the cstore. **A.1 would dissolve.**
+**GOTCHAS.**
+- **Don't ship this until the integration fixtures pass.** Toylang has zero drop tests today. Without baseline empirical validation, the mir_shims elimination is unverified.
+- **Sky's `__sky_drop_X` body must NOT invalidate field storage that auto-drop will subsequently traverse.** Today's ZST-only stub fields make this safe by construction (no fields to traverse). If skyc's stub_gen ever emits non-ZST destructor-bearing fields, the contract becomes load-bearing.
+- **CI fence**: `project_raw_field(self_ptr, FIELD_NAME)` helper in skyc's drop emitter for self-referential field access. CI greps emitter source for direct `builder.build_struct_gep` calls outside the helper. See Decision 17.
+- **Sync-only drop**: precommits Sky to NOT supporting `AsyncDrop` (rustc's experimental `InstanceKind::AsyncDropGlue`). Not currently a constraint (Sky is sync-cleanup per §15.3) but a soft commitment.
+- **B24 risk** (drop-glue shape stability): rustc's `build_drop_shim` shape is now in Sky's load-bearing dependency surface. See Decision 15.
 
-- **Could Sky walk its own typed AST and figure it out?** Sky knows
-  which traits its types impl. But Sky DOESN'T know which concrete
-  instantiations rustc's mono walker reaches — that depends on what
-  Rust generic intermediaries pass through (`duplicate<Wrapper<i32>>`
-  → triggers `<Wrapper<i32> as Clone>::clone`). Sky can't enumerate
-  this without re-running the cascade.
+**DOC IMPACT.**
+- §15 (drop semantics): substantial rewrite. Remove mir_shims; describe the new model.
+- §31 (drop glue sharing): simplify dramatically — drop is just function-call sharing now.
+- §10: note that ZST-only stub field convention is load-bearing (not strict invariant — see Decision 17 below for the more nuanced framing).
+- §14.1 / §14.3 / §14.10 (closures/async): note they use the same drop mechanism.
+- §15.7 (linear types): update to describe runtime panic path via Sky's drop function.
 
-**So:** A.1 is load-bearing as long as A.3 exists. Killing A.3 would
-naturally retire A.1.
+### Decision 2: Eliminate the `symbol_name` query override
 
-**Investigation tasks for A.1:**
-1. Verify the claim above by tracing through `case6_app` (the cross-
-   Sky-crate fixture): which discoveries are captured at case6_lib's
-   stub rlib? Which at case6_app's stub rlib? Which at user_bin? Are
-   any redundant or unused?
-2. Check whether A.1 captures any items that ARE in rustc's default
-   `upstream_monomorphizations_for` map (post the `__lang_stubs`
-   heuristic). If so, those captures are redundant duplicates of
-   information rustc would surface anyway.
+**WHAT.** Remove the `symbol_name` override. Sky's `Providers::symbol_name` is unset; rustc's default mangler (v0) fires for all items. Sky's call-site emission computes target names via `default_symbol_name()(tcx, instance)` (already what it does internally).
 
-### Sub-question A.2: Is synthesize-upstream-monomorphizations still load-bearing?
+**WHY.** The override is a live no-op confirmed by direct code audit. The facade's `lang_symbol_name` does shape classification (is_fn/is_accessor/is_trait_impl), builds a callback_name, and calls `consumer_symbol_for_callback_name`. The toylangc implementation (`compute_consumer_symbol`) IGNORES the callback_name parameter and returns rustc's default. The override does:
+- Filter to consumer items from `__lang_stubs`.
+- Classify shape (work).
+- Build callback_name (work).
+- Call consumer callback (work).
+- Get rustc-default-mangled name back.
+- Return it.
 
-**What it does today:**
+All the classification work the override does is ENTIRELY UNUSED at the symbol_name layer. The classification predicates (`is_consumer_fn`, etc.) are needed elsewhere (partition filter, layout) but those sites call the predicates directly.
 
-`lang_upstream_monomorphizations` (in
-`rustc-lang-facade/src/queries/upstream_monomorphization.rs`) overrides
-rustc's whole-map query. It:
-1. Calls the saved default provider to get rustc's default map.
-2. Calls `synthesize_upstream_monomorphizations` (consumer-provided)
-   to get a `Vec<(DefId, GenericArgsRef, CrateNum)>` of synthesized
-   entries.
-3. Merges them into the default map.
+The toylangc source even has a comment acknowledging the dormancy:
+> "The `_name` parameter (callback-name shape from the facade) is now unused for routing but kept in the signature so the trait method stays stable until Tier 3 #12 retires the `consumer_symbol_for_callback_name` callback entirely."
 
-`synthesize_upstream_monomorphizations`'s consumer implementation (in
-`toylangc/src/toylang/callbacks_impl.rs::synthesize_upstream_monomorphizations`)
-walks `SkyUniverse.discoveries`, looks up each trait-impl method's
-DefId via `find_trait_impl_method_def_id`, and builds the
-`(def_id, args, __lang_stubs_crate_num)` triple.
+This is Tier 3 #12.
 
-**Why it might be load-bearing or not:**
+**ALTERNATIVES CONSIDERED.**
+- Keep as drift-observation sentinel (the "live no-op overrides as drift sentinels" framing). Rejected for symbol_name specifically because the integration test surface (Thread C inlining matrix, cross-crate link tests) catches mangler drift cleanly without the override. Elimination is justified; B25 (default symbol mangling stability) covers the drift-observation responsibility going forward.
 
-For SKY-OWNED trait methods (`<Wrapper<T> as Clone>::clone`): rustc's
-default map is empty for these items because A.3 (partition filter)
-removed them from the stub rlib's CGU list before metadata was
-recorded. So the synthesized entries are necessary. **Load-bearing.**
+**IMPLEMENTATION NOTES.**
+- `rustc-lang-facade/src/queries/symbol_name.rs`: DELETE.
+- `rustc-lang-facade/src/queries/mod.rs`: remove `symbol_name` from providers.
+- `toylangc/src/toylang/callbacks_impl.rs::compute_consumer_symbol`: delete (orphaned).
+- `consumer_symbol_for_callback_name` callback in the consumer trait: remove (Tier 3 #12 done).
+- AUDIT: `is_consumer_fn` and `is_consumer_accessor_safe` for live callers post-symbol_name removal. They likely have no remaining users (the override was their primary caller). Delete if orphaned.
+- KEEP: `is_consumer_trait_impl_method` — used by `collect_consumer_trait_impl_instances` (§8.9.5 cascade drain). Different concern.
 
-For RUST GENERIC INTERMEDIARIES (`duplicate<Wrapper<i32>>`): rustc's
-default map NOW has these entries thanks to the `__lang_stubs`
-share_generics=on heuristic. So if Sky were synthesizing for them, the
-synthesis would be redundant. **Possibly redundant.**
+**GOTCHAS.**
+- Don't accidentally delete `is_consumer_trait_impl_method` along with the other matchers. It survives because §8.9.5's cascade drain uses it.
+- After elimination, `default_symbol_name()(tcx, instance)` is the canonical name computation. Make sure Sky's emission still calls this (it does today, just not through the override).
 
-Look at the current implementation:
+**DOC IMPACT.**
+- §5.4: drop `symbol_name` from override list.
+- §6.2: remove symbol_name override description; note that single-symbol naming uses rustc's default mangling natively.
+- §26.1 (SyMINCZ): keep the invariant ("symbol_name is a pure read, doesn't drive codegen") but frame as "rustc's default mechanism preserves this invariant" rather than "Sky's override enforces it."
+- Query-providers count: -1 from current.
+
+### Decision 3: `#[skyc::emit_consumer_body]` tool attribute as partition predicate
+
+**WHAT.** Replace the current `is_consumer_codegen_target` predicate (a three-way union of name-based + structural matchers) with a two-gate attribute conjunction:
 
 ```rust
-fn synthesize_upstream_monomorphizations<'tcx>(...) -> Vec<...> {
-    let stash = rustc_lang_facade::sky_universe().discoveries_clone();
-    // ... iterates `stash` (StashedDiscovery values) ...
-    let Some(def_id) = crate::oracle::find_trait_impl_method_def_id(
-        tcx, &d.trait_name, &d.self_type_name, &d.method_name,
-    ) else { continue; };
-    // ...
+pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+    is_from_lang_stubs(tcx, def_id)
+        && tcx.has_attr(def_id, sym::skyc_emit_consumer_body)
 }
 ```
 
-`find_trait_impl_method_def_id` is trait-impl-specific. The function
-ONLY synthesizes for trait-impl methods. So it doesn't synthesize for
-`duplicate` (a Rust generic). Already tight in this regard.
+Skyc's stub_gen tags items at emission time. Items in Category B (Sky-emitted bodies, `unreachable!()` placeholders) get the tag; items in Category A (real Rust bodies like Drop impl bridges, Phase-6 wrappers) don't.
 
-**Conclusion (tentative, verify):** A.2 is load-bearing for Sky trait
-methods. There's no immediate pruning available. Could only be retired
-if A.3 (which strips trait methods from CGUs → empty default map for
-them) goes away.
+Tool-attribute form: `#![register_tool(skyc)]` at the stub source crate root + `#[skyc::emit_consumer_body]` on tagged items.
 
-**Investigation tasks for A.2:**
-1. Confirm the conclusion above by running with logging in
-   `lang_upstream_monomorphizations` to see which entries get added.
-   At debug, vs at -O3, vs at the existing fixture corpus. Are any of
-   the added entries redundant with the default map?
-2. Audit whether `synthesize_upstream_monomorphizations` is called at
-   every compile or only when the marker is present. Cross-check
-   against the pass-through invariant.
+**WHY.** Post-mir_shims-elimination, the stub rlib has TWO body categories the old predicate can't distinguish:
+- Category A (real bodies, rustc compiles, filter LEAVES ALONE): Drop impl bridges, Phase-6 wrappers, type/trait declarations, the marker item.
+- Category B (unreachable placeholders, filter REMOVES, Sky emits via fill_extra_modules): exported Sky functions, Sky drop functions, Sky trait-impl methods on Sky types, Sky accessor methods.
 
-### Sub-question A.3: Could the partition filter be eliminated?
+The old predicate matched by crate-membership + name/shape heuristics, which:
+- Couldn't distinguish bridges from Sky drop fns (both have similar shapes from the predicate's view).
+- Required state-dependent reads (`is_consumer_fn` reads Sky's universe).
+- Required structural ADT walks per call (expensive).
 
-**What it does today:**
+The attribute-based mechanism is:
+- Explicit (human-readable at source level).
+- Auditable (`grep` for tagged items).
+- Stateless (no universe dependency).
+- Cheap (two query lookups, both cached or fast).
+- Dep-tracked (attributes flow through rustc's standard dep graph).
+- Robust to future emission shapes (doesn't depend on naming conventions).
 
-`lang_collect_and_partition_mono_items` (in
-`rustc-lang-facade/src/queries/partition.rs`) overrides rustc's
-partition query. It:
-1. Calls the saved default provider to get the unfiltered CGU list.
-2. For each CGU, walks `MonoItem::Fn(instance)` entries.
-3. Removes items where `is_consumer_defined_item(instance)` is true
-   (= Sky-defined item, identified via marker check).
-4. Returns the filtered CGU list to rustc.
+**ALTERNATIVES CONSIDERED.**
+- Body-shape detection (match on `unreachable!()` body): rejected, fragile to nightly MIR-shape changes and to future placeholder evolution.
+- Naming convention (function starts with `__sky_*`): rejected, brittle and doesn't extend to trait impls or types.
+- Per-crate flag (whole crate's bodies are Sky-emitted): rejected, too coarse — bridges and Sky drop fns coexist in the same crate.
+- `#[unsafe(rustc_intrinsic)]`-style decoration: wrong semantic — those are for compiler intrinsics.
+- Keep name-based approach with expanded matchers: rejected, adds matchers indefinitely as new emission categories appear.
 
-Rustc's LLVM backend then codegens the filtered list. Sky-defined items
-don't reach LLVM through rustc's pipeline; they go through Sky's
-`fill_module` pipeline instead.
+**IMPLEMENTATION NOTES.**
+- Stub source emits `#![register_tool(skyc)]` at crate root (already needs nightly features; cost is free).
+- Skyc's stub_gen tags items at emission per the two-category split:
+  - Tag: exported Sky functions, Sky drop fns (`__sky_drop_X<T>`), Sky trait-impl methods, Sky accessor methods.
+  - DON'T tag: Drop impl bridges, Phase-6 wrappers, type/trait declarations, the marker.
+- `rustc-lang-facade/src/lib.rs::is_consumer_codegen_target`: rewrite to two-gate conjunction.
+- AUDIT and delete: the three-way matchers (`is_consumer_fn`, `is_consumer_accessor_safe`) become orphaned after Decision 2 + this. Keep `is_consumer_trait_impl_method` (cascade drain still uses it).
+- CI fence: walk stub source for tagged items, walk Sky's emission list, verify 1:1 mapping for items the cascade reaches.
 
-**Why it exists:**
+**GOTCHAS.**
+- The 1:1 invariant: every tagged item ↔ exactly one Sky emission per mono Instance the cascade reaches. Skyc-side bug = link error (duplicate or undefined symbol). Loud failure mode, not silent.
+- Don't tag items rustc compiles (bridges, Phase-6 wrappers). The filter would remove them; rustc would emit no `.o` for them; Sky doesn't have a body for them; link error.
+- Don't FAIL to tag items Sky emits. Same failure direction.
+- Same predicate must be used by both the partition filter AND per_instance_mir override (they MUST agree on what's consumer).
 
-If we didn't filter, rustc would compile the stub source's
-`unreachable!()` bodies into actual machine code. Under non-LTO, the
-linker would see two definitions of the same symbol (Sky's and the
-stub's) and either fail with "duplicate symbol" or pick one
-non-deterministically. Under thin/fat LTO, the IR linker would face
-the same choice. The `#![no_builtins]` mechanism on stub rlibs
-addresses the LTO case (excludes the stub rlib's bitcode from the LTO
-pool), but doesn't address the non-LTO machine-code case.
+**DOC IMPACT.**
+- §5.3: rewrite partition filter section with the explicit predicate definition + the 1:1 invariant + the Category A/B split.
+- §6: stub_gen section needs the tagging rules.
+- §F.14.1 / §F.17: update the partition filter design history with the post-mir_shims-elimination shape.
 
-**Could it be eliminated?**
+### Decision 4: cdylib for Sky's backend (Phase 1)
 
-Three theoretical paths:
+**WHAT.** Sky's backend ships as a separately-loaded cdylib (`libsky_backend.so` / `.dylib` / `.dll`) instead of being statically linked into the forked rustc binary. The Sky toolchain bundle ships rustc-fork + libsky_backend.so as paired binaries; rustup-style atomic installation enforces pairing. Runtime version handshake at backend load detects mismatches.
 
-a) **Upstream `#[codegen_backend_provides_body]` attribute** — would
-   tell rustc "this function exists in source but the codegen backend
-   provides the body; don't codegen the source's body." The earlier
-   agent audit concluded this would require ~5 query overrides +
-   companion changes (`cross_crate_inlinable`, `should_encode_mir`,
-   `deduced_param_attrs`, `has_ffi_unwind_calls`, plus a Sky-IR
-   fingerprint), making it bigger than "one small RFC." Multi-year
-   upstream coordination. See arch doc §29.6.
+**WHY.** Post-elimination of mir_shims and symbol_name (Decisions 1+2), Sky's rustc-touch surface shrunk from ~8 entry points to ~6: `per_instance_mir`, `layout_of`, `cross_crate_inlinable` (both flavors), `collect_and_partition_mono_items`, and `fill_extra_modules` hook. Smaller surface tilts the cdylib calculus favorable.
 
-b) **Sky-side replacement: per-function LTO exclusion attribute**
-   (`#[exclude_body_from_lto]`). Would let stub bodies coexist with
-   Sky's emissions because the stub bodies don't participate in LTO.
-   Doesn't help the non-LTO case (stub bodies still emit to .o), but
-   the linker would dead-strip them if Sky's body has the same name
-   and is in another translation unit. This is essentially the
-   `#![no_builtins]` mechanism at per-function granularity. Probably
-   the smaller RFC.
+Empirical case (per reviewer's Q23 + cdylib pushback):
+- Dev velocity: rebuilding rustc-fork is 5-15 minutes for any backend change. Rebuilding a cdylib is 30s-2min. Order-of-magnitude faster iteration on backend hacking.
+- Cranelift's cdylib operation validates the model. Sky's touch surface is similar in shape (TyCtxt-typed entry points; standard `CodegenBackend` trait).
+- Reversible: if cdylib bites operationally in production, switch to static link in a subsequent release. End users see slightly larger rustc binary; engineering surface is unchanged.
 
-c) **Sky-side compile-time stub-source rewrite** — at stub_gen time,
-   wrap every Sky export in a `cfg(not(sky_provides_body))` guard, and
-   have the facade pass `--cfg sky_provides_body` when Sky's machinery
-   is active. The stub source then compiles to a different body shape
-   (extern decl) when Sky is providing. No fork patch needed; pure
-   skyc-side discipline. **This may be the cheapest path.** Worth
-   exploring.
+User priority context: user prioritizes runtime perf over dev perf (Q21 discussion), BUT dev velocity for Sky's IMPLEMENTERS (which is what cdylib helps) is "a reasonable factor" (Q23) → upgraded to "sufficient factor for Phase 1" given the eliminations shrunk the FFI surface.
 
-**Investigation tasks for A.3:**
-1. Build a small prototype of path (c) — modify stub_gen to emit
-   `extern "Rust" { pub fn foo() -> T; }` instead of `pub fn foo() ->
-   T { unreachable!() }` when a specific cfg is set. Have the facade
-   set that cfg. Verify that:
-   - Sky's emission can satisfy the extern declaration.
-   - The partition filter (A.3) is no longer needed.
-   - The augmented map (A.2) for Sky trait methods is still needed
-     (because rustc's default map still doesn't record extern decls
-     as monos).
-   - Whether discoveries (A.1) are still needed.
-2. If path (c) works at the toy level, evaluate the implications:
-   does it preserve LTO inlining? (extern decls don't carry MIR; LTO
-   wouldn't have anything to inline.) Does it affect debuginfo?
-3. Compare path (c) against path (b) (upstream RFC for
-   `#[exclude_body_from_lto]`) on architectural cleanness.
+**ALTERNATIVES CONSIDERED.**
+- Static link (current model from §4.1): rejected for Phase 1 due to dev-velocity cost. May revisit if cdylib operational issues surface.
+- Hybrid (forked rustc + thin shim statically linked + Sky frontend as cdylib): rejected, adds complexity without clear benefit.
 
-### Recommended sequence for Thread A (original, pre-deep-investigation)
+**IMPLEMENTATION NOTES.**
+- Sky toolchain bundle structure:
+  - `bin/rustc` (forked rustc binary with fork patches, codegen backend statically registered via `-Zcodegen-backend=sky` default).
+  - `lib/libsky_backend.{so,dylib,dll}` (Sky's frontend + Sky's codegen backend; provides the `Providers` setup and `fill_extra_modules` hook).
+  - `bin/skyc` (orchestrator; unchanged).
+  - `bin/cargo` (vanilla cargo from upstream nightly).
+- Rustc-fork's default codegen backend is set to load `libsky_backend.so` via the standard `CodegenBackend` plugin mechanism cranelift uses.
+- Build-time version pin: rustc-fork and libsky_backend.so are built from the same source tree at the same commit. Toolchain bundle ships the paired binaries together; version pin is a property of the bundle.
+- Runtime version handshake: when `libsky_backend.so` loads, it queries rustc-fork's version string and verifies the pairing. Mismatch → clear error message ("Sky backend version X.Y.Z doesn't match rustc-fork version A.B.C; reinstall the Sky toolchain") and exit cleanly.
+- Inkwell/LLVM version match: the bundle ships LLVM shared libs once; both rustc-fork and libsky_backend.so dynamically link them. No runtime LLVM version mismatch possible because the bundle's content enforces it.
+- See Decision 5 for the FFI shape.
 
-1. **First: verify the current claims** (~half day). Confirm A.1 and
-   A.2 conclusions with empirical logging. Confirm A.3's necessity by
-   trying to comment it out and seeing what breaks.
-2. **Then: explore path (c) for A.3** (~3-5 days). If it works,
-   sketch the migration plan. If it doesn't, document why for
-   future readers.
-3. **Then: act on findings.** If A.3 can be eliminated, A.1 also goes
-   (verify, then delete). A.2 stays only for Sky trait methods. Lots
-   of Sky-side code retires. The architecture doc §F.13/§F.14/§8.9.5
-   collapses significantly.
+**GOTCHAS.**
+- **Don't use `&mut dyn Trait` across the cdylib boundary** for any of the providers or hooks. Use `#[repr(C)]` function-pointer struct (Decision 5).
+- The marker check / `is_sky_active(tcx)` discipline must work the same across the cdylib boundary as statically linked. Sky's `init`/`provide` methods short-circuit on marker absence for byte-identical pass-through (§4.4) regardless of link mode.
+- B22/B23 risks: version-pairing drift + FFI ABI drift in TyCtxt-typed arguments. See Decision 15.
+- If cdylib bites operationally, the reversion path is changing the build system's link mode. The OVERRIDES themselves (what providers do, what the hook does) are identical either way.
 
-### Thread A — deep investigation findings (2026-06-20)
+**DOC IMPACT.**
+- §4.1: restructure — Sky's compiler is two binaries: rustc-fork + libsky_backend cdylib.
+- §4.2: third binary in toolchain (`lib/libsky_backend.*`).
+- §4.3: rustup toolchain layout updated.
+- §4.4: pass-through invariant requires marker-check in cdylib's init/provide methods.
+- §25: add B22 + B23 risks.
+- §29.6 (open question — cdylib as future direction): close, no longer open.
 
-The original 3 paths (a/b/c) above turn out to be incomplete. A deeper
-investigation surfaced **8 architectural mechanisms** for retiring the
-partition filter — listed in roughly increasing cost:
+### Decision 5: `#[repr(C)]` function-pointer struct for cdylib FFI (Patch 4 rev 3)
 
-**Mechanism family — Suppress rustc's stub-body codegen**
+**WHAT.** Replace patch 4's current `&mut dyn ExtraModuleAllocator<ModuleLlvm>` callback with a `#[repr(C)]` function-pointer struct:
 
-- **(1) `#![no_codegen]` sibling attribute (upstream RFC).** Smaller
-  RFC than path (a). `#![no_builtins]` already handles the LTO case
-  by excluding the rlib bitcode from the LTO pool. A sibling
-  `#![no_codegen]` attribute that does for `.o`/ELF what `no_builtins`
-  does for LTO — per-crate rather than per-function (Path b was
-  per-function).
-- **(2) Per-item `#[linkage = "..."]` via stub_gen.** Rejected
-  historically because `#![feature(linkage)]` is a crate-root attribute
-  that leaks. **The rejection no longer applies to Sky** — Sky's stubs
-  are in their own rlib, so the feature flag stays inside skyc-generated
-  code. From `docs/reasoning/rustc-fork-design-space.md` Part 3.
-- **(3) `#[no_mangle]` non-generic shim layer.** Non-generic `pub fn`
-  with `#[no_mangle]` always gets external linkage. Works on stable
-  Rust, no fork, no feature gate. Only addresses non-generics — doesn't
-  help generics or trait-impl methods.
+```rust
+#[repr(C)]
+pub struct ExtraModuleAllocator<M> {
+    pub state: *mut c_void,
+    pub allocate: unsafe extern "C" fn(
+        state: *mut c_void,
+        name_ptr: *const u8,
+        name_len: usize,
+    ) -> *mut M,
+}
+```
 
-**Mechanism family — Linkage-based without filtering**
+`repr(C)` + `extern "C" fn` are stable-ABI primitives. Pass cleanly across the cdylib FFI boundary without rustc-internal type-layout dependencies. ~10 more lines of boilerplate at the call sites (state pointer + fn pointer); failure mode goes from "subtle vtable-layout mismatch" to "if it links, it works."
 
-- **(4) Override `codegen_fn_attrs` to set `linkage = Some(AvailableExternally)`
-  on Sky-export stubs. ⭐ RECOMMENDED.** Rustc emits IR (for inlining)
-  but no `.o` symbol. Sky's `fill_extra_modules` body wins. No partition
-  filter needed. The `mono_item.explicit_linkage(tcx)` fast-path at
-  `rustc_monomorphize::partitioning.rs:749-751` short-circuits when
-  linkage is explicit. Risk (cross-module inliner pulling
-  `unreachable!()` into callers) is mitigated by existing `#![no_builtins]`
-  for LTO and by available_externally semantics for non-LTO.
-  **No new fork patch needed — `codegen_fn_attrs` is overridable.**
-- **(5) Same as (4) but with `linkage = Some(WeakAny)`.** Sky's
-  strong-linkage body wins at link. Stub's weak body still emits
-  ~10-20 bytes per export but is dead at link. No filter needed.
-  Crude but always-correct.
-- **(6) Post-partition linkage mutation pattern (already proven for
-  Phase 6 wrappers).** The erw codebase already mutates
-  `MonoItemData.linkage` post-partition for Phase 6 generic wrappers.
-  Generalize this pattern to mutate Sky-export stubs to
-  `AvailableExternally` or `WeakODR` linkage instead of filtering them
-  out. **The mechanism is already in production for a related case.**
+**WHY.** The reviewer's Q2 sharp catch: cranelift's `CodegenBackend` trait dispatch works because rustc owns the vtable, cdylib registers itself (callee-owns-vtable direction). Sky's allocator is the INVERSE — rustc constructs the trait object, cdylib receives and calls methods through it. The vtable was emitted by rustc; the cdylib has to match the rustc-side layout exactly.
 
-**Mechanism family — per_instance_mir variants**
+Within a single rustc invocation, vtable layouts are stable. Across the FFI to a separately-compiled cdylib, they're stable only if both sides were compiled against an identical `rustc_codegen_ssa` (same source, same rustflags, same feature flags). For Sky's distribution model this is satisfied IN PRACTICE (atomic bundle pairing), but the constraint is INVISIBLE at the type level — a toolchain mismatch produces runtime vtable interpretation error → segfault.
 
-- **(7) per_instance_mir returns a TRAMPOLINE body.** Stub's
-  `unreachable!()` body replaced (at codegen time) with `extern "C"`
-  call to Sky's real implementation symbol. Rustc emits a thin
-  trampoline that tail-calls into Sky's `.o`. Cost: doubles symbol
-  count. Works for non-generics; breaks for generics (no `extern "C"`
-  generics). Could be hybrid (trampoline for non-generics, current
-  path for generics).
-- **(8) per_instance_mir returns the REAL body — REJECTED PERMANENTLY.**
-  Originally framed as the "long-term endgame" (Sky lowers source to
-  rustc MIR; rustc's codegen pipeline emits the bodies; retires
-  fill_extra_modules + patch 4). **This direction is rejected outright:
-  it surrenders Sky's control of LLVM output to rustc's codegen
-  pipeline.** Sky's architecture (§5, §F.15) requires Sky's own LLVM
-  backend (Inkwell + patch 4's `fill_extra_modules`) to own every byte
-  of Sky-emitted LLVM IR. That control is non-negotiable — it's how Sky
-  guarantees its codegen quality, ABI discipline (`@ACRTFDZ`/`@TCHAPZ`),
-  pin discipline (`@SMPLZ`), and emission-shape stability across rustc
-  bumps. Any future investigator considering this direction: **do not
-  pursue.** Open the question with the user before reconsidering; the
-  rejection is a locked architectural property, not a deferral.
+Reviewer explicitly noted: "rustc_driver::Callbacks trait is dyn-passed, but rustc_driver is statically linked into consumers, not cdylib-passed. Cranelift's loaded-cdylib surface deliberately avoids `&mut dyn`. I'd treat the absence of precedent as evidence rather than as opportunity."
 
-### Updated recommended sequence for Thread A
+**ALTERNATIVES CONSIDERED.**
+- Keep `&mut dyn Trait` (current patch 4 rev 2 shape). Rejected: subtle FFI failure mode; no precedent in the rustc-private ecosystem for cdylib-passed trait objects.
+- Concrete struct with virtual dispatch internally: variant of the function-pointer struct; equivalent properties. Use whichever shape is more ergonomic at the call sites.
 
-| Path | Retires | Status |
-|---|---|---|
-| **Option 4 (AvailableExternally)** | A.3 only | ✅ SHIPPED 2026-06-21. ~half day end-to-end. ~107 lines retired. F1 promise verified preserved via matrix. |
-| **Option 8 (real-MIR per_instance_mir)** | hypothetically A.1+A.2+A.3+patch 4 | ❌ REJECTED PERMANENTLY. Surrenders Sky's LLVM control to rustc's codegen pipeline. Do not pursue. |
+**IMPLEMENTATION NOTES.**
+- Modify patch 4 in `~/rust/compiler/rustc_codegen_ssa/src/traits/backend.rs`:
+  - Replace `&mut dyn ExtraModuleAllocator<M>` with the function-pointer struct.
+  - Update the `fill_extra_modules` hook signature to take the struct by value (cheap copy of two pointers).
+- `rustc_codegen_ssa/src/base.rs::codegen_crate`: construct the struct with state = pointer to the modules-vec, allocate = a stable extern "C" fn that mints rustc-owned modules.
+- `rustc_codegen_llvm/src/lib.rs::fill_extra_modules`: read the hook (function pointer), invoke through the struct.
+- Sky's consumer side (`rustc-lang-facade/src/extra_modules_hook.rs`): the hook receives the struct, calls `(struct.allocate)(struct.state, name_ptr, name_len)` to get a `*mut ModuleLlvm`, wraps in suppressed-Drop Inkwell handles, emits IR.
+- Wrap/unwrap boilerplate: ~10 lines on each side of the FFI. Pay the cost once; the failure mode improvement is worth it.
 
-What the handoff's original Thread A claimed:
-- A.1 + A.2 + A.3 all dissolve under path (c). ❌ Wrong — path (c)
-  doesn't actually buy LTO inlining for non-generic Sky exports.
+**GOTCHAS.**
+- The struct's pointer fields are raw; provenance discipline applies. The `state` pointer must be valid for the duration of the `fill_extra_modules` call.
+- Mind the lifetime story: rustc owns the state (a Vec<ModuleCodegen<ModuleLlvm>>); Sky's hook receives a pointer to it; the allocate callback (on rustc's side) appends to the Vec and returns a `*mut ModuleLlvm` borrowing into the Vec's heap. Borrow scope is the duration of the hook call; rustc must not relocate the Vec mid-call.
+- If you need to extend the struct later (more callbacks), prefer adding a new struct variant or version-tagged struct rather than mutating the existing one. Stable ABI requires careful evolution.
 
-What Option 4 confirmed empirically (2026-06-21 shipping run):
-- A.1 (capture-ship-replay) IS genuinely load-bearing — preserved
-  unchanged through Option 4. **Permanent under Sky's locked LLVM-control
-  architecture.**
-- A.2 (synthesize_upstream_monomorphizations) IS genuinely load-bearing
-  for Sky trait methods — preserved unchanged. **Permanent for the same
-  reason.**
-- A.3 (partition filter) was retired via the `codegen_fn_attrs` override.
-  ~107 lines of partition.rs deleted; ~95 lines of codegen_fn_attrs.rs
-  added. Net cleanup smaller than the handoff predicted because the
-  type alias + accessor scaffolding for `default_collect_and_partition`
-  was preserved (still used by `toylangc::llvm_gen` and the discovery
-  pipeline for the unfiltered-slice walk — that consumer-side path can
-  also be retired in a follow-up but wasn't required for Option 4).
+**DOC IMPACT.**
+- §3.2 patch 4: update with the function-pointer struct shape.
+- §B.4 (the patch shape appendix): rewrite for the new shape.
+- §C.4 (shipping patch 4 shape: rustc-owns-lends): update; the OWNERSHIP model is the same, just the callback transport differs.
+- §F.15 (patch 4 design history): add the rev 3 rationale (reviewer's cdylib FFI shape pushback).
 
-So the actually-achievable architectural cleanup landed as documented:
-Option 4 retires A.3; A.1 and A.2 stay permanently as the cost of
-keeping Sky's LLVM control. Sky's architecture doc §F.14 gained §F.14.1
-documenting the retirement; §25.2 gained B17 as the closing entry.
+### Decision 6: u128 typeids with universe-level collision detection
 
-**Remaining Thread A hygiene** (opportunistic, not a thread of its own):
-- Audit A.2 for synthesis entries rustc's default map would have
-  produced anyway (post-`__lang_stubs` share_generics heuristic). Trim
-  redundant entries if any.
-- Consolidate the three Sky-owned-set predicates
-  (`is_consumer_codegen_target`, `is_consumer_trait_impl_method`,
-  `is_consumer_defined_item`) into one unified membership check.
-- Update the `default_collect_and_partition` consumer call sites
-  (`toylangc::llvm_gen` + `callbacks_impl`) to use
-  `tcx.collect_and_partition_mono_items(())` directly now that no
-  override is installed; then retire the type alias + OnceLock +
-  accessor scaffolding.
+**WHAT.** Sky's content-addressed type identities are u128 BLAKE3-truncated hashes. Sky's universe table maintains a `HashMap<u128, SkyTypeInfo>` and detects collisions explicitly: on every insertion, compute the BLAKE3-truncated hash, look up; if mapped to identical content → fine; if mapped to DIFFERENT content → build fails with explicit error.
 
-Each is ~hours of work; pick up next time someone touches those files.
+```rust
+pub struct SkyOpaqueType<const T: u128>(PhantomData<()>);
+```
+
+**WHY.** Round-1 Q10 raised collision risk for u64 typeids (birthday at ~2^32 = 4B types). Round-2 we agreed on 128 or 256 bits. Round-3 reviewer Q10 follow-up: u128 is enough (collision-free up to ~2^64 types in a single program), readable in error messages and `tcx.def_path_debug_str` output. 256-bit (`[u8; 32]`) is overkill; u128 is the better default.
+
+User raised concern: "any chance of birthday collision?" The answer is the universe-level collision detection: practically zero collision risk, hard error if it ever occurs, never silent corruption.
+
+**ALTERNATIVES CONSIDERED.**
+- u64 (current). Rejected: birthday collision at 4B types is small but not zero; failure mode (silent type confusion) is catastrophic.
+- 256-bit `[u8; 32]`. Rejected: overkill; harder to read in error messages.
+- Monotonic IDs. Rejected: requires central registry; breaks distributed compilation.
+- Full content as ID (variable-size). Rejected: doesn't fit const generic constraints.
+
+**IMPLEMENTATION NOTES.**
+- `rustc-lang-facade/src/lib.rs` (or wherever `SkyTypeId` is defined): change typeid type to `u128`.
+- Toylangc / Sky stdlib's `SkyOpaqueType<const T: u128>`: update wrapper declaration.
+- Universe table: change keys to u128. Add collision check on insertion:
+  ```rust
+  fn insert_type(&mut self, content_hash: u128, info: SkyTypeInfo) -> Result<(), CollisionError> {
+      match self.types.get(&content_hash) {
+          Some(existing) if existing.content_signature() != info.content_signature() => {
+              return Err(CollisionError { content_hash, existing: existing.clone(), incoming: info });
+          }
+          _ => { self.types.insert(content_hash, info); Ok(()) }
+      }
+  }
+  ```
+- Hashing: BLAKE3 of the canonical content (source path for source-defined types; canonical recipe for comptime-produced types per §10.8). Truncate to u128 (first 16 bytes).
+- Error message on collision: include both types' source paths or recipes so the user can identify what conflicted. Ask the user to file a Sky bug since the probability is astronomically low.
+
+**GOTCHAS.**
+- Collision detection runs on insertion, not on lookup. Lookups assume the table is correct.
+- The "content signature" for comparison is the canonical content (source path or recipe), not the SkyTypeInfo's full data (which may include compile-derived layout metadata that varies legitimately across compiles).
+- Don't share the u128 namespace between type typeids and value content hashes (Decision 7). They're in different DefId namespaces in rustc's view, so they can't collide rustc-side, but Sky's universe table should tag entries by kind anyway to keep the failure modes clean.
+
+**DOC IMPACT.**
+- §10.6: wrapper definition changes to `u128`.
+- §10.8: typeid format spec — BLAKE3 truncated to u128 with universe-level collision detection.
+- §13.8: same.
+
+### Decision 7: Content-hash const args (retire slab-pointer-as-u64)
+
+**WHAT.** Sky's comptime values that flow to rustc as const generic arguments are surfaced as `ConstKind::Value(content_hash_bytes)` — content-addressed u128 hashes (same scheme as Decision 6 typeids, applied to value content). The slab is purely Sky-internal; slab pointers never enter rustc's Instance args.
+
+**WHY.** Round-3 reviewer Q16 catch (the most important architectural correction from round 3): if Sky's per_instance_mir bodies use slab-pointer-as-u64 as the const-arg surface, two Sky source sites that produce content-equal values at different slab offsets generate two distinct rustc Instances with two distinct mono items. Symbol naming via content-hash would then produce TWO MonoItems with the SAME symbol name → comdat dedup (best case) or linker error / non-deterministic pick (worst case).
+
+The clean fix: do the content-hash dedup at the INSTANCE level, not the symbol_name level. Sky's frontend, when binding a comptime value as a generic arg, computes the content hash of the (frozen) snapshot and synthesizes `ConstKind::Value(hash)`. Rustc's collector dedups naturally on `(DefId, args)`. Symbol naming via rustc's default mangler produces the right names. Slab stays Sky-internal as the runtime substrate for mutable comptime evaluation.
+
+This dovetails with Decisions 6 (u128 typeids) and 1 (mir_shims elimination): unified u128 hashing scheme; per_instance_mir handles content-hash-keyed bodies the same way it handles any other Instance.
+
+**ALTERNATIVES CONSIDERED.**
+- Slab-pointer-as-u64 + content-addressed symbol naming (the round-2 plan). Rejected per the reviewer's Q16 catch.
+- Slab-pointer-as-u64 + Instance-level dedup via per_instance_mir canonicalization. Possible but requires Sky to canonicalize const args inside per_instance_mir, which is invasive. The content-hash-as-const-arg shape achieves the same result naturally.
+- Variable-size content as const arg. Rejected: doesn't fit existing const generic constraints.
+
+**IMPLEMENTATION NOTES.**
+- `toylangc/src/toylang/frontend` (or wherever comptime-arg binding lives): when binding a comptime value to a generic arg, compute BLAKE3 of the snapshot content, truncate to u128, synthesize `ConstKind::Value(u128_bytes)` for the Instance args.
+- Stub source signature for generic Sky fns with comptime args:
+  ```rust
+  pub fn zork<const T: u128>(...) { unreachable!() }
+  ```
+  T is the content hash, not the slab offset.
+- per_instance_mir: looks up the value in Sky's universe using the content hash as the key. Sky-side value lookup table (`HashMap<u128, SkyValue>`) maps hash → snapshot.
+- Slab stays as Sky's runtime substrate. Slab pointers never escape Sky's frontend.
+- Snapshot-at-capture semantics (from round-2 Q16 discussion): when a comptime value is bound as a generic arg, take a snapshot. Subsequent mutations to the original source variable don't propagate to the snapshot. The hash is computed from the frozen snapshot.
+
+**GOTCHAS.**
+- Don't allow identity observation (`ptr_eq`) on generic-arg references in Sky source (Approach A from round-2 Q16 discussion). Under content-hash naming, two content-equal snapshots at different slab offsets get the SAME hash → SAME symbol → SAME Instance. If user code could observe identity in the generic body, content-equal-but-identity-distinct values would conflate. Sky's typechecker rejects `ptr_eq` calls on generic-arg refs.
+- The hash table for value lookup is per-compile-invocation. Cross-invocation, two compiles producing content-equal snapshots independently compute the same hash → cross-crate symbol matching works automatically.
+- Symbol_name override removal (Decision 2) means Sky doesn't need to canonicalize symbols for comptime-arg-parameterized Instances. rustc's default mangler handles them correctly because the const args are already content-hashes.
+
+**DOC IMPACT.**
+- §13.3: rewrite — retire slab-pointer-as-u64; describe content-hash const args.
+- §13.4: clarify slab is purely Sky-internal substrate for active mutable comptime evaluation.
+- §13.7: SkyOpaqueType wrapper uses content-hash const args (same as typeids).
+- §13.8: unified content-hash mechanism for types and values.
+- §13.9: keep "no new fork surface" framing as primary reason; content-addressing is a bonus property (per reviewer's round-3 Q9 correction).
+
+### Decision 8: Per-view ref types `SkyRef<T, V>` for Send/'static honesty
+
+**WHAT.** Sky's stub rlib emits `SkyRef<T, V>` (parametric over view marker) for Sky references at the Rust boundary. View markers `Frozen` and `Mutable` (closed set, see Decision 9). Send/Sync/'static impls vary by view:
+
+```rust
+pub struct Frozen;
+pub struct Mutable;
+
+pub struct SkyRef<T, V> {
+    ptr: *const T,
+    _v: PhantomData<V>,
+}
+
+unsafe impl<T: Sync> Send for SkyRef<T, Frozen> {}
+// no Send impl for SkyRef<T, Mutable>
+
+// Methods polymorphic over view kind:
+impl<V> SkyRef<MyType, V> {
+    pub fn velocity(&self) -> f64 { unreachable!() }
+}
+
+// Frozen-view-only methods:
+impl SkyRef<MyType, Frozen> {
+    pub fn concurrent_read(&self) -> Data { unreachable!() }
+}
+```
+
+Sky's frontend picks the View at each `&` site based on the actual group's frozen/mutable status (which Sky's typechecker tracks). One Rust function/impl per Sky function/impl (parametric over view kind); cardinality doesn't double.
+
+**WHY.** Round-1 Q13 surfaced the silent-bug surface of the current "global `unsafe impl Send` for every Sky type" (§12.1). Rust source could pass a non-sendable Sky value to `tokio::spawn`; rustc accepts (because of the global lie); runtime data race.
+
+User clarified the actual Sky model: sendability is group-view-based, not per-type. `&g'Spaceship` is Send when group g is frozen (immutable). Round-1 Option C: emit two Rust types per ref (SkyFrozenRef / SkyMutableRef). Round-2 refinement to Option C': parametric `SkyRef<T, V>` to avoid stub rlib doubling. Single rustc type, view-marker parameter, conditional Send impl.
+
+This is the structurally honest design that matches what Sky's typechecker knows. Eliminates the Case 3b silent-bug surface from Q13.
+
+**ALTERNATIVES CONSIDERED.**
+- Global lie (current). Rejected: silent data races.
+- Refuse to project any Sky refs to Rust. Rejected: too restrictive.
+- Two distinct Rust types per ref (Option C original). Rejected: stub rlib doubling.
+- Per-type honest Send for owned values + per-view for refs (Option C' as written). Adopted.
+
+**IMPLEMENTATION NOTES.**
+- Sky stdlib defines `Frozen`, `Mutable`, `SkyRef<T, V>` (and the Send/Sync impls).
+- Sky's stub_gen, when emitting a function signature that takes `&g'Spaceship`:
+  - Determines the group's view at the call site (Sky's typechecker knows this).
+  - Emits the parameter as `SkyRef<Spaceship, FrozenView>` or `SkyRef<Spaceship, MutableView>` accordingly.
+  - For Sky source that's generic over the view (e.g., `fn process<G>(s: &G Spaceship)`), the Rust signature is parametric: `pub fn process<V>(s: SkyRef<Spaceship, V>)`.
+- Sky's stub_gen emits methods as one parametric impl per Sky type (`impl<V> SkyRef<T, V> { ... }`). Specialized impls only when behavior differs per view.
+- Sky's frontend's typechecker, at every `&` site, determines which view to project (frozen if Sky has proven the group is frozen at that scope; mutable otherwise).
+- For owned values (non-refs): per-type honest Send computation. Sky's typechecker analyzes the type's structure; emits `unsafe impl Send` only when structurally sendable. Opt-in lie via `#[unsafe_send]` Sky annotation for nuanced cases (rare).
+
+**GOTCHAS.**
+- The View parameter is a NEW dimension that Sky-source generics didn't have before. Sky's typechecker has to track it everywhere it tracks group views.
+- Closed V set (Decision 9) — don't let users define new V kinds; coherence gets fragmented across crates.
+- Tokio interop fallout: Sky futures capturing group-borrowed state can't `tokio::spawn` directly under Option C'. They need conversion via a Sky-provided bridge crate (deferred; see Open Questions).
+- Owned Sky values: per-type honest Send by default, but `#[unsafe_send]` annotation lets users opt into the lie for nuanced cases. Most Sky types should get honest Send (structural analysis works).
+
+**DOC IMPACT.**
+- §12.1: rewrite around per-view ref types + per-type honest Send for owned.
+- §12.2: rewrite — the 'static framing was wrong (per round-1 Q14). Same Option C extension: per-lifetime stubs for group-parameterized types.
+- §17: Sky-native async primary; tokio via bridge crate.
+- §11.2/§11.3: integrate with view-marker projection.
+
+### Decision 9: Closed V set in Sky stdlib
+
+**WHAT.** The set of view markers in Sky stdlib is closed: `Frozen`, `Mutable` (possibly `Exclusive` for &own-style if needed). Users cannot define new view kinds. Custom borrow semantics are achieved by wrapping (newtype + delegation), not by introducing new V.
+
+**WHY.** Round-3 reviewer Q3 follow-up: with open V, coherence fragments across crates. Sky stdlib provides `impl<T: Send> Send for SkyRef<T, Frozen>`; downstream crate could provide `impl<T> Send for SkyRef<T, MyCustomView>` for some custom view. Coherence is satisfied (different V), but the user model "Sky decides what's Send" fragments. Each new V is one more dimension to audit globally.
+
+Closed V makes coherence globally analyzable. Aligns with Sky's broader "wrap, don't fork" pattern (§6.6's first idiom — newtype with cheap delegation).
+
+**ALTERNATIVES CONSIDERED.**
+- Open V (user-extensible). Rejected per reviewer's catch.
+- Plugin-style V registration (Sky tooling enforces global registry). Possible but adds infrastructure; not justified absent demand.
+
+**IMPLEMENTATION NOTES.**
+- Sky stdlib defines `Frozen`, `Mutable` (and possibly `Exclusive`) as marker types.
+- Sky's typechecker rejects any attempt to define a new view marker outside stdlib.
+- The Send/Sync impls for `SkyRef<T, V>` are pinned to the closed set.
+
+**GOTCHAS.**
+- If a future Sky feature genuinely needs a new V (e.g., RC-shared view, transitioning view), it gets added to stdlib by stdlib authors — not by user crates.
+- The exact set (Frozen + Mutable, or +Exclusive, or +others) needs concrete design in Phase 5 (groups + linear types). The handoff commits to "closed"; the exact contents are open.
+
+**DOC IMPACT.**
+- §12.1 + §12.2 (per-view stubs): note V is closed-set.
+- New subsection or §6.6 update: document the closed-V principle and how users get custom borrow semantics (via wrapping).
+
+### Decision 10: Async typestate pattern (one rustc type, source-level witnesses)
+
+**WHAT.** Each Sky async fn produces ONE rustc-visible type whose storage is sized to hold both NotStarted and Running phase state. Sky source operates over this storage via two typestate witnesses (`SkyNotStarted_foo`, `SkyRunning_foo`) that share the underlying storage but expose different methods and have different safety properties enforced by Sky's typechecker. `.start()` is a typestate transition at Sky's source level; doesn't change rustc-level identity. The IntoFuture impl on the rustc-visible type handles polling in either phase via internal discriminant.
+
+Pin/Unpin properties are declared on the rustc-level type based on what the underlying state machine needs (migratory = Unpin; default = !Unpin). The typestate witness doesn't factor into Pin — Pin's contract is "no moves after pinning"; the pinning point is `.await` regardless of typestate.
+
+NotStarted phase IS movable for !Unpin types (Pin's contract is "no moves after pinning"; before pinning, !Unpin values move freely).
+
+**WHY.** Round-1 §14.10 framing presented this as "two distinct rustc-level types" which the reviewer pushed back on in round-2 Q19. The IntoFuture hybrid (which makes Rust callers see one type for `.await` ergonomics) implies the rustc-visible type IS singular; the "two-type split" was Sky-source-level discipline, not rustc-level structural.
+
+Round-3 reviewer confirmed: it's a typestate pattern, not two physical types.
+
+User had reservation about NotStarted movability under !Unpin declaration; cleared up by re-explaining Pin's actual semantics (it's "no moves AFTER pinning," not "no moves ever").
+
+**ALTERNATIVES CONSIDERED.**
+- Two distinct rustc-level types. Rejected per reviewer's Q19.
+- One type with internal flag and runtime state checks. Rejected — typestate at source level enforces safety properties at compile time.
+
+**IMPLEMENTATION NOTES.**
+- Sky's stub_gen emits ONE struct per Sky async fn: `pub struct __sky_async_foo<'a>(SkyOpaqueType<HASH>, PhantomData<&'a ()>);`
+- IntoFuture impl on this type handles polling in NotStarted or Running phase via internal discriminant in Sky's universe (or in the storage; choose based on implementation).
+- Sky source typechecker tracks the typestate witness — NotStarted vs Running — for source-level safety properties:
+  - Can't `.start()` twice (only NotStarted typestate has `.start()` method).
+  - Can't access captures after start (only NotStarted typestate exposes capture accessors).
+  - Can't drop a Running typestate of a default async fn (linearity rule).
+  - Migratory/cancellable propagation rules per typestate.
+- Pin/Unpin declarations on the rustc-level type:
+  - Migratory: `impl Unpin for __sky_async_foo<'a> {}` (no cross-await self-refs ever).
+  - Default: NO Unpin impl (`!Unpin`; may have cross-await self-refs after first poll).
+
+**GOTCHAS.**
+- NotStarted-phase movability for !Unpin types: works correctly. Pin's contract is "no moves after pinning"; the pinning point is `.await`. Before `.await`, the user can `move s` freely.
+- SkyRunning typestate can't be passed to Rust APIs (it's Sky-source-only). If a user calls `.start()` explicitly and then wants to pass to Rust, they need to either keep it Sky-side or not pre-start.
+- Drop for default async in Running phase: Sky's drop function panics (per Decision 11). The Sky source typechecker should also reject Sky-source-level drops, but the rustc-emitted drop_in_place path can still fire (e.g., when Rust source holds the future); the drop function is the runtime safety net.
+
+**DOC IMPACT.**
+- §14.10: substantial rewrite — typestate pattern, not two physical types.
+- §14.5: clarify migratory's marker bundle on the rustc-level type.
+- §14.7: cancellable wrapper's Drop semantics in the typestate model.
+- §15.7: phase-dependent drop semantics for state machines (Sky's drop function dispatches on phase).
+
+### Decision 11: Strict_linear default with `#[rust_droppable]` opt-out
+
+**WHAT.** Linear Sky types default to strict — runtime panic when Rust drops them (existing §15.7 design). User can opt-out via a `#[rust_droppable]` annotation; opt-out types drop normally without panic. Q15 Option 4 (compile-time error via mir_shims) is DEFERRED to v2; v1 uses runtime panic.
+
+**WHY.** User explicitly said in round-3: "sky might make their types *by default* linear, so forbidding using them directly in Vec<T> is a lot more friction than i want." Linear-by-default means the compile-time error path (Q15 Option 4) would block standard Rust container usage for most Sky types — too restrictive.
+
+Two-level distinction the user accepted:
+- Default (strict_linear): runtime panic if Rust drops. Most Sky types.
+- Opt-out (`#[rust_droppable]`): drop is fine, runs Sky's normal cleanup. Types where drop is safe and ergonomic.
+
+The compile-time error path (Option 4) is deferred to v2 as an explicit opt-in `#[ultra_strict]` (or similar) for types where runtime panic is too late.
+
+**ALTERNATIVES CONSIDERED.**
+- Compile-time error default (Q15 Option 4). Rejected — too restrictive given linear-by-default Sky types.
+- Refuse to export linear types (round-3 reviewer Q15 option). Rejected — too restrictive.
+- SkyOwn<T> wrapper as opt-in escape (round-3 reviewer suggestion). Deferred — useful for v2 if Option 4 lands as ultra-strict tier.
+
+**IMPLEMENTATION NOTES.**
+- Sky's typechecker tracks linearity per type.
+- Sky's stub_gen, for linear types:
+  - Default (strict_linear): emit Drop impl bridge calling Sky drop function that panics.
+  - With `#[rust_droppable]`: emit Drop impl bridge calling Sky drop function that does normal cleanup.
+- The Sky drop function body (via per_instance_mir):
+  - For strict_linear: `sky_runtime_panic("Sky linear type X dropped from Rust source")` + `abort()`. No actual cleanup — process is dying.
+  - For rust_droppable: normal Sky-side cleanup logic.
+
+**GOTCHAS.**
+- Async future Drop is phase-dependent (§14.4, §14.5). The Sky drop function for state machines reads the discriminant; for default-async in Running phase, panics; for migratory, normal cleanup; for NotStarted phase, normal cleanup.
+- Cancellable wrapper Drop (§14.7): reads Ready/Pending; for Pending, invokes the user's cleanup handler then drops the inner future.
+- The `#[rust_droppable]` annotation is Sky source-level; Sky's stub_gen translates it to the Drop impl body choice.
+
+**DOC IMPACT.**
+- §15.7: keep as runtime panic for default; add `#[rust_droppable]` opt-out spec.
+- §15: mention Q15 Option 4 (compile-time error tier) as deferred v2 work.
+
+### Decision 12: Narrowed `#[may_dangle]` policy (syntactic rule for synthesized types)
+
+**WHAT.** `#[may_dangle] T` is emitted for a generic Sky type's Drop iff T appears in the lifted type's storage EXCLUSIVELY behind pointer indirection (`&T`, `&mut T`, raw pointers). By-value storage of T (or storage of types containing T by-value) DEFAULTS to STRICT (no may_dangle).
+
+This rule is SYNTACTIC — Sky's frontend reads it directly off the capture-analysis output. No recursive structural-drop analysis. No "is the drop structural" proof obligation.
+
+For SYNTHESIZED types (closures, async state machines): Sky's frontend auto-applies the syntactic rule.
+
+For USER-DEFINED generic Sky types: default strict. User opts in via explicit Sky source annotation if their Drop is structural over T.
+
+For STDLIB CONTAINERS (SkyVec, SkyMap, SkyChannel, etc.): annotated by stdlib authors who guarantee structural drops.
+
+**WHY.** Round-3 reviewer's Q1 follow-up rejected my proposed "structural-over-T captures" rule because:
+- Recursive structural-drop analysis is a non-trivial property to maintain as Sky's type system evolves.
+- Every new feature (linear types, comptime-produced types, traits with default drop_in_place) has to re-prove "is structural drop preserved through this construct?"
+- Skip a case → silently emit may_dangle for a Drop that actually reads T → silent unsoundness.
+
+The syntactic rule (T appears only behind pointer indirection) is what rustc itself uses internally for some of its dropck heuristics. Captures the common case (closures over borrowed data, async state machines holding refs across await points) which is what's needed ergonomically. By-value captures default strict; revisit if a real workload needs them.
+
+User's earlier reasoning ("dangling things is baked into Sky's model anyway via group borrowing's invalidation rules") conflated two different concepts. Sky's group system manages when memory becomes dangling at the region level; `#[may_dangle]` is a per-Drop-impl promise about not dereferencing dangling pointers. Different concepts.
+
+**ALTERNATIVES CONSIDERED.**
+- Emit may_dangle by default for generic Sky containers (my round-3 initial position). Rejected — too permissive; soundness obligation passed to skyc's lifting analysis.
+- Always emit strict; user opts in for every case. Rejected — closure/async ergonomics suffer (which is what may_dangle is for).
+- "Drop is structural over T" recursive analysis. Rejected — fragile to type-system evolution.
+
+**IMPLEMENTATION NOTES.**
+- Sky's stub_gen, when emitting Drop for a generic Sky type:
+  - Read the type's storage shape from Sky's typechecker.
+  - For each type parameter T, check: does T appear in storage exclusively behind `&`/`&mut`/raw pointer indirection?
+  - If yes → `unsafe impl<#[may_dangle] T> Drop`.
+  - If no → `unsafe impl<T> Drop`.
+- For synthesized types (closures, async state machines): Sky's frontend has full info; auto-applies.
+- For user-defined types: default strict; user opts in via `#[sky_may_dangle(T)]` (or similar) source annotation. Sky's typechecker validates the opt-in is justified (e.g., warns or rejects if the user's Drop body accesses T-typed values).
+- For stdlib containers: stdlib authors explicitly annotate; no auto-inference.
+
+**GOTCHAS.**
+- The syntactic rule is conservative. Some closures with by-value captures whose Drop IS structural over T (rare) won't get may_dangle. User has to restructure or accept the borrowck friction.
+- Don't try to auto-infer for user-defined Drop bodies; that's where the analysis fragility lives.
+- This is one of the most important corrections from the review exchange — getting may_dangle wrong is a soundness bug, not just a UX issue.
+
+**DOC IMPACT.**
+- §15 (new chapter or rewrite): full `#[may_dangle]` policy subsection.
+- §10: stub-type contract notes the syntactic rule for synthesized types.
+
+### Decision 13: Sky-side recursion limit alignment
+
+**WHAT.** `walk_and_stash_internal_callees` (and any other Sky-side walker that enumerates dep graphs) gets memoization + depth counter aligned with `tcx.recursion_limit()`. Walks that exceed the limit emit a compile-time error attributed to a user-source entry point; don't stack-overflow Sky's walker.
+
+**WHY.** Round-3 reviewer Q3 follow-up: rustc's recursion_limit applies to rustc's mono collector. Sky has its OWN walks (Sky-internal callee enumeration) that don't go through rustc's collector. Without explicit handling, pathologically deep Sky-internal recursion stack-overflows Sky's walker or wedges in a cycle, before rustc's standard recursion-limit error can fire.
+
+**ALTERNATIVES CONSIDERED.**
+- No protection (current). Rejected — pathological Sky code crashes Sky's walker.
+- Sky-specific limit independent of rustc. Rejected — surprising for users who configure recursion_limit and expect it to govern any walker.
+- Iterative-only (no recursion in Sky's walker). Possible refinement; recommended where feasible but recursion + depth counter is simpler to implement first.
+
+**IMPLEMENTATION NOTES.**
+- Sky's `walk_and_stash_internal_callees` (location in toylangc; equivalent in Sky's frontend):
+  - Add per-walk `visited: FxHashMap<(DefId, GenericArgsRef), DepListHandle>` initialized at walk entry.
+  - Add per-walk `depth: usize` counter, checked against `tcx.recursion_limit().value` before each recursive descent.
+  - On exceed: emit error with walk's entry-point span (find by walking back through the in-flight stack to outermost user-source DefId); return error sentinel.
+  - Iterative traversal where feasible (worklist-based) to limit OS stack growth.
+- Memoization is also cycle detection: memo hit during in-flight walk → return placeholder.
+
+**GOTCHAS.**
+- Diagnostic attribution: don't emit at a synthetic "Sky walker at line ???" span. Walk back to the outermost user-source frame and emit there.
+- Memo + depth counter together are required: memo handles cycles (every cycle revisits a key), depth counter handles non-cyclic-but-deep cases.
+
+**DOC IMPACT.**
+- §19.5: expand into "Sky-side recursion and cycle handling" subsection covering all three Sky-side walks (comptime, typechecker, dep enumeration) and their protections.
+- §25: add B20 risk entry (Sky-side walker recursion safety).
+
+### Decision 14: `cache_on_disk_if(false)` for Sky-overridden queries
+
+**WHAT.** Every Sky-overridden query forces `cache_on_disk_if(false)` to prevent rustc's incremental cache from returning stale results when Sky's universe changes between compiles.
+
+Audit list (per reviewer's micro-note):
+- `per_instance_mir`: already declared `false` in the fork patch. ✓
+- `layout_of`: force false. Sky's universe-dependent layouts → silent-incremental-staleness is the failure mode.
+- `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable`: force false. The rmeta-encoding flow makes this load-bearing.
+- `collect_and_partition_mono_items`: verify rustc's default (probably already per-compile, not disk-cached); force false defensively if not.
+
+**WHY.** Round-3 reviewer's late-arriving Q4 concern (sharpened in the closing micro-note): post-elimination of mir_shims and symbol_name overrides, MORE queries flow through rustc's natural caching path. Sky's universe state affects, e.g., `layout_of` results for SkyOpaqueType; layout_of is cached on disk by default; Sky's universe changes between compiles (Sky source edit changes a typeid) → cache returns stale layout.
+
+Failure mode is SILENT WRONG layouts in incremental builds; doesn't show up in cold-build CI.
+
+`cross_crate_inlinable` is the sharpest case: Sky forces it to false universe-conditionally, AND that result flows into rmeta encoding for downstream consumers. Stale rmeta-encoded inlinability decisions propagate badly.
+
+**ALTERNATIVES CONSIDERED.**
+- Include Sky's universe fingerprint in cache key (preserves cache benefit). Deferred to v2 as perf optimization. v1 prioritizes correctness via the conservative cache disable.
+- Hope rustc's default invalidation catches it. Rejected — Sky's universe state isn't part of rustc's cache key.
+
+**IMPLEMENTATION NOTES.**
+- For each Sky-overridden query, the override forces cache_on_disk_if(false) via the providers structure:
+  ```rust
+  providers.queries.layout_of = sky_layout_of_provider;
+  providers.queries.layout_of_cache_on_disk_if = |_tcx, _key| false;
+  ```
+  (Exact API per current nightly; the point is Sky owns both the provider AND the cache policy.)
+- Verify `collect_and_partition_mono_items`'s default — probably already per-compile (not disk-cached); if confirmed, no Sky override needed for cache policy. Document the verification result either way.
+- CI fence: edit-and-rebuild test — build a project, edit Sky source that changes a typeid, rebuild WITHOUT cache wipe, verify the binary's behavior reflects the edit.
+
+**GOTCHAS.**
+- Sky's toolchain version is embedded in rustc's version string; the cache hashes the version string. Cross-Sky-version invalidation works via this mechanism. Don't double up.
+- Perf cost is small: cheap queries re-run per-compile; expensive ones like collect_and_partition_mono_items aren't typically disk-cached by default anyway.
+
+**DOC IMPACT.**
+- §22.3 (new subsection): "Queries Sky touches and their cache policy." Table per query: default policy, Sky's override, why Sky forces false (or doesn't).
+- §25: add B21 risk entry (per-query disk-cache staleness).
+
+### Decision 15: Drift-observation discipline + B24/B25/B26 risk entries
+
+**WHAT.** Cross-cutting discipline: each Sky override eliminated trades surface area for drift-observation. The criterion for eliminating a Sky override:
+1. Does this override serve as a synchronization point where Sky would observe rustc behavior drift?
+2. If yes: keep as a delegating shim (live no-op but with deliberate drift-observation purpose).
+3. If no (override genuinely does no work AND change in rustc's default would manifest cleanly via integration tests): eliminate.
+
+mir_shims elimination (Decision 1): justified — drop integration fixtures catch shape drift.
+symbol_name elimination (Decision 2): justified — Thread C inlining matrix + cross-crate link tests catch mangler drift.
+
+New B-class risks added to §25 capturing the drift-observation gaps:
+
+**B24. Drop-glue shape stability.** Post-mir_shims-elimination, rustc's `build_drop_shim` shape is in Sky's load-bearing dependency surface. Risk if rustc changes pre-drop/post-drop steps, Drop::drop ordering, field iteration order, etc. Probability ~5-10% over 5 years (deeply embedded in MIR semantics). Impact: silent UB in destructor chains. Detection: integration fixtures with multi-field types whose drops have observable side effects (Fixtures 1-3, 6-9 from the empirical work backlog). Reaction: re-introduce mir_shims override.
+
+**B25. Default symbol mangling stability.** Post-symbol_name-elimination, rustc's default mangler (v0) is load-bearing. Risk if rustc changes mangler defaults (HAS happened — v0 was introduced 2020). Probability ~20-30% over 5 years. Impact: link errors (mostly clean failure mode, low silent-corruption risk). Detection: cross-crate symbol-name tests + mangler-version sweep. Reaction: re-introduce symbol_name override as delegating shim.
+
+**B26. `drop_in_place` resolution path stability.** Post-mir_shims-elimination, Sky relies on rustc's `DropGlue` InstanceKind being the only relevant drop path. Risk if rustc adds new InstanceKind variants for drop (`AsyncDropGlue` already exists for experimental AsyncDrop). Probability ~15-20% over 5 years. Impact: silent miscompile if new variant bypasses user's Drop impl. Detection: drop-instance-kind-coverage tests. Reaction: override relevant InstanceKind resolution.
+
+**WHY.** Round-3 reviewer's "a new concern: every elimination tightens dependency on rustc's natural behavior." Each removed override removes a synchronization point where Sky could observe drift. The B-class risks should grow new entries.
+
+**IMPLEMENTATION NOTES.**
+- Add the discipline as a meta-invariant in §26 (or wherever cross-cutting principles live).
+- Add B24/B25/B26 risk entries to §25 with the full risk profile (probability, impact, canary, reaction).
+- Build CI fences per each risk's detection requirement (covered in the empirical work backlog).
+
+**GOTCHAS.**
+- Don't over-eliminate. If you eliminate an override without confirming integration tests cover the drift, you've removed a sentinel without gaining one. Some overrides should stay as delegating shims (live no-op but intentional).
+
+**DOC IMPACT.**
+- §25: B24, B25, B26 entries.
+- §26: drift-observation discipline as cross-cutting invariant.
+
+### Decision 16: §1.7 reframe — backend pluralism leads, not "MIR can't express it"
+
+**WHAT.** §1.7's "Sky does not surrender LLVM output control" reasoning leads with **backend pluralism** (GPU/NPU/MLIR/etc. won't go through LLVM, so committing to MIR forecloses non-LLVM backends) as the principled load-bearing reason. Engineering reuse of Vale's Inkwell pipeline is the secondary practical reason. The "MIR can't express it" framing is RETIRED — MIR is genuinely expressive enough; pretending otherwise invites future engineers to disprove it and re-open the decision.
+
+**WHY.** Round-2 reviewer Q2 + round-3 confirmation: "Sky's vocabulary is bigger than MIR" was doing too much work. MIR's `Rvalue`/`TerminatorKind` cover almost any imperative program. Once group/linearity invariants are typechecker-only and comptime values bake to constants, MIR could probably express the body content.
+
+The TRULY load-bearing reasons are:
+1. **Backend pluralism.** GPU/NPU/custom targets won't go through LLVM. Sky may want to lower to MLIR for some computations. Committing to MIR-as-target permanently bolts Sky to rustc's LLVM pipeline.
+2. **Engineering reuse.** Vale's existing Inkwell pipeline exists; rewriting as a MIR builder is months of work for a property that's already paid for.
+
+User confirmed: "i might want to make sky based on MLIR, which means holding direct references to high-level nodes and optimizations that are defined by others. i dont think MIR can express that. #2 (engineering reuse) isnt much of a reason for us, we can rewrite things, sky/vale are still small. its mainly the backend pluralism."
+
+**IMPLEMENTATION NOTES.**
+- This is a doc change, not an architecture change. Update §1.7 to lead with backend pluralism.
+
+**DOC IMPACT.**
+- §1.7 (Sky does not surrender LLVM output control): rewrite leading with backend pluralism. Drop the "vocabulary" framing. Acknowledge engineering reuse as secondary.
+
+### Decision 17: Stub-type contract — Sky's drop function must not invalidate field storage that auto-drop will subsequently traverse
+
+**WHAT.** The structural invariant for Sky's stub types under the mir_shims-eliminated model:
+
+> Sky's `__sky_drop_X` function must not invalidate field storage that auto-drop will subsequently traverse. Field destructors run via the standard auto-drop ladder after `Drop::drop` returns; Sky's drop function does Sky-side cleanup that's independent of field storage.
+
+Today's ZST-only stub pattern (`SkyOpaqueType<HASH>` + `PhantomData<P>`) trivially satisfies this (no fields with destructors to traverse). Future stub-gen evolutions may expose non-ZST fields (with or without destructors) as long as the contract holds.
+
+NO `ManuallyDrop` requirement by default. ManuallyDrop is only needed in edge cases where Sky's drop function specifically wants to take ownership of field destruction (rare).
+
+**WHY.** Round-3 discussion explored two false framings before landing here:
+- First false framing: "stub types' source-level fields must all be `!needs_drop`." Too narrow — implies stub fields are restricted to ZST or u64-tag-shaped types.
+- Second false framing: "non-ZST fields with destructors MUST be wrapped in `ManuallyDrop`." User pushed back: "why do we need to wrap them in `ManuallyDrop`?" Correct answer: we don't, generally.
+
+The actual invariant is about Sky's drop function's BEHAVIOR (don't invalidate field storage), not about the field TYPES.
+
+In practice: Sky's `__sky_drop_X` operates on Sky's UNIVERSE (off-stub), not on the stub allocation's bytes. The stub allocation is rustc-managed; Sky's universe holds the real data. Sky's drop function does universe-side cleanup that doesn't touch field storage. So field destructors via auto-drop work fine.
+
+**IMPLEMENTATION NOTES.**
+- Sky's `__sky_drop_X` body discipline: operate on Sky's universe; don't read or write the stub allocation's field storage in ways that would interfere with auto-drop.
+- For the typical case (stub fields are ZSTs by convention), this is vacuously satisfied.
+- For edge cases where Sky genuinely wants to take ownership of a field's destruction (e.g., specific ordering requirements), use `ManuallyDrop<T>` for that field and explicitly invoke `ManuallyDrop::drop(&mut self.field)` in Sky's drop function.
+- See Decision 1 (mir_shims elimination) for the broader drop machinery context.
+
+**GOTCHAS.**
+- This is a Sky drop function CORRECTNESS property, not a type-level structural property. CI fences can't easily enforce it at the type level; instead, enforce it at the emitter level (the `project_raw_field` helper discipline from Decision 1's CI fence).
+- The earlier "stub fields are `!needs_drop` only" framing was a self-imposed restriction we don't actually need. Allow stub fields to be anything Sky's `layout_of` override can report consistent offsets for.
+
+**DOC IMPACT.**
+- §10 / §15: state the invariant as the broader "auto-drop ladder finds only non-interfering fields" property. Today's ZST-only convention is one way to satisfy it; ManuallyDrop wrapping is the more flexible alternative for cases where Sky wants ownership.
 
 ---
 
-## Option 4 implementation guide (preserved as design history; work SHIPPED 2026-06-21)
+## Empirical work backlog (DO FIRST, before any migration)
 
-> **Status:** Option 4 was implemented and shipped on 2026-06-21 per the
-> playbook below. The integration suite passes (191 / 0 / 1) and the
-> inlining matrix verifies the LTO promise. This section is preserved
-> verbatim for posterity / future investigators reasoning about
-> alternative paths or revisiting the choice. If you're picking up where
-> this session left off, jump to "Thread B" or "What success looks like"
-> below instead.
+### The empirical-vacuum context
 
-This subsection is the complete how-to for retiring A.3 via Option 4.
-Treat it as a self-contained playbook. Estimated cost: half a day if
-the in-process inliner concern (see "Open question" below) doesn't
-bite; ~1 day if mitigation is needed.
+**Toylang has ZERO drop tests today.** Verified during round-3 follow-up Q2:
+- `drop_glue.rs` mir_shims override exists with a debug eprintln; nothing exercises it (no eprintln output appears in any test run).
+- Toylangc never emits `__toylang_drop_*` symbols.
+- Stub_gen never emits `impl Drop for ...` blocks.
+- No fixture in `tests/integration_projects/` has "drop", "linear", "destruct", "cleanup", or "finalize" in the name.
+- The historical `test_point_drop` fixture was deleted in 5c.4; nothing replaced it.
 
-### What's actually happening today (mechanical detail)
+This means: the mir_shims elimination's "current behavior" baseline is UNVERIFIED. Without an empirical baseline, the elimination is unverified against a behavior we never observed.
 
-The collision Option 4 is going to defuse:
+**Implication: build fixtures FIRST, validate baseline under CURRENT mir_shims model, THEN do the migration with fixtures as the regression suite.**
 
-1. **`stub_gen` emits Rust source** for every Sky-marked crate. For
-   `export fn add_one(x: i32) -> i32`, the stub source contains:
-   ```rust
-   pub fn add_one(x: i32) -> i32 { unreachable!() }
-   ```
-   See `toylangc/src/stub_gen.rs:333-342` for the wrapper-fn emission
-   site. (Pre-F1 this also had `#[inline(never)]`; that was removed
-   in commit `c4e8271`.)
+User confirmed: "we need to prototype all these things before handing anything off to sky. we need excellent test coverage. toylangc will exist even alongside sky well into the future, as a reference implementation that will help us narrow down bugs."
 
-2. **Rustc compiles `__lang_stubs`** as ordinary Rust. By default it
-   would emit machine code for `add_one` — a `panic("unreachable")`
-   blob in a `.rcgu.o`. This is the body that competes with Sky's.
+### Fixtures to build BEFORE migration
 
-3. **Sky's `fill_extra_modules` hook** (patch 4 of the fork) emits the
-   REAL body for `add_one` into a separate LLVM module. Same mangled
-   symbol name (per the Path B / single-symbol architecture, §F.2 in
-   arch doc), External linkage.
+Build under `toylangc/tests/integration_projects/drop/` (new subdirectory). Each fixture is a full mini-project (Cargo.toml, .toylang source, optionally Rust source). Integration test harness runs end-to-end.
 
-4. **The partition filter (A.3)** intercepts the CGU list between
-   rustc's default partitioner and rustc's LLVM backend. It REMOVES
-   every Sky-defined item from the CGU list. Rustc's backend then
-   has nothing to codegen for those items → no `.o` from rustc →
-   no collision with Sky's `.o`.
+**Fixture 1: basic drop chain.**
+```sky
+struct MyType { resource: SomeSkyResource }
+impl Drop for MyType { fn drop(&mut self) { release(self.resource) } }
 
-The filter is at `rustc-lang-facade/src/queries/partition.rs:59-107`.
-The whole file is 107 lines including comments. The retirement
-target.
-
-### Why Option 4 works
-
-LLVM has a linkage kind called `AvailableExternally`. Semantics: "the
-body of this function is present in the module **for inlining
-purposes only**. Do NOT emit it as a `.o` symbol. Assume someone else
-provides the symbol at link time."
-
-Set `attrs.linkage = Some(Linkage::AvailableExternally)` on every
-Sky-defined item's `CodegenFnAttrs`. Two effects:
-
-1. Rustc's partitioner sees `mono_item.explicit_linkage(tcx)` returns
-   `Some(AvailableExternally)` and short-circuits at
-   `rustc_monomorphize::partitioning.rs:749-751` — the item still
-   lands in a CGU, but the linkage decision is locked.
-
-2. Rustc's LLVM backend codegens the body but the resulting LLVM
-   function has `available_externally` linkage. LLVM's emit step
-   does NOT produce a `.o` symbol for `available_externally`
-   functions. The body exists in the IR for cross-module inlining
-   (LTO) but produces no machine code.
-
-Sky's `fill_extra_modules` still emits its real body with External
-linkage as usual. At link time, Sky's body is the sole definition;
-the linker resolves all references to it.
-
-No collision. No partition filter needed.
-
-### The rustc query you'll override
-
-```
-query codegen_fn_attrs(def_id: DefId) -> &'tcx CodegenFnAttrs {
-    desc { |tcx| "computing codegen attributes of `{}`", tcx.def_path_str(def_id) }
-    arena_cache
-    cache_on_disk_if { def_id.is_local() }
-    separate_provide_extern
-    feedable
+fn main() {
+    let mut v = SkyVec::<MyType>::new();
+    v.push(MyType { resource: acquire() });
+    v.push(MyType { resource: acquire() });
+    v.push(MyType { resource: acquire() });
+    // v drops at scope end
 }
 ```
+Assertions:
+- Drop chain runs: `Vec::Drop` → Sky-side handling → per-element drop → `MyType::Drop::drop` → release(resource) per element.
+- `release()` called exactly 3 times.
+- Drop order is deterministic (pin LIFO or FIFO; either is fine, document the choice).
+- Each `release` happens before SkyVec storage is freed.
+Verification: instrument `release` to log; assert log content matches expected sequence.
 
-Source: `~/rust/compiler/rustc_middle/src/query/mod.rs` (search for
-"query codegen_fn_attrs").
+**Fixture 2: drop with may_dangle (borrowed data in container).**
+```sky
+struct Holder<'a> { borrowed: &'a I32 }
 
-Important properties:
-- **`separate_provide_extern`**: there are TWO providers — one for
-  local items (`queries.codegen_fn_attrs`, takes `LocalDefId`) and one
-  for upstream items read from rmeta (`extern_queries.codegen_fn_attrs`,
-  takes `DefId`). Sky needs to override BOTH, just like the F2 fix
-  in `cross_crate_inlinable.rs` does. See that file for the pattern.
-- **`arena_cache`**: rustc wraps the provider to arena-allocate the
-  returned `CodegenFnAttrs` and serve it back as `&'tcx CodegenFnAttrs`.
-  Sky's provider returns by value; rustc handles the arena.
-- **`feedable`**: there's also a `tcx.feed_codegen_fn_attrs(...)` API
-  for direct injection. Not needed for Sky's use case — the query
-  override path is simpler.
+fn outer() {
+    let value = 42i32;
+    let mut v = SkyVec::<Holder<'_>>::new();
+    v.push(Holder { borrowed: &value });
+    drop(v);  // explicit drop before value goes out of scope
+}
 
-The default provider is at
-`~/rust/compiler/rustc_codegen_ssa/src/codegen_attrs.rs:fn codegen_fn_attrs`.
-It takes `LocalDefId` and returns `CodegenFnAttrs` by value.
+fn dangling_case() {
+    let mut v = SkyVec::<&'_ i32>::new();
+    {
+        let value = 42i32;
+        v.push(&value);
+    }  // value goes out of scope; v still holds dangling ref
+    // v drops at scope end — needs #[may_dangle] for SkyVec to compile
+}
+```
+Assertions:
+- With `#[may_dangle] T` on SkyVec's Drop (stdlib annotation per Decision 12): `dangling_case()` compiles. Drop runs without dereferencing the dangling reference.
+- For a user-defined Sky container without may_dangle: `dangling_case()` is a borrowck error pointing at v's drop site.
+Verification: build the fixture both ways and check rustc's output (success / specific error message).
 
-### Step-by-step implementation
-
-**Step 1 — Read these before touching code:**
-
-- `rustc-lang-facade/src/queries/cross_crate_inlinable.rs` — the F2
-  fix is the exact structural model for this override. Read the whole
-  file (it's ~90 lines). The new `codegen_fn_attrs.rs` will mirror its
-  shape almost identically.
-- `rustc-lang-facade/src/queries/mod.rs` lines 56-89 — see how
-  cross_crate_inlinable is wired into both `queries` and
-  `extern_queries`. New override follows the same pattern.
-- `rustc-lang-facade/src/lib.rs:1115-1145` — the
-  `install_query_defaults` function that saves the default providers.
-  Add two new parameters for codegen_fn_attrs (local + extern).
-- `rustc-lang-facade/src/queries/partition.rs` (107 lines, doomed) —
-  understand what you're deleting before you delete it.
-- `rustc-lang-facade/src/lib.rs:738-750` — the `is_consumer_codegen_target`
-  function. This is your filter predicate.
-
-**Step 2 — Create the override file.**
-
-New file: `rustc-lang-facade/src/queries/codegen_fn_attrs.rs`. Mirror
-the cross_crate_inlinable.rs shape:
-
+**Fixture 3: linear type in a Rust collection.**
 ```rust
-//! `codegen_fn_attrs` query override — retires the A.3 partition filter
-//! by marking Sky-defined items with `AvailableExternally` linkage.
-//!
-//! ## The problem
-//!
-//! Sky's stub_gen emits `pub fn add_one(x: i32) -> i32 { unreachable!() }`
-//! for every Sky export. Rustc's default codegen would compile that
-//! body to machine code (a `panic("unreachable")` blob in `.rcgu.o`).
-//! Sky's `fill_extra_modules` hook (patch 4) emits the REAL body for
-//! the same symbol. Two `.o` files, same mangled symbol — link
-//! collision.
-//!
-//! Historical fix: the A.3 partition filter (in `queries/partition.rs`)
-//! removed Sky-defined items from rustc's CGU list before codegen, so
-//! rustc emitted no machine code for them. ~107 lines of "Sky censors
-//! rustc's pipeline."
-//!
-//! ## The fix (this file)
-//!
-//! Override `codegen_fn_attrs` to set
-//! `linkage = Some(Linkage::AvailableExternally)` on every Sky-defined
-//! item. LLVM emits the body for inlining purposes but produces no
-//! `.o` symbol. Sky's `fill_extra_modules` body becomes the sole `.o`
-//! definition; the linker resolves cleanly. No filter needed.
-//!
-//! The partitioner short-circuits at
-//! `rustc_monomorphize::partitioning.rs:749-751` when
-//! `mono_item.explicit_linkage(tcx)` returns Some, so this override
-//! is sufficient — no need to also mutate `MonoItemData.linkage`
-//! post-partition.
-//!
-//! ## Why this preserves pass-through
-//!
-//! Gated on `is_consumer_codegen_target` which only fires for items
-//! in marker-bearing crates. Pure-Rust crates compiled via Sky's rustc
-//! binary delegate to the default provider — byte-identical to vanilla.
-//!
-//! ## Why this preserves F1's LTO inlining promise
-//!
-//! `available_externally` linkage means the body IS in the IR, just
-//! not in the `.o`. LTO's IR linker can still inline the body across
-//! crate boundaries — that's the whole point of the linkage kind.
-//! F1's matrix (29+ thin/fat LTO assertions) should still pass.
+extern crate sky_lib;
+use sky_lib::LinearWidget;
 
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
-use rustc_middle::ty::TyCtxt;
-use rustc_hir::attrs::Linkage;
+fn store(v: &mut Vec<LinearWidget>, x: LinearWidget) {
+    v.push(x);
+}
 
-pub type CodegenFnAttrsFn = for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> CodegenFnAttrs;
-pub type ExternCodegenFnAttrsFn = for<'tcx> fn(TyCtxt<'tcx>, DefId) -> &'static CodegenFnAttrs;
-// ^ verify the extern signature against rustc source — `&'static` may need
-// to be `&'tcx` or similar; mirror what extern_queries.codegen_fn_attrs
-// actually wants in the nightly Sky is pinned to.
+fn main() {
+    let mut v = Vec::new();
+    store(&mut v, sky_lib::make_linear_widget());
+    // v drops at scope end; LinearWidget's drop panics + aborts
+}
+```
+For v1 (runtime panic, per Decision 11):
+- Build succeeds.
+- Runtime: when Vec drops, `__sky_drop_LinearWidget` runs per element, panics with Sky's documented message.
+- Process aborts with non-zero exit.
+Assertion: panic message contains "linear type", "must be explicitly consumed" or equivalent, points to LinearWidget by name.
+For v2 (compile-time error, deferred — see Open Questions): build fails; error span at v.push(x) in user source; error text explains the constraint.
 
-pub fn lang_codegen_fn_attrs<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-) -> CodegenFnAttrs {
-    let mut attrs = crate::default_codegen_fn_attrs()(tcx, def_id);
-    if crate::is_consumer_codegen_target(tcx, def_id.to_def_id()) {
-        attrs.linkage = Some(Linkage::AvailableExternally);
+**Fixture 4: closure with move capture.**
+```sky
+fn outer() {
+    let resource = acquire();
+    let closure = move || drop(resource);
+    closure();  // closure drops; resource's destructor fires
+}
+```
+Assertions:
+- Closure type's stub representation includes the captured resource.
+- Drop runs for closure → resource drops → release.
+- `release()` called exactly once.
+
+**Fixture 5: closure with ref capture + may_dangle.**
+```sky
+fn outer<'a>(data: &'a Data) -> impl Fn() + 'a {
+    move || println(data.value())
+}
+
+fn dangling_case() {
+    let closure;
+    {
+        let data = Data::new(42);
+        closure = outer(&data);
+        // closure ends here
     }
-    attrs
+    // data is dropped; closure (which captures &data) is also out of scope
 }
+```
+Assertions:
+- Closure's stub Drop has `#[may_dangle] T` (per Decision 12's syntactic rule applied to ref captures).
+- Compiles cleanly.
 
-pub fn lang_extern_codegen_fn_attrs<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-) -> &'tcx CodegenFnAttrs {
-    let default = crate::default_extern_codegen_fn_attrs()(tcx, def_id);
-    if !crate::is_consumer_codegen_target(tcx, def_id) {
-        return default;
+**Fixture 6: async NotStarted phase drop.**
+```sky
+async fn fetch(id: I32) -> Data { http_get(id).await }
+
+fn main() {
+    let f = fetch(42);  // SkyNotStarted_fetch; captures id = 42
+    drop(f);            // dropped before .await
+    // captures (just id) drop normally; no abort
+}
+```
+Assertions:
+- f is movable (Decision 10).
+- Drop runs; no abort; no allocation leak.
+- Sky-side cleanup runs (if any captures need it).
+
+**Fixture 7: migratory async mid-execution drop.**
+```sky
+migratory async fn worker(items: Vec<I32>) -> () {
+    for item in items {
+        process(item).await;
     }
-    // Clone, mutate, re-arena. Sky's items reached via rmeta also
-    // need AvailableExternally so their downstream consumers don't
-    // emit collision `.o`s either.
-    let mut owned = (*default).clone();
-    owned.linkage = Some(Linkage::AvailableExternally);
-    tcx.arena.alloc(owned)
+}
+
+fn main() {
+    let f = worker(vec![1, 2, 3]);
+    let handle = tokio::spawn(f);
+    sleep(100ms);  // let it run for a bit
+    handle.abort();  // tokio drops the future mid-execution
+    // Migratory: state machine drops live captures, cleans up; no abort
 }
 ```
+Assertions:
+- Build links cleanly.
+- Runtime: spawn works; abort triggers drop; live captures (whichever are alive at current state) drop correctly; process exits cleanly.
 
-**Step 3 — Wire it into `queries/mod.rs`.**
+**Fixture 8: default async mid-execution drop = panic.**
+```sky
+async fn process(g: &g'State) -> () { /* uses g across .awaits */ }
 
-Mirror cross_crate_inlinable. Add `pub mod codegen_fn_attrs;` near
-the other module declarations. In `lang_override_queries`:
+fn main() {
+    let state = State::new();
+    let f = process(&state);
+    let handle = tokio::spawn(f);  // This should fail to compile (non-'static)
+    // ... assuming it compiles via wrappers ...
+    handle.abort();  // would trigger panic+abort
+}
+```
+Test in two variants:
+- Variant A: try to spawn directly; expect compile-time rejection (per Option C' Send/'static honesty, Decision 8).
+- Variant B: wrap via the (deferred) tokio bridge; abort triggers Sky's drop panic.
 
+**Fixture 9: cancellable wrapper Pending drop with cleanup handler.**
+```sky
+async fn long_running() -> Result { ... }
+
+fn main() {
+    let cleanup_ran = AtomicBool::new(false);
+    {
+        let f = into_cancellable(long_running(), || {
+            cleanup_ran.store(true, ...);
+        });
+        let handle = tokio::spawn(f);
+        sleep(10ms);
+        handle.abort();  // dropped while Pending
+    }
+    assert!(cleanup_ran.load(...));
+}
+```
+Assertions:
+- Cleanup handler invoked when wrapper dropped Pending.
+- Cleanup NOT invoked when wrapper dropped Ready (separate test variant).
+
+### Other tests/fences to build
+
+**Test A: multiple ReifyFnPointer casts (mentioned-items safety).**
+Fixture: Sky function with body that casts to multiple Rust deps (Vec::new, Vec::push, Vec::clear, Vec::drop — 4 distinct casts).
+Assertions:
+- `llvm-objdump -t` on resulting binary shows symbols for all 4 mono'd Rust deps.
+- Binary runs without undefined-symbol errors at link.
+- Sky's body in LLVM IR has all 4 casts in the right form.
+
+**Test B: Rust dep ONLY reachable through Sky's body.**
+Fixture: a Rust dep that no Rust source references directly; only Sky's per_instance_mir body references it via ReifyFnPointer cast.
+Assertions:
+- Binary's symbol table includes the dep's mono'd Instance.
+- Function works at runtime (if reachable through the Sky path).
+Tests end-to-end dep-registration mechanism.
+
+**Cache-correctness fence (edit-and-rebuild).**
+1. Build a project with `Widget { x: I32, y: I32 }` (16-byte struct).
+2. Edit Sky source: add `z: I32` (now 24 bytes).
+3. Rebuild WITHOUT cache wipe.
+4. Verify built binary uses NEW layout (24 bytes), not cached old layout (16 bytes).
+Catches Decision 14's failure mode.
+
+**Cross-crate symbol-name test (B25 drift detection).**
+Build a project that exercises cross-crate calls between Sky-emitted code and rustc-compiled call sites. Build at multiple `-Csymbol-mangling-version=` settings (v0 default + any new defaults). Verify link succeeds at each.
+
+**Drop-instance-kind coverage (B26 drift detection).**
+Integration tests exercising drop for every Sky type category (linear, async-migratory, async-default, generic, with `#[may_dangle]`, etc.). Verify Sky's `__sky_drop_X` is observed running (via instrumentation counters or side-effects).
+
+**Architecture-fence CI (NNGZ).**
+Per §26.15 (Non-generic is the Normal-case-of-Generic): grep-based CI test walks Sky's frontend source for `type_params.is_empty()` patterns, asserts each is annotated `arch-fence-allow: <reason>`. Unannotated occurrences fail the test.
+
+**Byte-identical pass-through corpus.**
+Per §25.3.5: corpus of representative Rust crates (small bin, serde-derive consumer, tokio program, generic-heavy, trait-heavy, sys-crate wrapper). For each: build with vanilla nightly rustc + with Sky's rustc (Sky machinery dormant). Byte-compare output objects. Any divergence is a regression.
+
+### The perf bench (PRIORITIZED FIRST ARTIFACT)
+
+Per reviewer's order-of-presentation discipline: **the bench numbers go FIRST in round 4.** Lead with this; the rest of the implementation work calibrates by the bench's results.
+
+**Bench 1: pure call-boundary cost (worst case).**
+```sky
+// Sky lib:
+export fn add(a: I32, b: I32) -> I32 { a + b }
+```
 ```rust
-crate::install_query_defaults(
-    providers.queries.layout_of,
-    providers.queries.mir_shims,
-    providers.queries.symbol_name,
-    providers.queries.collect_and_partition_mono_items,  // ← keep this; the default partitioner still runs
-    providers.queries.upstream_monomorphizations_for,
-    providers.queries.upstream_monomorphizations,
-    providers.queries.cross_crate_inlinable,
-    providers.extern_queries.cross_crate_inlinable,
-    providers.queries.codegen_fn_attrs,           // NEW
-    providers.extern_queries.codegen_fn_attrs,    // NEW
-);
-
-// ... existing overrides ...
-
-// REMOVE THIS LINE (A.3 retirement):
-// providers.queries.collect_and_partition_mono_items = partition::lang_collect_and_partition_mono_items;
-
-// ADD THESE (Option 4):
-providers.queries.codegen_fn_attrs =
-    codegen_fn_attrs::lang_codegen_fn_attrs;
-providers.extern_queries.codegen_fn_attrs =
-    codegen_fn_attrs::lang_extern_codegen_fn_attrs;
+// Rust bin:
+fn main() {
+    let mut sum: i64 = 0;
+    for i in 0..100_000_000 {
+        sum = sum.wrapping_add(add(i, 1) as i64);
+    }
+    println!("{}", sum);
+}
 ```
+Builds across the matrix:
+- Profiles: dev (default opt-level=0 + lto=false), dev-with-O1 (opt-level=1 + lto=false), release (lto=false), release with lto="thin", release with lto="fat".
+- Per reviewer's micro-note: add `opt-level=1 + lto=false` as third data point (isolates Sky's boundary cost from O0's general slowness).
+Measure:
+- Wall-clock runtime per build.
+- `.text` size of the produced binary.
+- Symbol count of the produced binary (`llvm-objdump -t | wc -l` or similar).
+Per reviewer's instrumentation suggestion: `.text` size + symbol count at each LTO level quantifies the inlining-vs-emission tradeoff visibly.
 
-**Step 4 — Extend `install_query_defaults` in `lib.rs`.**
+**Bench 2: realistic work-per-call.**
+Same Sky function but doing K units of work (`a*b + 3`, or a Vec push, or similar). Vary K from 1 to ~100. Plot ratio (lto=false/lto="thin") as function of K.
+Per reviewer's "the realistic ratio is usually 1.5-3x of the synthetic peak" rule-of-thumb: this calibrates whether the synthetic-bench cost translates to real-world UX pain.
 
-Add two more parameters and two more `OnceLock`s. Pattern is identical
-to how cross_crate_inlinable's default got saved (~10 lines added in
-that commit). Also add `default_codegen_fn_attrs()` and
-`default_extern_codegen_fn_attrs()` accessors.
-
-**Step 5 — Remove `queries/partition.rs`.**
-
-Delete the file. Search for references:
+**Bench 3: drop chain (validates mir_shims-eliminated drop model under perf scrutiny).**
+```sky
+export struct Widget { id: I32 }
+// Drop impl bridges into __sky_drop_Widget
 ```
-grep -rn "queries::partition\|queries/partition\|lang_collect_and_partition_mono_items" \
-  rustc-lang-facade/ toylangc/
-```
-
-Update each site. The `default_collect_and_partition()` accessor at
-`rustc-lang-facade/src/lib.rs` is called from
-`toylangc/src/llvm_gen.rs::generate_with_tcx` to get the unfiltered
-CGU slice for Case 1b discovery. After Option 4, the CGU slice is
-unfiltered by default (no override) — the call site can either keep
-calling `default_collect_and_partition()` directly or just call
-`tcx.collect_and_partition_mono_items(())`. Verify which is correct
-by checking what `toylangc::llvm_gen` actually does with the slice.
-
-**Step 6 — Remove the partition module from `queries/mod.rs`.**
-
-Delete `pub mod partition;` and the `partition::` references. Also
-update the module doc-comment that mentions partition as one of the
-overrides (currently lines 1-27).
-
-**Step 7 — Build and test.**
-
-```
-export LLVM_SYS_211_PREFIX=/Users/verdagon/rust/build/aarch64-apple-darwin/ci-llvm
-cargo +rustc-fork build --manifest-path ./toylangc/Cargo.toml > ./tmp/option4.txt 2>&1
-echo "build exit=$?"
-```
-
-If build is clean, run the suite:
-```
-cargo +rustc-fork test --manifest-path ./toylangc/Cargo.toml > ./tmp/option4.txt 2>&1
-echo "test exit=$?"
-grep "test result" ./tmp/option4.txt
-```
-
-Expected: 191 passing, 0 failing, 1 ignored (same as the current
-baseline). Especially watch the inlining matrix (40 fixtures, all
-under `inlining/case*` names) — F1's promise lives there.
-
-### Open question to validate
-
-This is the one thing that could go wrong. The available_externally
-body is present in the IR for inlining. Within the stub_rlib's own
-compile, Sky's emitted `__lang_stubs::duplicate<Wrapper<i32>>` body
-references `__lang_stubs::add_one`. Could LLVM (or rustc's MIR
-inliner) inline the `unreachable!()` body into Sky's callers at
-codegen time?
-
-**LTO case (cross-module):** `#![no_builtins]` on stub rlibs (emitted
-by stub_gen — see `toylangc/src/build.rs:329`) excludes their bitcode
-from the LTO pool entirely. The available_externally body never
-reaches the LTO IR linker. Sky's emitted body (in a separately-attached
-LLVM module via patch 4) IS in the LTO pool. So LTO inlines Sky's
-body, not the stub's. Safe.
-
-**Non-LTO case (in-process inliner at stub_rlib compile):** rustc's
-MIR inliner runs at -O1+. It might pull the stub's `unreachable!()`
-body INTO Sky-defined callers within the same crate. If it does,
-those callers crash at runtime when reached.
-
-**How to verify quickly:** after Step 7's tests pass, manually check
-case 4 / case 6 binaries at -O3:
-```
-/Users/verdagon/rust/build/aarch64-apple-darwin/ci-llvm/bin/llvm-objdump \
-  -d --no-show-raw-insn \
-  toylangc/target/integration-projects-cache/debug/case4_thin_lto \
-  | awk '/<.*case4_thin_lto.*4main>:/,/^$/' | head -20
-```
-
-What you want to see: main constant-folds Sky's body (e.g. `mov w8,
-#42`) — same as today. If instead you see an `unreachable` trap or a
-`udf` instruction inside main's body, the MIR inliner pulled the
-stub's body. Mitigation:
-
-**If the MIR inliner bites:** re-introduce targeted `#[inline(never)]`
-on the stub source's body. The F1 fence
-(`toylangc/tests/architecture_fence.rs::stub_gen_no_inline_never_on_sky_items`)
-will fire — that's correct; bump
-`F1_EXPECTED_INLINE_NEVER_SITES` from `2` to whatever the new count
-is, and update the comment to point at "MIR inliner mitigation for
-Option 4." Verify the matrix's LTO assertions still pass (F1's
-original concern was the LLVM-side inliner; `#[inline(never)]` doesn't
-block LTO inlining of Sky's separately-emitted body because Sky's body
-isn't the one the attribute is on).
-
-The two concerns are independent:
-- F1 was: "stub source has #[inline(never)] → LLVM doesn't inline
-  Sky's body cross-crate at LTO." Cause: the noinline attribute
-  propagated to call-site decisions. F1 removed the attribute to fix
-  this.
-- Option 4 risk: "stub source has available_externally body → rustc
-  MIR inliner pulls stub's unreachable into Sky's callers in same
-  crate." Cause: the body is visible in IR.
-
-`#[inline(never)]` blocks the MIR inliner (rustc-internal, per-call-site).
-F1's concern was an LLVM-internal, per-call-site decision driven by
-function-attribute metadata. Re-introducing `#[inline(never)]` to fix
-Option 4's MIR-inliner risk MAY also re-introduce F1's LLVM-inliner
-risk — verify by running the matrix.
-
-**If both can't be reconciled:** abort Option 4 and document why.
-Path is still open via Option 6 (post-partition linkage mutation)
-which doesn't trigger this exact concern because it doesn't emit a
-body at all into the rustc-controlled CGU — it just changes the
-data record's linkage field.
-
-### Verification checklist
-
-Before declaring Option 4 done:
-
-- [ ] `queries/partition.rs` is deleted
-- [ ] `queries/codegen_fn_attrs.rs` is created
-- [ ] Both `queries.codegen_fn_attrs` and `extern_queries.codegen_fn_attrs`
-      are overridden
-- [ ] `install_query_defaults` saves the new defaults
-- [ ] `is_consumer_codegen_target` is the gating predicate (same one
-      that partition.rs used)
-- [ ] All 191 tests still pass (run twice for warm+cold cache, since
-      we just fixed that flake)
-- [ ] Inlining matrix LTO assertions all pass
-- [ ] Case 4 / case 6 disasm shows constant-folded values in main
-      (not `udf`/`unreachable`)
-- [ ] `test_release_mode_smoke` passes (the B14 fence — patch 5
-      shouldn't be affected but worth verifying)
-- [ ] Arch doc §F.14 marked "purely historical; A.3 retired via
-      Option 4 commit XXX"
-- [ ] Arch doc §25.2 gains B17 closing entry for partition filter
-      retirement
-- [ ] Handoff updated to mark Option 4 SHIPPED + retire this whole
-      implementation guide section
-
-### What stays (don't accidentally delete)
-
-These are commonly confused with A.3 but are separate:
-
-- **A.1 capture-ship-replay** (`toylangc/src/toylang/callbacks_impl.rs`
-  around line 1305, the `capture_discovered_trait_impl_instances` flow
-  + the sidecar populate drain). STAYS. The cascade still fires at
-  stub_rlib compile; Sky still needs to ship trait-impl Instances.
-- **A.2 synthesize_upstream_monomorphizations** (`rustc-lang-facade/src/queries/upstream_monomorphization.rs`).
-  STAYS. The augmented map is what makes the v0 mangler pick
-  `__lang_stubs` disambig for Sky trait methods.
-- **`cross_crate_inlinable` override** (`queries/cross_crate_inlinable.rs`,
-  shipped in F2 / B16). STAYS. This is an independent fix for a
-  different mechanism (rustc's normal cross_crate_inlinable produces
-  available_externally without Sky asking — F2 forces those to real
-  symbols because Sky's CALLERS reference them. Option 4 produces
-  available_externally for Sky's CALLEES because Sky doesn't want
-  rustc to emit them. Different direction, different override; both
-  needed.)
-- **Patch 4 (`extra_modules` hook)** in the rustc fork. STAYS. Sky's
-  body emission still goes through it; Option 4 just stops rustc from
-  emitting competing bodies.
-- **`#![no_builtins]`** on stub rlibs (in `toylangc/src/build.rs:329`).
-  STAYS. It's load-bearing for the LTO-pool exclusion.
-
-### Files you'll touch
-
-| Path | Action |
-|---|---|
-| `rustc-lang-facade/src/queries/codegen_fn_attrs.rs` | CREATE (~90 lines, mirror cross_crate_inlinable.rs) |
-| `rustc-lang-facade/src/queries/mod.rs` | Add module decl + 2 override wirings; REMOVE partition module decl + override wiring |
-| `rustc-lang-facade/src/lib.rs` | Add 2 OnceLocks + extend install_query_defaults signature + 2 accessor fns; consider whether `default_collect_and_partition()` accessor stays (depends on whether toylangc still calls it) |
-| `rustc-lang-facade/src/queries/partition.rs` | DELETE |
-| `toylangc/src/llvm_gen.rs` (search for `default_collect_and_partition`) | Verify the CGU walk for Case 1b discovery still works — either no change (if `tcx.collect_and_partition_mono_items` is fine without the override) or update to use the accessor |
-| `rust-interop-architecture.md` §F.13/§F.14/§5.3 | Update to reflect A.3 retirement |
-| `rust-interop-architecture.md` §25.2 | Add B17 "A.3 partition filter retired via Option 4" |
-| `handoff.md` | Mark Option 4 SHIPPED; retire this whole "Option 4 implementation guide" subsection |
-
-### One last gotcha
-
-The `cross_crate_inlinable` override (F2 / B16) interacts with
-`codegen_fn_attrs` in subtle ways — both decide linkage. The interaction
-to watch: `attrs.linkage = Some(AvailableExternally)` is set BEFORE
-rustc's downstream code consults `cross_crate_inlinable`. If rustc
-checks cross_crate_inlinable on items with explicit linkage already
-set, the result might be ignored (because the linkage is locked).
-That's probably fine — Sky's items would get AvailableExternally from
-this override regardless of what cross_crate_inlinable says about
-them. But if you see weird linkage discrepancies, this is the
-interaction to grep for. Search rustc source for sites that read
-both attrs (`grep -rn "cross_crate_inlinable\|explicit_linkage"
-~/rust/compiler/rustc_monomorphize/src/`).
-
----
-
-## Thread B: share_generics support boundary
-
-### Current support matrix (re-stated)
-
-| Stub rlib | User-bin | Status | How |
-|---|---|---|---|
-| on (forced) | on | works | Vanilla rustc handles cstore lookup |
-| on (forced) | off | works | Patch 5 escape clause consults augmented map |
-| off (explicit) | any | hard-error | `LangDriver::config` exits with diagnostic |
-| (default at __lang_stubs) | any | forced to on | Heuristic in `LangDriver::config` |
-
-We DON'T currently distinguish:
-- User explicitly setting share_generics=true on `__lang_stubs` (works,
-  same as default forced-on).
-- User explicitly setting share_generics=false on user_bin (works at
-  -O>=2 because patch 5 escape fires; works at debug because gate
-  doesn't fire when share_generics is on... wait, in this scenario
-  share_generics is off at user_bin, so gate FIRES at debug too, then
-  the escape clause kicks in — same path as -O3).
-- User setting share_generics=true via `RUSTFLAGS` propagated to all
-  crates including pure-Rust deps. Affects pass-through byte-identity
-  for those crates (vanilla rustc defaults false at -O>=2).
-
-### Open questions for Thread B
-
-1. **Is the hard-error at `__lang_stubs` + share_generics=false too
-   aggressive?** The current behavior: `eprintln!` + `exit(1)`. The
-   user might have legitimate reasons (e.g., wanting to compare
-   behaviors, debugging). Alternatives:
-   - Warning + override (current rejection stays but we force it on
-     anyway with a warning).
-   - Error with an opt-in override flag (`-Z
-     allow-sky-stubs-no-share-generics=yes` or similar).
-   - Current behavior (hard error).
-   What's the right discipline?
-
-2. **Should we also force share_generics=on at `case6_lib` and other
-   Sky lib crates?** The heuristic currently matches only crate name
-   `__lang_stubs` (the bin's own stub rlib). For multi-Sky-crate
-   projects, each Sky lib has its OWN stub rlib (e.g., `case6_lib`'s
-   stub rlib is named `case6_lib`). The release-mode fix works for
-   case6 fixtures empirically, so something's right — but is it
-   because case6_lib doesn't emit Rust generic intermediaries (the
-   user_bin's cascade reaches Wrapper through duplicate at user_bin
-   side, not at case6_lib's stub rlib side)? Or are we missing
-   something?
-
-   **Verify:** trace through `test_case6_app_o3` to see which
-   share_generics setting case6_lib's compile gets. Does the lack
-   of forcing break anything?
-
-3. **Should pure-Rust crates compiled via Sky's rustc respect user's
-   explicit share_generics?** Today: yes. Pure-Rust crate has no
-   marker, so `consumer_lang_active=false`, the escape clause doesn't
-   fire, and rustc behavior is vanilla. The byte-identity invariant
-   is preserved. This seems correct. Just verify with a test.
-
-4. **Should we error/warn if the user passes
-   `RUSTFLAGS="-Z share-generics=yes"` on a project that's mixed
-   Sky + pure Rust?** Forcing share_generics on pure-Rust crates
-   weakens pass-through. Could detect at config time and emit a
-   warning. Not blocking; nice-to-have.
-
-5. **What about `RUSTFLAGS=-Z share-generics=no` on a user_bin?**
-   The bin doesn't have the marker (the upstream stub rlib does).
-   With this set: gate doesn't fire because share_generics is
-   honored (off). Patch 5 escape DOES fire (consumer_lang_active is
-   true because the loaded `__lang_stubs` has the marker). Should
-   work. Verify with a fixture.
-
-### Investigation tasks for Thread B
-
-1. Build the support matrix as actual fixtures, one per cell. Cover:
-   - { stub rlib share_generics = forced default, explicit on,
-     explicit off (error case) }
-   - × { user_bin share_generics = default, explicit on, explicit
-     off }
-   - × { pure-Rust dep share_generics = default, explicit on,
-     explicit off }
-   
-   Realistic minimum: 9 fixtures covering the meaningful subset.
-
-2. Decide and document each cell's behavior. Update
-   `LangDriver::config`'s diagnostic to reflect supported set.
-
-3. Update arch doc §3.2 patch 5 with the support matrix.
-
----
-
-## Thread C: Inlining test matrix (the big one)
-
-### 2026-06-20 update: partially shipped
-
-What landed (uncommitted on the working tree):
-
-| Component | Path | Notes |
-|---|---|---|
-| Harness | `toylangc/tests/common/inlining_harness.rs` | `DisasmContext`, `disassemble_binary`, `assert_no_call_to_symbols_matching`, `assert_call_to_symbol_matching`. Demangles symbols via `rustc-demangle`. Extracts mnemonic via `line.split_once(':')` then first whitespace token — robust to address-prefix in objdump format. |
-| Dev-dep | `toylangc/Cargo.toml` | Added `rustc-demangle = "0.1"` to `[dev-dependencies]`. |
-| Fixtures | `toylangc/tests/integration_projects/inlining/` | 40 subdirectories. Sky source + optional `rust_caller.rs` + `toylang.toml` (with `opt-level`/`lto`/`codegen-units`/`features` knobs) + `expected_output.txt`. Plus shared `case6_lib_inl/` Sky lib used by case6 fixtures. |
-| Test entries | `toylangc/tests/integration_projects.rs` (end-of-file) | 40 `#[test] fn test_inline_*`. Helpers: `run_inlining_project`, `assert_no_sky_branch_in_main`, `assert_no_some_rust_lib_branch_in_main`, `assert_sky_branch_present_in_main`, `assert_no_wrapper_branch`, `assert_wrapper_branch_present`. |
-| Search markers | (in test source) | `SKY_EXPORT_LTO_INLINING_FINDING` (F1), "sibling of B14" (F2), `PRIORITY_B_DISAMBIG_IGNORE`. |
-
-Test tally (Priority A + B + C + D, 40 total + the ported `test_lto_smoke`):
-
-| Phase | Pass | Ignored | Why ignored |
-|---|---|---|---|
-| Priority A — 7 cases × 3 LTO modes at -O3 (21) | 7 | 14 | Sky-export LTO inlining gap (F1) and case3/case5 disambig bug (F2) |
-| Priority B — 4 Rust-top cases × 3 `#[inline]` variants on Rust wrapper at -O3+thin LTO (12) | 6 | 6 | case3/case5 inherit F2 |
-| Priority C — case 4 opt-level sweep (5) | 5 | 0 | — |
-| Priority D — case 4 codegen-units {1, 16} at -O3+thin LTO (2) | 2 | 0 | — |
-| `test_lto_smoke` (ported) | 1 | 0 | Reduced to smoke-only; assertion was vacuous (see F1) |
-| **Total** | **21** | **20** | |
-
-Two findings surfaced (carried to top-of-stack in the TL;DR):
-
-#### F1 — Sky-export LTO inlining gap
-
-At thin/fat LTO + -O3, cases 1a / 2 / 4 / 6 — every case where the user-bin
-boundary is a Sky-EXPORTED non-generic fn — do NOT inline cross-crate.
-Disassembly evidence: the bin's `main` is a single tail-jump
-`b __lang_stubs::__toylang_main` (or `bl __lang_stubs::add_one`); Sky's body
-exists and constant-folds internally (e.g. `lto_smoke` produces `mov w8, #50`
-inside Sky's `__toylang_main`), but the call doesn't get inlined into the
-shim.
-
-Root cause: `toylangc/src/stub_gen.rs:221` emits `#[inline(never)]`
-unconditionally on every Sky export. LLVM honors this during the ThinLTO/FatLTO
-IR linker pass. The `#[inline(never)]` was added for two reasons (per the
-in-source comment): (1) defeats `requires_caller_location_or_inline_never`
-at -O2/-O3 — the share_generics gate the release-mode fix targets; (2)
-prevents rustc's MIR inliner from leaking the `unreachable!()` stub body
-into callers. Both reasons are load-bearing, so relaxing the discipline
-isn't a free choice.
-
-Importantly: Sky GENERICS with a Rust-side type arg (case 1b) DO inline at
-every opt level — because Sky's `per_instance_mir` emits the substituted
-body INTO the user_bin's CGU, where LLVM sees it locally. The gap is
-specific to Sky exports.
-
-The original `test_lto_smoke` assertion was **vacuously passing**: its
-`trimmed.contains("bl\t")` check (now ported to the harness) didn't match
-the `b\t` tail-jump emitted at LTO. Multiple sessions thought the inlining
-promise was empirically verified; it wasn't.
-
-Resolution candidates (in roughly increasing ambition):
-- **(a)** Document the tail-jump cost as the cost of safety. One tail-jump
-  per Sky-export call is real but small; the discipline that produces it
-  closes a class of MIR-inliner / share_generics bugs. Update the perf
-  promise from "interop is free" to "interop costs one tail-jump per
-  Sky-export entry."
-- **(b)** Add a per-export opt-in attribute on Sky source (e.g.
-  `export #[inline] fn add_one(...)`). stub_gen reads it and OMITS
-  `#[inline(never)]` for that export. Requires Sky parser extension + a
-  decision about whether the share_generics gate / MIR inliner leak still
-  apply per-export. Smallest user-facing change with real fix value.
-- **(c)** Replace `#[inline(never)]` with `#[cold]` or a custom attribute
-  that defeats only the MIR inliner without LTO's IR inliner. Requires
-  understanding rustc's inliner-stage hierarchy better than this handoff
-  has investigated.
-
-Investigation entry points: `toylangc/src/stub_gen.rs` (the emission of
-`#[inline(never)]` and its rationale comments); `toylangc/tests/integration_projects.rs`
-(search `SKY_EXPORT_LTO_INLINING_FINDING` for the 6 fixtures that lock
-this in once it's resolved); `rust-interop-architecture.md` §F.13 / §8.9.5
-(the share_generics gate + MIR inliner story `#[inline(never)]` defeats).
-
-#### F2 — case 3 / case 5 disambig bug at -O3
-
-`Rust → Sky generic → Rust impl` (case 3, derived `Clone` on a user_bin-local
-struct) and `Rust → Sky → Rust generic intermediary` (case 5, `Vec`) both
-fail to LINK at -O3, every LTO mode. Linker errors:
-
-```
-case 3 fat LTO:
-  Undefined symbols: __RNvXCs..._13case3_fat_ltoNtB2_9MyCounter
-                       NtNtCs..._4core5clone5Clone5clone
-case 5 no LTO:
-  Undefined symbols: __RNvMNtCs..._5alloc3vecINtB2_3VecJE3new
-                       ...12case5_no_lto
-                     __RNvMsF_NtCs..._5alloc3vecINtB5_3VecJE4push
-                       ...12case5_no_lto
-```
-
-Root cause hypothesis (verify): Sky's `per_instance_mir` emits
-`__lang_stubs::clone_it<MyCounter>` (for case 3) into the user_bin's CGU.
-That body references `<MyCounter as Clone>::clone`. At -O3 with the user_bin
-at default `share_generics=false`, the user_bin's mono collector doesn't
-emit `<MyCounter as Clone>::clone` with the disambig the Sky-emitted call
-site expects — same gate that B14 targeted, but in the OPPOSITE direction
-(B14 was Sky impl reached through Rust generic; F2 is Rust impl reached
-through Sky generic).
-
-Same shape for case 5: `Vec::<i64>::new` / `::push` from `alloc::vec` are
-referenced from Sky's `store_in_vec<i64>` body emitted at user_bin, but
-not emitted with the disambig the call expects.
-
-Resolution candidates:
-- **(a)** Extend `synthesize_upstream_monomorphizations`
-  (`rustc-lang-facade/src/queries/upstream_monomorphization.rs`) to add
-  entries for `<consumer_T as RustTrait>::method` instances that Sky's
-  generic bodies reference. Sky knows the (def_id, args) tuple when its
-  `per_instance_mir` returns the body — capture and synthesize. Mirror of
-  the existing trait-impl synthesis but for Rust impls reached through
-  Sky bodies.
-- **(b)** Add a sixth fork patch that makes user_bin's mono collector
-  re-visit body items referenced by Sky-emitted bodies (so the
-  user_bin's normal mono emits the impl method with its own disambig).
-  Probably larger surface than (a).
-- **(c)** Force `share_generics=true` at user_bin too (via the
-  `LangDriver::config` heuristic) when Sky's machinery is active. Symmetry
-  with the `__lang_stubs` heuristic. Breaks pass-through invariant more
-  broadly than the existing heuristic.
-
-Investigation entry points: `toylangc/tests/integration_projects.rs`
-(search "sibling of B14" — 9 fixtures locked in this finding);
-`rust-interop-architecture.md` §25.2 B14 (the existing release-mode fix
-for the opposite direction);
-`rustc-lang-facade/src/queries/upstream_monomorphization.rs` (the synthesis
-site for path (a)).
-
-### What's still on the table for Thread C
-
-If/when F1 and F2 are resolved, the natural follow-ups for Thread C:
-- **Sky-side `#[inline]` syntax support.** Currently `stub_gen` emits
-  `#[inline(never)]` on every export with no override. Adding a Sky
-  parser-level attribute (e.g. `export #[inline] fn ...`) would unlock
-  Priority B coverage for Sky-top cases (2, 4, 6) — 9 additional fixtures.
-- **Cross-Sky-CGU inlining.** Deferred until Sky partitioning exists.
-- **Cross-rustc-version drift CI fence.** When a nightly bump changes
-  LLVM's inliner thresholds, the matrix may regress. Worth a CI job that
-  reports differences rather than failing hard.
-
-### Original Thread C plan (pre-2026-06-20) — preserved for context
-
-### Current state (pre-shipping)
-
-| Verified | Mechanism |
-|---|---|
-| Sky body inlined into Rust caller at -O3 + thin LTO (Case 2) | `test_lto_smoke` disassembles `lto_smoke::main` and asserts no `bl` to Sky symbols + constant-folded result `mov w8, #50` |
-| Sky-emitted stubs never MIR-inlined | `architecture_fence.rs` asserts `#[inline(never)]` on stubs in stub_gen output |
-
-That's it. Everything else is hopeful inference.
-
-> **Update (2026-06-20):** the first row was vacuously passing — see F1
-> above. The original `test_lto_smoke` `bl\t` substring check didn't match
-> the `b\t` tail-jump LLVM actually emitted. We've been operating on a
-> false belief.
-
-### What the user wants
-
-Quote from session: "we need much more tests for all combinations of
-things that affect inlining. i think we need to go way overboard and
-have an excessive amount of tests for this."
-
-### The matrix
-
-Axes that affect inlining:
-- **7-case taxonomy** (case 1a, 1b, 2, 3, 4, 5, 6 from §2). 7 values.
-- **Direction** (Sky→Rust inlining vs Rust→Sky inlining). 2 values.
-- **opt-level** (-O0 baseline, -O1, -O2, -O3, -Os, -Oz). 6 values.
-- **LTO mode** (no LTO, thin, fat). 3 values.
-- **`#[inline]` annotation on the boundary callee** (none, #[inline],
-  #[inline(always)], #[inline(never)]). 4 values.
-- **codegen-units** (default ≥16, =1). 2 values.
-
-Full cross-product: 7 × 2 × 6 × 3 × 4 × 2 = 2016 cells. Not all
-meaningful. User said "way overboard" so aim for ~50-100 fixtures
-covering the meaningful subset.
-
-### Recommended subset (~40-50 fixtures)
-
-Priority A (catches the most likely real bugs):
-- 7 cases × 3 LTO modes (no, thin, fat) at -O3 = 21 fixtures.
-- Each one asserts via disassembly that the expected inlining happens.
-
-Priority B (annotation interaction):
-- For each of 7 cases at -O3 + thin LTO, add 3 variants: callee with
-  #[inline], #[inline(always)], #[inline(never)]. = 21 more fixtures.
-- Assert the inlining behavior matches the annotation's intent.
-
-Priority C (opt-level sensitivity):
-- For Case 4 only (the canonical hard case), add -O0, -O1, -O2, -Os,
-  -Oz variants. = 5 more fixtures. -O0 should NOT inline; -O1+ should.
-
-Priority D (codegen-units):
-- For Case 4 at -O3, add codegen-units=1 and codegen-units=16 (default
-  is something between; explicit values verify behavior). = 2 fixtures.
-
-Subtotal: 49 fixtures. Add 1-2 for sanity (does Sky's main get inlined
-into the bin shim's main? cross-Sky-CGU when Sky has multiple CGUs —
-deferred until partitioning exists).
-
-### The harness
-
-Current `test_lto_smoke` has the disassembly check inline. Lift it
-into a reusable helper:
-
 ```rust
-fn assert_no_call_to_symbols_in_binary(
-    binary_path: &Path,
-    function_name: &str,
-    forbidden_symbol_pattern: &str,
-) {
-    // Run llvm-objdump -d <binary> to get disassembly.
-    // Find the function by name.
-    // Walk its instructions looking for `bl` / `call` instructions.
-    // For each, resolve the target symbol name via the binary's
-    // relocation table or symbol table.
-    // Assert no target matches `forbidden_symbol_pattern`.
-}
-
-fn assert_call_to_symbol_in_binary(
-    binary_path: &Path,
-    function_name: &str,
-    required_symbol_pattern: &str,
-) {
-    // Inverse: assert that at least one `bl`/`call` target matches.
-}
-
-fn assert_constant_in_function(
-    binary_path: &Path,
-    function_name: &str,
-    expected_constant: u64,
-) {
-    // Assert the function loads the given immediate (e.g.
-    // `mov wN, #50`). Used to verify constant-folding from inlining.
+fn main() {
+    let v: Vec<Widget> = (0..10_000_000).map(|i| Widget { id: i }).collect();
+    drop(v);  // 10M Widget drops
 }
 ```
+Measure: per-drop overhead at lto=false vs lto="thin". Validates that mir_shims elimination doesn't have unexpected drop-perf surprises.
 
-Each fixture's test then becomes:
+**Possible outcomes (per reviewer's pre-discussion):**
+- Bench 1 ratio < 2x: architecture's perf overhead is small even worst-case. Document "LTO recommended but not critical"; lock §5.5 confidently.
+- Bench 1 ratio 2-10x: real cost for tight loops; mitigated by LTO. Document "recommend `[profile.dev] lto = 'thin'` for dev iteration"; lock §5.5.
+- Bench 1 ratio > 10x: architectural cost is significant. Same documentation recommendation; consider whether to investigate the AvailableExternally-or-equivalent alternative.
+- Bench 1 LTO doesn't reduce ratio: architecture has a bug — LTO isn't actually inlining. **DON'T lock §5.5; investigate and fix** before proceeding.
 
-```rust
-#[test]
-fn test_case_X_inlining_at_Y() {
-    run_integration_project_no_run_check("case_X_inlining_at_Y");
-    let bin = shared_cargo_target_dir()
-        .join("debug")
-        .join("case_X_inlining_at_Y");
-    assert_no_call_to_symbols_in_binary(
-        &bin,
-        "case_X_inlining_at_Y::main",
-        ".*sky_lib_function_name.*",
-    );
-}
-```
-
-### Why this is high-value
-
-Inlining is the user-visible perf promise of Sky's interop. If Sky's
-first benchmarks show "Sky→Rust calls are 5× slower than expected,"
-that's because some inlining direction silently failed. The matrix
-catches this BEFORE Sky's first benchmark.
-
-The fat-LTO bug we found via the recent matrix expansion is the
-template for what to expect: most cells will pass, 1-3 will reveal
-real surprises. Each one found pre-Sky-production is hours-of-
-investigation saved later.
-
-### Investigation tasks for Thread C
-
-1. **Build the harness** (~1-2 hours). The disassembly-walking
-   functions above. Test with the existing `test_lto_smoke` to verify
-   it produces the same result.
-
-2. **Build the 21 Priority A fixtures** (~3-4 hours). Each is a
-   small Sky + Rust source pair + a test entry. Use existing case
-   fixtures as templates.
-
-3. **Run them all, report which fail.** This is the actual discovery
-   step. Some failures will be real bugs (like the fat-LTO one);
-   others will be expected-behavior-not-yet-matching-assertions
-   (need to update the assertions).
-
-4. **Iterate.** Fix the real bugs; add Priority B/C/D fixtures.
-   Final count probably ~50-60 fixtures + harness + ~3-5 newly-
-   surfaced bugs.
-
-5. **Long-term: add CI fence**. The matrix should be part of every
-   release-mode test run.
+Schedule: ~1 focused day to write benches + run on representative targets (linux-x86_64 + macos-arm64 if available) + fold numbers into §22.4 doc draft.
 
 ---
 
-## All-the-other-tests recap (from prior recommendations)
+## Implementation backlog (ordered by dependency)
 
-These are things I recommended over the course of the session that
-also didn't land. Roll them into the next session if you want
-complete coverage:
+### Phase A: Empirical baseline fixtures under CURRENT model (1-2 weeks)
 
-- `debug_assertions_off_smoke` — `-C debug-assertions=off` at -O3.
-  Catches MIR-shape changes around `unreachable!` and overflow checks.
-- `opt_level_z_smoke` — `-Oz` (size optimization). Uses a totally
-  different optimization preset.
-- `lto_off_smoke` — explicit `lto = "off"` (vs current implicit
-  default). Validates the toml-parsing path.
-- Pass-through invariant assertion — verify pure-Rust crates compiled
-  via Sky's rustc don't get `@llvm.used` global injected (the SMPLZ
-  pin should be marker-gated).
-- panic=abort enforcement — assert that `LangDriver::config` errors
-  if `panic = "unwind"` is set. Today we silently inherit whatever
-  the user has; arch §16.1 says we require abort.
+Build Fixtures 1-3 from the empirical work backlog under the EXISTING mir_shims-based architecture. These are toylang's FIRST drop tests; they may reveal bugs in existing infrastructure that nothing has ever exercised.
 
-Plus the 4 from the agent audit that aren't biting today but should
-get fixed for production-readiness:
-- Cargo fingerprint sidecar blindness (~1 day)
-- Rustc incremental cache Sky-side blindness (~2-3 days conservative)
-- `deduce_param_attrs` from stub MIR (~half day)
-- Sky-side DWARF emission (~3-6 weeks, separate effort)
+Sequence:
+1. Build Fixture 1 (basic drop chain). Make it pass. Reveals: does toylang's existing drop infrastructure work end-to-end?
+2. Build Fixture 2 (may_dangle). Make it pass. Reveals: does the current implicit-may_dangle behavior work (or does it fail because Sky doesn't explicitly emit may_dangle)?
+3. Build Fixture 3 (linear type runtime panic). Make it pass. Reveals: does Sky's drop function emit and run correctly when triggered?
+
+Each fixture: full mini-project (Cargo.toml, .toylang source, Rust source where applicable), integration test in `tests/integration_projects.rs`, assertions.
+
+**Why first**: these fixtures become the regression suite for ALL subsequent migrations. If fixtures don't pass under the current model, the migration's "passes after migration" claim has no baseline.
+
+**Output**: 3 passing integration fixtures + log of any bugs/surprises found in existing toylang infrastructure during fixture construction.
+
+### Phase B: Perf bench (1 day)
+
+Build Benches 1-3 from the empirical work backlog. Run on representative targets. Report numbers.
+
+**Why second** (after fixtures but before migrations): the reviewer asked us to lead round 4 with bench numbers. Get them early so the round-4 conversation has the data anchor.
+
+**Output**: bench numbers + first draft of §22.4 doc subsection.
+
+### Phase C: Tool attribute infrastructure (1-2 days)
+
+Wire up the `#![register_tool(skyc)]` + `#[skyc::emit_consumer_body]` tool attribute machinery.
+
+Tasks:
+- Stub source's crate root emits `#![register_tool(skyc)]`.
+- Define `sym::skyc_emit_consumer_body` for the attribute name.
+- Verify rustc's `tcx.has_attr(def_id, sym::skyc_emit_consumer_body)` works correctly on tagged items.
+
+**Output**: attribute machinery in place; partition predicate can be migrated next.
+
+### Phase D: Partition predicate migration (1 day, depends on C)
+
+Replace `is_consumer_codegen_target` with the two-gate attribute conjunction (Decision 3). Update skyc's stub_gen to tag items per the Category A/B split.
+
+Tasks:
+- Implement new predicate per Decision 3.
+- Update skyc's stub_gen: tag exported Sky functions, Sky drop fns, Sky trait-impl methods, Sky accessors. Do NOT tag bridges, Phase-6 wrappers, type/trait declarations, the marker.
+- AUDIT classification matchers (`is_consumer_fn`, `is_consumer_accessor_safe`); delete if orphaned post-symbol_name-elimination.
+- Build CI fence: verify 1:1 mapping between tagged items and Sky's emission list.
+
+**Output**: predicate migrated; classification matchers cleaned up; CI fence in place.
+
+### Phase E: mir_shims elimination (1 week, gated on Phase A passing)
+
+Migrate drop handling from mir_shims override to standard Drop impl + Sky drop function via per_instance_mir (Decision 1).
+
+Tasks:
+- Delete `rustc-lang-facade/src/queries/drop_glue.rs`.
+- Remove `mir_shims` from providers registration.
+- Update skyc's stub_gen to emit Drop impl bridges + Sky drop function placeholders for Sky types with cleanup.
+- Extend toylangc's per_instance_mir-driven emission to handle `__sky_drop_X::<T>` instances.
+- Implement the `project_raw_field` helper in skyc's drop emitter (per Decision 1's CI fence requirement).
+- Build CI fence: grep emitter source for direct `builder.build_struct_gep` calls outside `project_raw_field`.
+- Run Fixtures 1-3 (built in Phase A). Verify they STILL PASS under the new model. If any regress, **stop and diagnose**.
+
+**Gating**: Phase A's fixtures must pass first to provide the regression baseline.
+
+**Output**: mir_shims gone; Drop impl bridges + Sky drop functions in stub source; fixtures pass under new model.
+
+### Phase F: symbol_name elimination (half-day)
+
+Remove the symbol_name override (Decision 2).
+
+Tasks:
+- Delete `rustc-lang-facade/src/queries/symbol_name.rs`.
+- Remove `symbol_name` from providers.
+- Delete `compute_consumer_symbol` and the `consumer_symbol_for_callback_name` callback (Tier 3 #12).
+- Verify rustc's default mangler is what Sky's emission now consults.
+
+**Output**: symbol_name override gone; Sky relies on rustc's default mangling.
+
+### Phase G: cdylib build system (3-5 days)
+
+Restructure Sky's toolchain to ship as paired rustc-fork + libsky_backend.so (Decision 4).
+
+Tasks:
+- Restructure `rustc-lang-facade` to compile as cdylib.
+- Modify rustc-fork to load libsky_backend.so via the `CodegenBackend` plugin mechanism (`-Zcodegen-backend=sky` baked into default config).
+- Build runtime version handshake at backend load.
+- Update toolchain bundle structure (Sky toolchain ships rustc-fork + libsky_backend.so + skyc + cargo + LLVM shared libs).
+- Update build scripts for the cdylib model.
+
+**Output**: Sky's backend loadable as cdylib; fast iteration loop unlocked for further work.
+
+### Phase H: cdylib FFI shape (1-2 days, depends on G)
+
+Refactor patch 4 to use `#[repr(C)]` function-pointer struct instead of `&mut dyn ExtraModuleAllocator` (Decision 5).
+
+Tasks:
+- Modify rustc-fork's patch 4: replace `&mut dyn ExtraModuleAllocator<M>` with the function-pointer struct.
+- Update `rustc_codegen_ssa::base::codegen_crate` call site.
+- Update `rustc_codegen_llvm::lib::fill_extra_modules`.
+- Update `rustc-lang-facade/src/extra_modules_hook.rs` consumer-side hook.
+
+**Output**: FFI uses stable-ABI primitives; cdylib pairing failures fail at link, not at runtime.
+
+### Phase I: cache_on_disk_if audit (half-day)
+
+Force `cache_on_disk_if(false)` on every Sky-overridden query (Decision 14).
+
+Tasks:
+- For each Sky-overridden query, install the `_cache_on_disk_if` override returning false:
+  - `per_instance_mir`: verify already declared false in fork patch.
+  - `layout_of`: force false.
+  - `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable`: force false.
+  - `collect_and_partition_mono_items`: verify upstream default; force false if needed.
+- Build the cache-correctness fence (edit-and-rebuild test) from the empirical work backlog.
+- Document the audit results.
+
+**Output**: cache discipline in place; CI fence catches future drift.
+
+### Phase J: u128 typeids + collision detection (2-3 days)
+
+Migrate typeids from u64 to u128 with universe-level collision detection (Decision 6).
+
+Tasks:
+- Change Sky's typeid type to u128.
+- Update `SkyOpaqueType<const T: u64>` → `SkyOpaqueType<const T: u128>` in Sky stdlib stub source.
+- Update universe table key type and add collision-detection on insertion.
+- Update typeid hashing (BLAKE3 truncated to 16 bytes).
+- Update all existing typeid plumbing (sidecar serialization, stub_gen, comptime-recipe encoding).
+- Build collision-error message with clear diagnostic.
+
+**Output**: typeids are u128 throughout; collision detection in place.
+
+### Phase K: Content-hash const args (1 week, depends on J)
+
+Retire slab-pointer-as-u64; replace with content-hash const args (Decision 7).
+
+Tasks:
+- Sky's frontend, at comptime-arg binding, computes BLAKE3 of the (frozen) snapshot content, truncates to u128, synthesizes `ConstKind::Value(u128_bytes)`.
+- Stub source signatures for Sky generic fns with comptime args use `const T: u128`.
+- per_instance_mir looks up values in Sky's universe via the content hash.
+- Sky's typechecker rejects `ptr_eq` on generic-arg references (Approach A from round-2 Q16).
+- Update §13.3 design doc and any code comments referencing the slab-pointer trick.
+
+**Output**: comptime args are content-hashes; slab is purely Sky-internal; cross-invocation symbol matching works automatically.
+
+### Phase L: Per-view ref types (2 weeks, depends on K)
+
+Introduce `SkyRef<T, V>` with View markers (Decision 8). Closed V set (Decision 9).
+
+Tasks:
+- Sky stdlib defines `Frozen`, `Mutable`, `SkyRef<T, V>` with conditional Send/Sync impls.
+- Sky's typechecker tracks group views at every `&` site.
+- Sky's stub_gen emits parametric `SkyRef<T, V>` for Sky references. Picks View at each call site based on Sky's typechecker analysis.
+- Methods emit as one parametric impl per Sky type (`impl<V> SkyRef<T, V> { ... }`). Specialized impls only when behavior differs per view.
+- Owned values: per-type honest Send computation.
+
+**Output**: Send/'static honesty at the Rust boundary; tokio interop fallout deferred to bridge crate work.
+
+### Phase M: Async typestate refinement (3-5 days, depends on L)
+
+Refactor async state machine emission per Decision 10.
+
+Tasks:
+- Sky's stub_gen emits ONE struct per Sky async fn (storage sized for both phases).
+- IntoFuture impl on the type handles polling in either phase.
+- Sky source typechecker tracks NotStarted vs Running typestate.
+- Pin/Unpin declared per migratory/default on the rustc-level type.
+- Sky drop function for state machines dispatches on phase discriminant.
+
+**Output**: async typestate pattern in place; Fixtures 6-9 should pass.
+
+### Phase N: Sky-side recursion handling (2-3 days)
+
+Add memoization + depth counter to `walk_and_stash_internal_callees` (Decision 13).
+
+Tasks:
+- Add visited-set memoization to the walker.
+- Add depth counter aligned with `tcx.recursion_limit()`.
+- Add diagnostic-attribution logic (walk back to user-source entry point on overflow).
+- Build a fixture: pathologically-deep Sky-internal recursion; assert clean compile-time error (not crash).
+
+**Output**: Sky-side walkers safe from runaway recursion.
+
+### Phase O: Drift-observation CI fences (3-5 days)
+
+Build the detection tests for B24/B25/B26 (Decision 15).
+
+Tasks:
+- Cross-crate symbol-name test (B25 detection).
+- Drop-instance-kind coverage tests (B26 detection).
+- Confirm Fixtures 1-9 cover B24 detection requirements.
+- Document fences in §25 risk entries.
+
+**Output**: drift-observation safety net in place.
+
+### Total estimate
+
+~6-10 weeks for a focused engineer:
+- Phase A: 1-2 weeks (empirical baseline).
+- Phase B: 1 day (perf bench).
+- Phase C: 1-2 days (attribute infra).
+- Phase D: 1 day (predicate migration).
+- Phase E: 1 week (mir_shims elimination, gated).
+- Phase F: half-day (symbol_name elimination).
+- Phase G: 3-5 days (cdylib build).
+- Phase H: 1-2 days (FFI shape).
+- Phase I: half-day (cache audit).
+- Phase J: 2-3 days (u128 typeids).
+- Phase K: 1 week (content-hash const args).
+- Phase L: 2 weeks (per-view ref types).
+- Phase M: 3-5 days (async typestate).
+- Phase N: 2-3 days (Sky-side recursion).
+- Phase O: 3-5 days (drift CI fences).
+
+Some can parallelize (cdylib build + FFI shape + cache audit could overlap with content-hash work); some can't (predicate migration must precede mir_shims elimination; both must precede per-view ref types in stub_gen).
 
 ---
 
-## Recommended sequence
+## Doc update plan
 
-If you can do it all:
+After implementation, the architecture doc needs updates reflecting the decisions. Don't do these BEFORE implementation — the doc updates should be backed by the implementation reality, not by predicted reality.
 
-1. **Thread C first** (~10-15 hours): build harness + 30-50 fixtures.
-   Highest risk-reduction value. Will find bugs you don't yet know
-   about. Sets up infrastructure that the other threads can leverage.
+### High-priority rewrites (substantial changes)
 
-2. **Thread A.1+A.2 verification** (~1 day): empirically confirm
-   they're still load-bearing. Cheap, mostly just adds confidence to
-   §F.13 / §8.9.5 doc claims.
+- **§15 (drop semantics):** substantial rewrite around standard Drop impl + Sky drop function model. Add `#[may_dangle]` policy subsection (syntactic rule for synthesized types; user types opt in; stdlib containers annotated). Add Drop-body contract (Sky's drop function must not invalidate field storage). Add the two-category body model (Category A real bodies vs Category B unreachable placeholders + attribute predicate). Drop the mir_shims-override description entirely.
+- **§1.7 (Sky does not surrender LLVM output control):** rewrite leading with backend pluralism. Drop the "MIR vocabulary" framing. Acknowledge engineering reuse as secondary practical reason.
+- **§10 (type representation):** add three explicit reasons for opacity (transitive cascade, exotic layouts, Sky-is-main-character). Update stub-type contract to the broader "Sky's drop must not invalidate field storage" formulation.
+- **§12.1 (Send):** rewrite around per-view ref types `SkyRef<T, V>`. Per-type honest Send for owned values.
+- **§12.2 ('static):** correction — the "honest by construction" framing was wrong. Same Option C extension applies.
+- **§13.3 / §13.4 (slab + content-hash):** rewrite — retire slab-pointer-as-u64; content-hash const args; slab purely Sky-internal.
+- **§14.10 (async two-type split):** rewrite — typestate pattern, not two physical types.
+- **§17 (tokio interop):** restructure — Sky-native async primary, tokio via bridge crate (deferred to when bridge crate exists).
 
-3. **Thread B** (~1 day): build the support matrix as fixtures, decide
-   each cell's behavior, document.
+### Smaller refinements
 
-4. **Thread A.3 investigation** (~1 week): the partition-filter
-   elimination. If path (c) works, this unlocks A.1 and A.2 pruning;
-   significant arch simplification.
+- **§1.2 + §11 (groups):** correction — groups are compile-time, not runtime arenas.
+- **§3.1 (per-Instance body content):** sharpen — per-Instance dep enumeration is the load-bearing reason, not arbitrary-typed const generics.
+- **§3.2 / §B.4 / §C.4 (patch 4):** update with rev 3 shape (function-pointer struct).
+- **§4.1 / §4.2 / §4.3 / §4.4 (distribution):** restructure for cdylib model.
+- **§5.3 (partition filter):** explicit predicate definition + 1:1 invariant + Category A/B split.
+- **§5.4 (LlvmCodegenBackend delegation):** drop symbol_name from override list.
+- **§6.2 (single-symbol):** reframe — single-symbol stays for simplicity, not IR-race protection (partition filter handles that independently).
+- **§6.6.5 (Phase-6 wrappers):** brief comparison of `#[inline(never)]` vs `@llvm.used` (different layers).
+- **§10.6 / §10.8 / §13.7 / §13.8 (typeids):** u128, content-hash mechanism.
+- **§13.9 (no synthetic DefIds):** keep "no new fork surface" framing primary; content-addressing is bonus.
+- **§14.1 / §14.3 / §14.5 / §14.7 (closures/async):** integrate with the new drop model and typestate pattern.
+- **§19 (per_instance_mir):** extend to cover drop functions as just-another-class of Sky-generic-function. Add safety-properties subsection (mentioned-items invariant, recursion safety).
+- **§22.3 (new):** queries Sky touches and cache policy table.
+- **§22.4 (new):** perf model — LTO-first; bench numbers go here.
+- **§25:** add B20-B26 risk entries.
+- **§26:** add NNGZ enforcement note (drift-observation discipline + grep CI).
+- **§29.6 (cdylib as open question):** close — committed for Phase 1.
+- **§F.14.1 / §F.17:** update with post-mir_shims-elimination architecture context.
 
-5. **Other tests recap** (~3-5 days): the various small fixtures and
-   the audit-surfaced bugs. Spread across whichever session has time.
+### Doc-correction discipline
 
-If you can only do one: do Thread C. It's the only one that catches
-bugs we don't yet know exist.
-
----
-
-## Files you'll touch
-
-### For Thread A
-
-| File | Purpose |
-|---|---|
-| `rustc-lang-facade/src/queries/upstream_monomorphization.rs` | A.2's whole-map override |
-| `rustc-lang-facade/src/queries/partition.rs` | A.3's CGU filter |
-| `toylangc/src/toylang/callbacks_impl.rs` (around line 1305) | A.1's capture + the populate drain |
-| `toylangc/src/stub_gen.rs` | A.3 path (c): cfg-guarded stub source rewrite |
-| `rustc-lang-facade/src/driver.rs` | Set `--cfg sky_provides_body` when machinery active |
-
-### For Thread B
-
-| File | Purpose |
-|---|---|
-| `rustc-lang-facade/src/driver.rs::LangDriver::config` | The heuristic + diagnostic |
-| `toylangc/tests/integration_projects/` | New fixtures per the support matrix |
-| `rust-interop-architecture.md` §3.2 patch 5 | Document the support matrix |
-
-### For Thread C
-
-| File | Purpose |
-|---|---|
-| `toylangc/tests/inlining_harness.rs` (new) | Reusable disassembly-assertion functions |
-| `toylangc/tests/inlining_matrix.rs` (new) | The test functions for each cell |
-| `toylangc/tests/integration_projects/inline_*` (new, ~40-50) | Fixtures |
-| `toylangc/tests/integration_projects.rs` | Add `mod inlining_matrix;` or `#[test]` entries |
+Audit other chapters for empirical-backing gaps (similar to §15's now-acknowledged "no empirical backing" status). Add "Status" notes to chapters that lack toylang verification for their main claims. Specifically check §11 (groups), §12 (Send/Sync/'static), §13 (comptime), §14 (closures/async) — these may have similar gaps.
 
 ---
 
-## Gotchas
+## Round 4 prep (when you come back to the reviewer)
 
-### Inlining behavior across rustc versions
+Order matters per reviewer's discipline:
 
-LLVM's inliner thresholds and pass scheduling change between rustc
-versions. Tests that assert specific inlining outcomes can break on
-nightly bumps even when nothing semantic changed. Mitigation: assert
-"inlined OR optimized differently in a way that still produces no `bl`
-to the boundary symbol" rather than "constant-folded to exact value X."
-The `test_lto_smoke` assertion is too tight in this regard; we got
-lucky that it hasn't broken yet.
+1. **Perf bench numbers FIRST.** Bench 1 + Bench 2 + Bench 3 across the lto matrix + O0/O1 dimension + `.text` size + symbol count. This single data point disambiguates whether several major architectural decisions (forced share_generics, cross_crate_inlinable=false, single-symbol-no-AvailableExternally) deliver acceptable UX. Without this number, round 4 has no anchor.
 
-### Symbol-name pattern matching is fragile
+2. **cache_on_disk_if audit results.** Confirmation that the four queries on the reviewer's audit list are correctly handled.
 
-Sky's symbols use v0 mangling with disambig codes that depend on the
-crate's compilation. Patterns like `.*sky_lib.*` should match against
-the symbol's *demangled* form (via `rustc-demangle` or LLVM's symbolizer)
-rather than the raw mangled name. The harness should do the demangling.
+3. **Drop integration fixture outcomes.** Fixtures 1-9 — did they pass under current model? Did they still pass after mir_shims elimination? What surprises surfaced?
 
-### Some inlining only happens at link time
+4. **mir_shims elimination empirical validation.** Specifically: did the round-3 8-agent investigation's predictions hold up? What did the fixtures reveal that the reasoning missed?
 
-Cross-CGU and cross-crate inlining requires LTO. Tests asserting these
-must explicitly set `lto = "thin"` or `lto = "fat"`. Without LTO, the
-linker can't inline across translation units even at -O3.
+5. **Implementation surprises grouped by where they surfaced.** cdylib build setup surprises, FFI shape surprises, per-view ref types coherence surprises, content-hash migration surprises, etc.
 
-### `#[inline(always)]` is a hint, not a guarantee
+DON'T:
+- Reopen design questions that were settled in rounds 1-3.
+- Bring questions that empirical data should answer (cdylib operational details, perf, drop chain correctness).
+- Pad with stylistic refinements.
 
-Even `#[inline(always)]` doesn't force inlining in all cases — LLVM
-refuses if the inliner's heuristics decide it'd produce bad code
-(recursive calls, very large body, sanitizer interaction). Tests
-asserting "inline(always) callee was inlined" should be aware of
-this and use forgiving patterns.
-
-### Sky's `#[inline(never)]` discipline on stubs
-
-`stub_gen` emits `#[inline(never)]` on every Sky export's stub. Tests
-asserting "this is NOT inlined" on Sky stubs should expect the
-discipline to work; tests asserting "this IS inlined" on Sky stubs
-will fail by design.
-
-### Save-temps for debugging fixture failures
-
-When an inlining test fails unexpectedly, the recipe from §25.2 B15's
-playbook applies: `RUSTFLAGS="-C save-temps"` preserves intermediate
-bitcode. `llvm-dis` and `llvm-objdump -d` let you see exactly what
-LLVM did or didn't inline.
+DO:
+- Frame surprises as questions if you genuinely need reviewer input.
+- Quantify everything (bench numbers, fixture counts, line-of-code changes).
+- Note any architectural decision that empirical work suggests we should REVISIT (rare; if it happens, lead with the evidence).
 
 ---
 
-## Long-term context (Sky proper)
+## Open / deferred (do NOT do now)
 
-Sky's actual implementation (Phase 1-9 in arch §28) will rebuild much
-of toylang's infrastructure with Sky's own types. The investigations
-here matter because:
+These are explicitly NOT in scope for the current implementation arc:
 
-- **Thread A's findings shape Sky's frontend.** If A.3 can be
-  eliminated, Sky's frontend doesn't need to maintain the partition
-  filter / capture-ship-replay / synthesize machinery. ~500 lines of
-  facade code retires. Less to port.
+- **Linear-type compile-time error diagnostic spans (v2).** Option 4 path. When implemented, needs real diagnostic-span walk (walk usage_map up to user-source frame). Non-trivial work; defer.
+- **SkyOwn<T> wrapper.** Only relevant if v2 lands ultra-strict-linear tier (Decision 11's deferred extension). Skip for v1.
+- **AvailableExternally-or-equivalent for non-LTO inlining.** Only revisit if Bench 1 reveals 10x+ slowdown the user isn't willing to accept. Otherwise the "LTO-first perf model" stands.
+- **Universe-fingerprint-in-cache-key.** v2 perf optimization that preserves cache benefit while ensuring correctness. v1 uses conservative cache disable (Decision 14).
+- **Drop body contract for non-ZST stub fields.** Allowed in principle (Decision 17); not needed for v1's stub_gen pattern. Revisit if Sky's stub-gen evolves.
+- **Comptime calling Rust functions.** v2 capability. Sky's design KEEPS THE OPTION OPEN but doesn't implement for v1. Design constraints (per round-2 user decision): sky-side comptime evaluator architecture should NOT preclude future "call Rust function via Miri" extension.
+- **Tokio bridge crate.** Sky-stdlib-provided bridge that hides Option C' Send/'static conversions for tokio interop. Real work; defer to when Sky's stdlib + async infrastructure exists.
+- **PinnedDrop-style mechanism.** Reviewer explicitly said "do not invent a PinnedDrop-style mechanism for Sky. The pattern you have is correct and well-trodden." Don't.
 
-- **Thread B's findings shape Sky's user-facing build flags.** Sky's
-  `skyc` orchestrator will need to respect (or override) various
-  share-generics user intents.
+---
 
-- **Thread C's harness is reusable.** Once built, the same harness
-  validates Sky's actual inlining behavior at every nightly bump,
-  every rustc-fork rebuild, and every Sky compiler change. Worth
-  the infra investment.
+## Pre-existing work not covered by the review exchange
+
+Items from prior sessions (mostly the toylang implementation arc) that the 2026-06-23 review exchange didn't touch. These are forward-looking work; do them alongside (or after) the review-exchange implementation backlog. Each is independent of the others.
+
+### 1. Thread B — share_generics support boundary (~1 day investigation + decision)
+
+The `share_generics` compile-time flag controls whether rustc encodes generic mono Instances into the upstream rlib's rmeta for downstream sharing (true) or has each downstream consumer re-mono locally (false). Cargo's default is `share_generics=true` at debug, `false` at release.
+
+Current Sky-side state (pre-review-exchange):
+- Sky's `LangDriver::config` heuristic FORCES `share_generics=true` at every `__lang_stubs`-named crate compile, regardless of user profile.
+- Sky HARD-ERRORS if user explicitly sets `share_generics=false` on `__lang_stubs`.
+- For non-`__lang_stubs` Sky lib crates (e.g., `case6_lib`): NO Sky-side override; respects whatever the user/cargo sets.
+- For pure-Rust crates: NO Sky-side involvement; vanilla rustc behavior.
+
+Open design questions (the original Thread B framing — partially obsoleted by patch 5 retirement 2026-06-22, but the support-matrix question stands):
+1. Is the hard-error at `__lang_stubs` + share_generics=false too aggressive? Alternatives: warning + auto-override, error with opt-in escape flag, current hard-error.
+2. Should the heuristic ALSO force share_generics=on at non-`__lang_stubs` Sky lib crates (e.g., `case6_lib`)? Current behavior empirically works for case6 fixtures, but it's not clear WHY (might be coincidence based on cascade timing).
+3. Should pure-Rust crates compiled via Sky's rustc respect user's explicit share_generics? Current answer: yes (no override fires). Verify with a test.
+4. Should we warn if user passes `RUSTFLAGS="-Z share-generics=yes"` on a mixed Sky+pure-Rust project? Forcing share_generics on pure-Rust deps weakens pass-through byte-identity. Nice-to-have, not blocking.
+5. Should we test `RUSTFLAGS=-Z share-generics=no` on a user_bin specifically? Should work but verify.
+
+Investigation tasks:
+- Build the support matrix as actual fixtures, one per cell. Realistic minimum: 9 fixtures covering `{stub_rlib: default-forced, explicit-on, explicit-off-error} × {user_bin: default, explicit-on, explicit-off} × {pure-Rust dep: default, explicit-on, explicit-off}` (a meaningful subset).
+- Decide each cell's behavior. Update `LangDriver::config`'s diagnostic to reflect the supported set.
+- Update arch doc §3.2 (or wherever share_generics is currently described — patch 5 retirement may have moved this content) with the support matrix.
+
+Priority: lowest urgency in this list. No current user pain; design-space hygiene work. Defer to after the review-exchange backlog if time-constrained.
+
+### 2. Test gaps from prior recommendations (~1-2 days total)
+
+Several test fixtures were recommended in prior sessions but never landed. They cover edge dimensions the existing test suite doesn't:
+
+**`debug_assertions_off_smoke`** — build at `-C debug-assertions=off` at -O3. Catches MIR-shape changes around `unreachable!` and overflow checks that only surface when debug assertions are disabled.
+
+**`opt_level_z_smoke`** — `-Oz` (size optimization) as a profile distinct from existing matrix coverage. -Oz uses a different optimization preset than -O3 / -O2; some bugs only surface there.
+
+**`lto_off_smoke`** — explicit `lto = "off"` (vs current implicit `lto = false` default). Distinct cargo behavior; validates the toml-parsing path.
+
+**Pass-through invariant assertion: verify pure-Rust crates compiled via Sky's rustc don't get `@llvm.used` global injected.** The SMPLZ pin (`pin_in_llvm_used` in `toylangc/src/llvm_gen.rs`) should be MARKER-GATED — only fire for Sky-marked crates. If it fires for pure-Rust crates, that's a real pass-through violation (the output differs from vanilla rustc's output). Test: build a pure-Rust corpus crate via Sky's rustc; verify the binary has NO `@llvm.used` Sky-related symbols.
+
+**panic=abort enforcement: `LangDriver::config` should error if user sets `panic = "unwind"`.** Arch §16.1 requires `panic = "abort"` exclusively. Today we silently inherit whatever the user has. If they accidentally set `panic = "unwind"`, Sky's no-landing-pads emission collides with the runtime expectation → UB at first panic. Diagnostic should be hard-error at config time with clear message.
+
+Each ~30 minutes to a few hours; net ~1-2 days. None blocking; all independently improve test coverage.
+
+### 3. Cargo fingerprint sidecar blindness (~1 day)
+
+SEPARATE from Decision 14's rustc per-query cache discipline. Cargo's fingerprinting is a different layer — cargo decides whether to re-invoke rustc at all based on whether inputs changed. Cargo's standard fingerprint includes source files, dep versions, profile settings. **Cargo does NOT know about Sky's sidecar (`.sky-meta`) files** as part of its fingerprint inputs.
+
+Failure mode: user edits a Sky lib's `.sky` source that changes the lib's sidecar content but NOT its rmeta (e.g., changes a non-export item's body). Cargo sees no change in rustc-visible inputs → skips re-invoking rustc for downstream crates → downstream uses stale Sky-emitted bodies (which were generated from the previous sidecar's universe).
+
+Mitigation: cargo's `links` mechanism or `rerun-if-changed` (via build.rs) can be wired to fingerprint the sidecar. Skyc-generated `build.rs` should emit `cargo:rerun-if-changed=<sidecar path>` for every Sky lib dep.
+
+Verification: a fixture that edits a Sky lib's non-export body, rebuilds without cache wipe, verifies downstream actually re-mono'd the affected Sky generics.
+
+Priority: medium. Not a current user-pain point (Sky toolchain workflow regenerates sidecars on every build), but a real correctness gap in incremental scenarios.
+
+### 4. `deduce_param_attrs` from stub MIR (~half day)
+
+Rustc's `deduce_param_attrs` query analyzes function MIR bodies to infer LLVM parameter attributes (`noalias`, `readonly`, `readnone`, `nocapture`, etc.). These attributes enable LLVM's alias analysis and optimization passes.
+
+For Sky's stub items in the Category B set (post-Decision 3 attribute predicate), the stub body is `unreachable!()`. `deduce_param_attrs` analyzes this empty body and infers... nothing useful. Sky's call sites in Rust source (which use the stub's mangled name) lose param-attr-based optimization.
+
+The real Sky-emitted body (via `fill_extra_modules`) HAS the actual semantics, but it's emitted as LLVM IR directly — `deduce_param_attrs` doesn't run on it.
+
+Fix options:
+- Override `deduce_param_attrs` for Sky stubs to return the attrs Sky knows are correct (Sky's typechecker has the info).
+- Emit the attrs directly on Sky's LLVM IR functions at codegen time (bypass rustc's deduction entirely for Sky-emitted bodies).
+- Accept the perf cost.
+
+Perf impact: probably small for most code (alias analysis at the call-site level is limited without these attrs); could be material for hot paths through Sky APIs. Worth measuring after the main perf bench lands.
+
+Priority: low for correctness, medium for perf-quality. Half-day to implement either fix option once measured.
+
+### 5. Sky-side DWARF emission (~3-6 weeks, significant separate effort)
+
+Sky emits LLVM IR via Inkwell. For debugger usefulness, Sky bodies need DWARF debug info that maps back to Sky source files (line numbers, variable scopes, type info). Today's toylangc emission has minimal-to-no DWARF for Sky bodies.
+
+Architectural commitment (§6.7, §23.3): published Sky libraries ship their `.sky` source alongside artifacts SPECIFICALLY so debug symbols can reference them. The reference is only useful if Sky's emission actually generates DWARF pointing at the source.
+
+Scope:
+- Inkwell DWARF API (`DIBuilder`, `DICompileUnit`, `DIFile`, `DIScope`, `DISubprogram`, `DILocalVariable`, `DIType`, etc.).
+- Sky source span tracking through Sky's typing pass → Temputs → fill_extra_modules emission.
+- Type info for Sky-defined types (mapped to DWARF type entries).
+- Variable scopes for Sky source locals.
+- Line table for Sky source lines.
+- Optimization-friendly debug info (Sky inlines aggressively in some paths; debug info needs to track inlined frames).
+
+Major effort (~3-6 weeks). Not blocking the architecture rollout but significantly improves Sky's UX. Track as known work for Sky proper; toylang may continue without it (minimal debugger usefulness is acceptable for a reference implementation).
+
+Priority: low for v1 architecture; high for Sky proper's user experience.
+
+### 6. Effective-registry merging for cross-Sky-crate dep enumeration (~1 day, low priority)
+
+Course-correct.md item #10 (PARTIAL). Today every Sky-active compile re-derives its dep registry from sidecars + local Temputs. For larger Sky projects with several Sky libs in the build graph, this is O(n²)-ish in the worst case (each lib's compile walks all upstream sidecars).
+
+Optimization: cache a merged Sky universe across libs in a single compile session. Facade-level coordination so each compile pays sidecar-load cost once, not per-Sky-lib.
+
+Not yet investigated rigorously. Probably ~1 day to design + implement once Sky proper or toylangc drives it.
+
+Status under post-review-exchange architecture: lower priority than it was. Compile times haven't been a user pain point and the review-exchange decisions didn't surface this as a bottleneck. Keep on the list but not top-of-stack.
+
+### 7. Wrapper-mode anti-pattern note for Sky proper
+
+Course-correct.md item #13 (REMAINING). Toylangc still uses `RUSTC_WORKSPACE_WRAPPER` wrapper mode (`@MRRIWMZ` arcanum from arch doc). At cargo invocation, toylangc's binary intercepts as the rustc wrapper, parses argv, re-reads `toylang.toml`, and dispatches to either a real rustc compile or its own driver.
+
+The arch doc explicitly calls this arcanum out as "one of two erw arcana with no Sky analog" because Sky's `rustc` is the forked rustc (statically linked OR loaded as cdylib per Decision 4) invoked directly by cargo via `rust-toolchain.toml`.
+
+**Action item for Sky proper's implementation:** do NOT replicate toylang's wrapper-mode dispatch pattern. Sky's distribution model (skyc orchestrator + forked rustc + libsky_backend.so as separate binaries per Decision 4) has no place for the wrapper-mode split. Sky's `bin/rustc` is invoked directly by cargo; no RUSTC_WORKSPACE_WRAPPER interception.
+
+Toylang itself can continue using wrapper-mode (operationally works; architecturally wrong-shape but functionally correct). Retiring toylang's wrapper-mode would be ~2-3 days of work in `toylangc/src/main.rs`; not justified absent a forcing function. The forcing function would be Sky proper's actual implementation work, which forces the split.
+
+Priority: zero for now (defer until Sky proper's toolchain phase begins). Listed here so the Sky proper engineer doesn't accidentally copy the pattern.
+
+### 8. Gotchas — debugging wisdom from prior sessions
+
+General knowledge accumulated through toylang's implementation. Not specific work items, but useful when debugging fixture failures or LLVM-pipeline mysteries.
+
+**Inlining behavior across rustc versions.** LLVM's inliner thresholds and pass scheduling change between rustc versions. Tests that assert specific inlining outcomes can break on nightly bumps even when nothing semantic changed. Mitigation: assert "inlined OR optimized differently in a way that still produces no `bl` to the boundary symbol" rather than "constant-folded to exact value X." Use forgiving patterns.
+
+**Symbol-name pattern matching is fragile.** Sky's symbols use v0 mangling with disambig codes that depend on the crate's compilation. Patterns like `.*sky_lib.*` should match against the symbol's DEMANGLED form (via `rustc-demangle` or LLVM's symbolizer), not the raw mangled name. The harness should do the demangling.
+
+**Some inlining only happens at link time.** Cross-CGU and cross-crate inlining requires LTO. Tests asserting these must explicitly set `lto = "thin"` or `lto = "fat"`. Without LTO, the linker can't inline across translation units even at -O3.
+
+**`#[inline(always)]` is a hint, not a guarantee.** Even `#[inline(always)]` doesn't force inlining in all cases — LLVM refuses if the inliner's heuristics decide it'd produce bad code (recursive calls, very large body, sanitizer interaction). Tests asserting "inline(always) callee was inlined" should be aware of this and use forgiving patterns.
+
+**Sky's `#[inline(never)]` discipline on Phase-6 stubs.** Per §6.6.5, Phase-6 stdlib wrappers carry `#[inline(never)]`. Tests asserting "Phase-6 wrapper is not inlined" should expect the discipline to work; tests asserting "Phase-6 wrapper IS inlined" will fail by design. (Note: this was removed from Sky-item stubs during the F1 investigation — see arch §F.1. Only Phase-6 stdlib wrappers retain it.)
+
+**Save-temps for debugging fixture failures.** When an inlining or codegen test fails unexpectedly, the recipe from arch §25.2 B15's playbook applies: `RUSTFLAGS="-C save-temps"` preserves intermediate bitcode through the LLVM pipeline. `llvm-dis` and `llvm-objdump -d` let you see exactly what LLVM did or didn't inline. Combine with `cargo build -v` to see the exact rustc invocations.
+
+**Worktree-isolated agents may be branched from old revisions.** When using parallel agents (workflow infrastructure) to investigate, pair the agent's reported findings with explicit git SHA verification. Agents in isolated worktrees may report behavior from an old branch state if the parent shell's branch has moved since the worktree was created.
+
+**Wipe BOTH the shared cache AND per-fixture `.toylang-build/`** before destructive probes. The shared cache (`toylangc/target/integration-projects-cache`) and per-fixture build directories are separate; wiping only one can leave the other stale and produce confusing results.
+
+---
+
+## Reference: cross-doc pointers
+
+- `rust-interop-architecture.md` — the architecture design doc. Current state is pre-review; will need updates per the doc update plan above.
+- `toylangc/` — the reference implementation. Most of your code changes land here.
+- `rustc-lang-facade/` — the facade crate. Provider overrides, hook installation. Substantial code changes here too.
+- `~/rust/` — the forked rustc tree. Patch 4 changes land here (Phase H).
+- `tmp/claude-conversation-2026-06-23-836f2993.md` — full review-exchange transcript. ~10,800 lines including pasted articles; the substantive content is roughly half that. Decisions log above is the distillation.
+- `tmp/patch5-empirical-2026-06-21/VERDICT.md` — the empirical contrast probe that validated §F.17 / drove the patch-5 retirement (pre-review, but useful context for understanding the codebase's empirical-validation methodology).
+
+---
+
+## Sanity-checking questions to ask yourself before starting
+
+Before diving into Phase A, confirm you can answer these:
+
+1. What's the difference between Sky's `__sky_drop_X<T>` function and rustc's `drop_in_place::<T>`? (They're different things; `drop_in_place` is rustc's auto-generated drop glue, which calls user-defined `Drop::drop`, which under the new model calls `__sky_drop_X<T>`. Three layers of indirection, each with a specific role.)
+2. What does the `#[skyc::emit_consumer_body]` attribute mean, semantically? (It tags items that Sky will provide bodies for via `fill_extra_modules`; the partition filter removes them from rustc's CGU list; mandatory 1:1 correspondence with Sky's emission list.)
+3. Why is `&mut dyn Trait` wrong across the cdylib FFI boundary but fine across a static-link boundary? (Vtable layout dependency; rustc constructs the vtable, cdylib has to interpret it; vtable layout is `rustc_codegen_ssa`-source-dependent.)
+4. Why content-hash const args instead of slab-pointer-as-u64? (Two content-equal Sky values at different slab offsets would produce two distinct rustc Instances → two MonoItems with same symbol → linker conflict. Content-hash const args dedup at the Instance level.)
+5. Why does toylang have zero drop tests today? (Historical: `test_point_drop` was deleted in 5c.4; nothing replaced it. The mir_shims override is installed but dormant — drop is unexercised in any current fixture.)
+
+If you can't answer one, re-read the relevant section above. If you can, you're ready.
 
 ---
 
 ## What success looks like
 
-When you finish all three threads:
+**Phase A success:** three drop integration fixtures pass cold + warm under current mir_shims model. Any bugs found during fixture construction are documented and fixed.
 
-- **Thread A:** the architecture doc has clear conclusions on
-  whether/how to retire A.1, A.2, A.3. Either: "Investigation
-  confirmed they're necessary, documented why" (no code change), or:
-  "Path (c) works; here's the migration plan." Either outcome is
-  forward progress because the question is answered.
+**Phase B success:** perf bench numbers documented in §22.4 draft. Numbers either confirm "LTO-first model is acceptable" or surface a real perf problem to flag in round 4.
 
-- **Thread B:** the support matrix is documented + fenced by
-  fixtures. Each cell either works as expected or is documented as
-  unsupported with a clear diagnostic.
+**Phases C+D success:** `#[skyc::emit_consumer_body]` attribute machinery in place; partition predicate migrated; orphaned classification matchers deleted; CI fence verifies 1:1 invariant.
 
-- **Thread C:** ~50-60 inlining fixtures all passing OR explicitly
-  failing-with-known-cause + tracked as risks. The harness is
-  reusable for future expansion. Sky's first production benchmark
-  has high confidence that the inlining promise holds.
+**Phase E success:** mir_shims override gone; Fixtures 1-3 still pass under new model; no regression in existing tests; `project_raw_field` discipline in place with CI grep fence.
 
-Test count likely goes from 277 to ~340-360. Architecture doc gains
-~3-5 new subsections (§F.x additions for each thread's findings,
-plus possibly new arcana entries if surprising patterns emerge).
+**Phase F success:** symbol_name override gone; no test regressions; rustc's default mangler is what Sky's emission consults.
 
----
+**Phases G+H success:** Sky's backend ships as cdylib with `#[repr(C)]` function-pointer struct FFI; iteration loop is order-of-magnitude faster.
 
-## Long-tail items inherited from `course-correct.md`
+**Phase I success:** cache_on_disk_if(false) audit complete; cache-correctness fence in place and passing.
 
-`course-correct.md` (kept at repo root for the 20+ code-comment
-references like `course-correct.md item #N`) tracked 18 numbered
-"wrong-track patterns" that erw needed to flip to align with Sky's
-architecture. **16 of 18 are DONE.** Folding the two remaining items
-here so they're visible alongside the active threads:
+**Phase J success:** typeids are u128 throughout; collision detection in place with clear error message; existing tests still pass.
 
-### Item #10 (PARTIAL) — `collect_generic_rust_deps` Instance-keyed body
+**Phase K success:** content-hash const args in use; slab is Sky-internal only; cross-invocation symbol matching works automatically.
 
-**Current state.** `collect_generic_rust_deps(LocalDefId) → Vec<(DefId, args-with-Params)>` was migrated to Instance-keyed input + Sky-side substitution per Approach A (commit-time documented at course-correct.md). The primary single-crate path landed. The cross-crate **effective-registry merging** (so a user_bin's compile can resolve Sky deps reaching across multiple Sky libs without each lib re-discovering independently) was deferred — labeled "E.5-style threading" in the course-correct snapshot.
+**Phase L success:** `SkyRef<T, V>` machinery in place; closed V set documented; per-type honest Send for owned values; existing tests still pass (within the constraints of the new model — some tests may need updating to use the new API surface).
 
-**Why it matters.** Today every Sky-active compile re-derives its dep registry from sidecars + local Temputs. For larger Sky projects with several Sky libs in the build graph, this is O(n²)-ish in the worst case. Effective-registry merging at the facade level would cache a merged universe across libs in a single compile.
+**Phase M success:** async typestate refinement in place; Fixtures 6-9 pass.
 
-**Cost.** Not yet investigated rigorously. Probably ~1 day to design + implement, dependent on whether Sky proper or toylang is the driver.
+**Phase N success:** Sky-side recursion handling in place; pathological-deep-recursion fixture produces clean compile-time error.
 
-**Status under post-F1/F2 architecture.** Lower priority than it was — Sky's compile times haven't been a user pain point and the matrix work and F2 fix didn't surface this as a bottleneck. Keep on the list but not top-of-stack.
+**Phase O success:** drift CI fences in place for B24/B25/B26 detection.
 
-### Item #13 (REMAINING) — wrapper-mode retirement
-
-**Current state.** toylangc still uses `RUSTC_WORKSPACE_WRAPPER` wrapper mode (`@MRRIWMZ` arcanum). At cargo invocation, toylangc's binary intercepts as the rustc wrapper, parses argv, re-reads `toylang.toml`, and dispatches to either a real rustc compile or its own driver. The arch doc explicitly calls this arcanum out as "one of two erw arcana with no Sky analog" because Sky's `rustc` is the forked rustc statically linked with the backend (§4.1) and is invoked directly by cargo via `rust-toolchain.toml`.
-
-**Why it persists.** The wrapper-mode dispatch is convenient for toylang because it lets the same binary play both "skyc orchestrator" and "rustc with consumer machinery" roles. Sky proper's distribution model splits these into two separate binaries (`skyc` + `rustc` — see arch §4.2). Until Sky proper's toolchain distribution is real, toylang has no place for the split.
-
-**Cost.** Significant restructuring of `toylangc/src/main.rs` (lines 39-55, 82-155 per the course-correct entry) — split the wrapper-mode dispatch and the orchestrator's argv handling. Probably ~2-3 days. Best done bundled with Sky's actual toolchain shipping work, since the split has to match Sky's distribution shape.
-
-**Status.** Deferred until Sky proper's toolchain phase begins. Operationally this is fine because the wrapper mode works; it's architecturally wrong-shape but functionally correct.
-
-### Other "what's NOT on the wrong track" items
-
-For completeness, the course-correct doc also documented patterns that were *direction-correct* but needed content changes — all subsequently landed:
-- `queries/layout.rs` opaque-with-size shape
-- `queries/drop_glue.rs` InstanceKind::DropGlue → synthetic body
-- `queries/upstream_monomorphizations_for.rs` force-local-mono
-- `abi_helpers.rs`, `mir_helpers.rs` inherited wholesale per §26.5–26.6
-
-If a future session is auditing the facade for cleanup opportunities, these four files were declared "right shape, content may evolve" — historically the boundary of what was actively re-architected.
-
----
-
-— Previous engineer, via Claude Opus 4.7 (1M context),
-  Claude-Session: https://claude.ai/code/session_014jTbwcznQUd4i89tbLMdAa
+**Overall success:** Round 4 with the reviewer happens. We bring bench numbers + audit results + fixture outcomes + implementation surprises. The conversation is grounded in data rather than reasoning. Architecture is sharper for having gone through implementation reality.
