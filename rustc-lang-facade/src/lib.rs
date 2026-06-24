@@ -481,10 +481,8 @@ static DEFAULT_CROSS_CRATE_INLINABLE:
     OnceLock<queries::cross_crate_inlinable::CrossCrateInlinableFn> = OnceLock::new();
 static DEFAULT_EXTERN_CROSS_CRATE_INLINABLE:
     OnceLock<queries::cross_crate_inlinable::ExternCrossCrateInlinableFn> = OnceLock::new();
-static DEFAULT_CODEGEN_FN_ATTRS:
-    OnceLock<queries::codegen_fn_attrs::CodegenFnAttrsFn> = OnceLock::new();
-static DEFAULT_EXTERN_CODEGEN_FN_ATTRS:
-    OnceLock<queries::codegen_fn_attrs::ExternCodegenFnAttrsFn> = OnceLock::new();
+// DEFAULT_CODEGEN_FN_ATTRS / DEFAULT_EXTERN_CODEGEN_FN_ATTRS retired
+// 2026-06-22 (Option 4 retirement — see arch §F.14.1 design history).
 
 /// Mutable state. Locked only by callbacks that need &mut consumer_state.
 static MUTABLE_STATE: OnceLock<std::sync::Mutex<Box<dyn Any + Send + Sync>>> = OnceLock::new();
@@ -1106,20 +1104,16 @@ pub(crate) fn install_query_defaults(
         queries::cross_crate_inlinable::CrossCrateInlinableFn,
     extern_cross_crate_inlinable:
         queries::cross_crate_inlinable::ExternCrossCrateInlinableFn,
-    codegen_fn_attrs:
-        queries::codegen_fn_attrs::CodegenFnAttrsFn,
-    extern_codegen_fn_attrs:
-        queries::codegen_fn_attrs::ExternCodegenFnAttrsFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
     let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
     // upstream_monomorphizations{_for} params retired 2026-06-21 (A.2).
+    // codegen_fn_attrs params retired 2026-06-22 (Option 4 retirement —
+    // see arch §F.14.1 design history).
     let _ = DEFAULT_CROSS_CRATE_INLINABLE.set(cross_crate_inlinable);
     let _ = DEFAULT_EXTERN_CROSS_CRATE_INLINABLE.set(extern_cross_crate_inlinable);
-    let _ = DEFAULT_CODEGEN_FN_ATTRS.set(codegen_fn_attrs);
-    let _ = DEFAULT_EXTERN_CODEGEN_FN_ATTRS.set(extern_codegen_fn_attrs);
 }
 
 /// Accessor for the saved upstream `cross_crate_inlinable` provider.
@@ -1137,22 +1131,8 @@ pub fn default_extern_cross_crate_inlinable()
         .expect("default_extern_cross_crate_inlinable: not installed yet")
 }
 
-/// Accessor for the saved upstream `codegen_fn_attrs` provider (local items).
-/// Used by the Option 4 override to delegate before mutating linkage on
-/// consumer-defined items. See `queries::codegen_fn_attrs` for the override.
-pub fn default_codegen_fn_attrs() -> queries::codegen_fn_attrs::CodegenFnAttrsFn {
-    *DEFAULT_CODEGEN_FN_ATTRS.get()
-        .expect("default_codegen_fn_attrs: not installed yet")
-}
-
-/// Accessor for the saved upstream extern `codegen_fn_attrs` provider
-/// (items decoded from rmeta). Used symmetrically to the local accessor.
-pub fn default_extern_codegen_fn_attrs()
-    -> queries::codegen_fn_attrs::ExternCodegenFnAttrsFn
-{
-    *DEFAULT_EXTERN_CODEGEN_FN_ATTRS.get()
-        .expect("default_extern_codegen_fn_attrs: not installed yet")
-}
+// default_codegen_fn_attrs / default_extern_codegen_fn_attrs accessors
+// retired 2026-06-22 (Option 4 retirement — see arch §F.14.1 design history).
 
 #[cfg(test)]
 mod tests {
