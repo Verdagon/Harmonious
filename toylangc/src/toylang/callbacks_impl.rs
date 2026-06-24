@@ -320,35 +320,11 @@ impl ToylangCallbacks {
     // variant likewise becomes vestigial. Tests on the log shape no
     // longer rely on accessor entries.
 
-    /// Path B / single-symbol architecture (Phase 4.5): return the
-    /// rustc-default mangled symbol name for `instance`.
-    ///
-    /// Sky's bitcode now emits every rustc-visible consumer body (exports,
-    /// accessors, trait-impl methods) under the rustc-mangled name rustc
-    /// would have given the stub fn. Call sites and definitions share one
-    /// symbol; ThinLTO sees a single definition and inlines it cross-
-    /// module. The previous two-symbol scheme (`__toylang_impl_*` vs
-    /// rustc-mangled stub) confused ThinLTO into inlining the
-    /// `unreachable!()` stub body.
-    ///
-    /// `crate::default_symbol_name()` returns the saved upstream
-    /// `SymbolNameFn`. Calling it directly (not `tcx.symbol_name(...)`)
-    /// dodges re-entrance through the facade's `lang_symbol_name`
-    /// override.
-    ///
-    /// The `_name` parameter (callback-name shape from the facade) is now
-    /// unused for routing but kept in the signature so the trait method
-    /// stays stable until Tier 3 #12 retires the
-    /// `consumer_symbol_for_callback_name` callback entirely.
-    pub fn compute_consumer_symbol<'tcx>(
-        &self,
-        _name: &str,
-        tcx: TyCtxt<'tcx>,
-        instance: ty::Instance<'tcx>,
-    ) -> String {
-        let default = rustc_lang_facade::default_symbol_name();
-        default(tcx, instance).name.to_string()
-    }
+    // `compute_consumer_symbol` retired 2026-06-24 (Phase F). It was the
+    // body of `consumer_symbol_for_callback_name`, which retired at the
+    // same time. Sky-side symbol-name lookups now go through
+    // `compute_fn_symbol` (which itself reads `tcx.symbol_name(instance)`
+    // directly post-Phase-F).
 
     /// Populate `state.toylang_instances` + `state.walked_entry_points` by
     /// walking the partitioner's CGU list + recursively resolving each
@@ -1120,18 +1096,9 @@ impl LangCallbacks for ToylangCallbacks {
         self.collect_generic_rust_deps_inner(state(s), name, tcx, instance)
     }
 
-    fn consumer_symbol_for_callback_name<'tcx>(
-        &self,
-        name: &str,
-        tcx: TyCtxt<'tcx>,
-        instance: ty::Instance<'tcx>,
-    ) -> String {
-        // Tier 3 #9: stateless. Pure function of (self.registry, name,
-        // tcx, instance). No `&mut dyn Any state`; no `MUTABLE_STATE`
-        // lock at the facade level. The trampoline takes no `state`
-        // either (mirrors `monomorphize_type`).
-        self.compute_consumer_symbol(name, tcx, instance)
-    }
+    // `consumer_symbol_for_callback_name` retired 2026-06-24 (Phase F).
+    // The symbol_name override that drove it is gone; emission reads
+    // `tcx.symbol_name(instance)` directly via `compute_fn_symbol`.
 
     fn consumer_fill_modules<'tcx>(
         &self,
@@ -2166,15 +2133,18 @@ fn collect_rust_type_names(ty: &crate::toylang::typed_ast::ResolvedType) -> Vec<
 ///
 /// Used at populate sites where Sky's bitcode emission needs to match the
 /// symbol rustc would have given the stub fn — so call sites and definition
-/// share one symbol. Calls `default_symbol_name()` directly (not
-/// `tcx.symbol_name(...)`) to dodge re-entrance through the facade's
-/// `lang_symbol_name` override.
+/// share one symbol (arch §6.2 single-symbol architecture).
+///
+/// Post-Phase-F (2026-06-24, handoff Decision 2): reads `tcx.symbol_name(...)`
+/// directly. Pre-Phase-F this went through `rustc_lang_facade::default_symbol_name()`
+/// to dodge re-entrance through the facade's `lang_symbol_name` override.
+/// With the override retired, the override-bypass is no longer needed —
+/// `tcx.symbol_name(instance)` calls the rustc default mangler directly.
 ///
 /// The `_name` parameter (registry name) is unused for naming but kept for
 /// observability / future log entries.
 pub fn compute_fn_symbol<'tcx>(_name: &str, tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> String {
-    let default = rustc_lang_facade::default_symbol_name();
-    default(tcx, instance).name.to_string()
+    tcx.symbol_name(instance).name.to_string()
 }
 
 

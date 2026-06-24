@@ -238,37 +238,17 @@ pub trait LangCallbacks: Send + Sync {
         instance: ty::Instance<'tcx>,
     ) -> Vec<(DefId, GenericArgsRef<'tcx>)>;
 
-    /// Called from the `symbol_name` query provider for each concrete
-    /// consumer entry-point Instance. Returns the extern symbol the consumer
-    /// has chosen for this Instance.
-    ///
-    /// **Tier 3 #9 (stateless).** Pre-#9 this method was named
-    /// `notify_concrete_entry_point` and held `&mut dyn Any state`; it
-    /// served as a discovery side-channel that stashed Instances into
-    /// codegen state. Phase C (Session 11) migrated discovery to the
-    /// `after_expansion` entry-point walk, and #9 retires the side
-    /// effect. The method now returns a symbol name as a pure function
-    /// of `(self, callback_name, tcx, instance)` — no consumer state
-    /// mutation. This is what unlocks dropping the @GCMLZ thread-local
-    /// fat-pointer bypass (Session 5): without re-entrant state
-    /// mutation through `symbol_name`, the trampoline never re-locks.
-    ///
-    /// The `callback_name` is a routing prefix the facade chose based on
-    /// the Instance's kind:
-    /// - `__impl_method__<Self>__<Trait>__<m>` for trait-impl methods
-    /// - `<Self>.<field>` for accessor methods
-    /// - `<fn_name>` for free fns
-    ///
-    /// The consumer mangles to its own symbol scheme. Toylang's
-    /// `consumer_symbol_for_callback_name` defers to its existing
-    /// `notify_concrete_entry_point_inner` helper (minus the log push)
-    /// which already had the mangling logic.
-    fn consumer_symbol_for_callback_name<'tcx>(
-        &self,
-        callback_name: &str,
-        tcx: TyCtxt<'tcx>,
-        instance: ty::Instance<'tcx>,
-    ) -> String;
+    // `consumer_symbol_for_callback_name` retired 2026-06-24 (Phase F of
+    // handoff.md Decision 2). The symbol_name override that drove it is
+    // gone; Sky's emission consults `tcx.symbol_name(instance)` directly,
+    // matching rustc's default v0 mangler. Single-symbol architecture
+    // (arch §6.2) means call sites and definitions share one name by
+    // construction — there's no consumer-chosen rename to delegate.
+    //
+    // Pre-retirement history: this method was the `notify_concrete_entry_point`
+    // discovery side-channel pre-Tier-3-#9, then a stateless symbol-name
+    // router until Phase F retired the override entirely. See arch §F.18
+    // for the broader retirement context.
 
     /// Called after rustc's analysis phase completes.
     fn after_rust_analysis<'tcx>(&self, state: &mut dyn Any, tcx: TyCtxt<'tcx>);
@@ -374,17 +354,9 @@ struct StatefulVtable {
         ty::Instance<'tcx>,
     ) -> Vec<(DefId, GenericArgsRef<'tcx>)>,
 
-    // Tier 3 #9: stateless successor to `notify_concrete_entry_point`. No
-    // `&mut state` parameter; dispatched without locking `MUTABLE_STATE`,
-    // matching the `monomorphize_type` pattern. The thread-local fat-pointer
-    // bypass (Session 5) becomes obsolete because no consumer state is
-    // mutated via the `symbol_name` re-entrance path.
-    consumer_symbol_for_callback_name: for<'tcx> fn(
-        &(dyn Any + Send + Sync),
-        &str,
-        TyCtxt<'tcx>,
-        ty::Instance<'tcx>,
-    ) -> String,
+    // `consumer_symbol_for_callback_name` slot retired 2026-06-24 (Phase F).
+    // The override that consumed it is gone; emission reads
+    // `tcx.symbol_name(instance)` directly.
 
     after_rust_analysis: for<'tcx> fn(
         &(dyn Any + Send + Sync),
@@ -474,7 +446,8 @@ pub type CollectAndPartitionFn = for<'tcx> fn(
 static DEFAULT_LAYOUT_OF: OnceLock<queries::layout::LayoutOfFn> = OnceLock::new();
 // DEFAULT_MIR_SHIMS retired 2026-06-23 (Phase E — drop is no longer
 // architecturally special; rustc's default DropGlue path fires unchanged).
-static DEFAULT_SYMBOL_NAME: OnceLock<queries::symbol_name::SymbolNameFn> = OnceLock::new();
+// DEFAULT_SYMBOL_NAME retired 2026-06-24 (Phase F — Sky's emission reads
+// `tcx.symbol_name(instance)` directly; no override to dodge anymore).
 // No DEFAULT_PER_INSTANCE_MIR: the upstream default returns None unconditionally
 // (see comment near `default_collect_and_partition`).
 static DEFAULT_COLLECT_AND_PARTITION: OnceLock<CollectAndPartitionFn> = OnceLock::new();
@@ -775,49 +748,36 @@ pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> boo
     )
 }
 
-/// Accessor-method structural check (cross-crate-safe). Shared between
-/// the partitioner-override consumer filter, the `per_instance_mir`
-/// override's consumer filter, and `queries/symbol_name.rs`. Walks
-/// `opt_associated_item` to find the impl's self type structurally
-/// (via `instantiate_identity` — inspection, not instantiation) and
-/// compares its ADT name against `is_consumer_type`. Safe from any
-/// phase — the `def_path_str` trap (@DPSFDOZ) isn't reached.
-///
-/// Phase 2 C.6: excludes trait-impl methods (where `impl_trait_ref` is
-/// Some). Those route through `is_consumer_trait_impl_method` instead and
-/// get a distinct mangled symbol (`__toylang_impl__<Self>__<Trait>__<m>`)
-/// so that body codegen can find them under a different key than
-/// inherent-impl accessors.
-pub(crate) fn is_consumer_accessor_safe<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
-    let Some(assoc_item) = tcx.opt_associated_item(def_id) else {
-        return false;
-    };
-    let impl_def_id = assoc_item.container_id(tcx);
-    // Phase 2 C.6 — discriminate inherent from trait impls. Trait impls go
-    // through is_consumer_trait_impl_method.
-    if tcx.impl_opt_trait_ref(impl_def_id).is_some() {
-        return false;
-    }
-    // instantiate_identity: structural inspection only — we want the impl's
-    // self type with its own params as placeholders so we can read the ADT
-    // name. We are not producing a concrete type here.
-    let self_ty = tcx.type_of(impl_def_id).instantiate_identity();
-    if let ty::TyKind::Adt(adt_def, _) = self_ty.kind() {
-        let struct_name = tcx.item_name(adt_def.did()).to_string();
-        return is_consumer_type(&struct_name);
-    }
-    false
-}
+// `is_consumer_accessor_safe` retired 2026-06-24 (Phase F). Its callers
+// were `is_consumer_codegen_target` (rewritten as the attribute-based
+// two-gate conjunction in Phase D) and `queries/symbol_name.rs` (the
+// override itself retired in Phase F). The "is this an inherent-impl
+// accessor on a consumer type?" question is now answered structurally
+// by the `#[toylang::emit_consumer_body]` tag stub_gen attaches to the
+// accessor method at emission — predicate-driven classification is no
+// longer needed at the facade layer. `is_consumer_trait_impl_method`
+// remains because the cascade drain at `consumer_fill_modules` still
+// uses it to detect Sky-defined trait impls in rustc's mono partition
+// (a different concern: detecting downstream-discovered Instances we
+// need to emit bodies for, not classifying our own stub items).
 
 /// Phase 2 C.6 — discriminate a trait-impl method on a consumer type.
 /// Returns `Some((self_type_name, trait_short_name, method_name))` when
 /// `def_id` is a method inside an `impl <RustTrait> for <ConsumerType>`
 /// block; None otherwise.
 ///
-/// Used by `queries/symbol_name.rs` to build a trait-impl-specific callback
-/// name (so the consumer's `notify_concrete_entry_point_inner` can mangle
-/// to `__toylang_impl__<Self>__<Trait>__<m>` instead of the accessor
-/// pattern). Also used by the consumer-codegen-target filter.
+/// Post-Phase-F caller: the toylangc-side cascade drain
+/// (`collect_consumer_trait_impl_instances`) walks rustc's mono partition
+/// at `consumer_fill_modules` time and filters `MonoItem::Fn(instance)`
+/// entries through this predicate to detect downstream-discovered Sky
+/// trait impls (case 4 / case 6 of arch §2's taxonomy) — Sky's
+/// `fill_extra_modules` then emits real bodies for them.
+///
+/// Pre-Phase-F it was also consumed by `queries/symbol_name.rs` to route
+/// a trait-impl-specific callback name (`__impl_method__<Self>__<Trait>__<m>`)
+/// through the consumer's symbol-name handler. With the symbol_name
+/// override retired (handoff Decision 2), the routing path is gone;
+/// only the cascade-drain detection remains.
 pub fn is_consumer_trait_impl_method<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
@@ -890,22 +850,8 @@ pub(crate) fn call_collect_generic_rust_deps<'tcx>(
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, name, tcx, instance)
 }
 
-/// Call the consumer's `consumer_symbol_for_callback_name`. **Tier 3 #9
-/// (stateless).** No `MUTABLE_STATE` lock; mirrors `call_monomorphize_type`.
-/// The previous `call_notify_concrete_entry_point` held the mutex (with a
-/// thread-local fat-pointer bypass for re-entrance via @GCMLZ) — both are
-/// gone. The override is now a pure read.
-pub(crate) fn call_consumer_symbol_for_callback_name<'tcx>(
-    name: &str,
-    tcx: TyCtxt<'tcx>,
-    instance: ty::Instance<'tcx>,
-) -> String {
-    let c = CONFIG.get().expect("config not installed");
-    let func = c.stateful_vtable.consumer_symbol_for_callback_name;
-    let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
-    // Safety: callbacks is immutable (from CONFIG, no lock needed).
-    (func)(unsafe { &*callbacks_ptr }, name, tcx, instance)
-}
+// `call_consumer_symbol_for_callback_name` retired 2026-06-24 (Phase F)
+// alongside the symbol_name override that drove it.
 
 /// Call the consumer's after_rust_analysis. Holds the mutable state mutex for the entire call.
 pub(crate) fn call_after_rust_analysis<'tcx>(tcx: TyCtxt<'tcx>) {
@@ -964,17 +910,10 @@ pub(crate) fn default_layout_of() -> queries::layout::LayoutOfFn {
 }
 
 // `default_mir_shims()` accessor retired 2026-06-23 (Phase E).
-
-/// Returns the saved upstream `symbol_name` provider for direct call.
-///
-/// Pub (not pub(crate)) so consumers can call rustc's default mangler for
-/// a concrete `Instance` without re-entering `lang_symbol_name` — Path B
-/// (Phase 4.5 single-symbol architecture) uses this to make
-/// `consumer_symbol_for_callback_name` return the rustc-mangled name
-/// rather than synthesizing `__toylang_impl_*`.
-pub fn default_symbol_name() -> queries::symbol_name::SymbolNameFn {
-    *DEFAULT_SYMBOL_NAME.get().expect("default symbol_name not saved")
-}
+// `default_symbol_name()` accessor retired 2026-06-24 (Phase F). The
+// override is gone, so Sky's emission can read the mangler directly via
+// `tcx.symbol_name(instance)` — no need to bypass re-entrance through a
+// saved provider pointer.
 
 // No `default_per_instance_mir` accessor: vanilla rustc's default provider
 // (installed by `rustc_mir_transform::provide` per the fork's patch 3) always
@@ -1029,14 +968,7 @@ fn trampoline_collect_generic_rust_deps<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().collect_generic_rust_deps(state, name, tcx, instance)
 }
 
-fn trampoline_consumer_symbol_for_callback_name<'tcx, C: LangCallbacks + 'static>(
-    data: &(dyn Any + Send + Sync),
-    name: &str,
-    tcx: TyCtxt<'tcx>,
-    instance: ty::Instance<'tcx>,
-) -> String {
-    data.downcast_ref::<C>().unwrap().consumer_symbol_for_callback_name(name, tcx, instance)
-}
+// `trampoline_consumer_symbol_for_callback_name` retired 2026-06-24 (Phase F).
 
 fn trampoline_after_rust_analysis<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
@@ -1078,7 +1010,7 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
         stateful_vtable: StatefulVtable {
             monomorphize_type: trampoline_monomorphize_type::<C>,
             collect_generic_rust_deps: trampoline_collect_generic_rust_deps::<C>,
-            consumer_symbol_for_callback_name: trampoline_consumer_symbol_for_callback_name::<C>,
+            // consumer_symbol_for_callback_name slot retired 2026-06-24 (Phase F).
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
             on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
             consumer_fill_modules: trampoline_consumer_fill_modules::<C>,
@@ -1105,9 +1037,12 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
 /// `per_instance_mir` is intentionally absent — its upstream default returns
 /// None unconditionally (the fork's patch 3), so the override file returns
 /// None directly instead of calling through a saved default.
+///
+/// `symbol_name` retired 2026-06-24 (Phase F). With the override gone, Sky's
+/// emission sites can read the mangler directly via `tcx.symbol_name(instance)`
+/// — no need for a saved upstream pointer to dodge re-entrance.
 pub(crate) fn install_query_defaults(
     layout_of: queries::layout::LayoutOfFn,
-    symbol_name: queries::symbol_name::SymbolNameFn,
     collect_and_partition: CollectAndPartitionFn,
     cross_crate_inlinable:
         queries::cross_crate_inlinable::CrossCrateInlinableFn,
@@ -1116,7 +1051,7 @@ pub(crate) fn install_query_defaults(
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     // mir_shims default retired 2026-06-23 (Phase E).
-    let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
+    // symbol_name default retired 2026-06-24 (Phase F).
     let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
     // upstream_monomorphizations{_for} params retired 2026-06-21 (A.2).
     // codegen_fn_attrs params retired 2026-06-22 (Option 4 retirement —

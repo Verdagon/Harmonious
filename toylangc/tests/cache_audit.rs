@@ -18,7 +18,15 @@
 //! | layout_of                          | (no clause → default false)          | Macro default is `false`; never disk-cached |
 //! | cross_crate_inlinable              | (no clause → default false)          | Same |
 //! | collect_and_partition_mono_items   | `eval_always`                        | Re-runs every compile; never cached |
-//! | symbol_name                        | `cache_on_disk_if { true }`          | Override scheduled for removal per Decision 2; default rustc behavior is Instance-keyed → correct invalidation by construction |
+//!
+//! `symbol_name` override retired 2026-06-24 (Phase F, handoff Decision 2).
+//! Rustc's default v0 mangler now produces every consumer symbol — call
+//! sites and the `fill_extra_modules` emission share a single name by
+//! construction (arch §6.2). The cache-safety question for symbol_name
+//! is moot post-retirement: rustc's default behavior is Instance-keyed,
+//! and the cache key includes the type args, so Sky's universe-state
+//! changes (typeid drift, sidecar updates) flow through correctly via
+//! Instance variation.
 //!
 //! This fence preserves the audit findings as code-level documentation:
 //! the test enumerates every override file Sky ships and asserts each
@@ -40,10 +48,12 @@ const QUERIES_DIR: &str = "../rustc-lang-facade/src/queries";
 /// file's comments). The marker captures the audit finding for that
 /// query in human-readable form. Future override changes that don't
 /// match the marker substring fail this test, forcing a fresh audit.
+///
+/// `symbol_name.rs` removed from this list 2026-06-24 (Phase F): the
+/// override is retired; there's no longer a file to audit.
 const EXPECTED_AUDIT_MARKERS: &[(&str, &str)] = &[
     ("layout.rs", "cache-audit:"),
     ("per_instance.rs", "cache-audit:"),
-    ("symbol_name.rs", "cache-audit:"),
     ("partition.rs", "cache-audit:"),
     ("cross_crate_inlinable.rs", "cache-audit:"),
 ];

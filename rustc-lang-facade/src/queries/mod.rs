@@ -3,11 +3,22 @@
 //! Rustc's compilation is driven by a demand-driven query system. We override
 //! these providers: `layout_of` (type layout), `per_instance_mir` (per-Instance
 //! synthetic dep-registering bodies for consumer fns, plus per-T bodies for
-//! Sky drop functions like `__sky_drop_X<T>` post-Phase-E), `symbol_name`
-//! (consumer symbol mapping), `collect_and_partition_mono_items` (filter
-//! consumer items out of rustc's CGU list), and `cross_crate_inlinable`
-//! (forces real `.o` symbols for cross-crate inlinable items in
-//! consumer-active compiles — closes B16).
+//! Sky drop functions like `__sky_drop_X<T>` post-Phase-E),
+//! `collect_and_partition_mono_items` (filter consumer items out of rustc's
+//! CGU list), and `cross_crate_inlinable` (forces real `.o` symbols for
+//! cross-crate inlinable items in consumer-active compiles — closes B16).
+//!
+//! `symbol_name` override retired 2026-06-24 (Phase F of handoff.md Decision
+//! 2). Under Path B's single-symbol architecture (arch §6.2) the override
+//! was a live no-op — it did shape classification (`is_consumer_fn` /
+//! `is_consumer_trait_impl_method` / `is_consumer_accessor_safe`), built a
+//! callback name, and asked the consumer for a symbol. Toylangc's consumer
+//! impl ignored the callback name and returned rustc's default mangler
+//! result. The classification work was entirely unused at the symbol_name
+//! layer. Sky's bitcode now emits each rustc-visible body under the
+//! rustc-mangled name rustc would have given the stub fn — the call sites
+//! and the definition share one symbol, and rustc's default v0 mangler is
+//! what every site consults. See arch §5.4 and §26.1 (SyMINCZ).
 //!
 //! `mir_shims` override retired 2026-06-23 (Phase E of handoff.md Decision 1).
 //! Drop is no longer architecturally special: rustc's default DropGlue path
@@ -59,7 +70,7 @@ pub mod cross_crate_inlinable;
 pub mod layout;
 pub mod partition;
 pub mod per_instance;
-pub mod symbol_name;
+// `symbol_name` module retired 2026-06-24 (Phase F — see module-level doc).
 // `upstream_monomorphization` module retired 2026-06-21 (A.2 retirement).
 // `codegen_fn_attrs` module retired 2026-06-22 (Option 4 retirement; see
 // arch §F.14.1 design history).
@@ -78,7 +89,6 @@ pub fn lang_override_queries(
     // so install_query_defaults does not save it.
     crate::install_query_defaults(
         providers.queries.layout_of,
-        providers.queries.symbol_name,
         providers.queries.collect_and_partition_mono_items,
         providers.queries.cross_crate_inlinable,
         providers.extern_queries.cross_crate_inlinable,
@@ -89,7 +99,10 @@ pub fn lang_override_queries(
     // DropGlue path fires unchanged; per-type drop semantics come from
     // stub_gen-emitted Drop impl bridges + Sky drop fns via per_instance_mir.
     providers.queries.per_instance_mir = per_instance::lang_per_instance_mir;
-    providers.queries.symbol_name      = symbol_name::lang_symbol_name;
+    // `symbol_name` override retired 2026-06-24 (Phase F). Rustc's default
+    // v0 mangler now produces every consumer symbol — call sites and the
+    // `fill_extra_modules` emission share a single name by construction
+    // (arch §6.2 single-symbol architecture).
     // Partition filter restored 2026-06-22 (Option 4 + patch 5 joint
     // retirement). Filters consumer items out of rustc's CGU list so
     // rustc's LLVM backend never sees them. The consumer's

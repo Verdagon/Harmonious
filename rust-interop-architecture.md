@@ -969,7 +969,7 @@ Sky's machinery activates only for crates that contain the `__SKY_STUBS_MARKER` 
 5. Otherwise, Sky's machinery stays dormant; the compile proceeds vanilla.
 ```
 
-The detection happens after `after_expansion` rather than at startup because rustc needs to have parsed the crate to know its items. The very first Sky-machinery installation step (registering Sky's query providers — `per_instance_mir`, `layout_of`, `symbol_name`, `collect_and_partition_mono_items`, `cross_crate_inlinable` — and the `fill_extra_modules` codegen hook) is gated on the detection result. (`mir_shims` was previously in this set; retired 2026-06-23 — see §15.7 / §F.18.)
+The detection happens after `after_expansion` rather than at startup because rustc needs to have parsed the crate to know its items. The very first Sky-machinery installation step (registering Sky's query providers — `per_instance_mir`, `layout_of`, `collect_and_partition_mono_items`, `cross_crate_inlinable` — and the `fill_extra_modules` codegen hook) is gated on the detection result. (`mir_shims` was previously in this set; retired 2026-06-23 — see §15.7 / §F.18. `symbol_name` was also in this set; retired 2026-06-24 Phase F — see §5.4 / §26.1.)
 
 **Why per-crate marker rather than per-invocation env var.** Earlier in the design conversation, the activation mechanism was `CARGO_PRIMARY_PACKAGE=1`. That's cargo's signal that this is the primary workspace package. The problem: a published Sky library, depended on by a user's Sky project, gets built by cargo as a normal dep — `CARGO_PRIMARY_PACKAGE` is unset. The Sky lib has `.sky` source that needs Sky processing, but with `CARGO_PRIMARY_PACKAGE` unset, Sky's machinery would stay dormant. The Rust stub bodies (`unreachable!()`) would be codegenned into the rlib, and runtime calls would panic.
 
@@ -1087,7 +1087,7 @@ The toylang reference implementation enforces this both ways via `stub_gen::test
 
 > **Design history.** This file resurrected the partition filter from `a51bd7c~1` after a brief 2026-06-21 → 2026-06-22 detour through Option 4 (a `codegen_fn_attrs` override that stamped `AvailableExternally` linkage on consumer items so they were IR-only). Option 4 was smaller in pure LOC but created a CGU-placement hazard: rustc's partitioner could co-locate the AvailableExternally `unreachable!()` body with `main` in the same CGU, and LLVM's intra-CGU inliner at -O3 would inline the panic body into main → runtime SBMNBIZ. Rustc-fork patch 5 papered over this by causing the partitioner to put the AvailableExternally body in a separate CGU. Retiring Option 4 + patch 5 together (2026-06-22) dropped the fork from 5 → 4 patches and eliminated the @SBMNBIZ invariant entirely (no AvailableExternally body to protect against). See §F.14.1 + §F.17 for the design history; `tmp/patch5-empirical-2026-06-21/VERDICT.md` for the empirical contrast probe.
 
-> **Predicate-shape history.** Pre-Phase-C/D (i.e. before 2026-06-24), `is_consumer_codegen_target` was a three-way union: `is_consumer_fn(name)` (name → universe lookup) || `is_consumer_accessor_safe(tcx, def_id)` (structural ADT walk + name check) || `is_consumer_trait_impl_method(tcx, def_id).is_some()` (structural walk for `impl <RustTrait> for <ConsumerType>` methods). The migration to the attribute-based two-gate conjunction (handoff Decision 3) shed the name-based universe dependency, the structural ADT walks, and the ambiguity between Drop-impl-bridge fns and Sky drop fns (both of which had similar name shapes). The three name-based matchers `is_consumer_fn` / `is_consumer_accessor_safe` / `is_consumer_trait_impl_method` remain alive in `queries/symbol_name.rs` (callback-name classification) and `queries/per_instance.rs` (callback-name routing) — they retire together with the symbol_name override in Phase F (handoff Decision 2).
+> **Predicate-shape history.** Pre-Phase-C/D (i.e. before 2026-06-24), `is_consumer_codegen_target` was a three-way union: `is_consumer_fn(name)` (name → universe lookup) || `is_consumer_accessor_safe(tcx, def_id)` (structural ADT walk + name check) || `is_consumer_trait_impl_method(tcx, def_id).is_some()` (structural walk for `impl <RustTrait> for <ConsumerType>` methods). The migration to the attribute-based two-gate conjunction (handoff Decision 3) shed the name-based universe dependency, the structural ADT walks, and the ambiguity between Drop-impl-bridge fns and Sky drop fns (both of which had similar name shapes). Phase F (2026-06-24) retired the `symbol_name` query override (handoff Decision 2) and with it `is_consumer_accessor_safe` (no remaining callers). `is_consumer_fn` stays alive in `queries/per_instance.rs` (callback-name routing into the consumer's dep-collection callback); `is_consumer_trait_impl_method` stays alive in the toylangc-side cascade drain at `consumer_fill_modules` (case 4 / case 6 trait-impl detection in the mono partition).
 
 After the filter override is installed, the rebuilt CGU list reaches `LlvmCodegenBackend::codegen_crate` with consumer items already excised. Rustc compiles only the items that survive the filter (Rust items emitted as part of the stub rlib's source, like Phase-6 wrappers); consumer items never reach LLVM lowering at all.
 
@@ -1174,7 +1174,6 @@ impl CodegenBackend for SkyCodegenBackend {
         // Sky's overrides:
         //   - per_instance_mir (Sky-defined items' synthetic dep-discovery body),
         //   - layout_of (for Sky types),
-        //   - symbol_name (for Sky items — see @SyMINCZ),
         //   - collect_and_partition_mono_items (restored 2026-06-22:
         //         filters consumer items out of the CGU list so rustc
         //         emits no .o symbol for them; the consumer's
@@ -1183,6 +1182,11 @@ impl CodegenBackend for SkyCodegenBackend {
         //         (B16: false in Sky-active compiles to keep real .o symbols
         //         for items Sky's call sites reference).
         // Retired (do NOT install):
+        //   - symbol_name (retired 2026-06-24, Phase F — single-symbol
+        //         architecture means Sky's bitcode emits each rustc-visible
+        //         body under the same rustc-mangled name rustc's default v0
+        //         mangler would give the stub fn; no override needed. See
+        //         §6.2 + §26.1, handoff Decision 2.);
         //   - mir_shims (retired 2026-06-23, Phase E — drop semantics now
         //         flow through rustc's standard DropGlue path; per-Sky-type
         //         bodies come from a compiler-synthesized `Drop::drop(&local)`
@@ -1413,24 +1417,19 @@ The Clone impl is in Sky's stub rlib because Sky owns the Widget type (orphan ru
 
 **Single-symbol architecture: Sky's bitcode emits each rustc-visible body under the *rustc-mangled name rustc would have given the stub fn*. Path B (empirically verified by toylang's `test_lto_smoke`).** The original design described a two-symbol scheme: stub fn `pub fn clone_widget` mangled by rustc as one name, Sky's bitcode emits the real body under a Sky-chosen name (`__sky_impl_clone_widget`), and the `symbol_name` query override redirects the rustc-mangled name to Sky's name at link time. **That scheme works under non-LTO but breaks under ThinLTO** — LLVM's IR linker sees two definitions of the logically-same function (the rustc-mangled stub with `unreachable!()` body, and Sky's `__sky_impl_*` with the real body) and non-deterministically picks the stub. Result: the binary panics at the inlined `unreachable!()`.
 
-The fix is the single-symbol architecture: Sky's bitcode emits the real body under the **same rustc-mangled name rustc would have given the stub fn**. Only one definition reaches the LTO IR linker; Sky's body is the sole def; cross-language inlining works correctly. The `symbol_name` query override now effectively passes through (it still classifies items by shape for partitioner/layout decisions, but the symbol it returns is the rustc-default).
+The fix is the single-symbol architecture: Sky's bitcode emits the real body under the **same rustc-mangled name rustc would have given the stub fn**. Only one definition reaches the LTO IR linker; Sky's body is the sole def; cross-language inlining works correctly.
 
-To compute the rustc-mangled name from Sky's side, call the saved upstream `symbol_name` provider directly — `default_symbol_name()(tcx, instance)` — bypassing the override. This dodges any re-entrance through Sky's own override and produces the linker-canonical name. The shape:
+**Phase F (2026-06-24, handoff Decision 2): the `symbol_name` query override is retired.** Pre-Phase-F, Sky installed a `symbol_name` override that did shape classification (`is_consumer_fn` / `is_consumer_trait_impl_method` / `is_consumer_accessor_safe`), built a callback name, asked the consumer for a symbol — but the consumer impl ignored the callback name and returned rustc's default mangler result. The classification work was entirely unused at the symbol_name layer. With the override retired, **rustc's default v0 mangler produces every consumer symbol directly**, and Sky's bitcode emits real bodies under that same name. Single-symbol architecture is now a property of "Sky reads `tcx.symbol_name(instance)` at every emission site" — no override, no bypass needed.
+
+To compute the rustc-mangled name from Sky's side, call `tcx.symbol_name(instance)` directly:
 
 ```rust
-// Save the upstream provider at init time, before installing Sky's override:
-static DEFAULT_SYMBOL_NAME: OnceLock<SymbolNameFn> = OnceLock::new();
-
-fn install_overrides(providers: &mut Providers) {
-    DEFAULT_SYMBOL_NAME.set(providers.symbol_name).ok();
-    providers.symbol_name = sky_symbol_name;
-}
-
-// Sky's emitter uses this to name each function it emits:
 fn sky_mangled_name_for(tcx: TyCtxt<'_>, instance: Instance<'_>) -> Symbol {
-    DEFAULT_SYMBOL_NAME.get().expect("init")(tcx, instance).name
+    tcx.symbol_name(instance).name
 }
 ```
+
+Pre-Phase-F, Sky's emission helper (`compute_fn_symbol` in `toylangc/src/toylang/callbacks_impl.rs`) went through a saved upstream provider pointer (`rustc_lang_facade::default_symbol_name()(tcx, instance)`) to bypass re-entrance through Sky's own override. Post-Phase-F there's no override to bypass — direct `tcx.symbol_name(...)` is the canonical path.
 
 Sky-internal items (non-export, reached only through Sky's own call graph) keep using Sky-internal mangling — rustc never sees them, so there's no symbol-priority concern there. The single-symbol discipline applies only to rustc-visible items (exports + trait-impl methods on Sky types).
 
@@ -1440,7 +1439,7 @@ Sky-internal items (non-export, reached only through Sky's own call graph) keep 
 
 Cross-language inlining is unaffected — the stub rlib's `.o` carries Rust-emitted machinery (Rust generic intermediaries, Phase-6 wrappers) but no consumer-item bodies (the filter removed them). `pub use std::clone::Clone` re-exports don't carry bitcode of their own (the symbol's actual code lives in std, which participates in LTO independently). The inlining Sky cares about happens between Sky's `fill_extra_modules` bodies and Rust deps' bitcode at LTO time.
 
-**Sky-emitted symbols do not need forward declarations in the stub rlib.** A natural temptation when adding a new emission shape is to also add an `extern "C" { pub fn __sky_<thing>(...); }` block to the stub rlib so that "rustc knows the symbol exists." Don't. Sky's `symbol_name` query override (§5.3, §26.1) is the bridge: rustc resolves a Rust-source call `sky_lib::clone_widget(...)` to the stub rlib's `pub fn clone_widget` DefId; Sky's `symbol_name` provider returns the rustc-default mangled name; Sky's bitcode emits the body under that same name. The forward declaration adds nothing. Toylang carried such forward declarations as vestigial scaffolding from a pre-`symbol_name`-override era; removing them eliminated a generic-vs-non-generic asymmetry (extern "C" blocks can't contain generic items) without affecting any visible behavior. (Body-less Sky source declarations of *real* Rust functions — the analog of toylang's `fn println_int(x: i32);` syntax for binding to existing Rust functions — do still produce extern decls in the stub rlib, because those describe symbols the linker resolves to a Rust-defined body. That's an unrelated use case.)
+**Sky-emitted symbols do not need forward declarations in the stub rlib.** A natural temptation when adding a new emission shape is to also add an `extern "C" { pub fn __sky_<thing>(...); }` block to the stub rlib so that "rustc knows the symbol exists." Don't. The single-symbol architecture above is what makes it work: rustc resolves a Rust-source call `sky_lib::clone_widget(...)` to the stub rlib's `pub fn clone_widget` DefId; rustc's default mangler produces the symbol name; Sky's `fill_extra_modules` emits the body under that same name. The forward declaration adds nothing. Toylang carried such forward declarations as vestigial scaffolding from a pre-single-symbol-architecture era; removing them eliminated a generic-vs-non-generic asymmetry (extern "C" blocks can't contain generic items) without affecting any visible behavior. (Body-less Sky source declarations of *real* Rust functions — the analog of toylang's `fn println_int(x: i32);` syntax for binding to existing Rust functions — do still produce extern decls in the stub rlib, because those describe symbols the linker resolves to a Rust-defined body. That's an unrelated use case.)
 
 ### 6.3 `__SKY_STUBS_MARKER` for activation
 
@@ -1965,7 +1964,7 @@ For an exported Sky item:
 - Sky's per_instance_mir provider answers when rustc queries the item.
 - Sky's layout_of override answers when rustc queries the item's layout.
 - Drop glue resolution flows through rustc's standard path; per-type Drop bodies (for Sky-defined `impl Drop`) come from `fill_extra_modules` via the cascade-discovery + AST-rewrite path described in §15.7.
-- Sky's symbol_name override determines the mangled name.
+- Rustc's default v0 mangler determines the symbol name (single-symbol architecture, §6.2). Sky's emission writes the body under exactly that name, so call sites and the definition share one symbol without any rename.
 
 For a non-exported Sky item:
 - Rustc has no DefId. The item doesn't exist from rustc's view.
@@ -3754,7 +3753,7 @@ The inner pipeline (one rustc subprocess for one Sky-marked crate compile) is th
 When Sky's rustc compiles a Sky-marked crate:
 
 1. **Startup.** Forked rustc starts. Parse argv. Identify the crate being compiled.
-2. **Default Callbacks::config().** Sky's codegen backend is constructed; query overrides are installed (`per_instance_mir`, `layout_of`, `symbol_name`, `collect_and_partition_mono_items` (the partition filter — see §5.3 / §C.2), `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable` (B16)). The driver also installs the `fill_extra_modules` hook via `extra_modules_hook::install_consumer_modules_hook()`. Retired overrides: `mir_shims` (retired 2026-06-23 Phase E — see §15.7 / §F.18 for the AST-rewrite replacement), `codegen_fn_attrs` + `extern_queries.codegen_fn_attrs` (Option 4, retired 2026-06-22 alongside patch 5 — see §F.14.1 / §F.17), `consumer_lang_active` (patch-5 shim, retired 2026-06-22 with patch 5 removal from the fork), `upstream_monomorphizations[_for]` (A.2, retired in §5.5 Step 3).
+2. **Default Callbacks::config().** Sky's codegen backend is constructed; query overrides are installed (`per_instance_mir`, `layout_of`, `collect_and_partition_mono_items` (the partition filter — see §5.3 / §C.2), `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable` (B16)). The driver also installs the `fill_extra_modules` hook via `extra_modules_hook::install_consumer_modules_hook()`. Retired overrides: `symbol_name` (retired 2026-06-24 Phase F — single-symbol architecture means rustc's default v0 mangler suffices; see §6.2 / §26.1), `mir_shims` (retired 2026-06-23 Phase E — see §15.7 / §F.18 for the AST-rewrite replacement), `codegen_fn_attrs` + `extern_queries.codegen_fn_attrs` (Option 4, retired 2026-06-22 alongside patch 5 — see §F.14.1 / §F.17), `consumer_lang_active` (patch-5 shim, retired 2026-06-22 with patch 5 removal from the fork), `upstream_monomorphizations[_for]` (A.2, retired in §5.5 Step 3).
 3. **Rustc parses the local crate's Rust source.** The stub rlib's `src/lib.rs` (skyc-generated). Trivially fast.
 4. **Rustc loads upstream rlibs.** Each loaded rlib goes through rustc's metadata-loader. Sky's machinery checks each for `__SKY_STUBS_MARKER`.
 5. **For each Sky-marked rlib loaded:** Sky's machinery locates the adjacent sidecar (`my_utils.sky-meta`), deserializes the Temputs into Sky's in-memory universe.
@@ -3799,7 +3798,7 @@ For Sky-defined types whose layout is needed: the collector calls Sky's `layout_
 
 For Sky-defined types whose drop glue is needed: rustc's standard DropGlue path produces the body. If the Sky type has an `export impl Drop for X`, the collector queues `<X as Drop>::drop`; the cascade discovery captures it; `fill_extra_modules` emits Sky's body — same path as case4's Clone. The compiler-synthesized `Drop::drop(&local)` calls (§15.7) are what drive the collector to queue the Instance in the first place.
 
-For Sky-defined functions' symbol names: Sky's `symbol_name` override returns the mangled name.
+For Sky-defined functions' symbol names: rustc's default v0 mangler produces the name (Phase F retired Sky's `symbol_name` override; single-symbol architecture per §6.2 means Sky's `fill_extra_modules` body uses the same name).
 
 These overrides fire interleaved as the collector encounters their triggers. Sky's responses are computed Sky-side; rustc consumes them and continues its walk.
 
@@ -4185,7 +4184,7 @@ slot. The audit re-derived the safety story from upstream declarations:
 | `layout_of` | (none → default `false`) | Never disk-cached. Re-derived from sidecar at every compile. |
 | `cross_crate_inlinable` | (none → default `false`) | Never disk-cached. Sky's override return depends on `is_sky_active(tcx)` marker walk. |
 | `collect_and_partition_mono_items` | (none + `eval_always`) | Re-runs every compile; never cached. |
-| `symbol_name` | `true` upstream | Override scheduled for removal per Decision 2. Once retired, rustc's default mangler is Instance-keyed → cache invalidates correctly when Sky's universe state changes. |
+| ~~`symbol_name`~~ | ~~`true` upstream~~ | **Override retired 2026-06-24 (Phase F, handoff Decision 2).** Rustc's default v0 mangler is Instance-keyed, so the cache key includes type args; Sky's universe state changes flow through correctly via Instance variation. No active staleness risk. |
 
 The CI fence at `toylangc/tests/cache_audit.rs` asserts every override
 file carries a `cache-audit:` marker comment describing its
@@ -4687,7 +4686,7 @@ Pass-through preserved: the partition filter is a no-op on pure-Rust crates beca
 
 This recipe found B15 in under an hour. Future "symbol disappeared" investigations should start here.
 
-**B21 (Sky-specific). Per-query disk-cache staleness if rustc's cache API evolves.** Probability: ~15% over 5 years. Handoff Decision 14 originally prescribed forcing `cache_on_disk_if(false)` on every Sky-overridden query via Provider slots. Audit at 2026-06-24 found the prescribed API doesn't exist on current nightly — `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit (see §22.4.1) verified every Sky-overridden query is cache-safe by construction: `per_instance_mir`, `layout_of`, `cross_crate_inlinable`, and `collect_and_partition_mono_items` are all declared non-disk-cached or `eval_always`; `symbol_name` is disk-cached upstream but its override is scheduled for removal per Decision 2 (the default mangler is Instance-keyed and correctly invalidates). **Risk: if rustc evolves the cache API such that one of these queries gains disk-caching, OR Sky adds a new override on a disk-cached query without considering universe-state-changes-invalidation, Sky's incremental builds could return stale results silently.** Canary: `toylangc/tests/cache_audit.rs` requires every override file to carry a `cache-audit:` marker comment. Adding a new override forces a marker, forces a fresh audit. Reaction: identify the new staleness risk; if rustc exposes a Provider-slot override API in the future, install it. Otherwise document as a known limitation and disable incremental compile globally when Sky's machinery is active.
+**B21 (Sky-specific). Per-query disk-cache staleness if rustc's cache API evolves.** Probability: ~15% over 5 years. Handoff Decision 14 originally prescribed forcing `cache_on_disk_if(false)` on every Sky-overridden query via Provider slots. Audit at 2026-06-24 found the prescribed API doesn't exist on current nightly — `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit (see §22.4.1) verified every Sky-overridden query is cache-safe by construction: `per_instance_mir`, `layout_of`, `cross_crate_inlinable`, and `collect_and_partition_mono_items` are all declared non-disk-cached or `eval_always`. (`symbol_name` was previously on this list; Phase F retired the override 2026-06-24 — rustc's default v0 mangler is Instance-keyed and correctly invalidates via Instance variation, so no override means no staleness concern at that layer.) **Risk: if rustc evolves the cache API such that one of these queries gains disk-caching, OR Sky adds a new override on a disk-cached query without considering universe-state-changes-invalidation, Sky's incremental builds could return stale results silently.** Canary: `toylangc/tests/cache_audit.rs` requires every override file to carry a `cache-audit:` marker comment. Adding a new override forces a marker, forces a fresh audit. Reaction: identify the new staleness risk; if rustc exposes a Provider-slot override API in the future, install it. Otherwise document as a known limitation and disable incremental compile globally when Sky's machinery is active.
 
 **B27 (Sky-specific). Bench-detected creeping perf regression between nightly bumps.** Probability: ~30% over 5 years. Sky pins a specific rustc-fork nightly; each bump (§3.5) inherits whatever LLVM/rustc upstream evolution happened in the interval. The perf model in §22.4 anchors on empirical bench numbers from a specific date (2026-06-24); the numbers drift as the toolchain bumps. Canary: re-run `bash toylangc/tests/scripts/run_perf_bench.sh` after every nightly bump. If Bench 2 K=100 LTO ratio regresses >10% (currently 1.48×; >1.63× would fail), or Bench 3 drop-chain ratio regresses >20% (currently 25.5× for Sky, 27.5× for the pure-Rust cross-crate baseline; <20.4× for either would fail), investigate. The Sky/Rust delta at thin LTO (currently 3% on Bench 3, 0.3% on Bench 1) is also worth tracking — if it grows >10%, Sky's emission has drifted from Rust's structurally. Reaction: bisect upstream nightly range with bench script as the regression detector; report upstream or pin to last-known-good. The `tmp/perf-bench-disasm/` archive (per-fixture main()-symbol disassembly) helps localize whether the regression is in inlining behavior vs scheduling vs register allocation.
 
@@ -4756,7 +4755,7 @@ This chapter documents the cross-cutting invariants Sky's implementation must re
 
 | ID | Rule (one sentence) |
 |---|---|
-| SyMINCZ | `symbol_name` is a pure read; drive codegen via `ReifyFnPointer` casts in `per_instance_mir` bodies. |
+| SyMINCZ | Symbol-name lookups are pure reads; drive codegen via `ReifyFnPointer` casts in `per_instance_mir` bodies. (Override retired 2026-06-24 Phase F; rustc's default mangler preserves the invariant.) |
 | GCMLZ | Don't lock a consumer-state mutex from inside a rustc query provider. |
 | DPSFDOZ | `tcx.def_path_str` ICEs outside diagnostics; use `def_path(...)` or `crate_name`. |
 | ELASZ | Populate lifetime slots of `GenericArgs` with `re_erased`, never `'static`. |
@@ -4779,17 +4778,19 @@ Each invariant is expanded in detail below.
 
 ### 26.1 SyMINCZ (Sky's Mangling Is Not Codegen)
 
-Sky's `symbol_name` query override returns a mangled name for a Sky Instance; computing the name does not drive codegen. To drive codegen of a generic Rust dep, Sky must emit a `Rvalue::Cast(CastKind::PointerCoercion(ReifyFnPointer(...)))` in the synthetic MIR body. Symbol-name computation is a pure read.
+Reading a symbol name for a Sky Instance — whether via Sky's own helpers or via `tcx.symbol_name(instance)` — is a **pure read**; computing the name does not drive codegen. To drive codegen of a generic Rust dep, Sky must emit a `Rvalue::Cast(CastKind::PointerCoercion(ReifyFnPointer(...)))` in the synthetic MIR body. The two surfaces are independent: symbol-name reads at call sites tell the linker which symbol to dispatch to; ReifyFnPointer casts in the per_instance_mir body tell rustc's mono collector which Instances to codegen.
 
-**Where:** Sky's codegen call sites that need a symbol name for an Instance use the symbol_name path; Sky's per_instance_mir body construction uses the ReifyFnPointer path. The two are separate; conflating them silently misses dep registration.
+**Where:** Sky's codegen call sites that need a symbol name for an Instance read `tcx.symbol_name(instance)` directly (post-Phase-F, 2026-06-24 — the `symbol_name` override was retired because rustc's default v0 mangler already produces the right name under the single-symbol architecture, see §6.2). Sky's per_instance_mir body construction uses the ReifyFnPointer path to drive monomorphization. The two are separate; conflating them silently misses dep registration.
 
 **Load-bearing because:** if a Sky engineer adds a new Rust call site by only computing the symbol name (no ReifyFnPointer cast in the synthetic body), the link will fail with undefined symbol. The arcana documents that the symbol-name side and the codegen-driving side are separate code paths that both must be touched.
+
+**Pre-Phase-F history:** Sky carried a `symbol_name` query override that did shape classification (`is_consumer_fn` / `is_consumer_trait_impl_method` / `is_consumer_accessor_safe`) and asked the consumer for a symbol via a `consumer_symbol_for_callback_name` callback — the consumer impl ignored the callback name and returned rustc's default mangler output. The classification work was entirely unused at the symbol_name layer. Phase F (handoff Decision 2) retired the override, the callback, and the saved `DEFAULT_SYMBOL_NAME` provider pointer; emission now reads `tcx.symbol_name(instance)` directly. The SyMINCZ invariant survives unchanged in spirit — what changed is that rustc's default mangler is now what every read consults.
 
 ### 26.2 GCMLZ (Generate Compile Mutex Lock)
 
 **Rule:** if Sky uses a global mutex for any mutable consumer state, the mutex must not be locked from query-provider code paths during codegen.
 
-**Mechanism:** Sky's architecture structurally avoids the failure mode by (a) keeping predicates (`is_consumer_type`, `is_consumer_fn`) as lock-free reads of the `SkyUniverse` (RwLock, populated during the populate-only phases — sidecar load via `on_sky_lib_loaded` and local-registry build via `after_rust_analysis`, both before codegen starts), (b) making `symbol_name` and other in-query callbacks stateless functions of `(tcx, instance)`, and (c) using patch 4's `fill_extra_modules` hook for codegen contribution instead of a long-running stateful callback holding the consumer-state lock.
+**Mechanism:** Sky's architecture structurally avoids the failure mode by (a) keeping predicates (`is_consumer_type`, `is_consumer_fn`) as lock-free reads of the `SkyUniverse` (RwLock, populated during the populate-only phases — sidecar load via `on_sky_lib_loaded` and local-registry build via `after_rust_analysis`, both before codegen starts), (b) making any in-query callbacks stateless functions of `(tcx, instance)` (or — post-Phase-F 2026-06-24 — retired entirely; the `symbol_name` override and its `consumer_symbol_for_callback_name` callback are both gone, with rustc's default mangler used directly), and (c) using patch 4's `fill_extra_modules` hook for codegen contribution instead of a long-running stateful callback holding the consumer-state lock.
 
 **Discipline:** any new query provider added must read from `SkyUniverse`, NOT from a `Mutex`-protected state. Any new stateful callback that takes `&mut consumer_state` must justify why it cannot fire from inside a rustc query.
 
@@ -5636,9 +5637,13 @@ The fix: **Sky's bitcode emits each rustc-visible body under the
 rustc-mangled name rustc would have given the stub fn.** Single
 symbol. One def. LTO can't pick wrong because there's no choice.
 
-To compute the rustc-mangled name from Sky's side without re-entering
-Sky's own `symbol_name` override, call the saved upstream provider
-directly. Tier 3 #9's `default_symbol_name()` helper is the pattern.
+To compute the rustc-mangled name from Sky's side, call
+`tcx.symbol_name(instance)` directly. Pre-Phase-F (before 2026-06-24)
+this went through a saved upstream provider pointer
+(`default_symbol_name()(tcx, instance)`) to dodge re-entrance through
+Sky's own `symbol_name` override. With the override retired (handoff
+Decision 2), there's nothing to dodge — `tcx.symbol_name` reads
+rustc's default v0 mangler directly.
 
 Path B is the canonical design — §6.2 + §9.6 describe it.
 

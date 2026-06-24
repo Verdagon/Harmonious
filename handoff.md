@@ -57,7 +57,7 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 - **Phase I (cache_on_disk_if audit)** — DONE 2026-06-24. **Decision 14's prescribed Provider-slot syntax (`providers.queries.layout_of_cache_on_disk_if = ...`) doesn't exist on current nightly.** `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit re-derived cache-safety: every Sky-overridden query is safe by construction (`per_instance_mir` declared `false` in fork patch; `layout_of` + `cross_crate_inlinable` default to `false`; `collect_and_partition_mono_items` is `eval_always`; `symbol_name` is disk-cached but its override is scheduled for removal per Decision 2 and the default mangler invalidates correctly). Annotated all 5 override files with `cache-audit:` marker comments. New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker. New §22.4.1 documents the policy table; new B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API." Decision 14 itself is revised below.
 
 **Not yet started (your work):**
-- Phases F (symbol_name elimination), G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences). Phase C+D done 2026-06-24 (tool attribute infra + partition predicate migration).
+- Phases G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences). Phase C+D + Phase F all done 2026-06-24 (tool attribute infra + partition predicate migration + symbol_name override retirement).
 
 **In flight from prior sessions (independent of this exchange):**
 - Patch 5 retirement (shipped 2026-06-22 per the historical section below).
@@ -82,12 +82,13 @@ Critical caveat (historical): **toylang had zero drop tests**, so the mir_shims 
 5. ~~Bench 3 pure-Rust baselines~~ — DONE (Phase B+, 2026-06-24, follow-up session). 6 new fixtures + test_widgets sibling crate. **Pure-Rust cross-crate Drop shows 27.5× LTO ratio** (within noise of Sky's 25.5×); the amplification is inherited from Rust, not Sky-specific. Round-4 framing for Bench 3 settled.
 
 6. ~~Tool attribute infrastructure + partition predicate migration (Phase C+D)~~ — DONE (2026-06-24). `#![register_tool(toylang)]` + `#[toylang::emit_consumer_body]` machinery in build.rs + stub_gen.rs; `is_consumer_codegen_target` rewritten as the two-gate conjunction `is_from_lang_stubs(tcx, def_id) && tcx.has_attrs_with_path(def_id, &[toylang, emit_consumer_body])`. New 1:1 invariant CI fence at `stub_gen::tests::emit_consumer_body_tags_only_category_b_items`. 477 tests pass (+1 from new fence). Smoke-test of `bench3_drop_thin` confirms runtime behavior unchanged.
+7. ~~Symbol_name override elimination (Phase F)~~ — DONE (2026-06-24). Per Decision 2: deleted `queries/symbol_name.rs`, removed the provider assignment, dropped `DEFAULT_SYMBOL_NAME` + `default_symbol_name()` + the `consumer_symbol_for_callback_name` callback + vtable slot + trampoline + accessor. `compute_fn_symbol` now reads `tcx.symbol_name(instance)` directly. `is_consumer_accessor_safe` deleted (orphaned). `is_consumer_fn` + `is_consumer_trait_impl_method` stay alive (per_instance.rs + cascade-drain callers). 477 tests pass; bench3_drop_thin smoke-test 352μs. Three of the four roundtrip-relevant cleanup arcs (Decisions 1/2/3) now ship.
 
 **NEXT — start here next session:**
 
-7. **Symbol_name override elimination (Phase F)** — ~½ day. Per Decision 2: delete `rustc-lang-facade/src/queries/symbol_name.rs`, remove from providers, delete `compute_consumer_symbol` + the `consumer_symbol_for_callback_name` callback. Audit orphaned matchers (`is_consumer_fn`, `is_consumer_accessor_safe`) — `queries/per_instance.rs` still calls `is_consumer_fn` for callback-name routing, so that may need rewiring too. Verify rustc's default mangler is what Sky's emission consults (it already is internally via `default_symbol_name()`). After Phase F, three of the four roundtrip-relevant cleanup arcs (Decisions 1/2/3) ship.
+8. **cdylib build system + FFI shape (Phases G+H)** — ~1 week combined. Restructure Sky's toolchain to ship as paired rustc-fork + libsky_backend cdylib (Decision 4); refactor patch 4 to use a `#[repr(C)]` function-pointer struct instead of `&mut dyn ExtraModuleAllocator` (Decision 5). Larger scope than Phases C/D/F because it crosses the rustc fork boundary (patch 4 rev 3) AND the toolchain bundle structure. Or alternatively: schedule round 4 with the reviewer now that the three "cleanup arc" Decisions (1/2/3) have shipped.
 
-After that: symbol_name elimination (Phase F, ½ day), cdylib build system + patch 4 rev 3 (Phases G+H, ~1 week), u128 typeids + content-hash const args (Phases J+K, ~1.5 weeks), per-view ref types + async typestate (Phases L+M, ~3 weeks).
+After that: ~~symbol_name elimination (Phase F, ½ day)~~ DONE 2026-06-24; cdylib build system + patch 4 rev 3 (Phases G+H, ~1 week), u128 typeids + content-hash const args (Phases J+K, ~1.5 weeks), per-view ref types + async typestate (Phases L+M, ~3 weeks).
 
 **Round 4 deliverables** (when you come back to the reviewer):
 1. **Perf bench numbers — IN HAND.** Bench 1 ratio 1.50×; Sky vs Rust baseline at 0.3% delta; Bench 3 drop chain 25.5× **with apples-to-apples pure-Rust comparison showing 27.5×** (inherited from Rust, not Sky-specific; Sky vs Rust cross-crate at thin LTO = 3% delta). Decision-gate verdict: lock §5.5. The round-4 framing for Bench 3 is now: "Sky's drop emission gives LLVM the same elimination opportunity Rust's does; the 26× speedup is a property of cross-crate Drop chains under LLVM's inliner that Sky inherits, not anything Sky adds."
@@ -96,7 +97,7 @@ After that: symbol_name elimination (Phase F, ½ day), cdylib build system + pat
 4. **mir_shims elimination empirical validation — IN HAND.** AST-rewrite shape ships at 342/0/1 tests; no regressions in the 191 prior integration tests.
 5. **Implementation surprises grouped by where they surfaced — IN HAND.** F3 (Sky main + while loop stack overflow due to toylangc O0 alloca recycling), B10 residual (Phase E drop synthesis + Vec<SkyStruct> still trips bug under ThinLTO cross-CGU import); both documented in arch doc §F.18.
 
-The round 4 conversation has all four data anchors the reviewer asked for. Next session can either schedule round 4 OR continue with the next chunk of execution work: Phase C/D/F (tool attribute + predicate migration + symbol_name elimination).
+The round 4 conversation has all four data anchors the reviewer asked for. Phase C+D+F all shipped 2026-06-24. Next session can either schedule round 4 OR continue with Phase G+H (cdylib backend + FFI shape).
 
 ---
 
@@ -241,7 +242,9 @@ sometimes auto-calls" — honored at ~95%:
 
 ### Decision 2: Eliminate the `symbol_name` query override
 
-**WHAT.** Remove the `symbol_name` override. Sky's `Providers::symbol_name` is unset; rustc's default mangler (v0) fires for all items. Sky's call-site emission computes target names via `default_symbol_name()(tcx, instance)` (already what it does internally).
+**STATUS: SHIPPED 2026-06-24** (Phase F). The override is gone; `compute_fn_symbol` now reads `tcx.symbol_name(instance)` directly. Implementation notes in the Phase F entry below.
+
+**WHAT.** Remove the `symbol_name` override. Sky's `Providers::symbol_name` is unset; rustc's default mangler (v0) fires for all items. Sky's call-site emission computes target names via `tcx.symbol_name(instance).name` (Phase F replaced the pre-2026-06-24 `default_symbol_name()(tcx, instance)` bypass since there's no override to dodge anymore).
 
 **WHY.** The override is a live no-op confirmed by direct code audit. The facade's `lang_symbol_name` does shape classification (is_fn/is_accessor/is_trait_impl), builds a callback_name, and calls `consumer_symbol_for_callback_name`. The toylangc implementation (`compute_consumer_symbol`) IGNORES the callback_name parameter and returns rustc's default. The override does:
 - Filter to consumer items from `__lang_stubs`.
@@ -1601,17 +1604,44 @@ Fill in the actual numbers from the rerun.
 - Async-fn drop wiring (Decision 11, §14) — gated on async support
   landing in toylang.
 
-### Phase F: symbol_name elimination (half-day)
+### Phase F: symbol_name elimination — DONE 2026-06-24
 
-Remove the symbol_name override (Decision 2).
+**Status: SHIPPED 2026-06-24** (Decision 2). The override is gone; rustc's default v0 mangler now produces every consumer symbol directly.
 
-Tasks:
-- Delete `rustc-lang-facade/src/queries/symbol_name.rs`.
-- Remove `symbol_name` from providers.
-- Delete `compute_consumer_symbol` and the `consumer_symbol_for_callback_name` callback (Tier 3 #12).
-- Verify rustc's default mangler is what Sky's emission now consults.
+**What landed:**
+- `rustc-lang-facade/src/queries/symbol_name.rs`: **deleted**.
+- `rustc-lang-facade/src/queries/mod.rs`: removed `mod symbol_name;`, removed the `providers.queries.symbol_name = symbol_name::lang_symbol_name;` assignment, removed the `symbol_name` argument to `install_query_defaults`, updated the module-level doc to describe the retirement.
+- `rustc-lang-facade/src/lib.rs`: removed `DEFAULT_SYMBOL_NAME` OnceLock, removed `default_symbol_name()` accessor, removed `symbol_name` parameter from `install_query_defaults`, dropped `is_consumer_accessor_safe` (orphaned post-override-removal; only the `symbol_name` override and the pre-Phase-D `is_consumer_codegen_target` were callers).
+- `rustc-lang-facade/src/lib.rs::LangCallbacks`: removed `consumer_symbol_for_callback_name` trait method.
+- `StatefulVtable`: removed `consumer_symbol_for_callback_name` fn-pointer slot.
+- `trampoline_consumer_symbol_for_callback_name`: removed.
+- `call_consumer_symbol_for_callback_name`: removed.
+- `install_callbacks::StatefulVtable::new`: removed the slot initializer.
+- `toylangc/src/toylang/callbacks_impl.rs`: removed the `consumer_symbol_for_callback_name` trait impl; removed `compute_consumer_symbol` helper; **`compute_fn_symbol` now reads `tcx.symbol_name(instance).name.to_string()` directly** instead of going through `default_symbol_name()(tcx, instance)`. The toylangc-internal callers of `compute_fn_symbol` (7 sites at populate time, populate_toylang_instances_from_cgus, cascade-drain emission, etc.) are unchanged.
+- `toylangc/tests/cache_audit.rs`: removed `symbol_name.rs` from the audit list (file is gone); module-level doc rewritten to note the retirement.
 
-**Output**: symbol_name override gone; Sky relies on rustc's default mangling.
+**What stayed alive:**
+- `is_consumer_fn` (in `queries/per_instance.rs`): used to route the consumer's `collect_generic_rust_deps` callback by name. Eventually retires when per_instance.rs migrates from name-keyed callback routing to Instance-keyed routing (no current driver).
+- `is_consumer_trait_impl_method` (in toylangc's `collect_consumer_trait_impl_instances`): used to detect trait-impl methods in rustc's mono partition at `consumer_fill_modules` time. Case 4 / case 6 cascade-drain mechanism; structural to Sky's interop.
+
+**Test coverage:**
+- 477 tests pass (same baseline as Phase C+D). 0 failures excluding the pre-existing rustdoc-not-installed doctest infrastructure error in rustc-fork.
+- Smoke-test of `bench3_drop_thin` (post-Phase-F): 352μs — within run-to-run variance of the 371μs / 419μs baselines from earlier sessions. The symbol-name path produces identical runtime behavior.
+
+**Doc updates:**
+- arch §4.5 marker-detection: dropped `symbol_name` from the provider registration list.
+- arch §5.4 (`SkyCodegenBackend::provide`): override list refreshed; symbol_name moved to the "Retired" section with the Phase F annotation.
+- arch §6.2: rewrote the single-symbol-architecture paragraph to reflect that rustc's default v0 mangler is now the source of truth, with the pre-Phase-F bypass mechanism documented as historical context. Code example shows `tcx.symbol_name(instance).name` directly.
+- arch §6.2 "no forward declarations": refreshed to credit the single-symbol architecture (not the override) for making forward decls unnecessary.
+- arch §9.3: rust-c-default mangler note replaces the "symbol_name override" mention.
+- arch §20.2 / §20.6 pipeline-ordering: dropped symbol_name from override list; refreshed the per-Instance symbol-name path to credit the default mangler.
+- arch §22.4.1 cache-policy table: `symbol_name` row crossed out with the retirement annotation.
+- arch §25.2 B21 risk entry: refreshed to note the symbol_name retirement.
+- arch §26.1 SyMINCZ quick-ref + body: rewritten to reflect that the invariant survives in spirit; rustc's default mangler is what reads consult.
+- arch §26.2 GCMLZ: refreshed the mechanism description.
+- arch §F.2: rewrote "compute the rustc-mangled name" guidance — `tcx.symbol_name(instance)` directly, no override to dodge.
+
+**Output:** symbol_name override gone; Sky relies on rustc's default mangling at every read site.
 
 ### Phase G: cdylib build system (3-5 days)
 
@@ -2024,7 +2054,7 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 **Phase E success — ACHIEVED 2026-06-23:** mir_shims override gone; all 9 drop fixtures pass under the new AST-rewrite model; no regressions in the 333 prior integration tests (now 342 total). The `project_raw_field` CI fence turned out unnecessary because the synth pass never directly accesses field storage.
 
-**Phase F success — NOT YET STARTED:** symbol_name override gone; no test regressions; rustc's default mangler is what Sky's emission consults.
+**Phase F success — ACHIEVED 2026-06-24:** symbol_name override gone (`queries/symbol_name.rs` deleted, `mod symbol_name;` removed from `queries/mod.rs`, provider unassigned). The full callback chain that fed it — `consumer_symbol_for_callback_name` trait method + vtable slot + trampoline + accessor + the toylangc impl — also retired. `DEFAULT_SYMBOL_NAME` + `default_symbol_name()` removed (no remaining callers). `is_consumer_accessor_safe` deleted (orphaned post-removal). `compute_fn_symbol` switched from `default_symbol_name()(tcx, instance)` → `tcx.symbol_name(instance).name.to_string()`. Tests: 477 pass cold; smoke-test of bench3_drop_thin reports 352μs (within run-to-run variance of pre-Phase-F baseline). The single-symbol architecture (arch §6.2) is now load-bearing purely through Sky's emission consulting `tcx.symbol_name(instance)` at every read site, with no override or bypass needed.
 
 **Phases G+H success — NOT YET STARTED:** Sky's backend ships as cdylib with `#[repr(C)]` function-pointer struct FFI; iteration loop is order-of-magnitude faster.
 
