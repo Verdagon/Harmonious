@@ -830,11 +830,13 @@ the same commit.
 
 **Total patch surface:** approximately 28 lines for the
 `per_instance_mir` trio (across `rustc_middle::query::mod`,
-`rustc_mir_transform::lib`, `rustc_monomorphize::collector`) + ~194
-lines for the `fill_extra_modules` hook + allocator trait (across
-`rustc_codegen_ssa::traits::backend` + `traits::mod` + `base` +
-`back::write`, plus `rustc_codegen_llvm::lib`) = ~222 lines across
-8 files. Each patch is small, structurally local, and follows
+`rustc_mir_transform::lib`, `rustc_monomorphize::collector`) + ~210
+lines for the `fill_extra_modules` hook + `#[repr(C)]` allocator struct
+(across `rustc_codegen_ssa::traits::backend` + `traits::mod` + `base` +
+`back::write`, plus `rustc_codegen_llvm::lib`) = ~238 lines across
+8 files. (Patch 4 grew from ~194 → ~210 LOC at rev 3, 2026-06-24 Phase H,
+when the trait-object boundary was replaced with the `#[repr(C)]`
+function-pointer struct; see §3.2 patch 4 + §F.15.) Each patch is small, structurally local, and follows
 established patterns in rustc's source. The patches collectively add two extension points
 that rustc's existing infrastructure (query macros, collector
 dispatch, the codegen backend trait) already accommodates
@@ -1011,7 +1013,7 @@ Sky's machinery activates only for crates that contain the `__SKY_STUBS_MARKER` 
 5. Otherwise, Sky's machinery stays dormant; the compile proceeds vanilla.
 ```
 
-The detection happens after `after_expansion` rather than at startup because rustc needs to have parsed the crate to know its items. The very first Sky-machinery installation step (registering Sky's query providers — `per_instance_mir`, `layout_of`, `collect_and_partition_mono_items`, `cross_crate_inlinable` — and the `fill_extra_modules` codegen hook) is gated on the detection result. (`mir_shims` was previously in this set; retired 2026-06-23 — see §15.7 / §F.18. `symbol_name` was also in this set; retired 2026-06-24 Phase F — see §5.4 / §26.1.)
+The detection happens after `after_expansion` rather than at startup because rustc needs to have parsed the crate to know its items. The very first Sky-machinery installation step (registering Sky's query providers — `per_instance_mir`, `layout_of`, `collect_and_partition_mono_items`, `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable` — and the `fill_extra_modules` codegen hook) is gated on the detection result. (`mir_shims` was previously in this set; retired 2026-06-23 — see §15.7 / §F.18. `symbol_name` was also in this set; retired 2026-06-24 Phase F — see §5.4 / §26.1.)
 
 **Why per-crate marker rather than per-invocation env var.** Earlier in the design conversation, the activation mechanism was `CARGO_PRIMARY_PACKAGE=1`. That's cargo's signal that this is the primary workspace package. The problem: a published Sky library, depended on by a user's Sky project, gets built by cargo as a normal dep — `CARGO_PRIMARY_PACKAGE` is unset. The Sky lib has `.sky` source that needs Sky processing, but with `CARGO_PRIMARY_PACKAGE` unset, Sky's machinery would stay dormant. The Rust stub bodies (`unreachable!()`) would be codegenned into the rlib, and runtime calls would panic.
 
@@ -1272,7 +1274,7 @@ Sky's `.o` content is produced at every crate compile where Sky's machinery acti
 
 This is the post-§5.5-Step-2 split. The locked architectural commitment is that Sky libraries do not ship precompiled bodies *for items whose final emission depends on the downstream's concrete args* — i.e. generic items, comptime-dependent items. Non-generic items, whose emission is the same regardless of downstream usage, emit at the owning crate's compile. Every Sky body in the final binary is still codegenned by *some* invocation of Sky's compiler from the library's Sky AST; the question Step 2 answered is "which invocation" — owning-crate for non-generics, binary for generics.
 
-**Trade-off the split introduced.** Cross-library Sky-body inlining at `lto = false` (cargo dev profile default) is lost. Pre-Step-2, the binary's compile owned every Sky body and rustc's thin-local LTO (Level 3, §F.16) could inline Sky bodies into the bin's `main` because they were peer CGUs of the same invocation. Post-Step-2, non-generic Sky bodies live in the upstream rlib's invocation; cross-crate visibility requires `lto = "thin"` or `"fat"` (Levels 4–5). The 8 `_no_lto` inlining-matrix fixtures were flipped from "Sky body inlined / constant-folded" to "tail-jump present" to lock in this honest semantics. See §F.16 for the full ladder. Empirical perf cost (2026-06-24 benches, see §22.4): **~1.5× slowdown on hot Sky-call paths at `lto = false`** (Bench 1: O3 nolto 86.7ms vs O3 thin 57.9ms) and **~26× slowdown on drop-heavy paths** (Bench 3: O3 nolto 10.0ms vs O3 thin 0.4ms). The Bench 1 ratio matches what a pure-Rust cross-crate baseline shows (Sky's emission gives LLVM the same inlining opportunity Rust's does); the Bench 3 ratio is amplified because drop chains accumulate per-call overhead 10M-fold and disappear entirely when LTO inlines + vectorizes the empty body. **Recommendation: use `[profile.release] lto = "thin"`** for any perf-sensitive build.
+**Trade-off the split introduced.** Cross-library Sky-body inlining at `lto = false` (cargo dev profile default) is lost. Pre-Step-2, the binary's compile owned every Sky body and rustc's thin-local LTO (Level 3, §F.16) could inline Sky bodies into the bin's `main` because they were peer CGUs of the same invocation. Post-Step-2, non-generic Sky bodies live in the upstream rlib's invocation; cross-crate visibility requires `lto = "thin"` or `"fat"` (Levels 4–5). The 8 `_no_lto` inlining-matrix fixtures were flipped from "Sky body inlined / constant-folded" to "tail-jump present" to lock in this honest semantics. See §F.16 for the full ladder. Empirical perf cost (2026-06-24 benches, see §22.4): **~1.5× slowdown on hot Sky-call paths at `lto = false`** (Bench 1: O3 nolto 86.7ms vs O3 thin 57.9ms) and **~25.5× slowdown on drop-heavy paths** (Bench 3: O3 nolto 9.5ms vs O3 thin 0.4ms). The Bench 1 ratio matches what a pure-Rust cross-crate baseline shows (Sky's emission gives LLVM the same inlining opportunity Rust's does, 0.3% delta at thin LTO). **The Bench 3 ratio is similarly INHERITED from Rust — Phase B+ (2026-06-24) added apples-to-apples pure-Rust baselines and measured R_rust_cross = 27.5× under the same cross-crate structural setup (Widget in a sibling `test_widgets` crate); Sky's 25.5× and the Rust baseline 27.5× are within run-to-run variance, and Sky vs Rust at thin LTO is a 3% delta — same range as Bench 1's 0.3%.** The amplification is a property of the cross-crate Drop chain under LLVM's LTO inliner, not Sky-specific overhead. **Recommendation: use `[profile.release] lto = "thin"`** for any perf-sensitive build.
 
 **Qualifier — what "library-owned Sky bodies" does and doesn't mean.** The stub rlib's `.o` carries Sky-emitted bodies only for items owned by *that* library (non-generic exports + cascade-discovered trait-impl methods whose impl is in that library). It also carries Rust-side machinery rustc emits during its own flow:
 
@@ -4674,7 +4676,7 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B1. Mono collector behavior drift.** Probability: 30-50% over 5 years. Impact: 1-3 weeks repair per occurrence. Sky's per_instance_mir returns synthetic bodies containing ReifyFnPointer casts; the collector walks them and queues Rust deps. If the collector restructures, this mechanism may break. Canary: deep-dep-graph tests start failing with missing-symbol link errors. Reaction: read updated `rustc_monomorphize/src/collector.rs`, adapt Sky's body construction.
 
-**B2. Partitioner restructure.** Probability: ~20-30% over 5 years (back at the historical level after the 2026-06-22 Option 4 retirement restored the partition filter). The B2 surface is "rustc restructures `collect_and_partition_mono_items` such that Sky's override's filter-and-rebuild pattern no longer suppresses consumer-item emission." Specific drift modes: (a) the partitioner adds a new field to `CodegenUnit` that Sky's rebuild loop doesn't copy (silently dropping data), (b) the partitioner's call ordering shifts such that some pass runs between Sky's filter and LLVM codegen and re-introduces consumer items, (c) the partitioner consults an internal cache that bypasses Sky's override output. (a) is the most likely; (b)/(c) are the failure modes that bit erw's pre-2026-06-21 partition filter empirically. Canary: link-time duplicate-symbol errors (Sky's `fill_extra_modules` body conflicting with rustc's now-real-bodied stub), or runtime SBMNBIZ-style panics from inlined unreachable bodies, or test fixtures that previously passed silently regressing. Reaction: 1-3 days repair — typically copying a new field, occasionally adapting to a partitioner restructure. The Sky-vs-erw contrast: Sky's Option C plugin re-asserts linkage during emission, so even if the filter partially fails on Sky's side, Sky's plugin owns the final say; erw doesn't have that backstop.
+**B2. Partitioner restructure.** Probability: ~20-30% over 5 years (back at the historical level after the 2026-06-22 Option 4 retirement restored the partition filter). The B2 surface is "rustc restructures `collect_and_partition_mono_items` such that Sky's override's filter-and-rebuild pattern no longer suppresses consumer-item emission." Specific drift modes: (a) the partitioner adds a new field to `CodegenUnit` that Sky's rebuild loop doesn't copy (silently dropping data), (b) the partitioner's call ordering shifts such that some pass runs between Sky's filter and LLVM codegen and re-introduces consumer items, (c) the partitioner consults an internal cache that bypasses Sky's override output. (a) is the most likely; (b)/(c) are the failure modes that bit erw's pre-2026-06-21 partition filter empirically. Canary: link-time duplicate-symbol errors (Sky's `fill_extra_modules` body conflicting with rustc's now-real-bodied stub), or runtime SBMNBIZ-style panics from inlined unreachable bodies, or test fixtures that previously passed silently regressing. Reaction: 1-3 days repair — typically copying a new field, occasionally adapting to a partitioner restructure. Note: under the restored partition filter (2026-06-22 retirement of Option 4 + patch 5), Sky has no linkage-re-assertion backstop — the filter is the ONLY mechanism keeping consumer items out of rustc's LLVM path. A pre-2026-06-22 framing claimed Option C's plugin "owns the final say" via linkage mutation; that's no longer accurate (Option 4's `codegen_fn_attrs` override retired; no post-partition linkage mutation occurs). The reactive 1-3 days repair window is what catches a B2 break.
 
 **B3. MIR construction API drift.** Probability: 100% per 6-month bump (some drift); ~40% over 5 years for structural rework. Sky's synthetic MIR body construction uses `rustc_middle::mir` directly; it churns. Canary: compile errors in `build_dependency_body`. Reaction: ~1 hour to 1 week per bump, depending on severity. Standard cost.
 
@@ -5123,7 +5125,7 @@ This chapter describes the order in which Sky's implementation should be built. 
 - Sky's per_instance_mir provider returns real synthetic bodies for generic items.
 - ReifyFnPointer-based dep registration in the synthetic body.
 - Layout_of override for generic Sky types (handles abstract Param-bearing args by propagating `LayoutError::TooGeneric` from `tcx.layout_of` rather than gating on `has_param()` — same uniform code path as N=0 per §1.5.5).
-- **Discovered-trait-impl-instances pipeline** (§8.9.5). The in-process capture-drain mechanism that handles cases 4/6 of the interop taxonomy: at the stub-rlib compile's `consumer_fill_modules` callback (NOT `after_rust_analysis` — @GCMLZ re-entry), the pure function `collect_consumer_trait_impl_instances(tcx) -> Vec<DiscoveredTraitImplInstance>` walks the partition for `MonoItem::Fn(instance)` entries matching `is_consumer_trait_impl_method`; the same callback drains the returned Vec inline, looks up the impl across loaded registries (local + upstream), substitutes the impl-method body with the captured args, and emits the bodies through Sky's standard codegen pipeline. Handles N=0 (non-generic impls) and N≥1 (generic impls) uniformly per @NNGZ (§26.15). Symbol canonicalization across crates is handled by the `codegen_fn_attrs` override marking consumer items `AvailableExternally` (Option 4) plus patch 5's gated share-generics escape — no augmented `upstream_monomorphizations` map required. (Earlier capture-ship-replay + A.2 augmentation retired 2026-06-21; see §F.13/§F.14/§F.14.1.)
+- **Discovered-trait-impl-instances pipeline** (§8.9.5). The in-process capture-drain mechanism that handles cases 4/6 of the interop taxonomy: at the stub-rlib compile's `consumer_fill_modules` callback (NOT `after_rust_analysis` — @GCMLZ re-entry), the pure function `collect_consumer_trait_impl_instances(tcx) -> Vec<DiscoveredTraitImplInstance>` walks the partition for `MonoItem::Fn(instance)` entries matching `is_consumer_trait_impl_method`; the same callback drains the returned Vec inline, looks up the impl across loaded registries (local + upstream), substitutes the impl-method body with the captured args, and emits the bodies through Sky's standard codegen pipeline. Handles N=0 (non-generic impls) and N≥1 (generic impls) uniformly per @NNGZ (§26.15). Symbol canonicalization across crates is handled by the restored `collect_and_partition_mono_items` filter (post-2026-06-22; consumer items don't reach rustc's LLVM-codegen path, so no rustc-side body competes with Sky's `fill_extra_modules` emission). The pre-2026-06-22 architecture used Option 4 + patch 5 + share-generics-at-stub-rlib for the same purpose; both Option 4 and patch 5 retired 2026-06-22 (see §F.14.1 / §F.17). (Earlier capture-ship-replay + A.2 augmentation retired 2026-06-21; see §F.13/§F.14/§F.14.1.)
 - Architecture fence CI test (§26.15) catches non-generic special-cases introduced in Phase 3's discovery + populate machinery.
 
 **Phase 4: Comptime (6-10 weeks).**
@@ -5333,7 +5335,7 @@ This chapter defines terms used throughout the document. Where a term is specifi
 
 **Cancellable [Sky]** — A property of futures (via `into_cancellable` wrapping): the future can be dropped while executing; a user-supplied cleanup handler runs on drop.
 
-**Stub rlib [Sky]** — A skyc-generated Rust crate (rlib) containing Rust-source declarations of every Sky export item. Compiled by rustc as ordinary Rust; Sky's `collect_and_partition_mono_items` query override filters consumer items out of rustc's CGU list before LLVM codegen, so the stub bodies produce no `.o` symbol; Sky's `fill_extra_modules` hook emits the real `External`-linkage bodies. (A brief 2026-06-21 → 2026-06-22 detour through an `codegen_fn_attrs` override / `AvailableExternally` linkage was reversed because it created a CGU-placement hazard requiring rustc-fork patch 5; see §F.14.1.)
+**Stub rlib [Sky]** — A skyc-generated Rust crate (rlib) containing Rust-source declarations of every Sky export item. Compiled by rustc as ordinary Rust; Sky's `collect_and_partition_mono_items` query override filters consumer items out of rustc's CGU list before LLVM codegen, so the stub bodies produce no `.o` symbol; Sky's `fill_extra_modules` hook emits the real `External`-linkage bodies. See §6.2 + §F.14.1 for the design history (including the brief 2026-06-21 → 2026-06-22 Option-4 detour that was reversed).
 
 **Sidecar [Sky]** — A binary file adjacent to each stub rlib, containing the Temputs for the library.
 
@@ -5363,7 +5365,7 @@ This chapter defines terms used throughout the document. Where a term is specifi
 
 **Marker-detection** — Sky's mechanism for "is this a Sky stub rlib?" Walks the crate root for `__SKY_STUBS_MARKER`.
 
-**Forked rustc** — Sky's rustc binary, statically linking the codegen backend and frontend, plus the three per_instance_mir fork patches. Cargo invokes this binary for every crate compile.
+**Forked rustc** — Sky's rustc binary, statically linking the codegen backend and frontend, plus the four fork patches (the `per_instance_mir` trio of patches 1-3 + the `fill_extra_modules` allocator-callback hook patch 4, now at rev 3 with the `#[repr(C)]` ABI; see §3.2). Cargo invokes this binary for every crate compile.
 
 **v1 / v2** — Sky version. v1 is the first usable release; v2 adds features that aren't blocking initial usability. Sky 1.0 is the first stable release.
 
@@ -5516,7 +5518,7 @@ the load-bearing detail about insertion-point timing.
 - A `fill_extra_modules` override reading a process-global `OnceLock<FillExtraModulesHook>` settable via `set_fill_extra_modules_hook(fn_ptr)`. The facade installs the hook in `LangDriver::config` alongside `Config::override_queries`. Process-global storage is forced by the crate-dependency graph (`rustc_session` is upstream of both `rustc_middle` and `rustc_codegen_llvm`, so the `TyCtxt`-typed hook can't live on `Session`); the hook is set once at init and read lock-free thereafter.
 - `ModuleLlvm::llcx_raw_mut() -> *mut c_void` and `ModuleLlvm::llmod_raw() -> *mut c_void` — type-erased raw-pointer accessors for FFI bridging into externally-managed LLVM wrappers (Inkwell's `Context::new` wrapped in `ManuallyDrop` + `Module::new_borrowed`). Type-erased to `c_void` to avoid leaking private `llvm::Context` / `llvm::Module` types through the public API.
 
-Total surface for patch 4: ~194 lines across 5 files (the four under `rustc_codegen_ssa` plus `rustc_codegen_llvm`). Default-no-op trait methods preserve vanilla rustc behavior. Forward-portable to other backends (cranelift, gcc-rs, spirv) — recommended as the first patch to attempt upstream landing.
+Total surface for patch 4: ~210 lines across 5 files (the four under `rustc_codegen_ssa` plus `rustc_codegen_llvm`); rev 2 was ~194 LOC, rev 3 grew the construction site in `base.rs::codegen_crate` by ~30 LOC for the per-`B` `unsafe extern "C" fn` thunk + state struct + struct-literal builder, partially offset by the `VecAllocator` retirement. Default-no-op trait methods preserve vanilla rustc behavior. Forward-portable to other backends (cranelift, gcc-rs, spirv) — recommended as the first patch to attempt upstream landing.
 
 **Approach B vs the earlier v1 bytes-as-interface shape.** The v1 patch 4 had `extra_modules() -> Vec<ModuleCodegen<M>>` and a `parse_from_tcx` sub-patch; Sky's emitter serialized Inkwell-built modules to bitcode bytes and rustc parsed them back. That shape worked but was interface-laziness — Sky's CGU context isn't migrating into rustc's, just being constructed and thrown away. Approach B eliminates the round-trip by having rustc own the LLVM resources and lend them to Sky via the allocator callback. Closes risks B9 (LLVM-binding version skew — structurally impossible), B10 (LLVM 21 BitcodeWriter bug — no bitcode is written), and B11 (round-trip scaling cost — no round-trip). See §F.15 for the design history.
 
@@ -5580,7 +5582,7 @@ impl CodegenBackend for SkyCodegenBackend {
 }
 ```
 
-The `fill_extra_modules` hook (installed during driver setup via `rustc_codegen_llvm::set_fill_extra_modules_hook(...)` — see `install_consumer_modules_hook` in `extra_modules_hook.rs`, called from `LangDriver::config`, NOT from the backend's `provide()`) is where Sky's bitcode actually enters rustc's pipeline. Under the shipping Approach B shape (§C.4, §F.15), the hook receives an `&mut dyn ExtraModuleAllocator<Self::Module>`, calls `allocator.allocate(name)` to obtain a rustc-owned `&mut ModuleLlvm`, wraps the borrowed `LLVMContext` + `LLVMModule` pointers in Inkwell's suppressed-Drop handles (`ManuallyDrop<Context>` + `Module::new_borrowed`), and emits LLVM IR directly into the rustc-owned module. No bitcode serialization, no `parse_from_tcx` round-trip, no context migration — rustc retains ownership of every module throughout. See §C.4 for the full pattern.
+The `fill_extra_modules` hook (installed during driver setup via `rustc_codegen_llvm::set_fill_extra_modules_hook(...)` — see `install_consumer_modules_hook` in `extra_modules_hook.rs`, called from `LangDriver::config`, NOT from the backend's `provide()`) is where Sky's bitcode actually enters rustc's pipeline. Under the shipping Approach B rev 3 shape (§C.4, §F.15 — patch 4 rev 3 landed 2026-06-24 Phase H), the hook receives `&ExtraModuleAllocator<ModuleLlvm>` (a `#[repr(C)]` struct carrying `state: *mut c_void` + `allocate: unsafe extern "C" fn`), calls `(allocator.allocate)(allocator.state, name.as_ptr(), name.len())` to obtain a rustc-owned `*mut ModuleLlvm`, briefly reborrows it to read the raw `LLVMContext` + `LLVMModule` pointers, wraps the borrowed handles in Inkwell's suppressed-Drop wrappers (`ManuallyDrop<Context>` + `Module::new_borrowed`), and emits LLVM IR directly into the rustc-owned module. No bitcode serialization, no `parse_from_tcx` round-trip, no context migration — rustc retains ownership of every module throughout. The rev-2 trait-object boundary (`&mut dyn ExtraModuleAllocator<M>`) retired in Phase H because it would have failed across an eventual cdylib FFI (vtable layout depends on `rustc_codegen_ssa` source identity); the `#[repr(C)]` shape is FFI-safe by construction. See §C.4 for the full pattern.
 
 #### C.2 Consumer item suppression: partition filter
 
@@ -5996,23 +5998,29 @@ This has three architectural consequences:
    linkage made owning-crate emission viable. §8.9.5 covers the
    current pipeline.
 
-3. **Symbol canonicalization across crates is handled by patch 5 +
-   share_generics, not by an `upstream_monomorphizations`
-   augmentation.** Without help, the user-bin compile's v0 mangler
-   would short-circuit at -O>=2 and pick user-bin as the
-   instantiating-crate disambig for trait-impl methods (mismatch →
-   link error). The shipping fix: (a) Sky's `LangDriver::config`
-   heuristic forces `share_generics=true` at stub rlib compiles so
-   rustc records the trait-impl monomorphizations in the rlib's
-   natural rmeta-encoded `upstream_monomorphizations_for` map; (b)
-   patch 5's gated escape clause in `Instance::upstream_monomorphization`
-   keeps the share-generics gate from short-circuiting at user-bin
-   compile so the mangler consults the natural map. The previous
+3. **Symbol canonicalization across crates is handled by the
+   partition filter (post-2026-06-22).** The pre-2026-06-22
+   architecture used Option 4's `codegen_fn_attrs` override +
+   rustc-fork patch 5's gated escape in
+   `Instance::upstream_monomorphization` to keep the v0 mangler from
+   short-circuiting at user-bin compile (so it would consult the
+   natural `upstream_monomorphizations_for` map). Both Option 4 and
+   patch 5 jointly retired 2026-06-22 — see §F.14.1 / §F.17. Under
+   the restored partition filter, consumer items don't reach rustc's
+   LLVM-codegen path at all, so no rustc-side body is emitted for
+   any consumer Instance; the only `.o` symbol for the trait-impl
+   method comes from Sky's `fill_extra_modules` body. The mangler's
+   instantiating-crate-disambig question becomes moot because there
+   isn't a competing rustc-emitted symbol to disambiguate against.
+   (Sky's `LangDriver::config` heuristic still forces
+   `share_generics=true` at stub rlib compiles so the rlib's rmeta
+   carries upstream-monomorphizations entries for downstream
+   share-generics lookups, but the patch-5 escape that previously
+   read those entries at -O>=2 is gone.) The earlier
    `synthesize_upstream_monomorphizations` callback + whole-map
-   `upstream_monomorphizations` query override (A.2) that injected
-   synthesized entries into rustc's map was retired 2026-06-21 in
-   §5.5 Step 3 + the dead-code cleanup (commits b09a90b + ff0cfe8) —
-   the natural map populated by share-generics is sufficient.
+   `upstream_monomorphizations` query override (A.2) retired
+   2026-06-21 in §5.5 Step 3 + the dead-code cleanup (commits
+   b09a90b + ff0cfe8).
 
 The corresponding insight for handoff-style decision-making: **when
 debugging a "Sky's body isn't getting emitted" failure, check WHICH
@@ -6033,10 +6041,14 @@ mangler disambig; user-bin's emission of clone uses a different one):
 - **B** (the shipped fix, F.13 above): let the cascade fire at the
   stub rlib compile and have Sky's `fill_extra_modules` emit the
   resulting bodies at that same compile session. Symbol
-  canonicalization across crates is handled by share_generics=true
-  at the stub rlib + patch 5 at user-bin. (The earlier
-  capture-ship-replay + A.2 augmented-map variant of B was retired
-  2026-06-21 — see F.14.1 and §F.13's revised consequence 3.)
+  canonicalization across crates is handled by the partition filter
+  removing consumer items from rustc's CGU list entirely (post-2026-
+  06-22 — see §F.14.1 / §F.17). Pre-2026-06-22 framing relied on
+  patch 5 + share-generics; with Option 4 + patch 5 retired, no
+  rustc-emitted consumer body exists to disambiguate against.
+  (The earlier capture-ship-replay + A.2 augmented-map variant of B
+  was retired 2026-06-21 — see F.14.1 and §F.13's revised
+  consequence 3.)
 - **C** (suppress `per_instance_mir` at stub rlib): return `None`
   from Sky's provider when the local crate is a stub rlib, so the
   cascade never fires there.
