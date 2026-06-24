@@ -4075,9 +4075,18 @@ the runner is `toylangc/tests/scripts/run_perf_bench.sh`.
 | 1 | 100M `add(a,b)` calls, with `black_box` defeating fold | O3: 86.7ms | O3: 57.9ms | **1.50×** |
 | 1 baseline | Same shape, Rust→Rust (`test_helpers::bench_baseline_add`) | O3: 90.7ms | O3: 58.1ms | 1.56× |
 | 2 K=100 | 10M calls, 100 units of work per call | O3: 11.7ms | O3: 7.9ms | 1.48× |
-| 3 | 10M `<Widget as Drop>::drop` calls via `Vec<Widget>` drop | O3: 10.0ms | O3: 0.4ms | **26.5×** |
+| 3 | 10M `<Widget as Drop>::drop` calls via `Vec<Widget>` drop | O3: 9.5ms | O3: 0.4ms | **25.5×** |
+| 3 baseline (single-crate) | Widget defined IN user_bin; intra-crate inlining | O3: 0.33ms | O3: 0.38ms | 0.89× (both at floor) |
+| 3 baseline (cross-crate) | Widget in `test_widgets` sibling crate (apples-to-apples vs Sky) | O3: 9.9ms | O3: 0.36ms | **27.5×** |
+| 3 baseline (inline_never) | `WidgetNoInline` in `test_widgets` with `#[inline(never)]` Drop | O3: 9.4ms | O3: 9.5ms | 0.99× (floor) |
 
-Two findings drive the user-facing recommendation:
+(Bench 3 numbers refreshed 2026-06-24 alongside the baselines; the
+new median for `bench3_drop_o3_nolto` is 9.5ms vs the 10.0ms reported
+in the original Phase B run — within the expected ~10% run-to-run
+variance. The ratio is 25.5× now where it was 26.5× then; both fall
+in the same "drop-heavy paths benefit massively from LTO" regime.)
+
+Three findings drive the user-facing recommendation:
 
 1. **Sky's call boundary essentially matches Rust's own cross-crate cost.**
    At O3 thin, Sky's 57.9ms and Rust-baseline's 58.1ms differ by 0.3% —
@@ -4086,11 +4095,36 @@ Two findings drive the user-facing recommendation:
    on Bench 1 is the SAME ratio the Rust baseline shows; it's a property
    of the cross-crate boundary, not of Sky's specific emission.
 
-2. **Drop-heavy code amplifies the LTO win massively.** Bench 3's
-   26.5× LTO speedup reflects LLVM inlining Sky's `Drop::drop` body into
-   `Vec::drop`'s element loop, eliding the empty body, and vectorizing
-   the resulting no-op. Without LTO, the chain pays full FFI cost per
-   element. With LTO, it disappears.
+2. **Drop-heavy code amplifies the LTO win massively, and the
+   amplification is inherited from Rust's cross-crate Drop chain — not
+   Sky-specific.** Bench 3's ~25× LTO speedup reflects LLVM inlining
+   Sky's `Drop::drop` body into `Vec::drop`'s element loop, eliding the
+   empty body, and vectorizing the resulting no-op. The pure-Rust
+   cross-crate baseline (`bench3_rust_baseline_cross_crate_*`: Widget
+   in the `test_widgets` sibling crate) shows **27.5×** under the same
+   structural setup — within run-to-run variance of Sky's 25.5×. And
+   Sky's thin-LTO result (371μs) matches the cross-crate Rust baseline
+   (360μs) at 3% delta, mirroring Bench 1's 0.3% Sky-vs-Rust finding.
+   The conclusion: **the ~26× LTO speedup is a property of the
+   cross-crate Drop chain under LLVM's inliner, not anything
+   Sky-specific.** Sky's drop emission gives LLVM the same elimination
+   opportunity a pure-Rust cross-crate Drop impl does. Without LTO, the
+   chain pays full FFI cost per element (~0.95ns/drop, matching the
+   `inline_never` floor and Bench 1's nolto baseline). With LTO, it
+   disappears in both languages.
+
+3. **The `single_crate` and `inline_never` baselines bracket what LTO
+   can deliver.** `single_crate` (Widget defined in the user_bin
+   itself) shows nolto ≈ thin both at ~0.35ms — LLVM's intra-crate
+   inliner already eliminates the empty Drop body at O3 without LTO;
+   LTO has nothing left to do. `inline_never` (Widget in
+   `test_widgets`, Drop impl carries `#[inline(never)]`) shows nolto ≈
+   thin both at ~9.5ms — LTO literally cannot help when the inliner is
+   forbidden. The per-element cost in `inline_never` (~0.95ns/drop)
+   matches Bench 1's nolto baseline (~0.87ns/call), confirming the
+   per-call cross-crate cost is dominated by dispatch overhead at this
+   scale regardless of what the function body does. The two baselines
+   sandwich Sky's actual operating point.
 
 **User-facing recommendation.** For dev iteration use the cargo dev
 profile's default (`lto = false` — thin-local LTO §F.16 still bridges
@@ -4283,12 +4317,32 @@ M-series LLVM 21. Sky inherits it; doesn't add to it.
 **Drop chain ratio interpretation.** Bench 3 measures the worst case:
 10M empty Drops. Real Drop bodies do work (free a handle, decrement a
 refcount, run cleanup logic), and that work cost will be at least
-comparable to the per-call dispatch cost — meaning the 26.5× ratio
+comparable to the per-call dispatch cost — meaning the ~25× ratio
 shrinks toward the Bench 1 ratio (1.5×) as Drop bodies grow. **Don't
-quote "Sky drops are 26× faster with LTO" as a user-facing number.**
+quote "Sky drops are 25× faster with LTO" as a user-facing number.**
 The honest framing: "drop-heavy workloads benefit most from LTO; for
 Drop bodies that do significant work, the LTO speedup approaches the
 generic call-boundary ratio (~1.5×)."
+
+**Apples-to-apples Rust baseline (added 2026-06-24, Phase B+).** The
+pure-Rust Bench 3 baselines (`bench3_rust_baseline_*`) confirm the
+above ratio is not Sky-specific. Pure-Rust with Widget in a sibling
+crate (`test_widgets`) shows an LTO ratio of **27.5×** (nolto 9.9ms,
+thin 0.36ms) — within run-to-run variance of Sky's 25.5×. Sky's
+thin-LTO result (371μs) matches the cross-crate Rust baseline (360μs)
+at 3% delta, mirroring Bench 1's 0.3% Sky-vs-Rust finding. The 25×
+LTO speedup is therefore "a property of cross-crate Drop chains under
+LLVM's LTO inliner that Sky inherits from Rust," NOT anything Sky
+adds. The `bench3_rust_baseline_inline_never_*` variant (Drop has
+`#[inline(never)]`) establishes the floor: when the inliner literally
+cannot help, the per-element chain cost is ~0.95ns/drop — matching
+Bench 1's general cross-crate call cost (~0.87ns/call). And the
+`bench3_rust_baseline_single_crate_*` variant (Widget in the user_bin
+itself) shows nolto ≈ thin at ~0.35ms — LLVM's intra-crate inliner
+already eliminates the empty Drop body at O3 without LTO, so LTO has
+nothing left to do. These three baselines sandwich Sky's actual
+operating point in three independent ways, all of which confirm the
+structural-equivalence story.
 
 ### 22.5 Deterministic output as a CI invariant
 

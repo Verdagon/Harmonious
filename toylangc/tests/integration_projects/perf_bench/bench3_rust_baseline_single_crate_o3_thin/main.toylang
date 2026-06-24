@@ -1,0 +1,13 @@
+// Bench 3 pure-Rust baseline (single-crate variant). Sky source is
+// intentionally minimal — the rust_caller defines Widget + impl Drop
+// + make_widget in Rust source ITSELF, not as a __lang_stubs export
+// and not in a sibling crate. This is the "easy case" for LLVM:
+// intra-crate inlining at O3 can already eliminate the Drop body
+// without LTO.
+//
+// Toylang requires a main.toylang. We export a no-op fn purely so the
+// stub rlib is well-formed; the rust caller doesn't call it.
+
+export fn unused_anchor() -> i32 {
+    0
+}

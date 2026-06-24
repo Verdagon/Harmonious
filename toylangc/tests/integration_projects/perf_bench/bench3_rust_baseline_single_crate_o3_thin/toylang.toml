@@ -1,0 +1,7 @@
+[project]
+name = "bench3_rust_baseline_single_crate_o3_thin"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "3"
+lto = "thin"
+codegen-units = 16

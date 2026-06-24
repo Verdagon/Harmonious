@@ -212,6 +212,34 @@ for name in bench3_drop_nolto bench3_drop_o0_thin bench3_drop_o3_nolto bench3_dr
 done
 
 echo
+echo "## Bench 3 pure-Rust baselines (10M Widget drops)"
+echo
+echo "Apples-to-apples comparisons against Sky's Bench 3. Widget is defined in Rust"
+echo "source (not as a Sky export) across three structural variants:"
+echo "- \`single_crate\`: Widget defined IN the user_bin's rust_caller. Intra-crate"
+echo "  inlining at O3 can already eliminate the Drop body without LTO; upper bound"
+echo "  on what nolto delivers in the best case."
+echo "- \`cross_crate\`: Widget in the \`test_widgets\` sibling crate. The structural"
+echo "  equivalent of Sky's bench3_drop_*: cross-crate Drop impl, no intra-crate"
+echo "  inlining shortcut. THIS is the row to compare against Sky's 26.5×."
+echo "- \`inline_never\`: WidgetNoInline in \`test_widgets\` with \`#[inline(never)]\`"
+echo "  on Drop. Establishes the floor — what does the chain cost when the inliner"
+echo "  literally can't help?"
+echo
+echo "| Config | Median elapsed (μs) | .text bytes | Symbol count |"
+echo "|---|---:|---:|---:|"
+
+for name in bench3_rust_baseline_single_crate_o3_nolto bench3_rust_baseline_single_crate_o3_thin bench3_rust_baseline_cross_crate_o3_nolto bench3_rust_baseline_cross_crate_o3_thin bench3_rust_baseline_inline_never_o3_nolto bench3_rust_baseline_inline_never_o3_thin; do
+  echo "BUILDING $name..." >&2
+  if build_bench "$name"; then
+    emit_row "$name" "$name"
+  else
+    printf "| %s | BUILD FAIL | — | — |\n" "$name"
+    echo "  build failed; see $BENCH_DIR/$name/.build.log" >&2
+  fi
+done
+
+echo
 echo "## Decision gate (per handoff.md / Bench 1)"
 echo
 echo "- Ratio < 2× (LTO over nolto at O3): architecture overhead is small even worst-case."

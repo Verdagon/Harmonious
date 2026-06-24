@@ -1,0 +1,14 @@
+// Bench 3 pure-Rust baseline (cross-crate variant). Sky source is
+// intentionally minimal — the rust_caller imports Widget + impl Drop
+// from the test_widgets SIBLING crate. This is the apples-to-apples
+// comparison with Sky's Bench 3: cross-crate Drop impl, called through
+// stdlib Vec drop. Expected behavior: matches Sky's 26.5× LTO ratio
+// (because the structural shape is identical) or reveals a Sky-specific
+// amplification.
+//
+// Toylang requires a main.toylang. We export a no-op fn purely so the
+// stub rlib is well-formed; the rust caller doesn't call it.
+
+export fn unused_anchor() -> i32 {
+    0
+}

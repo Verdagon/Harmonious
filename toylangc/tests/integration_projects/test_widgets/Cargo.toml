@@ -1,0 +1,14 @@
+[package]
+name = "test_widgets"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+# Self-contained workspace — same pattern as test_helpers/. Keeps cargo from
+# walking up into the outer `erw` workspace and treating this crate as a
+# member there. The bench fixtures under perf_bench/ that path-dep on this
+# crate share the same CARGO_TARGET_DIR so test_widgets compiles once
+# across the bench suite.
+[workspace]

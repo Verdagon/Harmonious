@@ -1,0 +1,14 @@
+// Bench 3 pure-Rust baseline (inline_never variant). Sky source is
+// intentionally minimal — the rust_caller uses WidgetNoInline from
+// the test_widgets sibling crate. WidgetNoInline's Drop impl carries
+// `#[inline(never)]`, forcing a real function call per element no
+// matter what LTO does. The nolto-vs-thin ratio for this fixture
+// establishes the floor: what does the chain cost when the inliner
+// literally can't help?
+//
+// Toylang requires a main.toylang. We export a no-op fn purely so the
+// stub rlib is well-formed; the rust caller doesn't call it.
+
+export fn unused_anchor() -> i32 {
+    0
+}

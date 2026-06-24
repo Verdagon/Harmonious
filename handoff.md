@@ -53,10 +53,11 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 - **Phase E (mir_shims elimination)** — DONE 2026-06-23. `mir_shims` override + `drop_glue.rs` + `mir_helpers.rs` + the `DEFAULT_MIR_SHIMS` plumbing all deleted. Rustc's default DropGlue path fires unchanged; per-type drop semantics flow through a compiler-synthesized `Drop::drop(&local)` AST node inserted at scope end (Phase E.b/E.c/E.d below).
 - **Phase E.b/E.c/E.d (scope-end drop emission)** — DONE 2026-06-23. The compiler synthesizes `TypedStmt::ExprStmt(TypedExprKind::StaticCall { ty: "Drop", method: "drop", args: [Ref(local)] })` at scope-end positions of every void-returning function whose body has a let-binding with a Drop-implementing type. The synthesis runs **once** in `insert_scope_end_drops` and is invoked from both the dep-collection site (`type_resolve_body` in `callbacks_impl.rs`) and the codegen site (`codegen_internal_function` in `llvm_gen.rs`). After that pass, every downstream stage — dep walker, mono cascade, codegen, symbol resolution, link — treats drop calls as ordinary trait static calls with no drop-specific code paths. 9 drop fixtures + 333 existing tests pass cold: **342 / 0 / 1 ignored**. See Decision 1 (substantially revised below) for the architectural detail.
 - **Phase B (perf bench)** — DONE 2026-06-24 (commits `81b6eb1` + later doc landing). 17 bench fixtures land under `toylangc/tests/integration_projects/perf_bench/` (5 Bench-1 configs + 2 Rust-only baselines + 6 Bench-2 K/LTO combos + 4 Bench-3 drop variants). Runner at `toylangc/tests/scripts/run_perf_bench.sh` builds, runs, and reports a markdown table. Headline numbers (M-series macOS, LLVM 21.1.8): **Bench 1 LTO ratio = 1.50× → handoff "<2× → lock §5.5 confidently" gate fires**; **Sky vs Rust baseline at O3 thin = 0.3% delta (essentially identical)**; **Bench 3 drop chain LTO ratio = 26.5×**. Full results + interpretation in `tmp/perf-bench-summary.md` and `rust-interop-architecture.md` §22.4 (which now includes §22.4.2 reproduction steps and §22.4.3 interpretation assumptions). Two follow-up findings surfaced: **F3** (Sky main + while loop + 1M+ allocations stack-overflows due to toylangc O0 alloca recycling bug) and **B10 residual** (Phase E drop synthesis + Vec<SkyStruct> at opt-level ≥ 1 still trips the LLVM 21 BitcodeWriter bug under ThinLTO cross-CGU import; arch doc §25.2 B10 tightened from "CLOSED" to "CLOSED for primary path; residual trigger…").
+- **Phase B+ (Bench 3 pure-Rust baselines)** — DONE 2026-06-24 (follow-up session). 6 new fixtures under `bench3_rust_baseline_{single_crate,cross_crate,inline_never}_o3_{nolto,thin}` + new `toylangc/tests/integration_projects/test_widgets/` sibling crate carrying `Widget` + `WidgetNoInline` + `make_test_widget` + `make_test_widget_no_inline`. Runner extended to include the new section. Bench fixture count: 17 → 23. **Verdict: the ~26× drop-chain LTO speedup is INHERITED from Rust, not Sky-specific.** Pure-Rust cross-crate Drop (`bench3_rust_baseline_cross_crate_*`) shows **27.5×** — within run-to-run variance of Sky's 25.5× (R_sky refreshed slightly from 26.5×; same regime). Sky's thin-LTO Drop chain (371μs) matches the cross-crate Rust baseline (360μs) at 3% delta, mirroring Bench 1's 0.3% Sky-vs-Rust finding. Two more baselines bracket the operating point: `single_crate` (Widget IN user_bin → intra-crate inliner already eliminates without LTO, both = ~0.35ms, ratio 0.89×) and `inline_never` (Drop has `#[inline(never)]` → LTO can't help, both = ~9.5ms, ratio 0.99×, ~0.95ns/drop matching Bench 1's nolto baseline ~0.87ns/call). Round-4 framing for Bench 3 becomes: "Sky's drop emission gives LLVM the same elimination opportunity a pure-Rust cross-crate Drop impl does; the 26× speedup is a general LLVM-LTO property Sky inherits, not Sky-specific overhead being eliminated." See `rust-interop-architecture.md` §22.4 (refreshed table + finding #2 rewrite + new finding #3 + new bullet in §22.4.3 "Apples-to-apples Rust baseline") and `tmp/perf-bench-summary.md` (refreshed F2 + new Bench 3 baseline table + round-4 lead-with bullet 2).
 - **Phase I (cache_on_disk_if audit)** — DONE 2026-06-24. **Decision 14's prescribed Provider-slot syntax (`providers.queries.layout_of_cache_on_disk_if = ...`) doesn't exist on current nightly.** `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit re-derived cache-safety: every Sky-overridden query is safe by construction (`per_instance_mir` declared `false` in fork patch; `layout_of` + `cross_crate_inlinable` default to `false`; `collect_and_partition_mono_items` is `eval_always`; `symbol_name` is disk-cached but its override is scheduled for removal per Decision 2 and the default mangler invalidates correctly). Annotated all 5 override files with `cache-audit:` marker comments. New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker. New §22.4.1 documents the policy table; new B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API." Decision 14 itself is revised below.
 
 **Not yet started (your work):**
-- Phases C (tool attribute), D (predicate migration), F (symbol_name elimination), G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences).
+- Phases C (tool attribute), D (predicate migration), F (symbol_name elimination), G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences). Phase B+ is now also done; nothing in the perf-bench arc remains.
 
 **In flight from prior sessions (independent of this exchange):**
 - Patch 5 retirement (shipped 2026-06-22 per the historical section below).
@@ -72,29 +73,28 @@ The review exchange committed us to **17 architectural changes**, most important
 
 Critical caveat (historical): **toylang had zero drop tests**, so the mir_shims elimination had no empirical baseline. Phase A built fixtures FIRST, validated baseline under current model, THEN did the migration with fixtures as the regression suite. Both phases shipped 2026-06-23. Phase B (perf bench) shipped 2026-06-24 with similar discipline — build fixtures, run, capture, interpret, land empirical anchors in the doc. Decision-gate verdict: **lock §5.5**.
 
-**Implementation order, top 5 (refreshed 2026-06-24 after Phases A/E/B/I shipped):**
+**Implementation order, top 5 (refreshed 2026-06-24 after Phases A/E/B/B+/I shipped):**
 
 1. ~~Drop fixtures~~ — DONE (Phase A, 2026-06-23). 9 fixtures + 333 existing tests passing.
 2. ~~Perf bench~~ — DONE (Phase B, 2026-06-24). 17 fixtures; Bench 1 ratio 1.50× → lock §5.5; Bench 3 drop chain 26.5×. See §22.4 + `tmp/perf-bench-summary.md`.
 3. ~~mir_shims elimination~~ — DONE (Phase E + E.b/c/d, 2026-06-23). AST-rewrite drop synthesis is shipped; the override + `drop_glue.rs` + `mir_helpers.rs` are deleted.
 4. ~~cache_on_disk_if audit~~ — DONE (Phase I, 2026-06-24). Audit found prescribed API doesn't exist; all queries cache-safe by construction; CI fence in place.
+5. ~~Bench 3 pure-Rust baselines~~ — DONE (Phase B+, 2026-06-24, follow-up session). 6 new fixtures + test_widgets sibling crate. **Pure-Rust cross-crate Drop shows 27.5× LTO ratio** (within noise of Sky's 25.5×); the amplification is inherited from Rust, not Sky-specific. Round-4 framing for Bench 3 settled.
 
 **NEXT — start here next session:**
 
-**0.5 (do this FIRST, ~1 hour, RESUME-HERE).** **Phase B+: Bench 3 pure-Rust baselines** — see the detailed phase entry below. Closes a round-4 framing gap: we don't currently know whether the 26.5× drop-chain LTO ratio is Sky-specific or just what pure Rust shows under the same cross-crate Drop conditions. The reviewer will ask; we need the answer in hand before the conversation. Small scope (~1 focused hour for 6 fixtures + 1 sibling crate + a rerun + interpretation), but real importance for how we frame Bench 3 in §22.4. Don't skip in favor of jumping to Phase C — this is fresh in our heads now, and forgetting we owe it will be embarrassing in round 4.
-
-5. **Tool attribute infrastructure + partition predicate migration (Phase C+D)** — after Phase B+ above. ~2-3 days. Wire up `#![register_tool(skyc)]` + `#[skyc::emit_consumer_body]`; migrate `is_consumer_codegen_target` to the two-gate attribute conjunction (Decision 3).
+6. **Tool attribute infrastructure + partition predicate migration (Phase C+D)** — ~2-3 days. Wire up `#![register_tool(skyc)]` + `#[skyc::emit_consumer_body]`; migrate `is_consumer_codegen_target` to the two-gate attribute conjunction (Decision 3). With all four round-4 deliverables now in hand, the next session can either schedule round 4 OR continue execution work starting here.
 
 After that: symbol_name elimination (Phase F, ½ day), cdylib build system + patch 4 rev 3 (Phases G+H, ~1 week), u128 typeids + content-hash const args (Phases J+K, ~1.5 weeks), per-view ref types + async typestate (Phases L+M, ~3 weeks).
 
 **Round 4 deliverables** (when you come back to the reviewer):
-1. **Perf bench numbers — IN HAND, but with one open question to close first (see Phase B+ below).** Bench 1 ratio 1.50×; Sky vs Rust baseline at 0.3% delta; Bench 3 drop chain 26.5× (Sky only — no Rust comparison yet; **Phase B+ below closes this gap, ~1 hour**). Decision-gate verdict: lock §5.5.
+1. **Perf bench numbers — IN HAND.** Bench 1 ratio 1.50×; Sky vs Rust baseline at 0.3% delta; Bench 3 drop chain 25.5× **with apples-to-apples pure-Rust comparison showing 27.5×** (inherited from Rust, not Sky-specific; Sky vs Rust cross-crate at thin LTO = 3% delta). Decision-gate verdict: lock §5.5. The round-4 framing for Bench 3 is now: "Sky's drop emission gives LLVM the same elimination opportunity Rust's does; the 26× speedup is a property of cross-crate Drop chains under LLVM's inliner that Sky inherits, not anything Sky adds."
 2. **Cache_on_disk_if audit results — IN HAND.** Prescribed API doesn't exist; every override cache-safe by construction; CI fence in place.
 3. **Drop fixture outcomes — IN HAND.** 9 fixtures pass; the prior `mir_shims` override was empirically broken (never fired; Finding A.6).
 4. **mir_shims elimination empirical validation — IN HAND.** AST-rewrite shape ships at 342/0/1 tests; no regressions in the 191 prior integration tests.
 5. **Implementation surprises grouped by where they surfaced — IN HAND.** F3 (Sky main + while loop stack overflow due to toylangc O0 alloca recycling), B10 residual (Phase E drop synthesis + Vec<SkyStruct> still trips bug under ThinLTO cross-CGU import); both documented in arch doc §F.18.
 
-The round 4 conversation has the data anchors the reviewer asked for, MODULO the Bench 3 pure-Rust comparison gap (Phase B+ below). Close that first (~1 hour), then either schedule round 4 OR continue with the next chunk of execution work: Phase C/D/F (tool attribute + predicate migration + symbol_name elimination).
+The round 4 conversation has all four data anchors the reviewer asked for. Next session can either schedule round 4 OR continue with the next chunk of execution work: Phase C/D/F (tool attribute + predicate migration + symbol_name elimination).
 
 ---
 
@@ -1249,11 +1249,49 @@ The shipped Fixtures 1-9 already cover the load-bearing cases.
 - I-1 B10 upstream investigation + minimal LLVM repro.
 - I-12 toylangc O0 alloca-recycling fix (F3 root cause).
 
-### Phase B+: Bench 3 pure-Rust baselines (~1 hour, RESUME-HERE candidate)
+### Phase B+: Bench 3 pure-Rust baselines — DONE 2026-06-24
 
-**Status: NOT YET DONE. Recommended as the FIRST thing to do next session — it's small (~1 focused hour) and closes a real round-4 framing gap before any further Phase work.**
+**Status: SHIPPED 2026-06-24** (follow-up session after Phase B). 6 new fixtures + 1 sibling crate + runner extension + doc updates landed cleanly.
 
-#### Why this is needed (read this first or you'll miss the point)
+#### What landed
+
+- **New sibling crate** `toylangc/tests/integration_projects/test_widgets/` with `Widget` (LLVM-inlinable Drop) + `WidgetNoInline` (`#[inline(never)]` Drop) + `make_test_widget` + `make_test_widget_no_inline`. Same `[workspace]` self-isolation pattern as `test_helpers/`.
+- **6 new bench fixtures** under `perf_bench/bench3_rust_baseline_{single_crate,cross_crate,inline_never}_o3_{nolto,thin}`, each with a minimal Sky-source placeholder + Rust caller + toml.
+- **Runner extended** with a new "Bench 3 pure-Rust baselines" section.
+- **§22.4 perf-model table extended** with 3 new rows; finding #2 rewritten ("inherited from Rust"); new finding #3 explaining the floor/ceiling baselines.
+- **§22.4.3 "Apples-to-apples Rust baseline" paragraph** added documenting the 27.5× / 3% delta / 0.95ns floor.
+- **`tmp/perf-bench-summary.md`** F2 finding rewritten + new Bench 3 baseline table + round-4 lead-with bullet 2 refreshed.
+
+#### Headline finding
+
+**R_rust_cross = 27.5×** (cross_crate_o3_nolto = 9901μs / cross_crate_o3_thin = 360μs) versus **R_sky = 25.5×** (drop_o3_nolto = 9470μs / drop_thin = 371μs). Within run-to-run variance. Sky-vs-Rust at thin LTO: 371μs vs 360μs = **3% delta** (matching Bench 1's 0.3% Sky-vs-Rust finding).
+
+**This is the first row of the interpretation matrix below** ("Sky inherits Rust's LTO behavior"). The 26× LTO speedup is a property of cross-crate Drop chains under LLVM's LTO inliner — NOT Sky-specific. Sky's drop emission gives LLVM the same elimination opportunity a pure-Rust cross-crate Drop impl does.
+
+#### The two bracket baselines
+
+- `single_crate` (Widget defined IN user_bin): nolto = 334μs ≈ thin = 377μs (ratio 0.89×). LLVM's intra-crate inliner already eliminates the empty Drop body at O3 without LTO; LTO has nothing left to do. Upper bound on what LTO can deliver.
+- `inline_never` (WidgetNoInline in `test_widgets`, Drop carries `#[inline(never)]`): nolto = 9400μs ≈ thin = 9491μs (ratio 0.99×). LTO literally cannot help when the inliner is forbidden. Per-element cost ≈ 0.95ns/drop — matches Bench 1's nolto baseline (~0.87ns/call), confirming the per-call cross-crate cost story.
+
+These two baselines sandwich Sky's actual operating point in three independent ways, all consistent.
+
+#### Files touched
+
+| File | Change |
+|---|---|
+| `toylangc/tests/integration_projects/test_widgets/{Cargo.toml,src/lib.rs}` | NEW (sibling crate) |
+| `toylangc/tests/integration_projects/perf_bench/bench3_rust_baseline_*/` | NEW (6 fixtures × 4 files each) |
+| `toylangc/tests/scripts/run_perf_bench.sh` | Extended with Bench 3 baseline section |
+| `rust-interop-architecture.md` §22.4 | Table extended + findings rewritten |
+| `rust-interop-architecture.md` §22.4.3 | New "Apples-to-apples Rust baseline" bullet |
+| `tmp/perf-bench-summary.md` | F2 rewritten + new Bench 3 baseline table + round-4 framing refresh |
+| `handoff.md` | This Phase B+ entry marked DONE + status section + top-5 + round-4 deliverables updated |
+
+The spec/rationale below is preserved as historical context for understanding why this work was important and what would have happened if the result had been the second or third row of the interpretation matrix.
+
+---
+
+#### Why this was needed (read this first or you'll miss the point)
 
 The shipped Bench 3 measures the Sky drop chain: O3 nolto = 10.0ms; O3 thin = 0.4ms; LTO ratio = 26.5×. We have NO pure-Rust comparison for this workload. The current §22.4 / `tmp/perf-bench-summary.md` framing says:
 
@@ -1951,6 +1989,8 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 **Phase B success — ACHIEVED 2026-06-24:** perf bench numbers documented in `rust-interop-architecture.md` §22.4 (with reproduction steps in §22.4.2 and interpretation assumptions in §22.4.3). Numbers confirm "LTO-first model is acceptable" — Bench 1 LTO ratio 1.50× (in handoff's "<2× → lock §5.5 confidently" band); Sky vs Rust baseline at 0.3% delta (Sky adds no measurable overhead); Bench 3 drop chain 26.5× LTO speedup. Decision-gate verdict: lock §5.5. Two follow-up findings flagged: F3 (toylangc O0 alloca recycling) and B10 residual (ThinLTO cross-CGU import re-triggers the bug); both documented in §F.18 + §25.2 B10.
 
+**Phase B+ success — ACHIEVED 2026-06-24 (follow-up):** Bench 3 pure-Rust baselines confirm the ~26× drop-chain LTO speedup is INHERITED from Rust, not Sky-specific. Pure-Rust cross-crate Drop shows 27.5×; Sky shows 25.5×; Sky vs Rust at thin LTO = 3% delta (matching Bench 1's 0.3%). `single_crate` baseline (Widget in user_bin) and `inline_never` baseline (Drop `#[inline(never)]`) bracket the operating point cleanly. 6 new fixtures + new `test_widgets/` sibling crate; 23 total fixtures; runner extended; §22.4 + §22.4.3 + perf-bench-summary updated. Round-4 framing for Bench 3 settled: "Sky's drop emission gives LLVM the same elimination opportunity Rust's does."
+
 **Phases C+D success — NOT YET STARTED:** `#[skyc::emit_consumer_body]` attribute machinery in place; partition predicate migrated; orphaned classification matchers deleted; CI fence verifies 1:1 invariant.
 
 **Phase E success — ACHIEVED 2026-06-23:** mir_shims override gone; all 9 drop fixtures pass under the new AST-rewrite model; no regressions in the 333 prior integration tests (now 342 total). The `project_raw_field` CI fence turned out unnecessary because the synth pass never directly accesses field storage.
@@ -1973,4 +2013,4 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 **Phase O success:** drift CI fences in place for B24/B25/B26 detection.
 
-**Overall success — round 4 inputs READY:** all four round-4 deliverables now in hand. Bench numbers (Phase B), cache audit results (Phase I), drop fixture outcomes (Phase A — 9 fixtures passing), mir_shims elimination empirical validation (Phase E — 342/0/1 tests). Plus implementation surprises grouped by where they surfaced (F3 toylangc alloca recycling; B10 residual under ThinLTO; cache_on_disk_if Provider-slot API doesn't exist). The next session can either (a) schedule round 4 with the reviewer using these anchors, or (b) continue with the unblocked next chunk of execution work — Phase C+D (tool attribute + predicate migration), Phase F (symbol_name retirement), Phase G+H (cdylib backend + FFI shape).
+**Overall success — round 4 inputs READY:** all four round-4 deliverables now in hand AND the Bench 3 framing question (Sky-specific vs inherited from Rust) is answered. Bench numbers + apples-to-apples Rust baselines (Phases B + B+), cache audit results (Phase I), drop fixture outcomes (Phase A — 9 fixtures passing), mir_shims elimination empirical validation (Phase E — 342/0/1 tests). Plus implementation surprises grouped by where they surfaced (F3 toylangc alloca recycling; B10 residual under ThinLTO; cache_on_disk_if Provider-slot API doesn't exist). The next session can either (a) schedule round 4 with the reviewer using these anchors, or (b) continue with the unblocked next chunk of execution work — Phase C+D (tool attribute + predicate migration), Phase F (symbol_name retirement), Phase G+H (cdylib backend + FFI shape).
