@@ -44,7 +44,7 @@ If you don't have rustc-internals background, plan ~1 week of orientation readin
 
 If you're picking up cold from someone else, also skim `tmp/claude-conversation-2026-06-23-836f2993.md` — the full review-exchange transcript. It's ~10,800 lines but the actual content is roughly half that (the user pasted some long articles in for context). The decisions in this handoff are the distillation; the transcript is the rationale at full fidelity if you ever need it.
 
-## Status as of writing (2026-06-23)
+## Status as of writing (2026-06-24)
 
 **Closed:**
 - The review exchange itself. Three rounds. Reviewer signed off; expecting round 4 only after we bring back bench numbers + implementation surprises.
@@ -52,9 +52,11 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 - **Phase A (empirical baseline drop fixtures)** — DONE 2026-06-23. Findings A.1–A.10 documented in the Empirical section below; headline: the previous `mir_shims` override was silently no-op'ing rather than performing useful work, validating Decision 1's premise empirically.
 - **Phase E (mir_shims elimination)** — DONE 2026-06-23. `mir_shims` override + `drop_glue.rs` + `mir_helpers.rs` + the `DEFAULT_MIR_SHIMS` plumbing all deleted. Rustc's default DropGlue path fires unchanged; per-type drop semantics flow through a compiler-synthesized `Drop::drop(&local)` AST node inserted at scope end (Phase E.b/E.c/E.d below).
 - **Phase E.b/E.c/E.d (scope-end drop emission)** — DONE 2026-06-23. The compiler synthesizes `TypedStmt::ExprStmt(TypedExprKind::StaticCall { ty: "Drop", method: "drop", args: [Ref(local)] })` at scope-end positions of every void-returning function whose body has a let-binding with a Drop-implementing type. The synthesis runs **once** in `insert_scope_end_drops` and is invoked from both the dep-collection site (`type_resolve_body` in `callbacks_impl.rs`) and the codegen site (`codegen_internal_function` in `llvm_gen.rs`). After that pass, every downstream stage — dep walker, mono cascade, codegen, symbol resolution, link — treats drop calls as ordinary trait static calls with no drop-specific code paths. 9 drop fixtures + 333 existing tests pass cold: **342 / 0 / 1 ignored**. See Decision 1 (substantially revised below) for the architectural detail.
+- **Phase B (perf bench)** — DONE 2026-06-24 (commits `81b6eb1` + later doc landing). 17 bench fixtures land under `toylangc/tests/integration_projects/perf_bench/` (5 Bench-1 configs + 2 Rust-only baselines + 6 Bench-2 K/LTO combos + 4 Bench-3 drop variants). Runner at `toylangc/tests/scripts/run_perf_bench.sh` builds, runs, and reports a markdown table. Headline numbers (M-series macOS, LLVM 21.1.8): **Bench 1 LTO ratio = 1.50× → handoff "<2× → lock §5.5 confidently" gate fires**; **Sky vs Rust baseline at O3 thin = 0.3% delta (essentially identical)**; **Bench 3 drop chain LTO ratio = 26.5×**. Full results + interpretation in `tmp/perf-bench-summary.md` and `rust-interop-architecture.md` §22.4 (which now includes §22.4.2 reproduction steps and §22.4.3 interpretation assumptions). Two follow-up findings surfaced: **F3** (Sky main + while loop + 1M+ allocations stack-overflows due to toylangc O0 alloca recycling bug) and **B10 residual** (Phase E drop synthesis + Vec<SkyStruct> at opt-level ≥ 1 still trips the LLVM 21 BitcodeWriter bug under ThinLTO cross-CGU import; arch doc §25.2 B10 tightened from "CLOSED" to "CLOSED for primary path; residual trigger…").
+- **Phase I (cache_on_disk_if audit)** — DONE 2026-06-24. **Decision 14's prescribed Provider-slot syntax (`providers.queries.layout_of_cache_on_disk_if = ...`) doesn't exist on current nightly.** `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit re-derived cache-safety: every Sky-overridden query is safe by construction (`per_instance_mir` declared `false` in fork patch; `layout_of` + `cross_crate_inlinable` default to `false`; `collect_and_partition_mono_items` is `eval_always`; `symbol_name` is disk-cached but its override is scheduled for removal per Decision 2 and the default mangler invalidates correctly). Annotated all 5 override files with `cache-audit:` marker comments. New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker. New §22.4.1 documents the policy table; new B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API." Decision 14 itself is revised below.
 
 **Not yet started (your work):**
-- Phases B (perf bench), C (tool attribute), D (predicate migration), F (symbol_name elimination), G (cdylib), H (FFI shape), I (cache audit), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences).
+- Phases C (tool attribute), D (predicate migration), F (symbol_name elimination), G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences).
 
 **In flight from prior sessions (independent of this exchange):**
 - Patch 5 retirement (shipped 2026-06-22 per the historical section below).
@@ -66,19 +68,28 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 
 If you only have time to read 200 words, here it is:
 
-The review exchange committed us to **17 architectural changes**, most importantly: eliminate the `mir_shims` query override (drop becomes a normal generic Sky function call), eliminate the `symbol_name` override (live no-op), replace the partition filter predicate with a `#[skyc::emit_consumer_body]` tool attribute, ship Sky's backend as a **cdylib** instead of statically linked, use **`#[repr(C)]` function-pointer struct** instead of `&mut dyn Trait` across the cdylib FFI boundary, retire the slab-pointer-as-u64 surface in favor of **content-hash const args** (u128 with collision detection), introduce **per-view ref types** `SkyRef<T, V>` with `V ∈ {Frozen, Mutable}` for Send/'static honesty at the Rust boundary, narrow `#[may_dangle]` policy to a **syntactic rule** (T appears only behind pointer indirection), and force `cache_on_disk_if(false)` on every Sky-overridden query.
+The review exchange committed us to **17 architectural changes**, most importantly: eliminate the `mir_shims` query override (drop becomes a normal generic Sky function call), eliminate the `symbol_name` override (live no-op), replace the partition filter predicate with a `#[skyc::emit_consumer_body]` tool attribute, ship Sky's backend as a **cdylib** instead of statically linked, use **`#[repr(C)]` function-pointer struct** instead of `&mut dyn Trait` across the cdylib FFI boundary, retire the slab-pointer-as-u64 surface in favor of **content-hash const args** (u128 with collision detection), introduce **per-view ref types** `SkyRef<T, V>` with `V ∈ {Frozen, Mutable}` for Send/'static honesty at the Rust boundary, narrow `#[may_dangle]` policy to a **syntactic rule** (T appears only behind pointer indirection), and audit + document cache-on-disk-if discipline (Decision 14 — note: 2026-06-24 audit found the prescribed Provider-slot API doesn't exist on current nightly; every Sky-overridden query is cache-safe by construction, documented via `cache-audit:` markers + CI fence at `toylangc/tests/cache_audit.rs`).
 
-Critical caveat: **toylang has zero drop tests**, so the mir_shims elimination has no empirical baseline. **Build fixtures FIRST**, validate baseline under current model, THEN do the migration with fixtures as the regression suite.
+Critical caveat (historical): **toylang had zero drop tests**, so the mir_shims elimination had no empirical baseline. Phase A built fixtures FIRST, validated baseline under current model, THEN did the migration with fixtures as the regression suite. Both phases shipped 2026-06-23. Phase B (perf bench) shipped 2026-06-24 with similar discipline — build fixtures, run, capture, interpret, land empirical anchors in the doc. Decision-gate verdict: **lock §5.5**.
 
-**Implementation order, top 5:**
+**Implementation order, top 5 (refreshed 2026-06-24 after Phases A/E/B/I shipped):**
 
-1. Build the drop integration fixtures under CURRENT mir_shims model. Pass them. ~1-2 weeks.
-2. Run the **perf bench** (add(a,b) × lto modes + O0/O1 + .text size). Single most important deliverable; the reviewer asked us to lead round 4 with it. ~1 day.
-3. Tool attribute infrastructure + partition predicate migration. ~2-3 days.
-4. mir_shims + symbol_name elimination, with fixtures as regression suite. ~1-2 weeks.
-5. cdylib build system + patch 4 rev 3 (function-pointer struct). ~1 week.
+1. ~~Drop fixtures~~ — DONE (Phase A, 2026-06-23). 9 fixtures + 333 existing tests passing.
+2. ~~Perf bench~~ — DONE (Phase B, 2026-06-24). 17 fixtures; Bench 1 ratio 1.50× → lock §5.5; Bench 3 drop chain 26.5×. See §22.4 + `tmp/perf-bench-summary.md`.
+3. ~~mir_shims elimination~~ — DONE (Phase E + E.b/c/d, 2026-06-23). AST-rewrite drop synthesis is shipped; the override + `drop_glue.rs` + `mir_helpers.rs` are deleted.
+4. ~~cache_on_disk_if audit~~ — DONE (Phase I, 2026-06-24). Audit found prescribed API doesn't exist; all queries cache-safe by construction; CI fence in place.
+5. **Tool attribute infrastructure + partition predicate migration (Phase C+D)** — NEXT. ~2-3 days. Wire up `#![register_tool(skyc)]` + `#[skyc::emit_consumer_body]`; migrate `is_consumer_codegen_target` to the two-gate attribute conjunction (Decision 3).
 
-**Round 4 deliverables** (when you come back to the reviewer): perf bench numbers first, then cache_on_disk_if audit results, then drop fixture outcomes, then mir_shims elimination empirical validation, then implementation surprises grouped by where they surfaced.
+After that: symbol_name elimination (Phase F, ½ day), cdylib build system + patch 4 rev 3 (Phases G+H, ~1 week), u128 typeids + content-hash const args (Phases J+K, ~1.5 weeks), per-view ref types + async typestate (Phases L+M, ~3 weeks).
+
+**Round 4 deliverables** (when you come back to the reviewer):
+1. **Perf bench numbers — IN HAND.** Bench 1 ratio 1.50×; Sky vs Rust baseline at 0.3% delta; Bench 3 drop chain 26.5×. Decision-gate verdict: lock §5.5.
+2. **Cache_on_disk_if audit results — IN HAND.** Prescribed API doesn't exist; every override cache-safe by construction; CI fence in place.
+3. **Drop fixture outcomes — IN HAND.** 9 fixtures pass; the prior `mir_shims` override was empirically broken (never fired; Finding A.6).
+4. **mir_shims elimination empirical validation — IN HAND.** AST-rewrite shape ships at 342/0/1 tests; no regressions in the 191 prior integration tests.
+5. **Implementation surprises grouped by where they surfaced — IN HAND.** F3 (Sky main + while loop stack overflow due to toylangc O0 alloca recycling), B10 residual (Phase E drop synthesis + Vec<SkyStruct> still trips bug under ThinLTO cross-CGU import); both documented in arch doc §F.18.
+
+The round 4 conversation now has the data anchors the reviewer asked for. The remaining open items are post-bench: Phase C/D/F (tool attribute + predicate migration + symbol_name elimination) is the next chunk of execution work.
 
 ---
 
@@ -732,6 +743,37 @@ User's earlier reasoning ("dangling things is baked into Sky's model anyway via 
 
 ### Decision 14: `cache_on_disk_if(false)` for Sky-overridden queries
 
+**STATUS: AUDIT SHIPPED 2026-06-24** (Phase I). The audit found this decision's
+prescribed Provider-slot syntax cannot be implemented as written — see the
+revised understanding immediately below, then the original text for historical
+context. The handoff Phase I entry above has the implementation notes.
+
+**REVISED understanding (2026-06-24 audit).** `cache_on_disk_if` is a
+query-DECLARATION-time modifier in rustc's macro DSL (`rustc_middle/src/query/mod.rs`),
+NOT a Provider slot. The `providers.queries.layout_of_cache_on_disk_if` syntax
+below doesn't compile against current nightly — that field doesn't exist on
+`Providers`. The macro-generated `cache_on_disk` function emits whatever the
+declaration says (defaulting to `false` if the modifier is absent). Sky cannot
+override this from outside without fork-patching each query's declaration.
+
+The audit re-derived cache-safety from upstream declarations:
+
+| Query | Upstream policy | Why safe under Sky |
+|---|---|---|
+| `per_instance_mir` | `false` (Sky fork patch) | Never disk-cached. |
+| `layout_of` | (no clause → default `false`) | Never disk-cached. |
+| `cross_crate_inlinable` | (no clause → default `false`) | Never disk-cached. |
+| `collect_and_partition_mono_items` | (no clause + `eval_always`) | Re-runs every compile. |
+| `symbol_name` | `true` upstream | Override scheduled for removal per Decision 2; default mangler invalidates correctly (Instance-keyed). |
+
+Implementation:
+- All 5 `rustc-lang-facade/src/queries/*.rs` files annotated with `cache-audit:` marker comments.
+- New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker.
+- New `rust-interop-architecture.md` §22.4.1 documents the policy table.
+- New §25.2 B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API."
+
+**ORIGINAL prescription (preserved for historical context — DO NOT IMPLEMENT AS WRITTEN):**
+
 **WHAT.** Every Sky-overridden query forces `cache_on_disk_if(false)` to prevent rustc's incremental cache from returning stale results when Sky's universe changes between compiles.
 
 Audit list (per reviewer's micro-note):
@@ -1079,7 +1121,9 @@ Per §26.15 (Non-generic is the Normal-case-of-Generic): grep-based CI test walk
 **Byte-identical pass-through corpus.**
 Per §25.3.5: corpus of representative Rust crates (small bin, serde-derive consumer, tokio program, generic-heavy, trait-heavy, sys-crate wrapper). For each: build with vanilla nightly rustc + with Sky's rustc (Sky machinery dormant). Byte-compare output objects. Any divergence is a regression.
 
-### The perf bench (PRIORITIZED FIRST ARTIFACT)
+### The perf bench (PRIORITIZED FIRST ARTIFACT) — DONE 2026-06-24
+
+**Status: SHIPPED 2026-06-24.** See Phase B entry below for the full outcome + headline numbers. The bench design notes that follow are preserved as the spec the shipped fixtures implement (commands have refreshed for the actual fixture layout — `bench1_dev_o0_nolto`, `bench1_o3_thin`, etc. — and the runner script + reproduction steps are in `rust-interop-architecture.md` §22.4.2).
 
 Per reviewer's order-of-presentation discipline: **the bench numbers go FIRST in round 4.** Lead with this; the rest of the implementation work calibrates by the bench's results.
 
@@ -1165,13 +1209,40 @@ Fixtures 2/3 (may_dangle, linear-panic) deferred — they need toylang
 grammar/runtime extensions that aren't on the Phase E critical path.
 The shipped Fixtures 1-9 already cover the load-bearing cases.
 
-### Phase B: Perf bench (1 day)
+### Phase B: Perf bench — DONE 2026-06-24
 
-Build Benches 1-3 from the empirical work backlog. Run on representative targets. Report numbers.
+**Status: SHIPPED 2026-06-24** in commit `81b6eb1` (initial scaffolding + first results) plus a follow-up commit landing the reproduction steps + interpretation assumptions in §22.4.2/§22.4.3.
 
-**Why second** (after fixtures but before migrations): the reviewer asked us to lead round 4 with bench numbers. Get them early so the round-4 conversation has the data anchor.
+**Outcome:** 17 bench fixtures (5 Bench-1 LTO/opt variants + 2 Rust-only baselines + 6 Bench-2 K/LTO combos + 4 Bench-3 drop variants); shell runner at `toylangc/tests/scripts/run_perf_bench.sh`; markdown results in `tmp/perf-bench-results.md`; round-4 summary in `tmp/perf-bench-summary.md`; per-fixture main-symbol disassembly archived to `tmp/perf-bench-disasm/`.
 
-**Output**: bench numbers + first draft of §22.4 doc subsection.
+**Headline numbers** (M-series macOS, LLVM 21.1.8, 5-run median):
+- Bench 1 (100M `add` calls): O3 nolto = 86.7ms; O3 thin = 57.9ms → **LTO ratio 1.50×** (handoff decision band: `<2×` → "lock §5.5 confidently").
+- Rust baseline at O3 thin = 58.1ms → **Sky vs Rust delta = 0.3%** (essentially identical).
+- Bench 2 K=100 (10M calls): nolto 11.7ms vs thin 7.9ms → ratio 1.48× (matches Bench 1; ratio is a property of the cross-crate boundary, not Sky-specific).
+- Bench 3 (10M `<Widget as Drop>::drop`): O3 nolto = 10.0ms; O3 thin = 0.4ms → **LTO ratio 26.5×** (worst-case empty-Drop amplification).
+
+**Decision-gate verdict:** lock §5.5. Recommendation: `[profile.release] lto = "thin"` for any perf-sensitive build.
+
+**Two follow-up findings (documented in arch doc §F.18 + §25.2 B10):**
+- **F3:** Sky `main` + while loop + 1M+ allocations stack-overflows (hypothesis: toylangc O0 alloca recycling bug). Worked around by driving Bench 3's loop from a Rust caller.
+- **B10 residual:** Phase E drop synthesis + `Vec<SkyStruct>` at opt-level ≥ 1 still trips the LLVM 21 BitcodeWriter bug under ThinLTO cross-CGU import. Same Rust-caller workaround. §25.2 B10 was tightened from "CLOSED" to "CLOSED for primary path; residual trigger…".
+
+**Doc landings in this phase:**
+- New §22.4 "Perf model" with bench results, recommendation, and the cache-policy table (§22.4.1).
+- New §22.4.2 "Reproducing the benches" with precise commands.
+- New §22.4.3 "Interpretation assumptions" covering host sensitivity, `black_box` discipline, thermal/freq variance, B10 Rust-caller workaround, LTO-ratio interpretation guidance.
+- §22 renumbered (existing §22.4 → §22.5; §22.5 → §22.6).
+- §5.5 trade-off paragraph: empirical anchors (1.5× hot-call slowdown, ~26× drop-heavy slowdown).
+- §F.16 inlining-levels table: empirical-speedup column at Levels 4/5.
+- §F.18 (Phase E lessons): F3 + B10 residual footnotes.
+- New §25.2 B27 risk entry: "bench-detected creeping perf regression between nightly bumps" with canary at Bench 2 K=100 ratio drift > 10% / Bench 3 ratio drift > 20%.
+
+**What stayed deferred (and is in the "Known follow-up" backlog at the end of this doc):**
+- B-22 criterion-style statistical framework (~1 day on its own).
+- B-11 cross-platform reruns (linux-x86_64 — Sky's actual primary target).
+- B-12 / B-13 generic-fn / trait-impl benches (need design).
+- I-1 B10 upstream investigation + minimal LLVM repro.
+- I-12 toylangc O0 alloca-recycling fix (F3 root cause).
 
 ### Phase C: Tool attribute infrastructure (1-2 days)
 
@@ -1270,20 +1341,35 @@ Tasks:
 
 **Output**: FFI uses stable-ABI primitives; cdylib pairing failures fail at link, not at runtime.
 
-### Phase I: cache_on_disk_if audit (half-day)
+### Phase I: cache_on_disk_if audit — DONE 2026-06-24
 
-Force `cache_on_disk_if(false)` on every Sky-overridden query (Decision 14).
+**Status: SHIPPED 2026-06-24** in commit `81b6eb1`.
 
-Tasks:
-- For each Sky-overridden query, install the `_cache_on_disk_if` override returning false:
-  - `per_instance_mir`: verify already declared false in fork patch.
-  - `layout_of`: force false.
-  - `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable`: force false.
-  - `collect_and_partition_mono_items`: verify upstream default; force false if needed.
-- Build the cache-correctness fence (edit-and-rebuild test) from the empirical work backlog.
-- Document the audit results.
+**Key finding (changes Decision 14's scope substantially):** the prescribed Provider-slot syntax doesn't exist on current nightly. `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL (`rustc_middle/src/query/mod.rs`), not a Provider slot. Searching `providers.queries.layout_of_cache_on_disk_if` against current rustc returns nothing — that field literally does not exist on `Providers`. The "force false via Provider slots" prescription cannot be implemented as written.
 
-**Output**: cache discipline in place; CI fence catches future drift.
+**What we did instead (audit + document + fence):**
+
+| Query | Upstream declaration | Why cache-safe under Sky |
+|---|---|---|
+| `per_instance_mir` | `cache_on_disk_if { false }` (Sky fork patch) | Never disk-cached. |
+| `layout_of` | no clause → default `false` | Never disk-cached. |
+| `cross_crate_inlinable` | no clause → default `false` | Never disk-cached. |
+| `collect_and_partition_mono_items` | `eval_always` | Re-runs every compile; never cached. |
+| `symbol_name` | `cache_on_disk_if { true }` | Override scheduled for removal per Decision 2. Default rustc behavior is Instance-keyed → cache invalidates correctly when Sky's universe state changes. |
+
+**Files touched:**
+- `rustc-lang-facade/src/queries/layout.rs`, `per_instance.rs`, `symbol_name.rs`, `partition.rs`, `cross_crate_inlinable.rs`: each gains a `cache-audit:` marker comment in its module header documenting the cache-on-disk policy + safety reasoning.
+- `toylangc/tests/cache_audit.rs`: NEW. CI fence asserts every override file carries a `cache-audit:` marker. Adding a new override forces a fresh audit at that time.
+- `rust-interop-architecture.md` §22.4.1: documents the policy table; cross-links to the fence.
+- `rust-interop-architecture.md` §25.2 B21: new risk entry tracking "per-query disk-cache staleness if rustc evolves the cache API."
+
+**What Decision 14 should be revised to say** (this entry's deferred to a clean revision pass; right now Decision 14 below is preserved as historical context with a footnote pointing here): "Audit every Sky-overridden query's `cache_on_disk_if` modifier in the upstream declaration. If the declaration is `false` / `eval_always` / missing-default-false, the query is cache-safe by construction. If the declaration is `true`, either retire the Sky override (preferred) or fork-patch the declaration to gate on a Sky-active marker. The `cache-audit:` marker discipline + CI fence preserve the audit findings at the code level so future overrides force a fresh audit."
+
+**Output achieved:** cache discipline documented; CI fence in place; arch doc reflects reality.
+
+**What stayed deferred:**
+- A "cache_correctness_smoke" edit-and-rebuild fixture that mutates Sky source between builds. The audit finding (all queries safe by construction) means this fence is regression insurance, not active need. Designing the fixture properly requires temp-dir file mutation infrastructure that's bigger than today's scope. Reasonable future work; not blocking.
+- Re-running this audit if rustc evolves the API (canary: B21 risk entry).
 
 ### Phase J: u128 typeids + collision detection (2-3 days)
 
@@ -1616,13 +1702,14 @@ General knowledge accumulated through toylang's implementation. Not specific wor
 
 ## Sanity-checking questions to ask yourself before starting
 
-Before diving into Phase A, confirm you can answer these:
+Before diving into the NEXT chunk of work (Phase C/D — tool attribute infrastructure + partition predicate migration), confirm you can answer these:
 
-1. What's the difference between Sky's `__sky_drop_X<T>` function and rustc's `drop_in_place::<T>`? (They're different things; `drop_in_place` is rustc's auto-generated drop glue, which calls user-defined `Drop::drop`, which under the new model calls `__sky_drop_X<T>`. Three layers of indirection, each with a specific role.)
+1. What's the actual shape of Sky's Drop dispatch after Phase E.d? (No bridge fn; `insert_scope_end_drops` synthesizes `Drop::drop(&local)` AST nodes; existing pipeline handles them as ordinary trait static calls. The `__sky_drop_X<T>` bridge from the original plan was collapsed out as functionally equivalent for the non-comptime case.)
 2. What does the `#[skyc::emit_consumer_body]` attribute mean, semantically? (It tags items that Sky will provide bodies for via `fill_extra_modules`; the partition filter removes them from rustc's CGU list; mandatory 1:1 correspondence with Sky's emission list.)
 3. Why is `&mut dyn Trait` wrong across the cdylib FFI boundary but fine across a static-link boundary? (Vtable layout dependency; rustc constructs the vtable, cdylib has to interpret it; vtable layout is `rustc_codegen_ssa`-source-dependent.)
 4. Why content-hash const args instead of slab-pointer-as-u64? (Two content-equal Sky values at different slab offsets would produce two distinct rustc Instances → two MonoItems with same symbol → linker conflict. Content-hash const args dedup at the Instance level.)
-5. Why does toylang have zero drop tests today? (Historical: `test_point_drop` was deleted in 5c.4; nothing replaced it. The mir_shims override is installed but dormant — drop is unexercised in any current fixture.)
+5. What does the perf bench actually measure, and what's the user-facing takeaway? (Bench 1 = synthetic call boundary cost: 1.50× LTO ratio, but ALSO Sky vs Rust baseline = 0.3% delta. Bench 3 = drop chain amplification: 26.5× LTO ratio because empty Drops chain. Recommendation: `[profile.release] lto = "thin"`. Bench 1 + baseline together prove Sky adds no measurable per-call overhead beyond Rust's cross-crate cost.)
+6. What does the cache_audit fence enforce, and why? (It walks the 5 Sky-overridden query files and requires each to carry a `cache-audit:` marker comment. Adding a new override forces a fresh audit because the marker is required to pass the test. The audit found Decision 14's prescribed Provider-slot API doesn't exist; safety is by upstream-declaration construction.)
 
 If you can't answer one, re-read the relevant section above. If you can, you're ready.
 
@@ -1630,19 +1717,19 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 ## What success looks like
 
-**Phase A success:** three drop integration fixtures pass cold + warm under current mir_shims model. Any bugs found during fixture construction are documented and fixed.
+**Phase A success — ACHIEVED 2026-06-23:** nine drop integration fixtures pass cold + warm under the new AST-rewrite drop synthesis model. Findings A.1-A.10 documented above; headline A.6 (prior `mir_shims` was empirically broken) validated Decision 1.
 
-**Phase B success:** perf bench numbers documented in §22.4 draft. Numbers either confirm "LTO-first model is acceptable" or surface a real perf problem to flag in round 4.
+**Phase B success — ACHIEVED 2026-06-24:** perf bench numbers documented in `rust-interop-architecture.md` §22.4 (with reproduction steps in §22.4.2 and interpretation assumptions in §22.4.3). Numbers confirm "LTO-first model is acceptable" — Bench 1 LTO ratio 1.50× (in handoff's "<2× → lock §5.5 confidently" band); Sky vs Rust baseline at 0.3% delta (Sky adds no measurable overhead); Bench 3 drop chain 26.5× LTO speedup. Decision-gate verdict: lock §5.5. Two follow-up findings flagged: F3 (toylangc O0 alloca recycling) and B10 residual (ThinLTO cross-CGU import re-triggers the bug); both documented in §F.18 + §25.2 B10.
 
-**Phases C+D success:** `#[skyc::emit_consumer_body]` attribute machinery in place; partition predicate migrated; orphaned classification matchers deleted; CI fence verifies 1:1 invariant.
+**Phases C+D success — NOT YET STARTED:** `#[skyc::emit_consumer_body]` attribute machinery in place; partition predicate migrated; orphaned classification matchers deleted; CI fence verifies 1:1 invariant.
 
-**Phase E success:** mir_shims override gone; Fixtures 1-3 still pass under new model; no regression in existing tests; `project_raw_field` discipline in place with CI grep fence.
+**Phase E success — ACHIEVED 2026-06-23:** mir_shims override gone; all 9 drop fixtures pass under the new AST-rewrite model; no regressions in the 333 prior integration tests (now 342 total). The `project_raw_field` CI fence turned out unnecessary because the synth pass never directly accesses field storage.
 
-**Phase F success:** symbol_name override gone; no test regressions; rustc's default mangler is what Sky's emission consults.
+**Phase F success — NOT YET STARTED:** symbol_name override gone; no test regressions; rustc's default mangler is what Sky's emission consults.
 
-**Phases G+H success:** Sky's backend ships as cdylib with `#[repr(C)]` function-pointer struct FFI; iteration loop is order-of-magnitude faster.
+**Phases G+H success — NOT YET STARTED:** Sky's backend ships as cdylib with `#[repr(C)]` function-pointer struct FFI; iteration loop is order-of-magnitude faster.
 
-**Phase I success:** cache_on_disk_if(false) audit complete; cache-correctness fence in place and passing.
+**Phase I success — ACHIEVED 2026-06-24:** cache_on_disk_if audit complete; key finding is that Decision 14's prescribed Provider-slot API doesn't exist on current nightly; every Sky-overridden query is cache-safe by construction; CI fence at `toylangc/tests/cache_audit.rs` enforces `cache-audit:` markers on every override file. Decision 14 itself is annotated with the revised understanding above. The cache-correctness "edit-and-rebuild" fixture from the original plan stayed deferred (audit found we're safe by construction; the fixture is regression insurance not active need; designing it properly needs temp-dir mutation infrastructure that's bigger than the day's scope).
 
 **Phase J success:** typeids are u128 throughout; collision detection in place with clear error message; existing tests still pass.
 
@@ -1656,4 +1743,4 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 **Phase O success:** drift CI fences in place for B24/B25/B26 detection.
 
-**Overall success:** Round 4 with the reviewer happens. We bring bench numbers + audit results + fixture outcomes + implementation surprises. The conversation is grounded in data rather than reasoning. Architecture is sharper for having gone through implementation reality.
+**Overall success — round 4 inputs READY:** all four round-4 deliverables now in hand. Bench numbers (Phase B), cache audit results (Phase I), drop fixture outcomes (Phase A — 9 fixtures passing), mir_shims elimination empirical validation (Phase E — 342/0/1 tests). Plus implementation surprises grouped by where they surfaced (F3 toylangc alloca recycling; B10 residual under ThinLTO; cache_on_disk_if Provider-slot API doesn't exist). The next session can either (a) schedule round 4 with the reviewer using these anchors, or (b) continue with the unblocked next chunk of execution work — Phase C+D (tool attribute + predicate migration), Phase F (symbol_name retirement), Phase G+H (cdylib backend + FFI shape).

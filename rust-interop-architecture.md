@@ -4121,6 +4121,171 @@ The B21 risk entry (§25.2) tracks "per-query disk-cache staleness"
 should rustc evolve the cache API in a way that makes one of the above
 queries unsafe.
 
+#### 22.4.2 Reproducing the benches
+
+The bench fixtures + runner ship in the toylang reference implementation
+under `toylangc/tests/integration_projects/perf_bench/` and
+`toylangc/tests/scripts/run_perf_bench.sh`. The runner is **not** wired
+into `cargo test` (integration tests are enumerated by name; perf
+fixtures are intentionally not enumerated so the suite stays fast).
+Run it manually.
+
+**Prerequisites:**
+- The Sky-fork rustc toolchain (`rustc-fork` per the workspace's
+  `rust-toolchain.toml`). Verify with `rustup toolchain list` —
+  `rustc-fork (active)` should be present and selected. If not, see
+  `docs/historical/rebuilding-rustc-fork.md`.
+- The `toylangc` binary built at `target/debug/toylangc`. Build with
+  `LLVM_SYS_211_PREFIX=<rust-fork-tree>/build/<host-triple>/ci-llvm
+  cargo build --bin toylangc`. The `LLVM_SYS_211_PREFIX` points at the
+  LLVM tree the rustc fork was built against (one of `ci-llvm` or
+  `llvm/build` under the fork's build dir).
+- `llvm-objdump` on `$PATH`. Any LLVM version's objdump works for
+  inspecting Mach-O / ELF symbol tables and disassembly; the runner
+  auto-detects via `command -v llvm-objdump`.
+
+**Single command:**
+
+```bash
+bash toylangc/tests/scripts/run_perf_bench.sh > tmp/perf-bench-results.md
+```
+
+The runner:
+1. Walks each fixture directory under `tests/integration_projects/perf_bench/`.
+2. For each: wipes `.toylang-build/`, invokes `toylangc build` with
+   `CARGO_TARGET_DIR` pointing at the shared cache dir, runs the
+   resulting binary 5 times, parses each `BENCH_ELAPSED_US=N` line,
+   reports the median.
+3. Captures `.text` size + symbol count via `llvm-objdump -h` /
+   `llvm-objdump -t`.
+4. Archives `_main`-symbol disassembly per fixture to
+   `tmp/perf-bench-disasm/<fixture>.main.disasm`.
+5. Emits a markdown report on stdout.
+
+**Total wall-clock cost:** ~5-10 min cold (most of which is the
+shared cargo target cache populating Rust deps once); ~2-3 min warm.
+Bench iteration counts (100M for Bench 1, 10M for Bench 2 and Bench 3)
+are tuned so each binary's measured region takes ~10-1000ms even
+under the slowest configuration (O0 nolto) — large enough to swamp
+process-startup noise but small enough that a 5-run median is stable.
+
+**Smoke-test a single fixture without the runner:**
+
+```bash
+# Build:
+cd toylangc/tests/integration_projects/perf_bench/bench1_o3_thin
+rm -rf .toylang-build
+SYSROOT="$(rustup run rustc-fork rustc --print=sysroot)"
+DYLD_LIBRARY_PATH="$SYSROOT/lib" \
+LD_LIBRARY_PATH="$SYSROOT/lib" \
+CARGO_TARGET_DIR=../../../target/integration-projects-cache \
+  ../../../../../target/debug/toylangc build
+
+# Run:
+DYLD_LIBRARY_PATH="$SYSROOT/lib" \
+  ../../../target/integration-projects-cache/debug/bench1_o3_thin
+```
+
+The binary prints `<sum>` then `BENCH_ELAPSED_US=<microseconds>`.
+
+**Adding a new bench cell.** Copy an existing fixture directory; edit
+the `name` and `lto`/`opt-level` keys in `toylang.toml`; append the
+new fixture name to the appropriate loop in `run_perf_bench.sh`. Keep
+the `expected_output.txt` line `BENCH_ELAPSED_US=` (with no value)
+so the runner's `grep -oE 'BENCH_ELAPSED_US=[0-9]+'` parsing
+succeeds.
+
+#### 22.4.3 Interpretation assumptions
+
+The bench numbers in §22.4 are anchors, not absolutes. The user-facing
+recommendation ("use thin LTO for release") holds across reasonable
+variation. The specific ratios will drift; if you re-run and get
+substantially different numbers, the following assumptions are where
+to look first.
+
+**Host hardware sensitivity.** The 2026-06-24 anchor numbers come from
+an M-series macOS host with LLVM 21.1.8. Different microarchitectures
+will produce different absolute numbers (linux-x86_64 vs macOS-arm64
+differ measurably in branch predictor + cache hierarchy + LLVM
+codegen-quality decisions). The LTO RATIOS are more stable than the
+absolute numbers — the structural claim "Sky's call boundary matches
+Rust's cross-crate boundary under LTO" should hold cross-platform; if
+it doesn't on linux-x86_64, that's a bug worth investigating, not just
+expected variance.
+
+**Constant-fold defense (`black_box`).** Bench 1 + Bench 2's
+`rust_caller.rs` files wrap the loop input and accumulator in
+`std::hint::black_box`. Without this, LLVM at O3+thin folds the entire
+100M-iter loop into a compile-time integer (`mov w8, #<closed-form-sum>`)
+and the timed region is empty. The original 2026-06-24 morning bench
+ran without `black_box` and reported 0μs everywhere LTO ran — a
+finding that initially looked like "LTO is so good it costs nothing"
+but actually meant "we measured nothing." If you write new benches,
+copy the black_box pattern from `bench1_o3_thin/rust_caller.rs`.
+
+**`black_box` doesn't defeat all optimization.** It forces a single
+value through an opaque-to-LLVM pipe. The inliner can still inline
+the called function; the vectorizer can still vectorize the loop;
+the constant propagator can still propagate constants WITHIN the
+function being called. What it prevents is reducing the WHOLE LOOP
+to a closed form. If a future bench needs to measure call cost in
+isolation (no inlining at all), use `#[inline(never)]` on the target
+function instead — but note that doing so changes what's being
+measured. The current Bench 1 reports "Sky's call cost when LLVM is
+free to inline" which is the user-facing relevant number.
+
+**Thermal / frequency drift.** macOS aggressively throttles when the
+CPU heats up. The bench runner takes a 5-run median per fixture but
+does NOT pin the CPU thermal state or pre-warm the frequency. Running
+the full 17-fixture matrix takes ~3 min warm — short enough that
+thermal drift is small but not zero. If you see > 10% drift between
+consecutive runs of the same fixture, suspect thermal throttling
+first (close other apps, run with `caffeinate -i`). The `tmp/perf-bench-disasm/`
+archive should be identical between runs even when timing isn't —
+that's a useful sanity check.
+
+**Run-to-run variance.** Median-of-5 is sufficient to dampen noise
+but not to characterize variance. Treat the reported numbers as
+"approximately right ± 10%." For tighter confidence intervals,
+re-run the runner multiple times and look at across-invocation
+variation. Future work (handoff B-22) would migrate the runner to a
+`criterion`-style framework with proper outlier detection + adaptive
+sample size.
+
+**Bench 3 (drop chain) runs through a Rust caller because of the
+B10 residual.** The natural design — Sky `main` allocating
+`Vec<Widget>` directly — triggers the LLVM 21 BitcodeWriter bug
+(§25.2 B10) at opt-level ≥ 1 because ThinLTO's cross-CGU import
+phase encodes/decodes bitcode containing the trigger pattern.
+Moving Vec allocation to `rust_caller.rs` sidesteps it (Sky's
+bitcode no longer contains the trigger pattern). The drop chain
+itself still measures Sky's `Drop::drop` invocations — Vec's
+stdlib drop iterates and calls `<Widget as Drop>::drop` per element.
+The architectural claim being measured (cross-language LTO inlines
+Sky's Drop body into Rust's Vec::drop loop) is the same regardless
+of who owns the Vec allocation.
+
+**LTO ratio interpretation.** The handoff's decision gate uses Bench 1
+ratio to characterize Sky's "synthetic peak call overhead." Bench 1
+nolto at O3 is ~87ms / 100M = 0.87ns per call — well within the range
+of "real cross-crate function call cost on M-series." Bench 1 thin at
+O3 is ~58ms; the 1.50× ratio is what an inliner gains by stitching
+the loop body's `add(i, 1)` into the caller and letting subsequent
+passes (vectorizer, scheduler) work on the unified body. **The same
+ratio shows up in the Rust baseline (1.56×).** Conclusion: the 1.5×
+isn't Sky-specific; it's a property of the cross-crate boundary under
+M-series LLVM 21. Sky inherits it; doesn't add to it.
+
+**Drop chain ratio interpretation.** Bench 3 measures the worst case:
+10M empty Drops. Real Drop bodies do work (free a handle, decrement a
+refcount, run cleanup logic), and that work cost will be at least
+comparable to the per-call dispatch cost — meaning the 26.5× ratio
+shrinks toward the Bench 1 ratio (1.5×) as Drop bodies grow. **Don't
+quote "Sky drops are 26× faster with LTO" as a user-facing number.**
+The honest framing: "drop-heavy workloads benefit most from LTO; for
+Drop bodies that do significant work, the LTO speedup approaches the
+generic call-boundary ratio (~1.5×)."
+
 ### 22.5 Deterministic output as a CI invariant
 
 Sky's CI verifies deterministic build outputs as a regression test. The mechanism:
