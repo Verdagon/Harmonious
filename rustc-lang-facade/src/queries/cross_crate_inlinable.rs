@@ -54,6 +54,17 @@
 //! available_externally on rarely-called cross_crate_inlinable items in
 //! Sky-active compiles." For Sky's user-visible perf model this is
 //! invisible; pure-Rust pass-through is unaffected.
+//!
+//! cache-audit: cross_crate_inlinable's upstream declaration in
+//! `rustc_middle/src/query/mod.rs` has NO `cache_on_disk_if` modifier;
+//! rustc's macro emits the default policy of `false`, so results are
+//! NEVER cached to disk between compile sessions. Both providers
+//! (`queries.cross_crate_inlinable` and
+//! `extern_queries.cross_crate_inlinable`) share the same upstream
+//! declaration and policy. Sky's override return value depends on
+//! `is_sky_active(tcx)` (a marker walk), which itself reflects the
+//! current compile's universe state — no staleness risk. See
+//! `toylangc/tests/cache_audit.rs` for the full audit table.
 
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::ty::TyCtxt;

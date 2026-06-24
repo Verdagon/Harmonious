@@ -1,0 +1,10 @@
+[project]
+name = "bench3_drop_o0_thin"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+features = ["allocator_api"]
+lto = "thin"
+codegen-units = 16
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

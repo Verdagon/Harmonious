@@ -19,6 +19,14 @@
 //! Target portability: all sizes and alignments come from `tcx.layout_of()` on the
 //! consumer-provided field types. No hardcoded sizes. This was fixed in the
 //! "replace hardcoded aarch64 values" change — see git history.
+//!
+//! cache-audit: layout_of's upstream declaration in
+//! `rustc_middle/src/query/mod.rs` has NO `cache_on_disk_if` modifier;
+//! rustc's macro emits a default policy of `false`, so layout_of results
+//! are NEVER cached to disk between compile sessions. Sky's override
+//! returns Sky-universe-dependent layouts, but those re-derive at every
+//! compile from sidecar data. No staleness risk. See
+//! `toylangc/tests/cache_audit.rs` for the full audit table.
 
 #![allow(unused)]
 

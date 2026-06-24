@@ -1,0 +1,7 @@
+[project]
+name = "bench1_dev_o0_nolto"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

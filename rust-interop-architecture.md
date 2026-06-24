@@ -1188,7 +1188,7 @@ Sky's `.o` content is produced at every crate compile where Sky's machinery acti
 
 This is the post-§5.5-Step-2 split. The locked architectural commitment is that Sky libraries do not ship precompiled bodies *for items whose final emission depends on the downstream's concrete args* — i.e. generic items, comptime-dependent items. Non-generic items, whose emission is the same regardless of downstream usage, emit at the owning crate's compile. Every Sky body in the final binary is still codegenned by *some* invocation of Sky's compiler from the library's Sky AST; the question Step 2 answered is "which invocation" — owning-crate for non-generics, binary for generics.
 
-**Trade-off the split introduced.** Cross-library Sky-body inlining at `lto = false` (cargo dev profile default) is lost. Pre-Step-2, the binary's compile owned every Sky body and rustc's thin-local LTO (Level 3, §F.16) could inline Sky bodies into the bin's `main` because they were peer CGUs of the same invocation. Post-Step-2, non-generic Sky bodies live in the upstream rlib's invocation; cross-crate visibility requires `lto = "thin"` or `"fat"` (Levels 4–5). The 8 `_no_lto` inlining-matrix fixtures were flipped from "Sky body inlined / constant-folded" to "tail-jump present" to lock in this honest semantics. See §F.16 for the full ladder.
+**Trade-off the split introduced.** Cross-library Sky-body inlining at `lto = false` (cargo dev profile default) is lost. Pre-Step-2, the binary's compile owned every Sky body and rustc's thin-local LTO (Level 3, §F.16) could inline Sky bodies into the bin's `main` because they were peer CGUs of the same invocation. Post-Step-2, non-generic Sky bodies live in the upstream rlib's invocation; cross-crate visibility requires `lto = "thin"` or `"fat"` (Levels 4–5). The 8 `_no_lto` inlining-matrix fixtures were flipped from "Sky body inlined / constant-folded" to "tail-jump present" to lock in this honest semantics. See §F.16 for the full ladder. Empirical perf cost (2026-06-24 benches, see §22.4): **~1.5× slowdown on hot Sky-call paths at `lto = false`** (Bench 1: O3 nolto 86.7ms vs O3 thin 57.9ms) and **~26× slowdown on drop-heavy paths** (Bench 3: O3 nolto 10.0ms vs O3 thin 0.4ms). The Bench 1 ratio matches what a pure-Rust cross-crate baseline shows (Sky's emission gives LLVM the same inlining opportunity Rust's does); the Bench 3 ratio is amplified because drop chains accumulate per-call overhead 10M-fold and disappear entirely when LTO inlines + vectorizes the empty body. **Recommendation: use `[profile.release] lto = "thin"`** for any perf-sensitive build.
 
 **Qualifier — what "library-owned Sky bodies" does and doesn't mean.** The stub rlib's `.o` carries Sky-emitted bodies only for items owned by *that* library (non-generic exports + cascade-discovered trait-impl methods whose impl is in that library). It also carries Rust-side machinery rustc emits during its own flow:
 
@@ -4052,7 +4052,76 @@ v2's Sky-side cache can use the fingerprint to detect "this item is unchanged fr
 
 Adding the fingerprint to the format from v1 is forward-compatibility for the v2 work. Cost: a few bytes per item in the sidecar.
 
-### 22.4 Deterministic output as a CI invariant
+### 22.4 Perf model
+
+Sky's call-boundary cost is structurally similar to Rust's
+`pub extern fn` cost at the non-LTO baseline: a real cross-crate call
+with no inlining. With cross-language LTO (`lto = "thin"` or
+`lto = "fat"`), Sky's emitted bitcode lives in the same LTO module pool
+as Rust callers (per the `fill_extra_modules` patch, §F.15), so LLVM's
+IR inliner crosses the language boundary the same way it crosses Rust
+crate boundaries.
+
+**Empirical measurements (2026-06-24, M-series macOS, LLVM 21.1.8).**
+Bench fixtures live under `toylangc/tests/integration_projects/perf_bench/`;
+the runner is `toylangc/tests/scripts/run_perf_bench.sh`.
+
+| Bench | Workload | nolto baseline | thin LTO | Ratio |
+|---|---|---:|---:|---:|
+| 1 | 100M `add(a,b)` calls, with `black_box` defeating fold | O3: 86.7ms | O3: 57.9ms | **1.50×** |
+| 1 baseline | Same shape, Rust→Rust (`test_helpers::bench_baseline_add`) | O3: 90.7ms | O3: 58.1ms | 1.56× |
+| 2 K=100 | 10M calls, 100 units of work per call | O3: 11.7ms | O3: 7.9ms | 1.48× |
+| 3 | 10M `<Widget as Drop>::drop` calls via `Vec<Widget>` drop | O3: 10.0ms | O3: 0.4ms | **26.5×** |
+
+Two findings drive the user-facing recommendation:
+
+1. **Sky's call boundary essentially matches Rust's own cross-crate cost.**
+   At O3 thin, Sky's 57.9ms and Rust-baseline's 58.1ms differ by 0.3% —
+   well within run-to-run variance. Sky adds no measurable overhead
+   beyond what Rust's own cross-crate boundary costs. The 1.5× LTO ratio
+   on Bench 1 is the SAME ratio the Rust baseline shows; it's a property
+   of the cross-crate boundary, not of Sky's specific emission.
+
+2. **Drop-heavy code amplifies the LTO win massively.** Bench 3's
+   26.5× LTO speedup reflects LLVM inlining Sky's `Drop::drop` body into
+   `Vec::drop`'s element loop, eliding the empty body, and vectorizing
+   the resulting no-op. Without LTO, the chain pays full FFI cost per
+   element. With LTO, it disappears.
+
+**User-facing recommendation.** For dev iteration use the cargo dev
+profile's default (`lto = false` — thin-local LTO §F.16 still bridges
+intra-invocation CGUs). For release builds and any perf-sensitive
+testing, set `[profile.release] lto = "thin"`. Fat LTO trades faster
+runtime for slower compile and a 2× symbol table without materially
+beating thin LTO at these workloads.
+
+#### 22.4.1 Queries Sky touches and their cache policy
+
+Per the handoff's Decision 14 audit (2026-06-24): every Sky-overridden
+rustc query is cache-safe by construction. The original prescription
+(force `cache_on_disk_if(false)` via Provider slots) used an API that
+doesn't exist on current nightly — `cache_on_disk_if` is a
+query-declaration-time modifier in rustc's macro DSL, not a Provider
+slot. The audit re-derived the safety story from upstream declarations:
+
+| Query | Upstream `cache_on_disk_if` | Why safe under Sky |
+|---|---|---|
+| `per_instance_mir` | `false` (Sky fork patch) | Never disk-cached; per-compile re-derive. |
+| `layout_of` | (none → default `false`) | Never disk-cached. Re-derived from sidecar at every compile. |
+| `cross_crate_inlinable` | (none → default `false`) | Never disk-cached. Sky's override return depends on `is_sky_active(tcx)` marker walk. |
+| `collect_and_partition_mono_items` | (none + `eval_always`) | Re-runs every compile; never cached. |
+| `symbol_name` | `true` upstream | Override scheduled for removal per Decision 2. Once retired, rustc's default mangler is Instance-keyed → cache invalidates correctly when Sky's universe state changes. |
+
+The CI fence at `toylangc/tests/cache_audit.rs` asserts every override
+file carries a `cache-audit:` marker comment describing its
+cache-safety reasoning. New overrides MUST add a marker; the test
+catches drift.
+
+The B21 risk entry (§25.2) tracks "per-query disk-cache staleness"
+should rustc evolve the cache API in a way that makes one of the above
+queries unsafe.
+
+### 22.5 Deterministic output as a CI invariant
 
 Sky's CI verifies deterministic build outputs as a regression test. The mechanism:
 
@@ -4068,7 +4137,7 @@ The CI invariant catches regressions in:
 
 Without the invariant, non-determinism would accumulate silently until a user noticed "my builds keep changing the binary's hash even with no source changes."
 
-### 22.5 Cross-references
+### 22.6 Cross-references
 
 - Section 7.4 — sidecar determinism.
 - Section 18.5 — skyc-generated workspace determinism.
@@ -4317,7 +4386,7 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B9 (Sky-specific). LLVM-binding-crate version skew with rustc's LLVM.** **CLOSED architecturally** by Approach B (patch 4 rev 2). Under the rustc-owns-lends shape, rustc constructs each per-CGU `ModuleLlvm` (`LLVMContext` + `LLVMModule` + `OwnedTargetMachine`) via `ModuleLlvm::new(tcx, name)` and lends Sky the borrowed pointers through an `ExtraModuleAllocator` callback. Sky's emitter wraps them in suppressed-Drop Inkwell handles (`Context::new` + `Module::new_borrowed`) and emits IR directly. **Sky has zero TargetMachine configuration to drift from rustc's** — the failure mode (Inkwell-bundled LLVM vs rustc's LLVM disagreeing on bitcode record format) cannot arise because no bitcode is serialized and no parallel context is constructed. The historical concern survives only as discipline on Inkwell's *Rust-binding* layer matching rustc-fork's LLVM major (so the FFI symbols resolve); the LLVM versions themselves are guaranteed identical by construction.
 
-**B10 (Sky-specific). LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures.** **CLOSED — irrelevant under Approach B.** The failure trigger was Sky's prior pipeline (build Inkwell module → `write_bitcode_to_memory` → `ModuleLlvm::parse_from_tcx`). Approach B eliminates the serialization step entirely: Sky's IR lands directly in rustc's `LLVMModule`, then rides rustc's optimize → ThinLTO → emission pipeline as just another CGU. No `BitcodeWriter::writeModuleInfo` call happens in Sky's path. The historical IR-text round-trip workaround (formerly `llvm_gen::roundtrip_text_to_bitcode`) was retired in the Phase 4 migration. The upstream LLVM bug remains real but is no longer Sky-blocking; if Sky ever re-introduces a serialize/parse step (e.g. for cross-process module caching), the workaround can be revived from git history.
+**B10 (Sky-specific). LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures.** **CLOSED for the primary fill_extra_modules path; residual trigger under ThinLTO cross-CGU import.** The primary trigger (Sky's prior `write_bitcode_to_memory` → `parse_from_tcx` pipeline) is gone under Approach B; Sky's IR lands directly in rustc's `LLVMModule` and rides rustc's optimize → ThinLTO → emission pipeline as just another CGU. No `BitcodeWriter::writeModuleInfo` call happens in Sky's primary path. **However, ThinLTO's internal cross-CGU import phase still encodes/decodes bitcode**, and the bug re-fires under a narrow shape: Sky `main` + Vec containing a Sky struct with an `impl Drop` + opt-level ≥ 1. The trigger pattern is the same as the original B10 — an ABI-coerced extern call site whose declared param type differs from the call-site type. Empirically reproduced 2026-06-24 while scaffolding the perf bench: `bench3_drop_*` had to be restructured with a Rust caller driving the Vec allocation; under the Rust-caller pattern, Sky's bitcode no longer contains the trigger pattern and the bug doesn't fire. The historical IR-text round-trip workaround (formerly `llvm_gen::roundtrip_text_to_bitcode`) was retired in the Phase 4 migration. Until the upstream LLVM bug is fixed, Sky's emission discipline should avoid creating ABI-coerced extern call signatures in IR that may flow through ThinLTO import; the toylangc-side codegen-quality follow-up (eliminate the signature mismatch at the emission layer) is tracked in handoff.md's deferred-investigation list. See §F.18 for the empirical narrative.
 
 **B11 (Sky-specific). Round-trip workaround scaling cost unmeasured.** **CLOSED — no round-trip occurs.** B11 was the meta-risk that B10's mitigation might scale poorly. With B10's mitigation retired (no bitcode is written, no IR text is printed, no parse happens), the question of round-trip cost at production scale is moot. The per-build cost contributed by Approach B is whatever Inkwell's direct IR construction already costs — the same path Sky was using to build the in-memory module before the round-trip, minus the round-trip itself. Memory pressure also returns to baseline (no triple-buffered original-module + IR-text + re-parsed-module peak).
 
@@ -4357,6 +4426,10 @@ Pass-through preserved: the partition filter is a no-op on pure-Rust crates beca
 5. **For LTO-specific issues, check both `lto = "thin"` and `"fat"`.** They run different internalize and DCE passes. A fixture clean at one but failing at the other is a strong hint about which pass is responsible. ThinLTO is less aggressive about internalize than fat; fat LTO is the canary for SMPLZ-class issues.
 
 This recipe found B15 in under an hour. Future "symbol disappeared" investigations should start here.
+
+**B21 (Sky-specific). Per-query disk-cache staleness if rustc's cache API evolves.** Probability: ~15% over 5 years. Handoff Decision 14 originally prescribed forcing `cache_on_disk_if(false)` on every Sky-overridden query via Provider slots. Audit at 2026-06-24 found the prescribed API doesn't exist on current nightly — `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit (see §22.4.1) verified every Sky-overridden query is cache-safe by construction: `per_instance_mir`, `layout_of`, `cross_crate_inlinable`, and `collect_and_partition_mono_items` are all declared non-disk-cached or `eval_always`; `symbol_name` is disk-cached upstream but its override is scheduled for removal per Decision 2 (the default mangler is Instance-keyed and correctly invalidates). **Risk: if rustc evolves the cache API such that one of these queries gains disk-caching, OR Sky adds a new override on a disk-cached query without considering universe-state-changes-invalidation, Sky's incremental builds could return stale results silently.** Canary: `toylangc/tests/cache_audit.rs` requires every override file to carry a `cache-audit:` marker comment. Adding a new override forces a marker, forces a fresh audit. Reaction: identify the new staleness risk; if rustc exposes a Provider-slot override API in the future, install it. Otherwise document as a known limitation and disable incremental compile globally when Sky's machinery is active.
+
+**B27 (Sky-specific). Bench-detected creeping perf regression between nightly bumps.** Probability: ~30% over 5 years. Sky pins a specific rustc-fork nightly; each bump (§3.5) inherits whatever LLVM/rustc upstream evolution happened in the interval. The perf model in §22.4 anchors on empirical bench numbers from a specific date (2026-06-24); the numbers drift as the toolchain bumps. Canary: re-run `bash toylangc/tests/scripts/run_perf_bench.sh` after every nightly bump. If Bench 2 K=100 LTO ratio regresses >10% (currently 1.48×; >1.63× would fail), or Bench 3 drop-chain ratio regresses >20% (currently 26.5×; <21.2× would fail), investigate. Reaction: bisect upstream nightly range with bench script as the regression detector; report upstream or pin to last-known-good. The `tmp/perf-bench-disasm/` archive (per-fixture main()-symbol disassembly) helps localize whether the regression is in inlining behavior vs scheduling vs register allocation.
 
 ### 25.3 Category C: operational invariants
 
@@ -5893,13 +5966,13 @@ LTO inlining).
 **Five levels of inlining, summarized.** For future investigators
 debugging "why isn't this inlining" questions:
 
-| Level | Mechanism | Spans | Enabled at |
-|---|---|---|---|
-| 1 | rustc MIR inliner | one item | `mir-opt-level >= 1` (default at -O>=1) |
-| 2 | LLVM intra-CGU inliner | one CGU | -O>=1 |
-| 3 | rustc-internal thin-local LTO between CGUs | CGUs of one rustc invocation | -O>=1 + `codegen-units > 1` + `lto != "off"` (where "off" is rustc's `-C lto=off`; cargo's `lto = false` is NOT `lto = "off"` — see paragraph below) |
-| 4 | Cross-crate ThinLTO | all rlibs | `lto = "thin"` |
-| 5 | Cross-crate FatLTO | all rlibs | `lto = "fat"` |
+| Level | Mechanism | Spans | Enabled at | Empirical 2026-06-24 |
+|---|---|---|---|---|
+| 1 | rustc MIR inliner | one item | `mir-opt-level >= 1` (default at -O>=1) | not directly measured |
+| 2 | LLVM intra-CGU inliner | one CGU | -O>=1 | not directly measured |
+| 3 | rustc-internal thin-local LTO between CGUs | CGUs of one rustc invocation | -O>=1 + `codegen-units > 1` + `lto != "off"` (where "off" is rustc's `-C lto=off`; cargo's `lto = false` is NOT `lto = "off"` — see paragraph below) | not measured in isolation; bench fixtures span multiple invocations so Level 3 alone is invisible |
+| 4 | Cross-crate ThinLTO | all rlibs | `lto = "thin"` | Bench 1: 1.50× speedup; Bench 2 K=100: 1.48×; Bench 3 drop chain: **26.5×** (see §22.4) |
+| 5 | Cross-crate FatLTO | all rlibs | `lto = "fat"` | Bench 1: ~1.49× (~similar to Level 4); .text size smaller than thin (Bench 1 fat: 218KB vs thin: 239KB) but 2× symbol count |
 
 Cargo's `lto = false` ≠ `lto = "off"`: `false` (dev default) leaves
 Level 3 ON; `"off"` (explicit) disables it.
@@ -6092,6 +6165,37 @@ linear-type compile-time error diagnostic spans, the `project_raw_field`
 CI fence (not needed since the synth pass never directly accesses
 field storage), and async-fn drop wiring (gated on async support
 landing in toylang).
+
+**Two follow-up codegen-quality findings (surfaced 2026-06-24 while
+scaffolding the perf bench).**
+
+*F3 — Sky `main` + tight allocation loop stack-overflows at scale.*
+A Sky-main fixture allocating Widget temporaries inside a `while` loop
+stack-overflows at ~1M iterations even with a 64MB stack. The math
+(1M × sizeof(Widget) ≈ 4MB) doesn't account for the failure; the
+likely cause is toylangc's O0 codegen emitting a fresh `alloca` per
+loop-body let-binding without hoisting to the function's entry block.
+LLVM convention is "alloca only at entry"; toylangc may violate this.
+Bench 3 was restructured to drive the loop from a Rust caller to
+sidestep the issue. Architectural impact: zero (this is a toylangc
+codegen-quality bug). Implementation impact: any user-written Sky
+program with deep loops over local allocating expressions will fail
+in the same way. Concrete fix path: audit `lower_typed_expr`'s
+`StructConstruction` arm in `toylangc/src/llvm_gen.rs` for unhoisted
+allocas.
+
+*B10 residual under ThinLTO cross-CGU import.* §25.2 B10 claimed
+"CLOSED architecturally by Approach B" because Sky's primary path no
+longer serializes bitcode. The bench surfaced that ThinLTO's internal
+import phase still encodes/decodes bitcode and re-triggers the bug
+under a narrow shape: Sky `main` + `Vec<SkyStructWithDrop>` + opt-level
+≥ 1. The Phase E AST-rewrite drop synthesis emits ABI-coerced extern
+call sites that match the original B10 trigger pattern. §25.2 B10 was
+tightened to document the residual. Concrete fix path: align Sky's
+emitted `Drop::drop` extern declaration's signature exactly with the
+call-site type so no ABI coercion occurs in IR. Until then, Sky-main
++ Vec-of-Sky-drop fixtures should be restructured with Rust callers,
+as Bench 3 does.
 
 This is the master design document for Sky's compiler & Rust interop architecture. Total length: ~30 chapters, 6 appendices, approximately 100 pages.
 

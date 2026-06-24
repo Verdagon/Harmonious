@@ -1,0 +1,9 @@
+export fn work(a: i32, b: i32) -> i32 {
+    let sum = 0;
+    let i = 0;
+    while i < 10 {
+        sum = sum + a * b + i;
+        i = i + 1;
+    }
+    sum
+}

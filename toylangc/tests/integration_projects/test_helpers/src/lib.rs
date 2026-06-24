@@ -64,6 +64,19 @@ pub extern "C" fn add(x: i32, y: i32) -> i32 {
     x + y
 }
 
+/// Perf-bench baseline. Same shape as Sky's `export fn add(a, b)` but
+/// in Rust source. Used by `perf_bench/bench1_rust_baseline_*` to
+/// measure the cross-crate Rust call cost as a reference point against
+/// Sky's call boundary. NO `#[inline(never)]` — under LTO, LLVM should
+/// freely inline both this and Sky's `add`; comparison shows whether
+/// Sky's emission gives LLVM as much opportunity to inline as Rust's
+/// emission does. Bench fixtures use `black_box` to defeat full
+/// constant folding so the measurement remains meaningful.
+#[no_mangle]
+pub extern "C" fn bench_baseline_add(x: i32, y: i32) -> i32 {
+    x + y
+}
+
 #[no_mangle]
 pub extern "C" fn add_one(x: i32) -> i32 {
     x + 1

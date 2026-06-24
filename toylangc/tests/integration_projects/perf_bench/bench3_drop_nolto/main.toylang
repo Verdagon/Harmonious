@@ -1,0 +1,21 @@
+// Bench 3: drop chain perf.
+//
+// Sky exports `make_widget(id) -> Widget` and `Widget` with an empty
+// Drop impl. Rust caller (rust_caller.rs) builds a Vec<Widget> with
+// 10M elements and times the drop. Measures per-drop dispatch
+// overhead through Sky's AST-rewrite drop model.
+
+use std::ops::Drop
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+    }
+}
+
+export fn make_widget(id: i32) -> Widget {
+    Widget { id: id }
+}

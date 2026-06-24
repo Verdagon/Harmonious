@@ -1,0 +1,10 @@
+[project]
+name = "bench1_o3_fat"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "3"
+lto = "fat"
+codegen-units = 1
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

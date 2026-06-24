@@ -1,0 +1,8 @@
+[project]
+name = "bench3_drop_nolto"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

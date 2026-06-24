@@ -1,0 +1,12 @@
+// Rust-only baseline for Bench 1. Sky source is intentionally minimal —
+// the rust_caller calls test_helpers::bench_baseline_add (pure Rust),
+// not __lang_stubs::add (Sky). This fixture is the reference column for
+// "what does a same-shape Rust function call cost in equivalent
+// LTO + opt-level conditions?"
+//
+// Toylang requires a main.toylang. We export a no-op fn purely so the
+// stub rlib is well-formed; the rust caller doesn't call it.
+
+export fn unused_anchor() -> i32 {
+    0
+}

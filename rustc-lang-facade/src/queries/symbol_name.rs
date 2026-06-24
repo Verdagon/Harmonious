@@ -17,6 +17,16 @@
 //! decisions. What this file does once Path B lands is route the
 //! callback (no rename, just structural diagnostics).
 //!
+//! cache-audit: symbol_name's upstream declaration in
+//! `rustc_middle/src/query/mod.rs` is `cache_on_disk_if { true }`, so
+//! results ARE disk-cached between compile sessions. This override is
+//! scheduled for removal per handoff.md Decision 2 (the override is a
+//! live no-op; classification work goes unused at the symbol_name
+//! layer). Once retired, rustc's default mangler fires; default behavior
+//! is Instance-keyed → cache key includes the type args → correct
+//! invalidation when Sky's universe state changes. No active staleness
+//! risk. See `toylangc/tests/cache_audit.rs` for the full audit table.
+//!
 //! Per @GCMLZ, this provider may fire during consumer codegen. Pure read
 //! in both branches: non-consumer items read CONFIG + DEFAULT_SYMBOL_NAME
 //! (no lock); consumer items round-trip through

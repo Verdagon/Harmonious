@@ -12,6 +12,13 @@
 //! reachable would alter behavior for those downstream callers. The filter
 //! applies only to CGU placement.
 //!
+//! cache-audit: collect_and_partition_mono_items's upstream declaration
+//! in `rustc_middle/src/query/mod.rs` has NO `cache_on_disk_if` modifier
+//! AND is marked `eval_always`. The query re-runs every compile and is
+//! never disk-cached. Sky's universe state changes have no staleness
+//! risk on this query. See `toylangc/tests/cache_audit.rs` for the full
+//! audit table.
+//!
 //! **Resurrected 2026-06-22 from a51bd7c~1.** This file was retired
 //! 2026-06-21 in favor of Option 4 (`codegen_fn_attrs` override stamping
 //! `AvailableExternally` linkage), then restored as part of the

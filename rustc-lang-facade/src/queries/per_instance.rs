@@ -12,6 +12,12 @@
 //! `None` for everything else — non-consumer items fall through to vanilla
 //! rustc behavior unchanged.
 //!
+//! cache-audit: per_instance_mir's upstream declaration in the Sky fork
+//! patch (`rust-interop-architecture.md` §B.1 / §3.2 Patch 1) explicitly
+//! sets `cache_on_disk_if { false }`. The result is never disk-cached.
+//! Sky's universe state can change between compiles without staleness
+//! risk. See `toylangc/tests/cache_audit.rs` for the full audit table.
+//!
 //! The returned synthetic body terminates with `Unreachable` and is never
 //! executed — the consumer's own `.o` supplies the real definition at link
 //! time, and the `codegen_fn_attrs` override in `queries::codegen_fn_attrs`
