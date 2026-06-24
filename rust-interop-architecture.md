@@ -660,19 +660,19 @@ rustc_queries! {
 
 The declaration plumbs the query through rustc's query macro infrastructure. It creates the `Providers` slot, the dispatch path, and the caching machinery.
 
-**Patch 2: collector calls per_instance_mir.** In `compiler/rustc_monomorphize/src/collector.rs`, modify the per-Instance walk to call `per_instance_mir` before falling through to `instance_mir`:
+**Patch 2: collector calls per_instance_mir.** In `compiler/rustc_monomorphize/src/collector.rs::collect_items_of_instance`, modify the per-Instance walk to call `per_instance_mir` before falling through to `instance_mir`:
 
 ```rust
-fn collect_neighbours<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, ...) {
+fn collect_items_of_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, ...) {
     let body = tcx.per_instance_mir(instance)
-        .unwrap_or_else(|| instance_mir(tcx, instance));
+        .unwrap_or_else(|| tcx.instance_mir(instance.def));
     // ... walk `body` for dependency edges as before ...
 }
 ```
 
 When the plugin's provider returns `Some(body)`, the collector walks the plugin-returned body; when it returns `None`, the collector falls through to the default `instance_mir` path (rustc's normal MIR resolution).
 
-**Patch 3: default provider returns None.** In `compiler/rustc_middle/src/query/provider.rs` (or wherever default providers are registered), the default for `per_instance_mir` is:
+**Patch 3: default provider returns None.** In `compiler/rustc_mir_transform/src/lib.rs::provide` (where rustc's MIR-related default providers are registered), add:
 
 ```rust
 providers.per_instance_mir = |_tcx, _instance| None;
@@ -742,9 +742,10 @@ let mut extra_modules: Vec<ModuleCodegen<B::Module>> = Vec::new();
 
 Sub-patch: `ModuleLlvm::llcx_raw_mut() -> *mut c_void` and
 `ModuleLlvm::llmod_raw() -> *mut c_void` exposed for FFI bridging into
-externally-managed LLVM wrappers (Inkwell's `ContextRef::new` +
-`Module::new_borrowed`). Type-erased to `c_void` to avoid leaking
-private `llvm::Context` / `llvm::Module` types through the public API.
+externally-managed LLVM wrappers (Inkwell's `Context::new` wrapped in
+`ManuallyDrop` + `Module::new_borrowed`). Type-erased to `c_void` to
+avoid leaking private `llvm::Context` / `llvm::Module` types through
+the public API.
 
 **Approach B design.** Rustc owns each per-CGU module's lifecycle
 (LLVMContext + LLVMModule + TargetMachine); the consumer's emitter
@@ -785,11 +786,14 @@ AvailableExternally body to LLVM IR entirely. With no such body to
 misplace, patch 5's protection was no longer needed. Both retired in
 the same commit.
 
-**Total patch surface:** approximately 50 lines for the
-`per_instance_mir` trio + ~100 lines for the `fill_extra_modules`
-hook + allocator trait = ~150 lines across 6 files. Each patch is
-small, structurally local, and follows established patterns in
-rustc's source. The patches collectively add two extension points
+**Total patch surface:** approximately 28 lines for the
+`per_instance_mir` trio (across `rustc_middle::query::mod`,
+`rustc_mir_transform::lib`, `rustc_monomorphize::collector`) + ~194
+lines for the `fill_extra_modules` hook + allocator trait (across
+`rustc_codegen_ssa::traits::backend` + `traits::mod` + `base` +
+`back::write`, plus `rustc_codegen_llvm::lib`) = ~222 lines across
+8 files. Each patch is small, structurally local, and follows
+established patterns in rustc's source. The patches collectively add two extension points
 that rustc's existing infrastructure (query macros, collector
 dispatch, the codegen backend trait) already accommodates
 structurally; the patches just connect the dots.
@@ -818,7 +822,7 @@ The upstream effort is *not* on Sky's critical path. Sky ships with the fork, ma
 
 The empirical baseline for fork maintenance is erw's pre-stage-3 experience: ~2-3 days per nightly bump for a 5-patch fork. Sky's fork is 4 patches (per_instance_mir trio + `fill_extra_modules` hook), and one of them touches the mono collector (a churn-prone area). Patch 5 was retired 2026-06-22 (see §3.2); its rebase cost is no longer a budget item. The realistic estimate:
 
-- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the four patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent. Patch 4 (`fill_extra_modules` hook) touches `rustc_codegen_ssa::traits::backend`, `rustc_codegen_ssa::base::codegen_crate`, and the LLVM impl in `rustc_codegen_llvm::lib` — these have moderate churn risk during periods when rustc restructures the codegen-coordinator/backend trait surface; the rebase may take a half-day during such windows. The debuginfo walker clamp (§10.4.5 / §25 B8) is no longer needed under the wrapper-as-field shape (§10.6) — the structural fix made the defensive patch obsolete.
+- **Per-bump cost: ~1-2 days for the fork rebase.** Rebasing the four patches onto a newer nightly. The patches are small; rebases are typically clean. When they aren't (rustc has restructured the touched code), the rebase is a couple of hours of figuring out the new shape and re-applying the patch's intent. Patch 4 (`fill_extra_modules` hook) touches five files in the codegen stack: `rustc_codegen_ssa::traits::backend` (allocator trait + default trait methods), `rustc_codegen_ssa::traits::mod` (re-exports), `rustc_codegen_ssa::base::codegen_crate` (hook invocation on the main thread before `start_async_codegen`), `rustc_codegen_ssa::back::write` (param threading through `start_async_codegen` + `start_executing_work`, plus the coordinator-thread `execute_optimize_work_item` loop and `compiled_modules.extend`), and the LLVM impl in `rustc_codegen_llvm::lib` (hook `OnceLock` + `ExtraBackendMethods` overrides + raw-pointer accessors). These have moderate churn risk during periods when rustc restructures the codegen-coordinator/backend trait surface; the `back::write` site is the most churn-prone. The rebase may take a half-day during such windows. The debuginfo walker clamp (§10.4.5 / §25 B8) is no longer needed under the wrapper-as-field shape (§10.6) — the structural fix made the defensive patch obsolete.
 - **Per-bump cost: ~1 week for MIR construction churn.** This is independent of the fork — it's the cost of Sky's per_instance_mir provider building synthetic MIR bodies, which uses rustc-internal MIR construction APIs that drift. The empirical erw data point: 15 months of MIR drift was ~1 hour for erw's 6 sites. Sky's count is higher (every generic Sky function exported produces per_instance_mir output containing ReifyFnPointer casts), so the per-bump cost is larger, but the per-site cost is similar.
 - **Per-bump cost: ~1-2 days for ABI helpers drift.** PassMode variants, BackendRepr changes, layout-data shape shifts. Sky inherits erw's ABI helpers wholesale; the drift surface is identical.
 - **Per-bump cost: ~0.5-1 day for everything else.** Driver entry-point changes, Callbacks trait additions, layout query key shape, providers struct restructuring. All small, all mechanical.
@@ -843,7 +847,7 @@ The Sky toolchain itself is built against a specific upstream nightly (e.g., `ni
 1. **Decide to bump.** Triggered by a calendar event (~6 months since last bump) or by a forcing function (need a specific upstream feature, security update, etc.). Not triggered by chasing the latest nightly.
 2. **Pick the target nightly.** ~3 months old. This window lets ecosystem-adjacent projects (cranelift, miri, rust-analyzer) report any drift issues with the target nightly before Sky encounters them.
 3. **Snapshot.** Run the full test suite on the current pin. Record the test count.
-4. **Bump the rustc fork.** Rebase the four patches onto the target nightly. Build the forked rustc. Resolve any patch conflicts. Patch 4 (`fill_extra_modules` hook) touches `rustc_codegen_ssa::traits::backend`, `base.rs::codegen_crate`, and `rustc_codegen_llvm::lib`, and may take a half-day to rebase during periods when rustc restructures the backend trait surface or the codegen coordinator; the per_instance_mir trio is typically clean.
+4. **Bump the rustc fork.** Rebase the four patches onto the target nightly. Build the forked rustc. Resolve any patch conflicts. Patch 4 (`fill_extra_modules` hook) touches five files: `rustc_codegen_ssa::traits::backend`, `rustc_codegen_ssa::traits::mod` (re-exports), `rustc_codegen_ssa::base::codegen_crate`, `rustc_codegen_ssa::back::write` (param threading + coordinator-thread processing loop), and `rustc_codegen_llvm::lib`. It may take a half-day to rebase during periods when rustc restructures the backend trait surface or the codegen coordinator; the `back::write` site is the most churn-prone. The per_instance_mir trio is typically clean.
 5. **Bump Sky.** Update Sky's `rust-toolchain.toml` to the new target. Run `cargo check` on Sky's compiler. Fix compilation errors (MIR construction drift, ABI helpers drift, etc.) in dedicated commits, each commit addressing one drift surface. The "one drift surface per commit" rule is for bisection — if a future bump reverts behavior, finding the commit that mattered is cleaner.
 6. **Test cold.** Wipe all caches. Run the full Sky test suite. Diagnose any test failures as either drift-related (fix the drift) or environmental (fix the harness).
 7. **Test warm.** Run the suite a second time. Catch incremental-compilation-related issues that only manifest on warm runs.
@@ -5278,20 +5282,20 @@ rustc_queries! {
 `compiler/rustc_monomorphize/src/collector.rs`:
 
 ```rust
-fn collect_neighbours<'tcx>(
+fn collect_items_of_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     output: &mut MonoItems<'tcx>,
 ) {
     let body = tcx.per_instance_mir(instance)
-        .unwrap_or_else(|| instance_mir(tcx, instance));
+        .unwrap_or_else(|| tcx.instance_mir(instance.def));
     // ... existing collector walk over `body` ...
 }
 ```
 
 #### B.3 Default provider returns None
 
-`compiler/rustc_middle/src/query/provider.rs` (or wherever default providers are registered):
+`compiler/rustc_mir_transform/src/lib.rs::provide` (where rustc's MIR-related default providers are registered):
 
 ```rust
 providers.per_instance_mir = |_tcx, _instance| None;
@@ -5347,15 +5351,19 @@ pub trait ExtraBackendMethods: ... {
 }
 ```
 
-`compiler/rustc_codegen_ssa/src/base.rs::codegen_crate` constructs a `VecAllocator` around the in-flight extras vec, passes it to `backend.fill_extra_modules`, then forwards the filled vec into `start_async_codegen`. Each filled module is fed through `execute_optimize_work_item` synchronously, mirroring the allocator-module pattern. See §F.4 for the load-bearing detail about insertion-point timing.
+`compiler/rustc_codegen_ssa/src/base.rs::codegen_crate` constructs a `VecAllocator` around the in-flight extras vec, passes it to `backend.fill_extra_modules` (synchronously on the main thread before `start_async_codegen`), then forwards the filled vec into `start_async_codegen`. See §F.4 for the load-bearing detail about insertion-point timing.
+
+`compiler/rustc_codegen_ssa/src/back/write.rs` is the largest patch-4 surface. `start_async_codegen` and `start_executing_work` each gain an `extra_modules: Vec<ModuleCodegen<B::Module>>` parameter; the value is threaded from `base.rs::codegen_crate` through to the body of `start_executing_work`'s `thread::JoinHandle`. Inside that body (i.e. on the **coordinator thread**, not the main thread), a `for extra_module in extra_modules` loop runs each module through `execute_optimize_work_item` synchronously, dispatching `Finished` to a `compiled_extra_modules` vec, `NeedsFatLto` to `needs_fat_lto`, and `NeedsThinLto` to `needs_thin_lto`. After the message loop completes, `compiled_modules.extend(compiled_extra_modules)` merges the finished extras into the regular-module list before the deterministic sort.
+
+`compiler/rustc_codegen_ssa/src/traits/mod.rs` re-exports `ExtraModuleAllocator` and `VecAllocator` alongside the existing `BackendTypes` / `CodegenBackend` / `ExtraBackendMethods`.
 
 `compiler/rustc_codegen_llvm/src/lib.rs` adds:
 
 - An `allocate_extra_module` override calling `ModuleLlvm::new(tcx, name)` — the same constructor rustc's own per-CGU pipeline uses.
 - A `fill_extra_modules` override reading a process-global `OnceLock<FillExtraModulesHook>` settable via `set_fill_extra_modules_hook(fn_ptr)`. The facade installs the hook in `LangDriver::config` alongside `Config::override_queries`. Process-global storage is forced by the crate-dependency graph (`rustc_session` is upstream of both `rustc_middle` and `rustc_codegen_llvm`, so the `TyCtxt`-typed hook can't live on `Session`); the hook is set once at init and read lock-free thereafter.
-- `ModuleLlvm::llcx_raw_mut() -> *mut c_void` and `ModuleLlvm::llmod_raw() -> *mut c_void` — type-erased raw-pointer accessors for FFI bridging into externally-managed LLVM wrappers (Inkwell's `ContextRef::new` + `Module::new_borrowed`). Type-erased to `c_void` to avoid leaking private `llvm::Context` / `llvm::Module` types through the public API.
+- `ModuleLlvm::llcx_raw_mut() -> *mut c_void` and `ModuleLlvm::llmod_raw() -> *mut c_void` — type-erased raw-pointer accessors for FFI bridging into externally-managed LLVM wrappers (Inkwell's `Context::new` wrapped in `ManuallyDrop` + `Module::new_borrowed`). Type-erased to `c_void` to avoid leaking private `llvm::Context` / `llvm::Module` types through the public API.
 
-Total surface for patch 4: ~100 lines across 4 files. Default-no-op trait methods preserve vanilla rustc behavior. Forward-portable to other backends (cranelift, gcc-rs, spirv) — recommended as the first patch to attempt upstream landing.
+Total surface for patch 4: ~194 lines across 5 files (the four under `rustc_codegen_ssa` plus `rustc_codegen_llvm`). Default-no-op trait methods preserve vanilla rustc behavior. Forward-portable to other backends (cranelift, gcc-rs, spirv) — recommended as the first patch to attempt upstream landing.
 
 **Approach B vs the earlier v1 bytes-as-interface shape.** The v1 patch 4 had `extra_modules() -> Vec<ModuleCodegen<M>>` and a `parse_from_tcx` sub-patch; Sky's emitter serialized Inkwell-built modules to bitcode bytes and rustc parsed them back. That shape worked but was interface-laziness — Sky's CGU context isn't migrating into rustc's, just being constructed and thrown away. Approach B eliminates the round-trip by having rustc own the LLVM resources and lend them to Sky via the allocator callback. Closes risks B9 (LLVM-binding version skew — structurally impossible), B10 (LLVM 21 BitcodeWriter bug — no bitcode is written), and B11 (round-trip scaling cost — no round-trip). See §F.15 for the design history.
 
@@ -5437,7 +5445,7 @@ Target-specific runtime support (e.g., the runtime's I/O implementation differs 
 
 Rustc allocates each per-CGU `LLVMContext` + `LLVMModule` via the standard `ModuleLlvm::new(tcx, name)` path and lends the borrowed pointers to the consumer through an `ExtraModuleAllocator<M>` callback. The consumer wraps the borrowed handles in suppressed-Drop Inkwell wrappers (`ManuallyDrop<Context>` + `Module::new_borrowed`) and emits LLVM IR directly into the rustc-owned module. No bitcode serialization, no `parse_from_tcx` round-trip, no context migration; rustc retains ownership throughout. See `rustc-lang-facade/src/extra_modules_hook.rs` + `toylangc/src/llvm_gen.rs::fill_module` for the shipping code, and §B.4 + §F.15 for the patch surface, design history, and the vendored `Module::new_borrowed(LLVMModuleRef) -> ManuallyDrop<Module<'ctx>>` helper (~5 LOC vendor patch at `vendor/inkwell/src/module.rs`; retires together with the workspace `[patch."https://github.com/TheDan64/inkwell"]` override when upstream Inkwell lands an equivalent API).
 
-Fork patch surface: ~100 LOC across 4 files (the `ExtraModuleAllocator<M>` trait + generic `VecAllocator<'a, M, F>` driver, the `allocate_extra_module` + `fill_extra_modules` trait methods, the `FillExtraModulesHook` OnceLock + installer, the `ModuleLlvm::llcx_raw_mut` + `llmod_raw` raw-pointer accessors, and the call-site change in `base.rs::codegen_crate`). The earlier v1 bytes-in shape (`extra_modules() -> Vec<ModuleCodegen<M>>` plus `ModuleLlvm::parse_from_tcx`) was retired in the rev-2 rewrite — no backward-compatibility surface remains.
+Fork patch surface: ~194 LOC across 5 files (the `ExtraModuleAllocator<M>` trait + generic `VecAllocator<'a, M, F>` driver + the `allocate_extra_module` + `fill_extra_modules` trait methods in `traits/backend.rs`; the re-exports in `traits/mod.rs`; the call-site change in `base.rs::codegen_crate`; the `extra_modules` parameter threading + coordinator-thread `execute_optimize_work_item` loop + `compiled_modules.extend` in `back/write.rs`; the `FillExtraModulesHook` OnceLock + installer + `ExtraBackendMethods` overrides + `ModuleLlvm::llcx_raw_mut` + `llmod_raw` raw-pointer accessors in `rustc_codegen_llvm::lib`). The earlier v1 bytes-in shape (`extra_modules() -> Vec<ModuleCodegen<M>>` plus `ModuleLlvm::parse_from_tcx`) was retired in the rev-2 rewrite — no backward-compatibility surface remains.
 
 ### Appendix D. Reference: Temputs Schema
 
@@ -5592,13 +5600,24 @@ message which the coordinator interprets as "a worker thread just
 finished a CGU"; the state machine assumes that means a worker is
 currently active, which isn't true for a main-thread submission.
 
-The right insertion point is **synchronously on the main thread,
-BEFORE `start_async_codegen`** is called. The submitted modules go
-through `execute_optimize_work_item` directly (same path the
-allocator module takes), then enter the coordinator's pool as
-already-compiled extras. See Appendix B.4 for the patch shape and
+The right shape is a **two-stage split**: rustc's `base.rs::codegen_crate`
+invokes `backend.fill_extra_modules(tcx, &mut allocator)` **synchronously
+on the main thread, BEFORE `start_async_codegen`** is called; the
+returned `Vec<ModuleCodegen<B::Module>>` is then passed into
+`start_async_codegen` and threaded through to `start_executing_work`'s
+`thread::JoinHandle` body. Inside that body — i.e. on the **coordinator
+thread** spawned by `start_executing_work`, not the main thread —
+a `for extra_module in extra_modules` loop runs each module through
+`execute_optimize_work_item` synchronously (same path the allocator
+module takes), dispatching results into the existing `compiled_modules`,
+`needs_fat_lto`, and `needs_thin_lto` vecs before the message loop
+starts. The fork's in-code comment at the loop site (`back/write.rs`
+line ~1513) reads "Process synchronously on the coordinator thread,
+mirroring the allocator module pattern" — that's the accurate
+description; the main-thread piece is just the hook call itself, not
+the per-module processing. See Appendix B.4 for the patch shape and
 toylang's `~/rust` fork on the `per-instance-mir` branch for the
-exact insertion site.
+exact insertion sites.
 
 #### F.5 Replace lifetime-erased CGU stash with direct provider re-call
 
@@ -6013,7 +6032,7 @@ than a *substantive* problem (contexts that need merging).
 |---|---|---|
 | Who creates `LLVMContext` | Sky (via Inkwell) | rustc |
 | Who creates `TargetMachine` | Sky (must mirror rustc's settings) | rustc (inherited automatically) |
-| Inkwell API needed | `Context::into_raw` + `Module::into_raw` (ownership transfer) | `Context::from_raw_borrowed` (no-op-Drop wrapper) |
+| Inkwell API needed | `Context::into_raw` + `Module::into_raw` (ownership transfer) | `Context::new` wrapped in `ManuallyDrop` + `Module::new_borrowed` (suppress-Drop wrappers) |
 | `mem::forget` dance | yes | no |
 | Risk of leaked Inkwell-internal state | yes (skips Inkwell's Drop) | no |
 | Target-attr skew (B9) | possible (Sky configures independently) | impossible (inherited) |
