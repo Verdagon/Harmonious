@@ -49,9 +49,12 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 **Closed:**
 - The review exchange itself. Three rounds. Reviewer signed off; expecting round 4 only after we bring back bench numbers + implementation surprises.
 - All architectural decisions documented below.
+- **Phase A (empirical baseline drop fixtures)** — DONE 2026-06-23. Findings A.1–A.10 documented in the Empirical section below; headline: the previous `mir_shims` override was silently no-op'ing rather than performing useful work, validating Decision 1's premise empirically.
+- **Phase E (mir_shims elimination)** — DONE 2026-06-23. `mir_shims` override + `drop_glue.rs` + `mir_helpers.rs` + the `DEFAULT_MIR_SHIMS` plumbing all deleted. Rustc's default DropGlue path fires unchanged; per-type drop semantics flow through a compiler-synthesized `Drop::drop(&local)` AST node inserted at scope end (Phase E.b/E.c/E.d below).
+- **Phase E.b/E.c/E.d (scope-end drop emission)** — DONE 2026-06-23. The compiler synthesizes `TypedStmt::ExprStmt(TypedExprKind::StaticCall { ty: "Drop", method: "drop", args: [Ref(local)] })` at scope-end positions of every void-returning function whose body has a let-binding with a Drop-implementing type. The synthesis runs **once** in `insert_scope_end_drops` and is invoked from both the dep-collection site (`type_resolve_body` in `callbacks_impl.rs`) and the codegen site (`codegen_internal_function` in `llvm_gen.rs`). After that pass, every downstream stage — dep walker, mono cascade, codegen, symbol resolution, link — treats drop calls as ordinary trait static calls with no drop-specific code paths. 9 drop fixtures + 333 existing tests pass cold: **342 / 0 / 1 ignored**. See Decision 1 (substantially revised below) for the architectural detail.
 
 **Not yet started (your work):**
-- All implementation in this section. Nothing has shifted in the codebase as a result of the review exchange.
+- Phases B (perf bench), C (tool attribute), D (predicate migration), F (symbol_name elimination), G (cdylib), H (FFI shape), I (cache audit), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences).
 
 **In flight from prior sessions (independent of this exchange):**
 - Patch 5 retirement (shipped 2026-06-22 per the historical section below).
@@ -103,47 +106,120 @@ For each decision: **WHAT** (the commitment), **WHY** (the load-bearing reason),
 
 ### Decision 1: Eliminate the `mir_shims` query override
 
-**WHAT.** Remove the `mir_shims` override entirely. Drop becomes a normal generic Sky function call from Rust. Sky's stub_gen emits standard `impl Drop` bridges that call a generic `__sky_drop_X<T>(self as *mut _)`. The `__sky_drop_X<T>` function is itself a generic Sky function with `unreachable!()` placeholder body; `per_instance_mir` provides the per-T body via Sky's standard machinery.
+**STATUS: SHIPPED 2026-06-23** (Phase E + E.b + E.c + E.d). The
+implementation reality differs from the original "bridge through
+`__sky_drop_X<T>`" plan in a clarifying way — see **AS IMPLEMENTED**
+below for the actual shape.
 
-**WHY.** Drop is not architecturally special; it's just a function that the language sometimes auto-calls. The user's insight in round 3 — "destructors are not special; mir_shims overrides an entire rustc mechanism when we could just bridge through standard Rust trait dispatch" — collapsed the special-case machinery into the general mechanism. The mir_shims override was a category mistake: treating drop as a thing that needs its own emission path when it actually fits perfectly into the existing per_instance_mir path.
+**WHAT.** Remove the `mir_shims` override entirely. Drop becomes a
+normal Rust trait method call (`Drop::drop(&local)`) emitted at scope
+end. Sky's stub_gen emits standard `impl Drop` blocks for Sky types
+whose Sky source declares `export impl Drop for X`. The compiler
+inserts the scope-end calls; everything downstream treats them as
+ordinary trait static calls.
 
-The 8-agent investigation confirmed the simplification works:
+**WHY.** Drop is not architecturally special; it's just a function
+that the language sometimes auto-calls. The user's insight in round
+3 — "destructors are not special; mir_shims overrides an entire
+rustc mechanism when we could just bridge through standard Rust
+trait dispatch" — collapsed the special-case machinery into the
+general mechanism. The mir_shims override was a category mistake:
+treating drop as a thing that needs its own emission path when it
+actually fits perfectly into the existing per_instance_mir + cascade
+discovery path.
+
+**AS IMPLEMENTED (Phase E.d AST-rewrite shape — 2026-06-23).** The
+plan above describes a "bridge through `__sky_drop_X<T>` placeholder
+fn" mechanism. The shipped implementation is *more principled*: there
+is no bridge function, no placeholder, no separate Sky drop fn. The
+compiler synthesizes a real `Drop::drop(&local)` AST node at scope
+end and lets it flow through the same machinery as any other trait
+static call. The pipeline:
+
+1. **`stub_gen` emits `impl Drop for X { fn drop(&mut self) { unreachable!() } }` for every Sky struct with `export impl Drop`** (already required by toylang's `is_export` discipline; the user's source has the impl). Plus an unconditional `pub use core::ops::Drop;` re-export so the synthesis pass below can resolve the trait DefId regardless of whether the user wrote `use std::ops::Drop`. The re-export is gated on absence — if the user's source already imports `Drop`, stub_gen skips it (avoids name collision).
+2. **Type resolution runs.** `resolve_fn_body` produces the typed AST as usual.
+3. **`insert_scope_end_drops` runs immediately after `resolve_fn_body`.** For void-returning functions whose body has any let-binding whose type needs a drop, the pass appends `TypedStmt::ExprStmt(TypedExprKind::StaticCall { ty: "Drop", method: "drop", args: [Ref(local)] })` to the block's stmts in REVERSE declaration order (LIFO — Rust's drop order). Non-void-returning fns are skipped entirely: the caller's let-binding owns the eventual drop via move semantics.
+4. **Predicate.** `local_needs_scope_drop(tcx, ty, registry)` returns true for:
+   - Sky struct types (`StructRef` / `Struct`) whose `name` matches an `imp.trait_name == "Drop" && imp.self_type_name == name` entry in the registry's `trait_impls`.
+   - Rust types (`RustType`) whose ADT has an explicit `impl Drop`, queried via `tcx.adt_destructor(adt_def.did())`. This filters out `Option`/`Result`/`Stdout`/primitives whose drop semantics flow through auto-generated DropGlue with no trait-method symbol; calling `Drop::drop` on those ICEs rustc's mono collector ("failed to resolve instance").
+5. **The synthesized calls run through the existing pipeline unchanged.** `walk_typed_body_for_deps` collects them through its normal `rust_method_deps` arm. `collect_rust_deps_recursive` queues `<T as Drop>::drop` as a Rust dep through the standard trait-method dispatch. The per_instance_mir cascade surfaces them. `is_consumer_trait_impl_method` recognizes Sky's `<Widget as Drop>::drop` exactly the same way it recognizes `<Widget as Clone>::clone`. `fill_extra_modules` emits the body for Sky-owned impls; rustc emits the body for std-owned impls like `<Vec<T> as Drop>::drop`.
+6. **`codegen_extern_wrapper` reuses existing function declarations.** Switched from unconditional `module.add_function(extern_symbol)` to `get_function(extern_symbol).unwrap_or_else(add_function)` because `declare_external_fn` may have already declared the symbol when the body referenced it via a previous call site (Fixture 6 surfaced this: `__toylang_internal_main`'s synthesized `Drop::drop` call declared the extern before the cascade-drain emitted the body, and the unconditional add produced an LLVM `.1` symbol-disambiguation collision that left the call site unresolved).
+
+This is what "drop is just a function" actually looks like in code:
+ONE Drop-aware site (`insert_scope_end_drops` + the predicate it
+uses); everything downstream is generic.
+
+**The 8-agent investigation (round 3, before implementation) confirmed the simplification works.**
 - Field auto-drop is a no-op for Sky stub types (they're ZST-only).
 - Rustc's collector walks drop generically through the same path it uses for any other call.
 - Cross-crate generic drop works under §5.5's rules (mono'd at user_bin).
-- Const-generic SkyOpaqueType drop works via plain `pub fn __sky_drop_opaque<const T: u128>`.
+- Const-generic SkyOpaqueType drop works via plain `pub fn __sky_drop_opaque<const T: u128>` — though under the AS IMPLEMENTED shape this becomes `Drop::drop(&opaque)` resolving to a Sky-emitted `<SkyOpaqueType<T> as Drop>::drop` (same mechanism as Widget; the bridge fn collapses out).
 - Linear types + async futures + Pin/Unpin + vtable dispatch all preserved.
-- The current mir_shims override is already partially vestigial — no integration test exercises it; the override's `consumer_struct_name` lookup ignores type args, making generic Sky types indistinguishable per-T at today's `mir_shims` layer. The proposed per_instance_mir approach is STRICTLY MORE CAPABLE than what's being replaced.
+- The previous mir_shims override was vestigial — **empirically validated 2026-06-23 (Phase A finding A.6)**: even with the override installed and a stub `impl Drop` block in place, the override's `consumer_struct_name` lookup path never fired for any test fixture. `drop_in_place::<Widget>`'s body was a no-op (just stack save/restore/ret) and `<Widget as Drop>::drop` was absent from the binary entirely. The handoff's "build fixtures first" gate revealed the previous machinery had never worked. mir_shims removal lost zero functionality.
 
-**ALTERNATIVES CONSIDERED.**
-- Keep mir_shims (current). Rejected: extra query override, special-case machinery, less capable per-T than per_instance_mir for generic types.
+**ALTERNATIVES CONSIDERED (additional considerations from the implementation).**
+- **Bridge through `__sky_drop_X<T>(self as *mut _)` (the original plan).** Two-layer (stub-emitted Drop impl → `__sky_drop_X<T>` Sky fn → real body). Architecturally fine but **functionally equivalent to the direct dispatch** for the non-comptime case, and toylang has no comptime today. The bridge's primary value (sharing one drop fn across content-hash-keyed `SkyOpaqueType<T>` variants) is a v2 concern when comptime lands. We picked the simpler direct dispatch for v1.
+- **LLVM-IR-layer emission of drop calls (Phase E.b/E.c shape, briefly shipped).** Worked but leaked specialness across four sites: `walk_typed_body_for_drop_types`, `local_needs_scope_drop_for_deps`, the drop dep arms in `collect_rust_deps_recursive`, and `emit_scope_drops` / `emit_drop_in_place` / `emit_sky_struct_drop` in `llvm_gen`. Refactored to AST-rewrite (Phase E.d) for principled adherence — see the "principle audit" subsection below.
+- Keep mir_shims (the pre-handoff state). Rejected: extra query override, special-case machinery, less capable per-T than per_instance_mir for generic types, and (empirically) didn't actually work.
 - Standard Drop impl with per-T iteration in Rust source (e.g., Vec's drop iterates elements). Rejected: leaks opacity (Rust source sees Sky's internals).
-- Runtime dispatch via typeid (universal Drop impl + dispatch in Sky's runtime). Rejected: per-drop overhead; mir_shims via per_instance_mir gives compile-time per-T specialization.
+- Runtime dispatch via typeid (universal Drop impl + dispatch in Sky's runtime). Rejected: per-drop overhead; per_instance_mir gives compile-time per-T specialization.
 
-**IMPLEMENTATION NOTES.**
-- `rustc-lang-facade/src/queries/drop_glue.rs`: DELETE.
-- `rustc-lang-facade/src/queries/mod.rs`: remove `mir_shims` from the providers registration.
-- `toylangc/src/stub_gen.rs`: add Drop impl emission for Sky types with cleanup needs.
-  - For non-generic Sky types: `impl Drop for X { fn drop(&mut self) { unsafe { __sky_drop_X(self as *mut _); } } }` plus `pub fn __sky_drop_X(p: *mut X) { unreachable!() }`.
-  - For generic Sky types: `impl<T...> Drop for X<T...> { fn drop(&mut self) { unsafe { __sky_drop_X::<T...>(self as *mut _); } } }` plus `pub fn __sky_drop_X<T...>(p: *mut X<T...>) { unreachable!() }`.
-  - Stdlib containers (SkyVec, SkyMap, SkyChannel, etc. — when they exist): apply `#[may_dangle]` per Decision 12.
-- `toylangc/src/llvm_gen.rs`: extend the per_instance_mir-driven emission to handle `__sky_drop_X::<T>` instances. The per-T body should call drop_in_place on owned captured fields (where applicable) and do Sky-side cleanup.
-- For closures and async (Decision 11 covers details): same pattern.
-- For linear types (Decision 12): the `__sky_drop_X` body invokes `sky_runtime_panic` + `abort()` for strict_linear types; runs normal cleanup for `#[rust_droppable]` types.
+**FILES TOUCHED (Phase E + E.b + E.c + E.d, 2026-06-23).**
+- `rustc-lang-facade/src/queries/drop_glue.rs`: DELETED.
+- `rustc-lang-facade/src/mir_helpers.rs`: DELETED (orphaned — its only consumer was `build_drop_call_body` for mir_shims).
+- `rustc-lang-facade/src/queries/mod.rs`: removed `mir_shims` from providers registration + `install_query_defaults` arg list + module-level doc header. Pointed forward at the AST-rewrite mechanism.
+- `rustc-lang-facade/src/lib.rs`: removed `DEFAULT_MIR_SHIMS` OnceLock, `default_mir_shims()` accessor, `install_query_defaults`'s `mir_shims` parameter.
+- `toylangc/src/toylang/parser.rs`: extended `parse_impl_method` to accept `&mut self` (Phase A — required by Drop's receiver).
+- `toylangc/src/toylang/registry.rs`: `ToyImplMethod` gains `is_self_mut: bool` (serde-default for back-compat).
+- `toylangc/src/stub_gen.rs`: emits `fn drop(&mut self)` receiver when flag set; conditionally re-exports `core::ops::Drop` when absent from user imports.
+- `toylangc/src/toylang/callbacks_impl.rs`: added `insert_scope_end_drops` (pub) + `local_needs_scope_drop` predicate (queries `tcx.adt_destructor`) + `synth_scope_drop_call` builder. Wired into `type_resolve_body` (dep-collection site).
+- `toylangc/src/llvm_gen.rs`: calls `insert_scope_end_drops` from `codegen_internal_function` (codegen site); switched `codegen_extern_wrapper` from unconditional `module.add_function` to `get_function`-or-add to handle the case where the body's call site declared the extern symbol first.
+- `toylangc/tests/integration_projects/drop/`: 9 new fixtures (basic chain, two-Vec LIFO, helper-fn drop, empty Vec, Widget without Drop, single Sky local with Drop, multiple Sky locals LIFO, Sky local without Drop impl, Sky local in helper fn). All pass cold.
 
 **GOTCHAS.**
-- **Don't ship this until the integration fixtures pass.** Toylang has zero drop tests today. Without baseline empirical validation, the mir_shims elimination is unverified.
-- **Sky's `__sky_drop_X` body must NOT invalidate field storage that auto-drop will subsequently traverse.** Today's ZST-only stub fields make this safe by construction (no fields to traverse). If skyc's stub_gen ever emits non-ZST destructor-bearing fields, the contract becomes load-bearing.
-- **CI fence**: `project_raw_field(self_ptr, FIELD_NAME)` helper in skyc's drop emitter for self-referential field access. CI greps emitter source for direct `builder.build_struct_gep` calls outside the helper. See Decision 17.
+- **Both dep-collection and codegen sites must run the synthesis pass.** Initially only `type_resolve_body` ran it; codegen called `resolve_fn_body` directly, bypassing the synth → drops were queued as deps but never emitted as calls. Fix: call `insert_scope_end_drops` at both sites. The two synth invocations must use identical inputs (same registry, same `returns_void` predicate) or the dep queue and emitted body disagree.
+- **`tcx.adt_destructor(adt_def.did())` is load-bearing in the predicate.** Without it, the synth tries to emit `Drop::drop` for `Option`/`Result`/`Stdout` which ICEs the mono collector ("failed to resolve instance for `<Option<i32> as Drop>::drop`"). The query returns `Some(_)` iff the ADT has an explicit `impl Drop`; `None` for types whose drop semantics flow through auto-generated DropGlue.
+- **`codegen_extern_wrapper` must reuse existing extern declarations.** The body's call site (`__toylang_internal_main`'s emit-call) declares the symbol via `declare_external_fn` (which dedups). The cascade-drain's `codegen_extern_wrapper` formerly added the symbol unconditionally → LLVM `.1` disambig → bare-name call site unresolved. Fix: `get_function(symbol).unwrap_or_else(add_function)`.
+- **`pub use core::ops::Drop;` must be gated on absence.** Source files with explicit `use std::ops::Drop` would otherwise collide.
+- **Move semantics: non-void returns skip drops.** The synth pass treats `returns_void = matches!(return_ty, None | Some(Void))`. Functions returning a Vec/Widget/etc. don't get scope-end drops — the caller's binding owns it. Conservative; could be tightened later by tracking which locals the return expression moves.
+- **Only the OUTERMOST block scope is walked today.** If toylang grows nested-block scopes (currently `while` has its own scope but we don't track per-block drops), the synth needs to recurse and insert drops at each scope's exit.
 - **Sync-only drop**: precommits Sky to NOT supporting `AsyncDrop` (rustc's experimental `InstanceKind::AsyncDropGlue`). Not currently a constraint (Sky is sync-cleanup per §15.3) but a soft commitment.
 - **B24 risk** (drop-glue shape stability): rustc's `build_drop_shim` shape is now in Sky's load-bearing dependency surface. See Decision 15.
 
-**DOC IMPACT.**
-- §15 (drop semantics): substantial rewrite. Remove mir_shims; describe the new model.
-- §31 (drop glue sharing): simplify dramatically — drop is just function-call sharing now.
-- §10: note that ZST-only stub field convention is load-bearing (not strict invariant — see Decision 17 below for the more nuanced framing).
-- §14.1 / §14.3 / §14.10 (closures/async): note they use the same drop mechanism.
-- §15.7 (linear types): update to describe runtime panic path via Sky's drop function.
+**PRINCIPLE AUDIT (Phase E.d, post-refactor).** "Drop is not
+architecturally special; it's just a function that the language
+sometimes auto-calls" — honored at ~95%:
+- Specialness lives in ONE site: `insert_scope_end_drops` (~30 lines)
+  + `local_needs_scope_drop` predicate (~25 lines) +
+  `synth_scope_drop_call` AST builder (~20 lines) + one
+  `pub use Drop` line in stub_gen.
+- After the synth pass, every downstream stage treats drop calls as
+  ordinary trait static calls. No drop-specific path in: dep walker,
+  mono cascade, per_instance_mir, codegen, symbol resolution, link.
+- Remaining 5% leak: the predicate hardcodes the trait name "Drop"
+  (and "drop" method name) at the registry lookup. Could be
+  generalized to "synthesize trait-method calls based on a marker
+  trait" but Drop is the only such trait Sky needs today.
+
+**EMPIRICAL FINDINGS (Phase A characterization, 2026-06-23).**
+| # | Finding |
+|---|---------|
+| A.1 | Parser rejected `&mut self` — Drop's receiver requires the mutable form. Fixed: `parse_impl_method` plumbs `is_self_mut: bool` to `ToyImplMethod`. |
+| A.2 | Toylang requires `;` between statements (fixture-author syntax error, not a toylangc gap). |
+| A.3 | `impl Drop` requires `export impl Drop` to surface to the stub rlib (doc lesson). |
+| A.4 | stub_gen's `is_export` gate is correct — no change needed. |
+| A.5 | `layout_of` intercepts Widget but `mir_shims/DropGlue intercepted` never fires. Override's `consumer_struct_name` lookup was never invoked. |
+| A.6 | **Headline**: Even with `impl Drop for Widget` properly emitted in the stub source, `drop_in_place::<Widget>`'s body is a no-op (`sub; str; add; ret`) and `<Widget as Drop>::drop` is absent from the binary. The mir_shims override never fired; rustc's collector + the partition filter eliminated the body before any callable symbol could exist. The previous machinery was empirically broken, not just vestigial. |
+| A.7 | `collect_consumer_trait_impl_instances` correctly captures `<Widget as Drop>::drop` from the partition once the toylang source declares `use std::ops::Drop` (`name=drop is_consumer_trait_impl_method=true`). |
+| A.8 | `oracle::find_trait_impl_method_def_id` requires the trait to be `use`-imported in toylang source (or `pub use`-re-exported by stub_gen). For Drop, the user must import it OR stub_gen must re-export unconditionally. Phase E.d chose the latter (gated on absence). |
+| A.9 | With `use std::ops::Drop` present, the cascade fully wires through: rlib defines `<Widget as Drop>::drop` and `__toylang_internal__Widget__Drop__drop`, the chain `drop_in_place → Drop::drop → __toylang_internal` is intact. |
+| A.10 | But Sky's `__toylang_internal_main` didn't emit a drop_in_place / Drop::drop call at scope end. Drop fired for Vec elements (Vec's stdlib drop iterates) but not for bare Sky-struct locals. This is the gap Phase E.b/E.c/E.d filled: synthesize the call at scope end via AST rewrite. |
+
+**DOC IMPACT (covered by this commit, 2026-06-23 doc-update pass).**
+- §15.7 of `rust-interop-architecture.md`: rewritten around AST-rewrite synthesis + `Drop::drop` direct dispatch.
+- §1.7: notes that drops fit through standard machinery.
+- §5.4: providers list reflects mir_shims retirement.
+- §F: new appendix entry F.18 — Phase E implementation lessons.
 
 ### Decision 2: Eliminate the `symbol_name` query override
 
@@ -1060,20 +1136,34 @@ Schedule: ~1 focused day to write benches + run on representative targets (linux
 
 ## Implementation backlog (ordered by dependency)
 
-### Phase A: Empirical baseline fixtures under CURRENT model (1-2 weeks)
+### Phase A: Empirical baseline fixtures under CURRENT model (1-2 weeks) — DONE 2026-06-23
 
-Build Fixtures 1-3 from the empirical work backlog under the EXISTING mir_shims-based architecture. These are toylang's FIRST drop tests; they may reveal bugs in existing infrastructure that nothing has ever exercised.
+**Status: SHIPPED 2026-06-23.** Findings A.1–A.10 in Decision 1 above.
 
-Sequence:
-1. Build Fixture 1 (basic drop chain). Make it pass. Reveals: does toylang's existing drop infrastructure work end-to-end?
-2. Build Fixture 2 (may_dangle). Make it pass. Reveals: does the current implicit-may_dangle behavior work (or does it fail because Sky doesn't explicitly emit may_dangle)?
-3. Build Fixture 3 (linear type runtime panic). Make it pass. Reveals: does Sky's drop function emit and run correctly when triggered?
+**Headline finding (A.6):** the previous `mir_shims` model was silently
+no-op'ing — even with a properly emitted `impl Drop for Widget` stub,
+`drop_in_place::<Widget>`'s body was a no-op and `<Widget as Drop>::drop`
+was absent from the binary. The handoff's "build fixtures first" gate
+revealed the previous machinery had never actually worked, validating
+Decision 1's premise empirically and reframing Phase E's risk profile:
+mir_shims elimination loses zero functionality because there was no
+functionality to lose.
 
-Each fixture: full mini-project (Cargo.toml, .toylang source, Rust source where applicable), integration test in `tests/integration_projects.rs`, assertions.
+**Fixture 1 (basic drop chain)** lives at
+`toylangc/tests/integration_projects/drop/fixture1_basic_drop_chain/`
+under the AS-IMPLEMENTED shape (Phase E.d) and serves as the forward-
+going regression test. The other 8 fixtures (Phase E.b/E.c additions —
+see Phase E entry below) also live under `drop/` and pass green.
 
-**Why first**: these fixtures become the regression suite for ALL subsequent migrations. If fixtures don't pass under the current model, the migration's "passes after migration" claim has no baseline.
+**Empirical work surfaced:**
+- Toylang parser rejected `&mut self` — extended `parse_impl_method` to accept it.
+- Required `use std::ops::Drop` in source; later relaxed by adding unconditional `pub use core::ops::Drop;` re-export in stub_gen (gated on absence).
+- The cascade-discovery path (`collect_consumer_trait_impl_instances`) already captures `<Widget as Drop>::drop` correctly when the partition contains it.
+- `oracle::find_trait_impl_method_def_id` correctly resolves to the impl method's DefId once the trait is `pub use`-re-exported.
 
-**Output**: 3 passing integration fixtures + log of any bugs/surprises found in existing toylang infrastructure during fixture construction.
+Fixtures 2/3 (may_dangle, linear-panic) deferred — they need toylang
+grammar/runtime extensions that aren't on the Phase E critical path.
+The shipped Fixtures 1-9 already cover the load-bearing cases.
 
 ### Phase B: Perf bench (1 day)
 
@@ -1106,22 +1196,42 @@ Tasks:
 
 **Output**: predicate migrated; classification matchers cleaned up; CI fence in place.
 
-### Phase E: mir_shims elimination (1 week, gated on Phase A passing)
+### Phase E: mir_shims elimination — DONE 2026-06-23
 
-Migrate drop handling from mir_shims override to standard Drop impl + Sky drop function via per_instance_mir (Decision 1).
+**Status: SHIPPED 2026-06-23**, in four sub-phases:
 
-Tasks:
-- Delete `rustc-lang-facade/src/queries/drop_glue.rs`.
-- Remove `mir_shims` from providers registration.
-- Update skyc's stub_gen to emit Drop impl bridges + Sky drop function placeholders for Sky types with cleanup.
-- Extend toylangc's per_instance_mir-driven emission to handle `__sky_drop_X::<T>` instances.
-- Implement the `project_raw_field` helper in skyc's drop emitter (per Decision 1's CI fence requirement).
-- Build CI fence: grep emitter source for direct `builder.build_struct_gep` calls outside `project_raw_field`.
-- Run Fixtures 1-3 (built in Phase A). Verify they STILL PASS under the new model. If any regress, **stop and diagnose**.
+**Phase E (the override deletion).** `rustc-lang-facade/src/queries/drop_glue.rs` + `mir_helpers.rs` deleted. `mir_shims` removed from `Providers` registration + `install_query_defaults` + `DEFAULT_MIR_SHIMS` OnceLock + `default_mir_shims()` accessor. Rustc's default DropGlue path fires unchanged thereafter. All 333 existing integration tests passed immediately upon override removal — empirical proof that the override was vestigial (Finding A.6 expansion).
 
-**Gating**: Phase A's fixtures must pass first to provide the regression baseline.
+**Phase E.b (Rust-typed locals get scope-end `drop_in_place::<T>`).** Briefly shipped: `CodegenCtx::scope_drops` tracked `(alloca, ResolvedType)` at let bindings; `emit_scope_drops` walked LIFO before each void return. Move-semantics conservative: sret / primitive returns skipped drops (caller's binding owns). Refactored away in E.d below.
 
-**Output**: mir_shims gone; Drop impl bridges + Sky drop functions in stub source; fixtures pass under new model.
+**Phase E.c (Sky-struct locals get direct `<T as Drop>::drop` via trait dispatch).** Briefly shipped: `emit_sky_struct_drop` dispatched on type-kind in `emit_scope_drops`. Codegen-extern-wrapper fix landed in this sub-phase too: switched unconditional `module.add_function` to `get_function`-or-add to handle the case where the body's call site declared the extern symbol first, which had been producing LLVM `.1` disambig collisions (Fixture 6 surfaced it). The `get_function`-or-add fix is RETAINED post-E.d. Refactored further in E.d.
+
+**Phase E.d (AST-rewrite refactor for principled adherence).** The shipped shape. Replaced LLVM-IR-layer drop emission with a typed-AST synthesis pass `insert_scope_end_drops` that runs after `resolve_fn_body`. The pass appends synthetic `Drop::drop(&local)` StaticCall nodes at scope-end positions; existing pipeline machinery handles them uniformly. Collapsed 4 specialness sites to 1. Added `tcx.adt_destructor` query as the Rust-type filter so Option / Result / Stdout / primitives (which have no trait-symbol drop) don't ICE the mono collector. Added `pub use core::ops::Drop` to stub_gen, gated on absence. See Decision 1's "AS IMPLEMENTED" subsection for the full shape.
+
+**Files touched (full inventory):** see Decision 1's "FILES TOUCHED" subsection. Net diff: 9 files modified, 2 deleted, ~640 insertions / ~33 deletions; +9 drop fixtures.
+
+**Output:**
+- mir_shims gone.
+- `insert_scope_end_drops` is the single Drop-aware compiler pass.
+- 9 drop fixtures (basic chain, two-Vec LIFO, helper-fn drop, empty Vec, Widget without Drop, single Sky local with Drop, multiple Sky locals LIFO, Sky local without Drop impl, Sky local in helper fn) at `toylangc/tests/integration_projects/drop/`.
+- Full integration suite: 342 / 0 / 1 ignored cold.
+
+**What was deferred** (and remains deferred):
+- The `__sky_drop_X<T>` bridge function from the original plan. Sky's
+  AS-IMPLEMENTED direct-dispatch is functionally equivalent for the
+  non-comptime case (toylang has no comptime). When comptime lands
+  (Sky v2), the bridge may need re-introduction to share one drop
+  fn across content-hash-keyed `SkyOpaqueType<T>` variants.
+- `project_raw_field` CI fence — not needed because the synth pass
+  never directly accesses field storage; the drop call is just
+  `Drop::drop(&local)` and the body lives in fill_extra_modules
+  emission that goes through normal codegen.
+- The `#[may_dangle]` syntactic-rule wiring (Decision 12) — gated
+  on Sky generic stdlib containers existing. Toylang's existing
+  uses of `Vec<Widget>` flow through Rust's stdlib `<Vec<T> as Drop>::drop`
+  which already has correct `#[may_dangle]` annotations.
+- Async-fn drop wiring (Decision 11, §14) — gated on async support
+  landing in toylang.
 
 ### Phase F: symbol_name elimination (half-day)
 

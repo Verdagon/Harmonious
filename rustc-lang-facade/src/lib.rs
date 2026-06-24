@@ -30,7 +30,10 @@ pub mod abi_helpers;
 pub mod codegen_wrapper;
 pub mod driver;
 pub mod extra_modules_hook;
-pub mod mir_helpers;
+// `mir_helpers` module retired 2026-06-23 (Phase E — its only consumer
+// was `lang_mir_shims`, which is gone). When Phase E's per_instance_mir
+// path needs MIR construction helpers (e.g. for __sky_drop_X bodies),
+// re-introduce as needed.
 pub mod queries;
 
 // Tier 3 #3 Phase 3: `cgu_stash` retired. The lifetime-erased CGU stash
@@ -469,7 +472,8 @@ pub type CollectAndPartitionFn = for<'tcx> fn(
 
 /// Default query providers saved from rustc. Set once, never changes.
 static DEFAULT_LAYOUT_OF: OnceLock<queries::layout::LayoutOfFn> = OnceLock::new();
-static DEFAULT_MIR_SHIMS: OnceLock<queries::drop_glue::MirShimsFn> = OnceLock::new();
+// DEFAULT_MIR_SHIMS retired 2026-06-23 (Phase E — drop is no longer
+// architecturally special; rustc's default DropGlue path fires unchanged).
 static DEFAULT_SYMBOL_NAME: OnceLock<queries::symbol_name::SymbolNameFn> = OnceLock::new();
 // No DEFAULT_PER_INSTANCE_MIR: the upstream default returns None unconditionally
 // (see comment near `default_collect_and_partition`).
@@ -951,9 +955,7 @@ pub(crate) fn default_layout_of() -> queries::layout::LayoutOfFn {
     *DEFAULT_LAYOUT_OF.get().expect("default layout_of not saved")
 }
 
-pub(crate) fn default_mir_shims() -> queries::drop_glue::MirShimsFn {
-    *DEFAULT_MIR_SHIMS.get().expect("default mir_shims not saved")
-}
+// `default_mir_shims()` accessor retired 2026-06-23 (Phase E).
 
 /// Returns the saved upstream `symbol_name` provider for direct call.
 ///
@@ -1097,7 +1099,6 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
 /// None directly instead of calling through a saved default.
 pub(crate) fn install_query_defaults(
     layout_of: queries::layout::LayoutOfFn,
-    mir_shims: queries::drop_glue::MirShimsFn,
     symbol_name: queries::symbol_name::SymbolNameFn,
     collect_and_partition: CollectAndPartitionFn,
     cross_crate_inlinable:
@@ -1106,7 +1107,7 @@ pub(crate) fn install_query_defaults(
         queries::cross_crate_inlinable::ExternCrossCrateInlinableFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
-    let _ = DEFAULT_MIR_SHIMS.set(mir_shims);
+    // mir_shims default retired 2026-06-23 (Phase E).
     let _ = DEFAULT_SYMBOL_NAME.set(symbol_name);
     let _ = DEFAULT_COLLECT_AND_PARTITION.set(collect_and_partition);
     // upstream_monomorphizations{_for} params retired 2026-06-21 (A.2).

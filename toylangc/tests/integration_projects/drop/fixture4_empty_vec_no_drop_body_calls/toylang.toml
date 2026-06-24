@@ -1,0 +1,7 @@
+[project]
+name = "fixture4_empty_vec_no_drop_body_calls"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

@@ -1,12 +1,22 @@
 //! Query override installation.
 //!
 //! Rustc's compilation is driven by a demand-driven query system. We override
-//! these providers: `layout_of` (type layout), `mir_shims` (drop glue),
-//! `per_instance_mir` (per-Instance synthetic dep-registering bodies for
-//! consumer fns), `symbol_name` (consumer symbol mapping),
-//! `collect_and_partition_mono_items` (filter consumer items out of rustc's
-//! CGU list), and `cross_crate_inlinable` (forces real `.o` symbols for
-//! cross-crate inlinable items in consumer-active compiles — closes B16).
+//! these providers: `layout_of` (type layout), `per_instance_mir` (per-Instance
+//! synthetic dep-registering bodies for consumer fns, plus per-T bodies for
+//! Sky drop functions like `__sky_drop_X<T>` post-Phase-E), `symbol_name`
+//! (consumer symbol mapping), `collect_and_partition_mono_items` (filter
+//! consumer items out of rustc's CGU list), and `cross_crate_inlinable`
+//! (forces real `.o` symbols for cross-crate inlinable items in
+//! consumer-active compiles — closes B16).
+//!
+//! `mir_shims` override retired 2026-06-23 (Phase E of handoff.md Decision 1).
+//! Drop is no longer architecturally special: rustc's default DropGlue path
+//! fires unchanged; the per-type body comes from stub_gen-emitted bridges
+//! (`impl Drop for X { fn drop(&mut self) { unsafe { __sky_drop_X(self as
+//! *mut _); } } }`) calling generic Sky drop functions whose bodies are
+//! supplied via per_instance_mir like any other Sky-defined function. The
+//! handoff documents the empirical baseline (Phase A) that revealed
+//! mir_shims was silently no-op'ing rather than performing useful work.
 //!
 //! `upstream_monomorphizations{_for}` overrides retired 2026-06-21 (A.2
 //! retirement under §5.5 Step 3 — see handoff.md).
@@ -45,7 +55,7 @@
 //! body (rustc fork patch 4) is the sole def at link time.
 
 pub mod cross_crate_inlinable;
-pub mod drop_glue;
+// `drop_glue` module retired 2026-06-23 (Phase E — see module-level doc).
 pub mod layout;
 pub mod partition;
 pub mod per_instance;
@@ -68,7 +78,6 @@ pub fn lang_override_queries(
     // so install_query_defaults does not save it.
     crate::install_query_defaults(
         providers.queries.layout_of,
-        providers.queries.mir_shims,
         providers.queries.symbol_name,
         providers.queries.collect_and_partition_mono_items,
         providers.queries.cross_crate_inlinable,
@@ -76,7 +85,9 @@ pub fn lang_override_queries(
     );
 
     providers.queries.layout_of        = layout::lang_layout_of;
-    providers.queries.mir_shims        = drop_glue::lang_mir_shims;
+    // `mir_shims` override retired 2026-06-23 (Phase E). Rustc's default
+    // DropGlue path fires unchanged; per-type drop semantics come from
+    // stub_gen-emitted Drop impl bridges + Sky drop fns via per_instance_mir.
     providers.queries.per_instance_mir = per_instance::lang_per_instance_mir;
     providers.queries.symbol_name      = symbol_name::lang_symbol_name;
     // Partition filter restored 2026-06-22 (Option 4 + patch 5 joint

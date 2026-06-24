@@ -1,0 +1,7 @@
+[project]
+name = "fixture2_two_vecs_lifo_order"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

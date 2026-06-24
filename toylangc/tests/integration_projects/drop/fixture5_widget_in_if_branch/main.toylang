@@ -1,0 +1,22 @@
+// Phase E.b Fixture 5 — Widget WITHOUT impl Drop. Vec<Widget> drops at
+// scope end, iterates elements, but each Widget's drop_in_place is
+// effectively a no-op (no Drop impl + opaque/ZST fields). Verifies the
+// "no spurious prints" path: the only output should be the bookend
+// println_i32 calls.
+
+use std::alloc::Global
+use std::vec::Vec
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+fn main() {
+    println_i32(1);
+    let v = Vec::new<Widget, Global>();
+    v.push(Widget { id: 99 });
+    v.push(Widget { id: 99 });
+    println_i32(2);
+}

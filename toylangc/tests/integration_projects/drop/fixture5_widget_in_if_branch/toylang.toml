@@ -1,0 +1,7 @@
+[project]
+name = "fixture5_widget_in_if_branch"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

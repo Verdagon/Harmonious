@@ -514,11 +514,15 @@ impl Parser {
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
             match self.peek() {
                 Token::Ident(s) if s == "fn" => {
-                    let (m_name, m_func) = self.parse_impl_method(
+                    let (m_name, m_func, m_is_mut) = self.parse_impl_method(
                         &self_type_name, struct_names, &impl_type_params,
                         &self_type_args,
                     )?;
-                    methods.push(ToyImplMethod { name: m_name, func: m_func });
+                    methods.push(ToyImplMethod {
+                        name: m_name,
+                        func: m_func,
+                        is_self_mut: m_is_mut,
+                    });
                 }
                 t => return Err(ParseError::UnexpectedToken {
                     expected: "fn".to_string(),
@@ -550,7 +554,7 @@ impl Parser {
         struct_names: &[String],
         impl_block_type_params: &[String],
         impl_block_self_type_args: &[String],
-    ) -> Result<(String, ToyFunction), ParseError> {
+    ) -> Result<(String, ToyFunction, bool), ParseError> {
         use crate::toylang::registry::{ToyParam};
         use crate::toylang::typed_ast::ResolvedType;
 
@@ -580,12 +584,26 @@ impl Parser {
         body_scope_type_params.extend(method_type_params.iter().cloned());
 
         self.expect(Token::LParen)?;
-        // Receiver: must be `&self` (taken by shared ref). Elevate to an
-        // explicit first parameter `self: &Struct[<args>]`. The self-type
-        // args come from the impl block (`Wrapper<T>` ⇒ args = `[T]`).
+        // Receiver: `&self` or `&mut self`. Elevate to an explicit first
+        // parameter `self: &Struct[<args>]`. The self-type args come from
+        // the impl block (`Wrapper<T>` ⇒ args = `[T]`).
+        //
+        // The is_self_mut bool is plumbed back so stub_gen can emit the
+        // right receiver token (`&mut self` for Drop, `&self` otherwise).
+        // The internal ToyParam representation is the same `Ref { inner:
+        // StructRef }` for both — toylang has no mutation surface today,
+        // so &mut is purely receiver syntax for Rust-emission purposes.
         let mut params: Vec<ToyParam> = Vec::new();
+        let mut is_self_mut = false;
         if self.peek() == &Token::Ampersand {
             self.consume();
+            // Optional `mut` before `self` (Phase A — required by Drop).
+            if let Token::Ident(s) = self.peek() {
+                if s == "mut" {
+                    self.consume();
+                    is_self_mut = true;
+                }
+            }
             match self.peek() {
                 Token::Ident(s) if s == "self" => { self.consume(); }
                 t => return Err(ParseError::UnexpectedToken {
@@ -645,7 +663,7 @@ impl Parser {
             return_ty,
             body: Some(body),
             is_export: false,
-        }))
+        }, is_self_mut))
     }
 
     fn parse_struct(&mut self, struct_names: &[String]) -> Result<(String, ToyStruct), ParseError> {

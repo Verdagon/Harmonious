@@ -208,6 +208,14 @@ pub struct ToyImpl {
 pub struct ToyImplMethod {
     pub name: String,
     pub func: ToyFunction,
+    /// True when the source receiver was `&mut self` rather than `&self`.
+    /// Phase A: needed by Drop, which requires `fn drop(&mut self)`. The
+    /// inner `params` still stores `self` as `Ref { inner: StructRef }`
+    /// (no `RefMut` variant — toylang has no mutation surface today, so
+    /// the &mut is purely receiver syntax for Rust-emission purposes).
+    /// Stub_gen consults this to emit the right receiver token.
+    #[serde(default)]
+    pub is_self_mut: bool,
 }
 
 /// A parsed parameter in a Toylang function signature.

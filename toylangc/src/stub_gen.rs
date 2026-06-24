@@ -453,9 +453,22 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             };
             // No `#[inline(never)]` — see the accessor emission site
             // for the full rationale (F1 investigation 2026-06-20).
-            parse_quote! {
-                fn #m_name(&self, #(#user_params),*) -> #ret {
-                    unreachable!()
+            //
+            // Phase A: `is_self_mut` flips the receiver token from `&self`
+            // to `&mut self`. Today only `Drop::drop` needs this; the body
+            // is still `unreachable!()` (the override / per_instance_mir
+            // path supplies the real semantics).
+            if m.is_self_mut {
+                parse_quote! {
+                    fn #m_name(&mut self, #(#user_params),*) -> #ret {
+                        unreachable!()
+                    }
+                }
+            } else {
+                parse_quote! {
+                    fn #m_name(&self, #(#user_params),*) -> #ret {
+                        unreachable!()
+                    }
                 }
             }
         }).collect();
@@ -467,6 +480,25 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         items.push(syn::Item::Impl(impl_block));
     }
 
+    // Phase E.d — re-export `Drop` from the stub rlib so the
+    // compiler-synthesized scope-end drop calls can resolve the
+    // trait DefId. Skipped when the user's toylang source already has
+    // a `use ...::Drop` import (`registry.imports` contains a path
+    // ending in `::Drop`) — re-exporting twice is a name collision.
+    //
+    // The synthesized scope-end calls are `Drop::drop(&local)`; the
+    // dispatch path in `lower_typed_expr` and the dep-walker both
+    // route through `find_use_imported_trait_def_id("Drop")`, which
+    // walks this stub rlib's `pub use` re-exports.
+    let user_already_imports_drop = registry.imports.iter().any(|p| {
+        p.split("::").last() == Some("Drop")
+    });
+    if !user_already_imports_drop {
+        items.push(parse_quote! {
+            #[allow(unused_imports)]
+            pub use core::ops::Drop;
+        });
+    }
     items.push(parse_quote! {
         #[inline(never)]
         pub unsafe fn __toylang_option_unwrap<T>(o: *mut core::option::Option<T>) -> T {
@@ -634,6 +666,7 @@ mod tests {
                     }),
                     body: None, // body irrelevant for stub emission (always unreachable!())
                 },
+                is_self_mut: false,
             }],
         });
 

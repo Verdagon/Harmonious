@@ -1,0 +1,37 @@
+// Phase A Fixture 1 — basic drop chain.
+//
+// Builds a Vec<Widget>; lets it drop at scope end; asserts the drop fires
+// once per element in deterministic order. Empirical baseline for what the
+// CURRENT mir_shims model can express.
+//
+// Under mir_shims (current model): when Vec drops, rustc emits
+// drop_in_place::<Widget> per element. The mir_shims override intercepts
+// each drop and emits a body that calls `__toylang_drop_Widget(ptr)`.
+// Toylangc emits `__toylang_drop_Widget` with the user's drop body.
+//
+// Under post-Phase-E model: stub_gen emits a standard `impl Drop for
+// Widget` bridge calling `__sky_drop_Widget(self as *mut _)`; that's a
+// normal generic Sky function whose body comes from per_instance_mir.
+
+use std::alloc::Global
+use std::ops::Drop
+use std::vec::Vec
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn main() {
+    let v = Vec::new<Widget, Global>();
+    v.push(Widget { id: 1 });
+    v.push(Widget { id: 2 });
+    v.push(Widget { id: 3 });
+}

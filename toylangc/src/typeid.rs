@@ -3,7 +3,7 @@
 //! Architecture: `rust-interop-architecture.md` §10.6 — a typeid is a stable
 //! u64 identity for a Sky-defined type, used as the const-generic argument of
 //! `__ToylangOpaque<const T: u64>`. The decoding side (queries/layout.rs,
-//! eventually queries/symbol_name.rs and queries/drop_glue.rs) reads the const
+//! eventually queries/symbol_name.rs) reads the const
 //! u64 out of an `Instance`'s args, looks the typeid up in the registry's
 //! `typeid_table`, and recovers the original `(name, type_args)` pair.
 //!

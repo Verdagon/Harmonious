@@ -1,0 +1,35 @@
+// Phase E.b Fixture 2 — two Vec<Widget> locals; LIFO drop order.
+//
+// Rust's spec: locals drop in reverse declaration order. Sky's
+// emit_scope_drops iterates `scope_drops` in `.rev()`, matching that.
+// Fixture: two Vecs, one with id=100..102, one with id=200..202.
+// Expected output prints v2's ids first (200,201,202), then v1's
+// (100,101,102) because v2 was declared after v1.
+
+use std::alloc::Global
+use std::ops::Drop
+use std::vec::Vec
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn main() {
+    let v1 = Vec::new<Widget, Global>();
+    v1.push(Widget { id: 100 });
+    v1.push(Widget { id: 101 });
+    v1.push(Widget { id: 102 });
+
+    let v2 = Vec::new<Widget, Global>();
+    v2.push(Widget { id: 200 });
+    v2.push(Widget { id: 201 });
+    v2.push(Widget { id: 202 });
+}

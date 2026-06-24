@@ -1,0 +1,30 @@
+// Phase E.b Fixture 3 — drop fires at the END of any void-returning fn,
+// not just main. Helper fn fills then drops; main observes the drops.
+
+use std::alloc::Global
+use std::ops::Drop
+use std::vec::Vec
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn run_inner() {
+    let v = Vec::new<Widget, Global>();
+    v.push(Widget { id: 7 });
+    v.push(Widget { id: 8 });
+}
+
+fn main() {
+    println_i32(1);
+    run_inner();
+    println_i32(2);
+}

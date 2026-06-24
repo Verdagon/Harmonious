@@ -1,0 +1,27 @@
+// Phase E.c Fixture 7 — multiple Sky struct locals, LIFO drop order.
+//
+// Three Widgets with ids 10, 20, 30. Expected: at scope end they drop
+// in 30, 20, 10 order (reverse declaration). Each Drop body prints
+// `self.id`. The bookend prints frame the sequence.
+
+use std::ops::Drop
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn main() {
+    println_i32(1);
+    let a = Widget { id: 10 };
+    let b = Widget { id: 20 };
+    let c = Widget { id: 30 };
+    println_i32(2);
+}

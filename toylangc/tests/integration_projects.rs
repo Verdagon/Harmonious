@@ -3102,3 +3102,162 @@ fn test_inline_case3_inline_never() {
     // -Os/-Oz inlining behavior is LLVM-heuristic-dependent. No
     // inlining assertion — only correctness. See handoff open item.
 }
+
+// =========================================================================
+// Phase A: Empirical baseline drop fixtures.
+// =========================================================================
+// Per handoff.md "Empirical work backlog": toylang has zero drop tests
+// today (verified during round-3 follow-up Q2). These fixtures characterize
+// what the CURRENT mir_shims model can actually express; pass/fail under
+// the current model is empirical signal, and the fixtures become the
+// regression suite for Phase E (mir_shims elimination).
+//
+// Each fixture lives under tests/integration_projects/drop/<name>/.
+
+fn run_drop_project(name: &str) {
+    let project = projects_dir().join("drop").join(name);
+    assert!(
+        project.is_dir(),
+        "drop fixture not found: {}",
+        project.display(),
+    );
+
+    let build_dir = project.join(".toylang-build");
+    if build_dir.exists() {
+        std::fs::remove_dir_all(&build_dir).unwrap();
+    }
+
+    let cargo_target = shared_cargo_target_dir();
+
+    let build_out = {
+        let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
+        Command::new(toylangc_bin())
+            .current_dir(&project)
+            .env("DYLD_LIBRARY_PATH", sysroot_lib())
+            .env("LD_LIBRARY_PATH", sysroot_lib())
+            .env("CARGO_TARGET_DIR", &cargo_target)
+            .args(["build"])
+            .output()
+            .expect("failed to spawn toylangc")
+    };
+    assert!(
+        build_out.status.success(),
+        "{} toylangc build failed:\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr),
+    );
+
+    let bin = cargo_target.join("debug").join(name);
+    assert!(
+        bin.exists(),
+        "{} expected binary at {}, found nothing",
+        name,
+        bin.display(),
+    );
+
+    let run = Command::new(&bin)
+        .env("DYLD_LIBRARY_PATH", sysroot_lib())
+        .env("LD_LIBRARY_PATH", sysroot_lib())
+        .output()
+        .unwrap_or_else(|e| panic!("{}: failed to spawn binary: {}", name, e));
+    assert!(
+        run.status.success(),
+        "{} binary exited non-zero:\nstdout: {}\nstderr: {}",
+        name,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    let expected = std::fs::read_to_string(project.join("expected_output.txt"))
+        .unwrap_or_else(|e| panic!("{}: cannot read expected_output.txt: {}", name, e));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for line in expected.lines() {
+        if line.is_empty() { continue; }
+        assert!(
+            stdout.contains(line),
+            "{}: expected '{}' in stdout, got:\n{}",
+            name, line, stdout,
+        );
+    }
+}
+
+/// Fixture 1 — basic drop chain. Build a Vec<Widget>; drop at scope end;
+/// each element's Drop should fire once and print its id.
+///
+/// Phase A characterization (2026-06-23): under the current mir_shims
+/// model this fixture builds + links + runs but produces empty stdout
+/// because the mir_shims override never fires for Widget's DropGlue;
+/// rustc's drop_in_place::<Widget> body is a no-op and <Widget as
+/// Drop>::drop is absent from the binary. The drop chain is silently
+/// broken end-to-end. See handoff.md Phase A Finding A.6.
+///
+/// Currently `#[ignore]`d pending Phase E (mir_shims elimination +
+/// __sky_drop_X<T> via per_instance_mir). Phase E removes the ignore
+/// and uses this fixture as forward-going regression evidence that the
+/// new drop model wires up end-to-end.
+#[test]
+fn test_drop_fixture1_basic_drop_chain() {
+    run_drop_project("fixture1_basic_drop_chain");
+}
+
+/// Fixture 2 — two Vec<Widget> locals; verify LIFO drop order.
+#[test]
+fn test_drop_fixture2_two_vecs_lifo_order() {
+    run_drop_project("fixture2_two_vecs_lifo_order");
+}
+
+/// Fixture 3 — drop fires at the END of any void-returning fn, not
+/// just main. Helper fn fills a Vec then drops it; main observes the
+/// drops between two bookend prints.
+#[test]
+fn test_drop_fixture3_drop_in_helper_fn() {
+    run_drop_project("fixture3_drop_in_helper_fn");
+}
+
+/// Fixture 4 — Vec<Widget> with zero pushes; Widget's Drop body never
+/// fires. Verifies the Vec dealloc path is still reachable and
+/// element iteration is a no-op for an empty Vec.
+#[test]
+fn test_drop_fixture4_empty_vec_no_drop_body_calls() {
+    run_drop_project("fixture4_empty_vec_no_drop_body_calls");
+}
+
+/// Fixture 5 — Widget with NO Drop impl; Vec<Widget> drops cleanly;
+/// element-level drop_in_place is a no-op. Verifies the "no Drop
+/// impl + opaque ZST fields" path doesn't add spurious output.
+#[test]
+fn test_drop_fixture5_widget_no_drop_impl() {
+    run_drop_project("fixture5_widget_in_if_branch");
+}
+
+/// Fixture 6 — single Sky struct as a let-local with `impl Drop`.
+/// At scope end, `<Widget as Drop>::drop` must fire. Phase E.b alone
+/// silently leaks this case (only Rust types like Vec<T> are tracked);
+/// Phase E.c adds the direct-trait-method-call path.
+#[test]
+fn test_drop_fixture6_single_sky_local_with_drop() {
+    run_drop_project("fixture6_single_sky_local_with_drop");
+}
+
+/// Fixture 7 — multiple Sky struct locals with `impl Drop`. LIFO drop
+/// order: c then b then a (reverse declaration).
+#[test]
+fn test_drop_fixture7_sky_locals_lifo() {
+    run_drop_project("fixture7_sky_locals_lifo");
+}
+
+/// Fixture 8 — Sky struct local with NO Drop impl. No drop call
+/// emitted; only the bookend prints fire.
+#[test]
+fn test_drop_fixture8_sky_local_no_drop_impl() {
+    run_drop_project("fixture8_sky_local_no_drop_impl");
+}
+
+/// Fixture 9 — Sky struct local in a void-returning helper fn. Helper's
+/// scope-end drop fires at helper exit; main observes the drop between
+/// two bookend prints.
+#[test]
+fn test_drop_fixture9_sky_local_in_helper_fn() {
+    run_drop_project("fixture9_sky_local_in_helper_fn");
+}

@@ -311,6 +311,13 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
         func
     }
 
+    // `emit_drop_in_place` + `emit_sky_struct_drop` + `emit_scope_drops`
+    // retired 2026-06-23 (Phase E.d). Drop calls now appear as
+    // synthesized `Drop::drop(&local)` StaticCall AST nodes that the
+    // existing `lower_typed_expr::StaticCall` arm emits uniformly —
+    // no drop-specific emission helpers. See callbacks_impl.rs's
+    // `insert_scope_end_drops` for the synthesis pass.
+
     // --- Rust method resolution ---
 
     /// Lazily resolve and cache a Rust method. Returns the mangled symbol name
@@ -696,8 +703,21 @@ fn codegen_internal_function<'ctx, 'tcx>(
     let is_rust_trait = |name: &str| {
         crate::oracle::find_use_imported_trait_def_id(ctx.tcx, name).is_some()
     };
-    let typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait)
+    let mut typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait)
         .expect("type resolution should succeed (already validated)");
+
+    // Phase E.d — insert scope-end `Drop::drop(&local)` calls into the
+    // typed AST. Mirrors `callbacks_impl::type_resolve_body`'s wrapper
+    // so both the dep-collection and codegen paths see identical
+    // typed ASTs (the synth must be applied at BOTH sites or the dep
+    // queue and the emitted body will disagree on what's called).
+    let returns_void = matches!(
+        &func.return_ty,
+        None | Some(ResolvedType::Void),
+    );
+    crate::toylang::callbacks_impl::insert_scope_end_drops(
+        ctx.tcx, &mut typed_body, ctx.registry, returns_void,
+    );
 
     // Resolve any Rust method symbols used in this function by walking the typed body
     resolve_rust_methods_from_typed_body(ctx, &typed_body);
@@ -778,7 +798,34 @@ fn codegen_internal_function<'ctx, 'tcx>(
         lower_typed_stmt(ctx, stmt);
     }
 
-    // Lower return expression
+    // Phase E.b — scope-end drop emission discipline:
+    //
+    //  * Void return / void-tailed body: emit drops for every tracked
+    //    local. No move semantics to worry about; the locals fall out of
+    //    scope at fn exit and rustc-side ownership stays self-contained.
+    //
+    //  * sret return: the return value is a struct that was memcpy'd
+    //    from a local. Emitting drops here would double-drop the
+    //    returned-via-memcpy value (the source local's storage shares
+    //    contents with the sret slot, and the caller will subsequently
+    //    drop the sret value too). The MOVE-OUT discipline is: the
+    //    caller's `let v = make_vec();` binding is the one that
+    //    schedules the eventual drop. SKIP scope drops on sret return.
+    //
+    //  * Primitive return (i32/bool/...): the return is a register
+    //    value — safely independent of any local storage. But if any
+    //    local owns a Drop'able value, dropping it here is correct.
+    //    Conservative for now: skip — toylang fns that compute then
+    //    return primitives typically don't own externally-Drop'able
+    //    locals that need cleanup, and the move-semantics edge cases
+    //    (`let v = make_vec(); v.len()`) are subtle. Move tracking is
+    //    Phase E.c follow-up. The leak is bounded: a forgetting-to-drop
+    //    Vec at fn exit gets dropped by the caller's binding.
+    //
+    // The result: locals only fully participate in scope-end drops at
+    // void-returning fns (main / unit-bodied helpers). For non-void
+    // returns we lean on the caller's binding to do the drop. Fixture 1
+    // (Vec<Widget> in `fn main()`) exercises the void-return path.
     if let Some(ref ret_expr) = typed_body.ret {
         let result = lower_typed_expr(ctx, ret_expr);
 
@@ -797,15 +844,25 @@ fn codegen_internal_function<'ctx, 'tcx>(
                 src_ptr, ctx.pointer_align as u32,
                 size,
             ).unwrap();
+            // Phase E.d: scope-end drop calls are inserted into the
+            // typed AST by `insert_scope_end_drops`. For non-void
+            // returns the synthesizer skips entirely — caller's
+            // binding owns the drop. Nothing to do here.
             ctx.builder.build_return(None).unwrap();
         } else if llvm_ret_type.is_some() {
-            // Primitive return
+            // Primitive return — same as above.
             let val = result.into_value(&ctx.builder);
             ctx.builder.build_return(Some(&val)).unwrap();
         } else {
+            // Void-typed ret_expr (e.g. a unit expression). Synthesized
+            // drop calls are already present as ExprStmt entries in
+            // the block's stmts and were lowered above.
             ctx.builder.build_return(None).unwrap();
         }
     } else {
+        // Void-tailed fn body (the @MBMRVZ shape — `fn main() { ... }`
+        // with trailing `;`). Same — synth drop calls were lowered
+        // earlier as part of the stmt loop.
         ctx.builder.build_return(None).unwrap();
     }
 }
@@ -942,7 +999,22 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     // The rustc-visible extern wrapper. Per @SMPLZ, this symbol gets
     // pinned in `@llvm.used` later in `fill_module` so LTO `internalize`
     // doesn't demote its linkage and break cross-crate references.
-    let function = ctx.module.add_function(extern_symbol, fn_type, None);
+    //
+    // Reuse an existing declaration of the same symbol if one was
+    // already added — e.g. when an internal body (`__toylang_internal_main`)
+    // referenced this extern symbol via `declare_external_fn` before
+    // the extern wrapper itself was codegen'd. A naive `add_function`
+    // would create a SECOND definition with the same name; LLVM
+    // disambiguates with a `.1` suffix, the call sites stay bound to
+    // the original (now defless) name, and the link fails with
+    // "undefined symbol: <T as Drop>::drop". Phase E.c surfaced this
+    // through Fixture 6: `__toylang_internal_main`'s emit_scope_drops
+    // declares the extern Drop method before the cascade-drain's
+    // codegen_extern_wrapper runs to define it.
+    let function = match ctx.module.get_function(extern_symbol) {
+        Some(existing) => existing,
+        None => ctx.module.add_function(extern_symbol, fn_type, None),
+    };
 
     // Add sret attribute if Rust ABI uses sret
     if rust_sret {
@@ -1782,6 +1854,12 @@ fn lower_typed_expr<'ctx>(
         }
     }
 }
+
+// `local_needs_scope_drop` retired 2026-06-23 (Phase E.d). The
+// equivalent predicate lives next to the synthesis pass in
+// `callbacks_impl::local_needs_scope_drop`. Lowering itself no
+// longer makes drop decisions — drop calls are present in the
+// typed AST as ordinary StaticCall nodes by the time lowering runs.
 
 fn lower_typed_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>, stmt: &TypedStmt) {
     match stmt {

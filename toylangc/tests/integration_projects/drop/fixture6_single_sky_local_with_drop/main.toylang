@@ -1,0 +1,30 @@
+// Phase E.c Fixture 6 — single Sky struct as a let-local with Drop
+// impl. At scope end, `<Widget as Drop>::drop` must fire.
+//
+// Under Phase E.b alone this silently leaks (no scope-end drop call is
+// emitted for Sky-struct locals — only Rust types like Vec<T>).
+// Phase E.c adds the direct-trait-method-call path that closes the gap.
+//
+// Expected stdout: `1\n42\n2` — "1" before, the Widget's id at scope
+// end, "2" after the scope (but main's scope ends right at the Widget,
+// so "2" prints first, then 42 at fn exit; see expected_output.txt).
+
+use std::ops::Drop
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn main() {
+    println_i32(1);
+    let w = Widget { id: 42 };
+    println_i32(2);
+}

@@ -77,7 +77,7 @@ Linearity is a property of the type, not of the value or the binding. Some Sky t
 
 For interop purposes, linear Sky types pose a problem: rustc has no concept of linearity. When a Sky linear type appears in Rust source — perhaps because the Sky type is passed to a Rust generic and the Rust code stores it in a `Vec<T>` — rustc may decide to drop it. Sky's typechecker can't prevent this; the type has crossed into rustc's domain.
 
-Sky's solution: every linear Sky type's drop glue panics. The `mir_shims` query returns a synthetic body for `DropGlue(_, Some(LinearSkyType))` whose only operation is to call `__sky_runtime_panic("Sky linear type X was dropped from Rust")` followed by `abort()`. The program terminates with a clear diagnostic. Sky's user has not violated linearity from inside Sky source; Rust has violated it, and Sky responds by killing the program before further damage. Section 15 covers the drop story.
+Sky's solution: every linear Sky type's source-level `impl Drop` body calls `sky_runtime_panic("Sky linear type X was dropped from Rust")` followed by `abort()`. The compiler's AST-rewrite pass synthesizes `Drop::drop(&local)` calls at scope-end positions for any let-binding whose type has a Drop impl; rustc's auto-generated `drop_in_place` chain reaches the user's panic-and-abort body via the same path it reaches any other Sky-emitted trait impl method. The program terminates with a clear diagnostic. Sky's user has not violated linearity from inside Sky source; Rust has violated it, and Sky responds by killing the program before further damage. Section 15 covers the drop story; the AST-rewrite mechanism is §15.7 in detail.
 
 **Slab-based comptime.** Sky's comptime is Zig-style: the same expression language runs at compile time as runs at runtime. A `comptime` block evaluates immediately at the surrounding compile point; a `comptime` parameter is bound to a specific compile-time value that becomes a property of the type. Sky's comptime evaluator implements this by simulating a "RAM-like slab" — an in-memory byte buffer with allocator services — that holds comptime-constructed values. Comptime values are referenced by their slab address (a `usize`-typed offset).
 
@@ -210,6 +210,8 @@ This subsection records what Sky is *not* — design choices that have been cons
 
 **Sky does not surrender LLVM output control to rustc's codegen pipeline.** Sky's LLVM backend (Inkwell-based, contributed via patch 4's `fill_extra_modules` hook — see §5, §F.15) owns every byte of Sky-emitted LLVM IR. This is non-negotiable. It enables Sky to guarantee codegen quality, ABI discipline (`@ACRTFDZ`/`@TCHAPZ`), pin discipline (`@SMPLZ`), and emission-shape stability across rustc bumps. Designs that lower Sky source to rustc MIR and let rustc's codegen produce the bodies — periodically proposed as a "long-term simplification" because they would retire the discovery/synthesis machinery — are **rejected permanently** for this reason. Sky's frontend never emits rustc MIR for Sky-defined bodies; per_instance_mir returns synthetic dep-registering bodies (see §19), but the real bodies come from Sky's own LLVM backend, full stop.
 
+**Sky does not treat drop as architecturally special.** Drop is just a function the language sometimes auto-calls. The compiler synthesizes `Drop::drop(&local)` AST nodes at scope-end positions during type resolution (see §15.7); after that pass, every downstream stage — dep walker, mono cascade, per_instance_mir, codegen, symbol resolution, link — treats the synthesized calls as ordinary trait static calls with no drop-specific code paths. The retired `mir_shims` query override (Phase E, 2026-06-23) had categorized drop as a thing that needed its own emission path; empirical validation showed the override had never actually worked for any shipping fixture, and its removal lost zero functionality. See §F.18 for the implementation lessons.
+
 Many of these "does not do" entries are recovered through specific designed mechanisms — Sky doesn't unwind but Result is rich enough for error handling, Sky doesn't cancel by drop but channel-based cancellation is composable. The point of this subsection is not to enumerate Sky's limitations as a sales criticism but to make explicit the boundaries of the design space so future contributors know which questions are settled.
 
 ---
@@ -323,7 +325,7 @@ export fn wrap<T>(x: T) -> Wrapper<T> {
 
 Over-approximation does not rescue pre-pass either. `LocalThing` is a user type defined in the top-level Rust code; Sky has no finite universe to over-approximate over. Any Rust-defined type could be passed to `wrap`. The set of instantiations is, in principle, unbounded.
 
-**How Sky handles it via interleaving:** rustc's collector walks `main.rs`, sees the call `sky_lib::wrap::<LocalThing>(t)`, queues `wrap<LocalThing>`. Sky's `per_instance_mir` provider fires with `Instance(wrap_def_id, [LocalThing])`. Sky substitutes `T = LocalThing` (Sky-side substitution, since Sky's comptime machinery may participate), generates a synthetic MIR body whose drop semantics call into Sky's emitted `wrap<LocalThing>` symbol, and tells rustc that `wrap<LocalThing>` exists. Sky's codegen produces the actual machine code; rustc handles its half (the call site in `main.rs`, the linkage). Sky's `layout_of` provider answers when rustc queries the layout of `Wrapper<LocalThing>`. Sky's `mir_shims` provider answers when rustc queries the drop glue.
+**How Sky handles it via interleaving:** rustc's collector walks `main.rs`, sees the call `sky_lib::wrap::<LocalThing>(t)`, queues `wrap<LocalThing>`. Sky's `per_instance_mir` provider fires with `Instance(wrap_def_id, [LocalThing])`. Sky substitutes `T = LocalThing` (Sky-side substitution, since Sky's comptime machinery may participate), generates a synthetic MIR body whose drop semantics call into Sky's emitted `wrap<LocalThing>` symbol, and tells rustc that `wrap<LocalThing>` exists. Sky's codegen produces the actual machine code; rustc handles its half (the call site in `main.rs`, the linkage). Sky's `layout_of` provider answers when rustc queries the layout of `Wrapper<LocalThing>`. Drop semantics for `Wrapper<LocalThing>` flow through rustc's standard DropGlue path (post-2026-06-23 Phase E retirement of the `mir_shims` override — see §15.7).
 
 ### 2.4 Case 2: Sky program calls a Rust library
 
@@ -587,7 +589,7 @@ The cost of supporting the full taxonomy is the interleaved-monomorphization mac
 
 A note on terminology, because the word "interleaving" can be vague.
 
-Interleaving here means: **Sky's compiler hooks fire during rustc's monomorphization collection phase, supplying per-Instance information about Sky-defined items as the collector encounters concrete Instances of those items.** The collector calls Sky's `per_instance_mir` query when it walks a body referencing a Sky-defined function; Sky's provider returns the body (substituted to the concrete Instance's args). The collector calls Sky's `layout_of` query when it needs a Sky type's layout; Sky's provider returns it. The collector calls Sky's `mir_shims` query when it needs drop glue for a Sky type; Sky's provider returns it.
+Interleaving here means: **Sky's compiler hooks fire during rustc's monomorphization collection phase, supplying per-Instance information about Sky-defined items as the collector encounters concrete Instances of those items.** The collector calls Sky's `per_instance_mir` query when it walks a body referencing a Sky-defined function; Sky's provider returns the body (substituted to the concrete Instance's args). The collector calls Sky's `layout_of` query when it needs a Sky type's layout; Sky's provider returns it. Drop semantics flow through rustc's standard DropGlue path post-Phase-E; Sky-defined Drop impls (`<Widget as Drop>::drop`) flow through the cascade-discovery + `fill_extra_modules` emission path like any other Sky trait-impl method. See §15.7 for the AST-rewrite mechanism that inserts the drop calls.
 
 The collector is the driver. Sky is the responder. The collector's walk is what discovers the reachable set; Sky supplies the parts the collector doesn't have access to via Rust source.
 
@@ -963,7 +965,7 @@ Sky's machinery activates only for crates that contain the `__SKY_STUBS_MARKER` 
 5. Otherwise, Sky's machinery stays dormant; the compile proceeds vanilla.
 ```
 
-The detection happens after `after_expansion` rather than at startup because rustc needs to have parsed the crate to know its items. The very first Sky-machinery installation step (registering Sky's query providers — `per_instance_mir`, `layout_of`, `mir_shims`, `symbol_name`, `collect_and_partition_mono_items`, `cross_crate_inlinable` — and the `fill_extra_modules` codegen hook) is gated on the detection result.
+The detection happens after `after_expansion` rather than at startup because rustc needs to have parsed the crate to know its items. The very first Sky-machinery installation step (registering Sky's query providers — `per_instance_mir`, `layout_of`, `symbol_name`, `collect_and_partition_mono_items`, `cross_crate_inlinable` — and the `fill_extra_modules` codegen hook) is gated on the detection result. (`mir_shims` was previously in this set; retired 2026-06-23 — see §15.7 / §F.18.)
 
 **Why per-crate marker rather than per-invocation env var.** Earlier in the design conversation, the activation mechanism was `CARGO_PRIMARY_PACKAGE=1`. That's cargo's signal that this is the primary workspace package. The problem: a published Sky library, depended on by a user's Sky project, gets built by cargo as a normal dep — `CARGO_PRIMARY_PACKAGE` is unset. The Sky lib has `.sky` source that needs Sky processing, but with `CARGO_PRIMARY_PACKAGE` unset, Sky's machinery would stay dormant. The Rust stub bodies (`unreachable!()`) would be codegenned into the rlib, and runtime calls would panic.
 
@@ -1137,7 +1139,6 @@ impl CodegenBackend for SkyCodegenBackend {
         // Sky's overrides:
         //   - per_instance_mir (Sky-defined items' synthetic dep-discovery body),
         //   - layout_of (for Sky types),
-        //   - mir_shims (for Sky types, including drop glue),
         //   - symbol_name (for Sky items — see @SyMINCZ),
         //   - collect_and_partition_mono_items (restored 2026-06-22:
         //         filters consumer items out of the CGU list so rustc
@@ -1147,6 +1148,13 @@ impl CodegenBackend for SkyCodegenBackend {
         //         (B16: false in Sky-active compiles to keep real .o symbols
         //         for items Sky's call sites reference).
         // Retired (do NOT install):
+        //   - mir_shims (retired 2026-06-23, Phase E — drop semantics now
+        //         flow through rustc's standard DropGlue path; per-Sky-type
+        //         bodies come from a compiler-synthesized `Drop::drop(&local)`
+        //         AST node inserted by `insert_scope_end_drops`; cascade
+        //         discovery + fill_extra_modules emits the bodies. See
+        //         §15.7 for the AST-rewrite mechanism, §F.18 for the
+        //         implementation lessons.);
         //   - codegen_fn_attrs + extern_queries.codegen_fn_attrs
         //         (Option 4, retired 2026-06-22 alongside patch 5 — see
         //         §F.14.1 + §F.17 design history);
@@ -1892,7 +1900,7 @@ fn helper(x: I32) -> I32 { ... }   // non-export
 
 The export keyword applies to: structs, enums, traits, type aliases, functions, constants, modules. The semantics:
 
-- **Export struct** generates a stub declaration in the stub rlib. Rustc has a DefId for it. Rust callers can name it. Sky's layout_of override fires for it. Sky's mir_shims may fire for its drop glue.
+- **Export struct** generates a stub declaration in the stub rlib. Rustc has a DefId for it. Rust callers can name it. Sky's layout_of override fires for it. Drop glue flows through rustc's standard DropGlue path (post-Phase-E retirement of mir_shims override — see §15.7).
 - **Export fn** generates a function declaration in the stub rlib. Rust callers can call it. Sky's per_instance_mir override fires for it. Sky's codegen emits its body.
 - **Export trait** generates a trait declaration in the stub rlib. Rust types can impl the trait (Sky inherits Rust's orphan rule; impls must be in the trait's owning crate or a type-owning crate, Section 6.6).
 - **Export impl** (an impl block marked `export` or with both trait and type being export) generates an impl declaration in the stub rlib.
@@ -1915,7 +1923,7 @@ For an exported Sky item:
 - Rustc can name the item via its absolute path.
 - Sky's per_instance_mir provider answers when rustc queries the item.
 - Sky's layout_of override answers when rustc queries the item's layout.
-- Sky's mir_shims override answers when rustc needs drop glue.
+- Drop glue resolution flows through rustc's standard path; per-type Drop bodies (for Sky-defined `impl Drop`) come from `fill_extra_modules` via the cascade-discovery + AST-rewrite path described in §15.7.
 - Sky's symbol_name override determines the mangled name.
 
 For a non-exported Sky item:
@@ -2198,7 +2206,7 @@ let v = Vec::<comptime_type<N>>::new()
 
 Sky's frontend evaluates `comptime_type<42>` at comptime, gets a Sky-internal type representation, assigns it a typeid based on the construction recipe, rewrites to `SkyOpaqueType<typeid>`. Rustc sees `Vec<SkyOpaqueType<typeid>>`.
 
-In all three cases, rustc treats `SkyOpaqueType<N>` as a normal generic struct instantiation. `layout_of(SkyOpaqueType<N>)` fires; Sky's override looks up N in the universe, returns the layout. `mir_shims` for drop glue fires; Sky's override returns a body calling `__sky_drop_typeid_N(ptr)`.
+In all three cases, rustc treats `SkyOpaqueType<N>` as a normal generic struct instantiation. `layout_of(SkyOpaqueType<N>)` fires; Sky's override looks up N in the universe, returns the layout. Drop semantics flow through the AST-rewrite mechanism (§15.7): if the universe's entry for typeid N marks the type as needing drop, the compiler synthesizes `Drop::drop(&local)` at scope-end positions; cascade discovery + `fill_extra_modules` emits the body via the same path as Sky-defined `<Widget as Drop>::drop`.
 
 ### 10.8 Content-addressed typeids for cross-crate stability
 
@@ -2776,7 +2784,7 @@ So a migratory future satisfies `F: Future + Send + 'static + Unpin`. tokio::spa
 
 Wait, that creates an inconsistency. If migratory futures' drop glue is normal but default futures' drop glue panics, how does Sky distinguish?
 
-The mechanism: Sky's mir_shims override checks whether the type is linear (default async fn produces a linear type; migratory async fn produces a normal type). For linear types, mir_shims returns a panic body. For non-linear types, it returns the standard drop glue body.
+The mechanism: linear types' source-level `impl Drop` body is the panic-and-abort code; non-linear types' source-level `impl Drop` body (if any) is normal cleanup. The compiler's AST-rewrite pass (§15.7) inserts `Drop::drop(&local)` calls uniformly; the body that runs at scope end is whatever the user wrote, supplied via the standard cascade-discovery + `fill_extra_modules` pipeline. Linear vs non-linear is purely a Sky-source-level discipline tracked by the typechecker; the codegen path is the same for both.
 
 ### 14.6 Migratory propagation through call graph
 
@@ -2982,23 +2990,139 @@ The wrapper's "started" or "completed" flag tracks state:
 
 Cleanup runs only on cancellation. Normal completion is handler-free. If a user wants code to run on both completion and cancellation, they put it in two places (the completion branch of their async code, and the cleanup handler) — or use a shared helper.
 
-### 15.7 Rust drops a Sky linear type: auto-generated abort destructor
+### 15.7 The drop emission mechanism — AST-rewrite synthesis
 
-Sky's frontend, for every linear Sky type (a type marked linear in Sky source), generates an mir_shims override entry that returns a body calling Sky's runtime panic + abort:
+**Updated 2026-06-23 (Phase E + E.b/c/d).** Drop is not architecturally
+special; it is just a function that the language sometimes auto-calls.
+Sky's frontend implements this principle through a single AST-rewrite
+pass that runs immediately after type resolution. After the pass,
+every downstream stage — dep walker, mono cascade, per_instance_mir,
+codegen, symbol resolution, link — treats drop calls as ordinary
+trait static calls with no drop-specific code paths.
 
-```rust
-// Conceptually, the body for DropGlue(_, Some(LinearSkyType)):
-fn drop_in_place(ptr: *mut LinearSkyType) {
-    sky_runtime_panic("Sky linear type X was dropped from Rust source. Linear types must be consumed via Sky-native operations, not dropped.");
-    abort();
+**The mechanism in five steps.**
+
+1. **Source-level Drop impls are normal trait impls.** A Sky type that
+   needs cleanup carries an `export impl Drop for X { fn drop(&mut self) { ... } }`
+   in Sky source. From Sky's typechecker's view, Drop is just a Rust
+   trait that Sky source can impl, no different from `Clone`.
+
+2. **stub_gen emits the impl declaration.** Stub source contains
+   `impl Drop for X { fn drop(&mut self) { unreachable!() } }` (with
+   `unreachable!()` body — Sky's `fill_extra_modules` supplies the
+   real body, same as case4's Clone pattern). Stub_gen also emits
+   `pub use core::ops::Drop;` unconditionally (gated on absence to
+   avoid colliding with any user `use std::ops::Drop` import) so the
+   trait DefId is always resolvable from the synthesis pass.
+
+3. **Type resolution runs.** `resolve_fn_body` produces the typed AST
+   as usual — no drop knowledge anywhere.
+
+4. **`insert_scope_end_drops` synthesizes drop calls into the typed AST.**
+   This is the ONE site that knows about Drop. The pass:
+   - Skips entirely when the function has a non-void return (the
+     caller's let-binding takes ownership of the returned value via
+     move semantics; dropping our local would double-drop).
+   - For each `let` binding in the function body whose type needs a
+     drop (predicate `local_needs_scope_drop(tcx, ty, registry)` —
+     see below), appends a synthetic `TypedStmt::ExprStmt(TypedExprKind::StaticCall { ty: "Drop", method: "drop", args: [Ref(Var(local_name))] })`
+     to the block's stmts in REVERSE declaration order (LIFO — Rust's
+     drop order).
+
+5. **The synthesized calls flow through the existing pipeline unchanged.**
+   - `walk_typed_body_for_deps` collects them via its standard
+     `rust_method_deps` arm.
+   - `collect_rust_deps_recursive` queues `<T as Drop>::drop` as a
+     Rust dep through the trait-method dispatch path.
+   - The per_instance_mir cascade surfaces the dep so rustc's mono
+     collector queues the concrete monomorphization.
+   - For Sky-defined Drop impls (e.g. `<Widget as Drop>::drop`), the
+     cascade discovery (`is_consumer_trait_impl_method`) captures the
+     instance and `fill_extra_modules` emits Sky's body — exactly the
+     same path case4's Clone uses.
+   - For std-defined Drop impls (e.g. `<Vec<Widget> as Drop>::drop`),
+     rustc emits the body from std's source as part of its normal
+     cross-crate generic mono.
+   - `lower_typed_expr`'s `StaticCall` arm emits the LLVM call at the
+     resolved symbol.
+
+**The predicate.** `local_needs_scope_drop(tcx, ty, registry)` returns
+true when the type has a callable Drop trait method:
+- **Sky struct types** (`StructRef` / `Struct`): true iff
+  `registry.trait_impls` contains a matching `impl Drop for <name>` entry.
+- **Rust types** (`RustType`): true iff `tcx.adt_destructor(adt_def.did())`
+  returns `Some(_)`. This is rustc's query for "does this ADT have an
+  explicit `impl Drop`?" — returns `Some` for Vec/String/Box/etc.,
+  `None` for Option/Result/Stdout/primitives whose drop semantics
+  flow through auto-generated `DropGlue` with no trait-method symbol.
+  Without this filter, synthesizing `Drop::drop` on the latter types
+  ICEs rustc's mono collector ("failed to resolve instance for
+  `<Option<i32> as Drop>::drop`").
+- Everything else (primitives, refs, unsized types, type params): false.
+
+**Linear types** are simply Sky source types whose user-written
+`impl Drop` body invokes `sky_runtime_panic` + `abort()`. There is no
+separate mechanism — the same compiler pass synthesizes the same kind
+of `Drop::drop(&local)` call; the body that runs at scope end is the
+user's panic-and-abort code, supplied via the standard cascade
+discovery + `fill_extra_modules` pipeline.
+
+```sky
+// Sky source — linear type:
+linear struct LinearWidget { fd: I32 }
+
+export impl Drop for LinearWidget {
+    fn drop(&mut self) {
+        sky_runtime_panic("Sky linear type LinearWidget was dropped from Rust source. \
+                          Linear types must be consumed via Sky-native operations.");
+        abort();
+    }
 }
 ```
 
-When rustc emits drop glue for a linear Sky type (because Rust source has stored it on the stack, in a Vec, anywhere it gets dropped), the drop glue calls the panic+abort sequence. The program terminates with a clear diagnostic.
+When rustc emits drop glue for `LinearWidget` (because Rust source
+stored it on the stack, in a Vec, or anywhere else it gets dropped),
+the drop glue calls `<LinearWidget as Drop>::drop`, which is the body
+Sky's `fill_extra_modules` emitted from the source's panic-and-abort
+implementation. The program terminates with the user's diagnostic.
 
-The implication: Rust code that uses Sky linear types must explicitly consume them via Sky-side operations (call `sky_consume(value)` or similar). Without that consumption, drop fires; abort happens.
+The implication: Rust code that uses Sky linear types must explicitly
+consume them via Sky-side operations (call `sky_consume(value)` or
+similar). Without consumption, drop fires; abort happens. This is the
+documented constraint on Rust callers of Sky linear-returning APIs.
+Sky cannot enforce the consumption requirement from Sky source (the
+consumer is Rust code); the panic+abort body is the safety net.
 
-This is the documented constraint on Rust callers of Sky linear-returning APIs. Sky's library documentation makes the consumption requirement explicit. Sky cannot enforce it from Sky source (the consumer is Rust code); the panic+abort is the safety net.
+**Why this is principled.** "Drop is just a function the language
+sometimes auto-calls" is honored at ~95%:
+- ONE site knows about Drop: `insert_scope_end_drops` (~30 lines) +
+  `local_needs_scope_drop` predicate (~25 lines) +
+  `synth_scope_drop_call` AST builder (~20 lines) + one `pub use Drop`
+  line in stub_gen.
+- After the synth pass runs, every downstream stage treats drop calls
+  as ordinary `StaticCall` AST nodes. No drop-specific code paths in:
+  type resolution, dep walker, mono cascade, per_instance_mir, codegen,
+  symbol resolution, link.
+- Remaining 5% leak: the predicate hardcodes the trait name "Drop"
+  (and method name "drop") at the registry lookup. Could be
+  generalized to a marker-trait registry, but Drop is the only such
+  trait Sky needs today.
+
+**Historical (pre-2026-06-23): the retired mir_shims model.** Before
+Phase E, Sky's `mir_shims` query override generated synthetic
+DropGlue bodies that called Sky-emitted `__toylang_drop_<TypeName>`
+symbols. The mechanism was:
+1. Source-level Drop impls were the same as today.
+2. Sky's `mir_shims` provider intercepted `InstanceKind::DropGlue(_, Some(ty))` for consumer types and returned a body calling `__toylang_drop_<TypeName>(ptr)`.
+3. Sky's codegen emitted `__toylang_drop_<TypeName>` separately.
+4. The chain `rustc-emitted drop_in_place → Sky-synthesized DropGlue body → `__toylang_drop_X` → Sky's body` carried the drop call to its destination.
+
+The retirement was empirically validated 2026-06-23: the previous
+override's `consumer_struct_name` lookup never fired across the entire
+test suite (Finding A.5/A.6). `drop_in_place::<Widget>`'s body was a
+no-op and `<Widget as Drop>::drop` was absent from binaries. The
+machinery had never worked in any shipping fixture, so its removal
+lost zero functionality.
 
 ### 15.8 Cross-references
 
@@ -3589,7 +3713,7 @@ The inner pipeline (one rustc subprocess for one Sky-marked crate compile) is th
 When Sky's rustc compiles a Sky-marked crate:
 
 1. **Startup.** Forked rustc starts. Parse argv. Identify the crate being compiled.
-2. **Default Callbacks::config().** Sky's codegen backend is constructed; query overrides are installed (`per_instance_mir`, `layout_of`, `mir_shims`, `symbol_name`, `collect_and_partition_mono_items` (the partition filter — see §5.3 / §C.2), `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable` (B16)). The driver also installs the `fill_extra_modules` hook via `extra_modules_hook::install_consumer_modules_hook()`. Retired overrides: `codegen_fn_attrs` + `extern_queries.codegen_fn_attrs` (Option 4, retired 2026-06-22 alongside patch 5 — see §F.14.1 / §F.17), `consumer_lang_active` (patch-5 shim, retired 2026-06-22 with patch 5 removal from the fork), `upstream_monomorphizations[_for]` (A.2, retired in §5.5 Step 3).
+2. **Default Callbacks::config().** Sky's codegen backend is constructed; query overrides are installed (`per_instance_mir`, `layout_of`, `symbol_name`, `collect_and_partition_mono_items` (the partition filter — see §5.3 / §C.2), `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable` (B16)). The driver also installs the `fill_extra_modules` hook via `extra_modules_hook::install_consumer_modules_hook()`. Retired overrides: `mir_shims` (retired 2026-06-23 Phase E — see §15.7 / §F.18 for the AST-rewrite replacement), `codegen_fn_attrs` + `extern_queries.codegen_fn_attrs` (Option 4, retired 2026-06-22 alongside patch 5 — see §F.14.1 / §F.17), `consumer_lang_active` (patch-5 shim, retired 2026-06-22 with patch 5 removal from the fork), `upstream_monomorphizations[_for]` (A.2, retired in §5.5 Step 3).
 3. **Rustc parses the local crate's Rust source.** The stub rlib's `src/lib.rs` (skyc-generated). Trivially fast.
 4. **Rustc loads upstream rlibs.** Each loaded rlib goes through rustc's metadata-loader. Sky's machinery checks each for `__SKY_STUBS_MARKER`.
 5. **For each Sky-marked rlib loaded:** Sky's machinery locates the adjacent sidecar (`my_utils.sky-meta`), deserializes the Temputs into Sky's in-memory universe.
@@ -3632,7 +3756,7 @@ The mono collector starts. For each Instance the collector encounters whose def_
 
 For Sky-defined types whose layout is needed: the collector calls Sky's `layout_of` override. Sky's provider returns the opaque-with-size LayoutData.
 
-For Sky-defined types whose drop glue is needed: the collector calls Sky's `mir_shims` override. Sky's provider returns the synthetic drop-glue body.
+For Sky-defined types whose drop glue is needed: rustc's standard DropGlue path produces the body. If the Sky type has an `export impl Drop for X`, the collector queues `<X as Drop>::drop`; the cascade discovery captures it; `fill_extra_modules` emits Sky's body — same path as case4's Clone. The compiler-synthesized `Drop::drop(&local)` calls (§15.7) are what drive the collector to queue the Instance in the first place.
 
 For Sky-defined functions' symbol names: Sky's `symbol_name` override returns the mangled name.
 
@@ -4631,7 +4755,7 @@ This chapter describes the order in which Sky's implementation should be built. 
 
 **Phase 5: Groups and linear types (8-12 weeks).**
 - Group system (parsing, type-checking, ABI translation to re_erased).
-- Linear type system (parsing, type-checking, panic-on-drop mir_shims).
+- Linear type system (parsing, type-checking; the panic-on-drop semantics come from the user-written `impl Drop` body, surfaced via the same AST-rewrite + cascade-discovery path as any other Sky trait impl — no separate mir_shims; see §15.7).
 - Group-aware aliasing rules.
 
 **Phase 6: Async (6-8 weeks).**
@@ -5832,6 +5956,142 @@ LLVM's intra-CGU inliner at -O3 aggressively inlines `AvailableExternally` bodie
 None of these is clearly more attractive than keeping patch 5. The retirement arc is closed for the foreseeable future; patch 5 stays.
 
 **Side observation:** patch 5's gated escape clause condition `(consumer_lang_active && map.contains_key)` requires `contains_key` to be true for the escape to actually change behavior. For the case5 probe, `contains_key(store_in_vec<i32>)` must be true at user_bin compile time — but `__lang_stubs.rlib`'s `.o` files don't contain a `store_in_vec<i32>` symbol (verified via `ar x` + `llvm-objdump -t`), implying __lang_stubs's compile didn't mono it. So the natural `upstream_monomorphizations_for` map gets its entry from somewhere else — possibly rustc's local mono at user_bin populating the map mid-compile, possibly interactions between Option 4's AvailableExternally stamping and rustc's rmeta-encoded share_generics tracking. Pinning down the exact source of the natural-map entry was not done in this investigation but is the next probe if someone re-opens the retirement question.
+
+#### F.18 Phase E: mir_shims elimination + AST-rewrite drop synthesis (2026-06-23)
+
+The implementation arc for Decision 1's "drop is just a function"
+principle. Three sub-phases, four key empirical findings, one
+significant principle-honoring refactor mid-flight.
+
+**Empirical baseline (Phase A).** Toylang had zero drop tests before
+this session. Building one (Fixture 1: `Vec<Widget>` where Widget has
+`impl Drop` that prints `self.id`) and instrumenting along the way
+surfaced 10 findings; the headline (A.6) was that the previous
+`mir_shims` override was not just vestigial — it was **silently
+broken**. Even with a properly emitted `impl Drop for Widget` block
+in the stub source, the override's `consumer_struct_name` lookup
+path never fired. `drop_in_place::<Widget>`'s body was a no-op
+(`sub sp, sp, #0x10; str x0, [sp, #0x8]; add sp, sp, #0x10; ret` —
+just stack save/restore), and `<Widget as Drop>::drop` was absent
+from the binary entirely. The previous machinery had never worked in
+any shipping fixture. mir_shims removal lost zero functionality.
+
+Other Phase A findings worth remembering:
+- Toylang's parser rejected `&mut self` — Drop's receiver requires it. Extended `parse_impl_method` to accept the `mut` keyword after `&` and plumb `is_self_mut: bool` to `ToyImplMethod` (serde-default for back-compat).
+- `oracle::find_trait_impl_method_def_id` requires the trait to be `use`-imported in toylang source (or `pub use`-re-exported by stub_gen).
+- The cascade-discovery path (`collect_consumer_trait_impl_instances`) already captures `<Widget as Drop>::drop` correctly when the partition contains it — same path as case4's Clone. Sky's existing trait-impl-method emission machinery handles Drop with zero changes.
+
+**Mid-flight refactor (Phase E.b → E.c → E.d).** The first two
+implementation attempts emitted drop calls at the LLVM-IR layer
+(`emit_scope_drops` / `emit_drop_in_place` / `emit_sky_struct_drop`
+in llvm_gen, plus a `walk_typed_body_for_drop_types` walker in
+callbacks_impl and dedicated drop dep arms in
+`collect_rust_deps_recursive`). Worked, but leaked drop-specificness
+across four sites in the pipeline — every site had a small "is this
+the Drop call site? do something special" branch. Phase E.d
+refactored to a single AST-rewrite pass: `insert_scope_end_drops`
+appends synthetic `TypedExprKind::StaticCall { ty: "Drop", method:
+"drop", args: [Ref(local)] }` AST nodes at scope-end positions; the
+existing dep walker, codegen, and cascade-discovery machinery handle
+them identically to any other trait static call.
+
+**Specialness audit, principle adherence ~95%.** Drop-aware code
+post-refactor lives in ONE site: `insert_scope_end_drops` (~30 lines)
+plus `local_needs_scope_drop` predicate (~25 lines) plus
+`synth_scope_drop_call` AST builder (~20 lines) plus one
+`pub use core::ops::Drop` line in stub_gen. After the synth pass,
+every downstream stage treats drop calls as ordinary `StaticCall`
+AST nodes. No drop-specific paths in: dep walker, mono cascade,
+per_instance_mir, codegen, symbol resolution, link.
+
+The remaining 5% leak: the predicate hardcodes the trait name "Drop"
+(and method name "drop") at the registry lookup. Could be generalized
+to a marker-trait registry but Drop is the only such trait Sky needs
+today.
+
+**Two surprises caught during implementation.**
+
+1. **`codegen_extern_wrapper` had unconditional `module.add_function`.**
+   When the body's call site (`__toylang_internal_main`'s
+   synthesized `Drop::drop` call) declared the extern symbol via
+   `declare_external_fn` (which dedups), and then the cascade-drain
+   later ran `codegen_extern_wrapper` for the same Instance, the
+   unconditional add produced a SECOND function with the same name.
+   LLVM disambiguated with a `.1` suffix; the call site bound to the
+   bare name; linker failed with "undefined symbol". Fix: switch to
+   `module.get_function(symbol).unwrap_or_else(|| module.add_function(...))`.
+   This fix is RETAINED post-refactor — it covers any future case
+   where call-site declarations precede body codegen.
+
+2. **`tcx.adt_destructor(adt_def.did())` is load-bearing in the predicate.**
+   Without it, the synth pass synthesized `Drop::drop` calls for
+   `Option`/`Result`/`Stdout`/primitives whose drop semantics flow
+   through auto-generated DropGlue with no trait-method symbol. Rustc's
+   mono collector ICEs ("failed to resolve instance for
+   `<Option<i32> as Drop>::drop`"). The query returns `Some(_)` iff
+   the ADT has an explicit `impl Drop`; the predicate gates on this.
+   Tests like `option_unwrap_basic`, `result_unwrap_basic`,
+   `stdout_call` all surfaced this immediately when the broad
+   predicate first ran without the filter.
+
+**Two gotchas worth documenting.**
+
+1. **Both dep-collection and codegen sites must run the synthesis pass.**
+   Initially `type_resolve_body` (the dep-collection site) ran it; the
+   codegen site (`codegen_internal_function`) called `resolve_fn_body`
+   directly. Result: drops were queued as deps (rustc mono'd them)
+   but the bodies of Sky functions didn't actually emit the calls
+   (synth nodes weren't in the typed body codegen saw). The
+   dep-queue / emitted-body disagreement surfaces as "binary builds
+   and runs cleanly but the Drop body never fires." Fix: call
+   `insert_scope_end_drops` at both sites with identical inputs.
+
+2. **`pub use core::ops::Drop;` must be gated on absence.** Fixtures
+   that explicitly `use std::ops::Drop` in toylang source surface as
+   `pub use std::ops::Drop;` in the stub rlib. Adding a second
+   unconditional `pub use core::ops::Drop;` produces an `E0252`
+   ("the name `Drop` is defined multiple times") error. The gate
+   walks `registry.imports` looking for any path whose last segment
+   is "Drop" and skips the unconditional re-export when found.
+
+**Move-semantics handling.** The synthesis pass skips entirely when
+the function has a non-void return type. Functions returning a
+Vec/Widget/etc. don't get scope-end drops — the caller's let-binding
+takes ownership via move semantics and will eventually drop. This is
+conservative; could be tightened later by tracking which locals the
+return expression moves out. For void-returning functions, all
+tracked locals drop in LIFO order at scope end.
+
+**Test inventory.** 9 drop fixtures landed under
+`toylangc/tests/integration_projects/drop/`:
+- Fixture 1: `Vec<Widget>` with Widget's `impl Drop` — basic chain (Vec drop iterates, calls Widget drop per element).
+- Fixture 2: two `Vec<Widget>` locals — LIFO scope-drop order across multiple locals.
+- Fixture 3: `Vec<Widget>` in a void-returning helper fn — drop fires at helper exit.
+- Fixture 4: empty `Vec<Widget>` — Vec deallocs but Widget's Drop body never fires.
+- Fixture 5: `Vec<Widget>` where Widget has NO `impl Drop` — Vec drops cleanly, no Widget body calls.
+- Fixture 6: single bare `Widget` local with `impl Drop` — direct trait dispatch path.
+- Fixture 7: three Sky-struct locals with Drop — LIFO ordering for the direct-dispatch path.
+- Fixture 8: bare Sky-struct local WITHOUT `impl Drop` — predicate skips, no spurious calls.
+- Fixture 9: Sky-struct local in helper fn — drop fires at helper exit.
+
+Plus 333 existing integration tests continue to pass cold under the
+new model. Total: 342 / 0 / 1 ignored.
+
+**Net diff.** 9 files modified, 2 deleted (`drop_glue.rs`,
+`mir_helpers.rs`), ~640 insertions / ~33 deletions in the
+implementation; +9 drop fixtures (~200 lines of toylang source +
+toml + expected output).
+
+**What stayed deferred.** The `__sky_drop_X<T>` bridge function
+from Decision 1's original plan was not implemented. The direct
+`Drop::drop` dispatch is functionally equivalent for the non-comptime
+case (toylang has no comptime), and the bridge's primary value
+(sharing one drop fn across content-hash-keyed `SkyOpaqueType<T>`
+variants) is a v2 concern when Sky comptime lands. Also deferred:
+linear-type compile-time error diagnostic spans, the `project_raw_field`
+CI fence (not needed since the synth pass never directly accesses
+field storage), and async-fn drop wiring (gated on async support
+landing in toylang).
 
 This is the master design document for Sky's compiler & Rust interop architecture. Total length: ~30 chapters, 6 appendices, approximately 100 pages.
 

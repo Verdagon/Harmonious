@@ -1,0 +1,28 @@
+// Phase E.b Fixture 4 — empty Vec at scope end: Vec's own dealloc
+// fires, but Widget's Drop body never runs (no elements to iterate).
+//
+// The drop chain wiring exists; the Vec just has zero elements. So
+// the assertion is that we see "before" + "after" with NOTHING in
+// between (no widget-id prints).
+
+use std::alloc::Global
+use std::ops::Drop
+use std::vec::Vec
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn main() {
+    println_i32(1);
+    let v = Vec::new<Widget, Global>();
+    println_i32(2);
+}

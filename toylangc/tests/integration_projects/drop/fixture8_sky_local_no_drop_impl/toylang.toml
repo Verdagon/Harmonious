@@ -1,0 +1,6 @@
+[project]
+name = "fixture8_sky_local_no_drop_impl"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

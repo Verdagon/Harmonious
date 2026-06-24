@@ -1583,6 +1583,126 @@ pub fn compute_internal_symbol_from_type_args(
 /// Type-resolve a consumer function body given its already-substituted
 /// `ToyFunction`. Shared primitive for both walkers below; kept read-only
 /// with respect to `ToylangState`.
+/// Phase E.d — should this let-binding type get a scope-end
+/// `Drop::drop(&local)` call synthesized at the end of its enclosing
+/// scope?
+///
+/// **Sky struct types** with `impl Drop` in registry: yes. The
+/// cascade discovery captures `<T as Drop>::drop` and
+/// `fill_extra_modules` emits the body, same as case4's Clone
+/// pattern.
+///
+/// **Rust types** (Vec<T>, String, ...): yes IFF the type has an
+/// explicit `impl Drop`. Vec/String/Box/etc. do; Option/Result/Stdout/
+/// primitives do NOT — their drop semantics flow through
+/// auto-generated `DropGlue`, not through a trait-method symbol that
+/// rustc can resolve. Synthesizing `<Option<T> as Drop>::drop` ICEs
+/// rustc's mono collector ("failed to resolve instance"). The query
+/// is `tcx.adt_destructor`-equivalent via lang-item lookup.
+///
+/// Everything else (primitives, refs, unsized, type params): no.
+fn local_needs_scope_drop<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: &crate::toylang::typed_ast::ResolvedType,
+    registry: &ToylangRegistry,
+) -> bool {
+    use crate::toylang::typed_ast::ResolvedType;
+    match ty {
+        ResolvedType::StructRef { name, .. }
+        | ResolvedType::Struct { name, .. } => {
+            registry.trait_impls.iter().any(|imp| {
+                imp.trait_name == "Drop" && &imp.self_type_name == name
+            })
+        }
+        ResolvedType::RustType { .. } => {
+            // Query rustc: does this concrete type have an explicit
+            // `impl Drop`? `tcx.adt_destructor(adt_did, typing_env)`
+            // returns `Some(Destructor { did, .. })` iff the ADT has
+            // an explicit Drop impl. Vec/String/Box/etc. return Some
+            // (they impl Drop); Option/Result/primitives return None
+            // (they rely on auto-generated DropGlue, no trait symbol
+            // to resolve). Synthesizing `Drop::drop` for the latter
+            // ICEs rustc's mono collector.
+            let rustc_ty = crate::oracle::resolved_to_rustc_ty(tcx, ty);
+            let rustc_middle::ty::TyKind::Adt(adt_def, _) = rustc_ty.kind() else {
+                return false;
+            };
+            tcx.adt_destructor(adt_def.did()).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Phase E.d — synthesize a `TypedStmt::ExprStmt(Drop::drop(&local))`
+/// statement for one let-binding. The receiver is a `Ref` to the
+/// local; the call uses `StaticCall` with `ty = "Drop"`, which routes
+/// through the existing trait-call dispatch in `lower_typed_expr` and
+/// `walk_typed_expr_for_deps`. After this synthesis, drop calls are
+/// indistinguishable from any other trait call in the typed AST.
+fn synth_scope_drop_call(
+    name: &str,
+    ty: &crate::toylang::typed_ast::ResolvedType,
+) -> crate::toylang::typed_ast::TypedStmt {
+    use crate::toylang::typed_ast::*;
+    let var = TypedExpr {
+        kind: TypedExprKind::Var(name.to_string()),
+        ty: ty.clone(),
+    };
+    let ref_to_var = TypedExpr {
+        kind: TypedExprKind::Ref(Box::new(var)),
+        ty: ResolvedType::Ref { inner: Box::new(ty.clone()) },
+    };
+    let drop_call = TypedExpr {
+        kind: TypedExprKind::StaticCall {
+            ty: "Drop".to_string(),
+            method: "drop".to_string(),
+            type_args: vec![],
+            args: vec![ref_to_var],
+        },
+        ty: ResolvedType::Void,
+    };
+    TypedStmt::ExprStmt(drop_call)
+}
+
+/// Phase E.d — append synthesized scope-end drop calls to a fn body's
+/// top-level statement list.
+///
+/// Walks forward through the body collecting let-bindings whose types
+/// need drop. Appends synthesized drop calls at the END of `stmts` in
+/// REVERSE declaration order (LIFO — Rust's documented drop order).
+///
+/// Skips entirely when the fn has a non-void return: the caller's
+/// let-binding takes ownership of the returned value via move
+/// semantics; dropping our local would double-drop. Matches the
+/// move-out invariant from Phase E.b/E.c's emit-scope-drops gating.
+///
+/// Only walks the OUTERMOST scope today. If toylang ever grows
+/// nested-block scopes (currently only `while` has its own scope but
+/// we don't track per-block drops), this pass needs to recurse into
+/// each scope and insert drops at that scope's exit.
+pub fn insert_scope_end_drops<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    block: &mut crate::toylang::typed_ast::TypedBlock,
+    registry: &ToylangRegistry,
+    fn_returns_void: bool,
+) {
+    use crate::toylang::typed_ast::*;
+    if !fn_returns_void {
+        return;
+    }
+    let mut to_drop: Vec<(String, ResolvedType)> = Vec::new();
+    for stmt in &block.stmts {
+        if let TypedStmt::Let { name, expr } = stmt {
+            if local_needs_scope_drop(tcx, &expr.ty, registry) {
+                to_drop.push((name.clone(), expr.ty.clone()));
+            }
+        }
+    }
+    for (name, ty) in to_drop.into_iter().rev() {
+        block.stmts.push(synth_scope_drop_call(&name, &ty));
+    }
+}
+
 fn type_resolve_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
@@ -1615,8 +1735,19 @@ fn type_resolve_body<'tcx>(
     let is_rust_trait = |name: &str| {
         crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
     };
-    crate::toylang::type_resolve::resolve_fn_body(registry, resolved_fn, &rust_method_ret, &rust_param_types, &is_rust_trait)
-        .unwrap_or_else(|e| panic!("[toylang] type error in '{}': {:?}", fn_name, e))
+    let mut block = crate::toylang::type_resolve::resolve_fn_body(
+        registry, resolved_fn, &rust_method_ret, &rust_param_types, &is_rust_trait,
+    ).unwrap_or_else(|e| panic!("[toylang] type error in '{}': {:?}", fn_name, e));
+    // Phase E.d — insert synthesized scope-end drop calls into the
+    // typed AST. After this pass, drops are normal `Drop::drop(&local)`
+    // StaticCall nodes that the existing dep walker and codegen
+    // handle uniformly. No drop-specific paths downstream.
+    let returns_void = matches!(
+        &resolved_fn.return_ty,
+        None | Some(crate::toylang::typed_ast::ResolvedType::Void),
+    );
+    insert_scope_end_drops(tcx, &mut block, registry, returns_void);
+    block
 }
 
 /// Substitute a toylang callee's body given call-site type args.
@@ -1660,6 +1791,11 @@ fn collect_rust_deps_recursive<'tcx>(
     let mut deps = Vec::new();
     let mut fn_calls = Vec::new();
     let mut rust_method_deps = Vec::new();
+    // Phase E.d — drop calls now appear as ordinary StaticCall nodes
+    // in `typed_body` (inserted by `insert_scope_end_drops` at type-
+    // resolution time). `walk_typed_body_for_deps` collects them
+    // through its normal rust_method_deps arm — no separate drop
+    // walker needed.
     walk_typed_body_for_deps(&typed_body, &mut fn_calls, &mut rust_method_deps);
 
     for (callee_name, type_args) in &fn_calls {
@@ -1845,6 +1981,24 @@ struct RustMethodDep {
 }
 
 /// Walk a TypedBlock and collect toylang FnCall deps and Rust method deps.
+/// Phase E.b — collect the let-binding types in `body` that will need a
+/// scope-end `drop_in_place::<T>` call. The llvm_gen side emits the
+/// call; this walker exists so `collect_rust_deps_recursive` can also
+/// add `(drop_in_place_def_id, [T])` pairs to its dep list, which the
+/// `per_instance_mir` synthetic body then surfaces via ReifyFnPointer
+/// casts. Without this, rustc's mono collector doesn't queue
+/// `drop_in_place::<T>` for items Sky emits indirectly, and the linker
+/// fails with "undefined symbol: drop_in_place::<…>" at user_bin time.
+///
+/// Mirrors `walk_typed_body_for_deps`'s recursion structure exactly —
+/// any block-shaped grammar surface (if/else branches, while body) needs
+/// to participate so nested lets are surfaced too.
+// `walk_typed_body_for_drop_types` + `local_needs_scope_drop_for_deps`
+// retired 2026-06-23 (Phase E.d). Drop calls now appear as ordinary
+// `Drop::drop(&local)` StaticCall nodes in the typed AST after
+// `insert_scope_end_drops` runs; `walk_typed_body_for_deps` collects
+// their deps through its normal rust_method_deps arm.
+
 fn walk_typed_body_for_deps(
     body: &crate::toylang::typed_ast::TypedBlock,
     fn_calls: &mut Vec<(String, Vec<crate::toylang::typed_ast::ResolvedType>)>,

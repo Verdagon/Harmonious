@@ -1,0 +1,6 @@
+[project]
+name = "fixture7_sky_locals_lifo"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

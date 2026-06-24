@@ -1,0 +1,27 @@
+// Phase E.c Fixture 9 — Sky struct local in a void-returning helper
+// fn. Helper's scope-end drop fires at helper exit; main observes
+// the drop between two bookend prints.
+
+use std::ops::Drop
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn helper() {
+    let w = Widget { id: 55 };
+}
+
+fn main() {
+    println_i32(1);
+    helper();
+    println_i32(2);
+}

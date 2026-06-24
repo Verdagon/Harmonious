@@ -1,0 +1,7 @@
+[project]
+name = "fixture3_drop_in_helper_fn"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

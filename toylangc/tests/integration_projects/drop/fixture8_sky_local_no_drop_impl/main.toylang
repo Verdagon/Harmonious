@@ -1,0 +1,15 @@
+// Phase E.c Fixture 8 — Sky struct local with NO Drop impl. No drop
+// call is emitted; only the bookend prints fire. Verifies the
+// "Drop impl in registry" gate is respected.
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+fn main() {
+    println_i32(1);
+    let w = Widget { id: 999 };
+    println_i32(2);
+}
