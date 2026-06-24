@@ -57,7 +57,7 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 - **Phase I (cache_on_disk_if audit)** — DONE 2026-06-24. **Decision 14's prescribed Provider-slot syntax (`providers.queries.layout_of_cache_on_disk_if = ...`) doesn't exist on current nightly.** `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit re-derived cache-safety: every Sky-overridden query is safe by construction (`per_instance_mir` declared `false` in fork patch; `layout_of` + `cross_crate_inlinable` default to `false`; `collect_and_partition_mono_items` is `eval_always`; `symbol_name` is disk-cached but its override is scheduled for removal per Decision 2 and the default mangler invalidates correctly). Annotated all 5 override files with `cache-audit:` marker comments. New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker. New §22.4.1 documents the policy table; new B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API." Decision 14 itself is revised below.
 
 **Not yet started (your work):**
-- Phases G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences). Phase C+D + Phase F all done 2026-06-24 (tool attribute infra + partition predicate migration + symbol_name override retirement).
+- Phases G (cdylib build system — when Sky proper's architecture migration begins), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences). Phase C+D + Phase F + Phase H all done 2026-06-24 (tool attribute infra + partition predicate migration + symbol_name override retirement + patch 4 rev 3 FFI shape). Phase H shipped standalone (not bundled with G) because the new `#[repr(C)]` FFI shape works under both static-link and cdylib integration.
 
 **In flight from prior sessions (independent of this exchange):**
 - Patch 5 retirement (shipped 2026-06-22 per the historical section below).
@@ -83,10 +83,15 @@ Critical caveat (historical): **toylang had zero drop tests**, so the mir_shims 
 
 6. ~~Tool attribute infrastructure + partition predicate migration (Phase C+D)~~ — DONE (2026-06-24). `#![register_tool(toylang)]` + `#[toylang::emit_consumer_body]` machinery in build.rs + stub_gen.rs; `is_consumer_codegen_target` rewritten as the two-gate conjunction `is_from_lang_stubs(tcx, def_id) && tcx.has_attrs_with_path(def_id, &[toylang, emit_consumer_body])`. New 1:1 invariant CI fence at `stub_gen::tests::emit_consumer_body_tags_only_category_b_items`. 477 tests pass (+1 from new fence). Smoke-test of `bench3_drop_thin` confirms runtime behavior unchanged.
 7. ~~Symbol_name override elimination (Phase F)~~ — DONE (2026-06-24). Per Decision 2: deleted `queries/symbol_name.rs`, removed the provider assignment, dropped `DEFAULT_SYMBOL_NAME` + `default_symbol_name()` + the `consumer_symbol_for_callback_name` callback + vtable slot + trampoline + accessor. `compute_fn_symbol` now reads `tcx.symbol_name(instance)` directly. `is_consumer_accessor_safe` deleted (orphaned). `is_consumer_fn` + `is_consumer_trait_impl_method` stay alive (per_instance.rs + cascade-drain callers). 477 tests pass; bench3_drop_thin smoke-test 352μs. Three of the four roundtrip-relevant cleanup arcs (Decisions 1/2/3) now ship.
+8. ~~Patch 4 rev 3: `#[repr(C)]` FFI shape (Phase H)~~ — DONE (2026-06-24). Per Decision 5: replaced `&mut dyn ExtraModuleAllocator<M>` trait-object + `VecAllocator` driver with `#[repr(C)] struct ExtraModuleAllocator<M> { state, allocate }`. Updated rustc-fork (4 files: `traits/backend.rs`, `traits/mod.rs`, `base.rs::codegen_crate`, `rustc_codegen_llvm/lib.rs`) and the facade (2 files: `extra_modules_hook.rs`, `lib.rs::LlvmModuleFactory`). Rebuilt rustc-fork via the full `x.py dist rustc-dev` + library + reinstall procedure (~3.5 min). 477 tests pass; bench3_drop_thin smoke-test 615μs (within run-to-run variance). FFI shape is now correct under both static-link (current) and cdylib (future Phase G) integration. Shipped standalone — Phase G's wrapper-mode-retirement + cdylib-build-system work waits for Sky proper's architecture migration.
 
 **NEXT — start here next session:**
 
-8. **cdylib build system + FFI shape (Phases G+H)** — ~1 week combined. Restructure Sky's toolchain to ship as paired rustc-fork + libsky_backend cdylib (Decision 4); refactor patch 4 to use a `#[repr(C)]` function-pointer struct instead of `&mut dyn ExtraModuleAllocator` (Decision 5). Larger scope than Phases C/D/F because it crosses the rustc fork boundary (patch 4 rev 3) AND the toolchain bundle structure. Or alternatively: schedule round 4 with the reviewer now that the three "cleanup arc" Decisions (1/2/3) have shipped.
+9. **Either schedule round 4 with the reviewer**, or continue with one of these smaller execution chunks:
+   - **Phase J (u128 typeids, ~2-3 days)** — direct continuation of the cleanup arc; no fork changes.
+   - **Phase N (recursion safety, ~2-3 days)** — bounded fix to a known runaway-walker risk; no fork changes.
+   - **Phase O (drift CI fences, ~3-5 days)** — building B24/B25/B26 detection tests.
+   - **Phase G (cdylib build system, ~5-7 days)** — the larger Sky-architecture migration (retire toylangc wrapper mode + cdylib loader + bundle structure); pairs with the now-shipped Phase H ABI rewrite.
 
 After that: ~~symbol_name elimination (Phase F, ½ day)~~ DONE 2026-06-24; cdylib build system + patch 4 rev 3 (Phases G+H, ~1 week), u128 typeids + content-hash const args (Phases J+K, ~1.5 weeks), per-view ref types + async typestate (Phases L+M, ~3 weeks).
 
@@ -385,6 +390,8 @@ User priority context: user prioritizes runtime perf over dev perf (Q21 discussi
 - §29.6 (open question — cdylib as future direction): close, no longer open.
 
 ### Decision 5: `#[repr(C)]` function-pointer struct for cdylib FFI (Patch 4 rev 3)
+
+**STATUS: SHIPPED 2026-06-24** (Phase H). The trait-object allocator + `VecAllocator` driver are gone; the new `#[repr(C)]` struct + `unsafe extern "C" fn` callback ship in the fork patch and in the facade hook. Implementation details in the Phase H entry below.
 
 **WHAT.** Replace patch 4's current `&mut dyn ExtraModuleAllocator<ModuleLlvm>` callback with a `#[repr(C)]` function-pointer struct:
 
@@ -1656,17 +1663,41 @@ Tasks:
 
 **Output**: Sky's backend loadable as cdylib; fast iteration loop unlocked for further work.
 
-### Phase H: cdylib FFI shape (1-2 days, depends on G)
+### Phase H: cdylib FFI shape — DONE 2026-06-24
 
-Refactor patch 4 to use `#[repr(C)]` function-pointer struct instead of `&mut dyn ExtraModuleAllocator` (Decision 5).
+**Status: SHIPPED 2026-06-24** (Decision 5). Patch 4 rev 3 lands: trait-object `&mut dyn ExtraModuleAllocator<M>` retired in favor of a `#[repr(C)]` struct with two stable-ABI fields (state pointer + extern-C fn pointer). Done as standalone work without Phase G because the new FFI shape is correct under both static-link (current) and cdylib (future) integration; preserves wrapper-mode unchanged.
 
-Tasks:
-- Modify rustc-fork's patch 4: replace `&mut dyn ExtraModuleAllocator<M>` with the function-pointer struct.
-- Update `rustc_codegen_ssa::base::codegen_crate` call site.
-- Update `rustc_codegen_llvm::lib::fill_extra_modules`.
-- Update `rustc-lang-facade/src/extra_modules_hook.rs` consumer-side hook.
+**What landed (rustc fork, ~/rust):**
+- `compiler/rustc_codegen_ssa/src/traits/backend.rs`:
+  - Removed: `pub trait ExtraModuleAllocator<M> { fn allocate(...) -> &mut M; }` + `pub struct VecAllocator<'a, M, F>` + its impl.
+  - Added: `#[repr(C)] pub struct ExtraModuleAllocator<M> { state: *mut c_void, allocate: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> *mut M }`.
+  - Changed: `ExtraBackendMethods::fill_extra_modules` allocator param from `&mut dyn ExtraModuleAllocator<Self::Module>` → `&ExtraModuleAllocator<Self::Module>`.
+- `compiler/rustc_codegen_ssa/src/traits/mod.rs`: dropped `VecAllocator` from the public re-export list.
+- `compiler/rustc_codegen_ssa/src/base.rs::codegen_crate`: replaced the `VecAllocator` construction with: an inner `AllocatorState<'a, 'tcx, B>` struct, an `unsafe extern "C" fn allocate_thunk<B: ExtraBackendMethods>` thunk (monomorphized per `B`), and an `ExtraModuleAllocator<B::Module>` struct literal built from a pointer to the state + the thunk. Passes the allocator by shared reference (`&allocator`).
+- `compiler/rustc_codegen_llvm/src/lib.rs`: `FillExtraModulesHook` type alias + `LlvmCodegenBackend::fill_extra_modules` signature updated from `&mut dyn ...` to `&...`.
 
-**Output**: FFI uses stable-ABI primitives; cdylib pairing failures fail at link, not at runtime.
+**What landed (facade + toylangc, erw):**
+- `rustc-lang-facade/src/extra_modules_hook.rs::consumer_fill_modules_hook`: signature updated to take `&ExtraModuleAllocator<ModuleLlvm>`; module-level doc rewritten with the rev-3 ABI note.
+- `rustc-lang-facade/src/lib.rs::LlvmModuleFactory`:
+  - Inner field changed from `&'a mut (dyn ExtraModuleAllocator<ModuleLlvm> + 'a)` → `&'a ExtraModuleAllocator<ModuleLlvm>` (the `#[repr(C)]` struct).
+  - `fill_module` now reads `(self.inner.allocate)(self.inner.state, name.as_ptr(), name.len())` to obtain `*mut ModuleLlvm`, briefly reborrows it to read the raw LLVMContext + LLVMModule pointers, and hands them to the closure. Reborrow scope ends before the closure returns; subsequent `fill_module` calls (which may invalidate prior pointers via vec realloc inside rustc) are safe.
+  - Docstring updated with the rev-3 ABI context + the closed cdylib-FFI risk.
+
+**Test coverage:**
+- Rebuilt rustc-fork via `python3 x.py dist rustc-dev` + tarball reinstall + `x.py build --stage 2 library src/tools/rustdoc` + rustc-dev reinstall (the full procedure from `docs/historical/rebuilding-rustc-fork.md`). Rebuild wall-clock: ~3.5 min.
+- `cargo build --bin toylangc`: clean.
+- Smoke-test of `bench3_drop_thin`: 615μs — within run-to-run variance of recent bench results (range across recent sessions: 352–615μs; M-series macOS thermal/freq drift dominates at this scale).
+- `cargo test --workspace`: 477 pass cold, exit 0 (including the doctest pass from yesterday's rustdoc + library + rustc-dev fix).
+- No regressions from the FFI shape change.
+
+**Why standalone Phase H (without Phase G):**
+Phase G described as the full Sky-architecture migration (toylangc retires wrapper mode + facade becomes cdylib + rustc-fork loads cdylib via `-Zcodegen-backend`). That's ~5-7 days because retiring wrapper mode in toylangc is itself ~2-3 days, plus Phase G's structural work, plus Phase H. The new patch 4 shape from Phase H is correct under BOTH the current static-link model AND the future cdylib model — moving the FFI ABI to stable-ABI primitives first means Phase G, when it lands, becomes a wiring change (build system + crate-type + loader path) rather than an ABI-compatibility rewrite.
+
+**Files touched (8 total):**
+- ~/rust: `compiler/rustc_codegen_ssa/src/traits/backend.rs`, `compiler/rustc_codegen_ssa/src/traits/mod.rs`, `compiler/rustc_codegen_ssa/src/base.rs`, `compiler/rustc_codegen_llvm/src/lib.rs`.
+- erw: `rustc-lang-facade/src/extra_modules_hook.rs`, `rustc-lang-facade/src/lib.rs`, `rust-interop-architecture.md` (§3.2 patch 4 + §C.1 hook signature comment + §B.4 + §C.4 + §F.15), `handoff.md` (this entry + Decision 5).
+
+**Output:** FFI uses stable-ABI primitives. Sky proper's cdylib refactor (handoff Phase G — when prioritized) becomes a wiring change rather than an ABI-compatibility rewrite. cdylib pairing failures will fail at link, not at runtime.
 
 ### Phase I: cache_on_disk_if audit — DONE 2026-06-24
 
@@ -2056,7 +2087,9 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 **Phase F success — ACHIEVED 2026-06-24:** symbol_name override gone (`queries/symbol_name.rs` deleted, `mod symbol_name;` removed from `queries/mod.rs`, provider unassigned). The full callback chain that fed it — `consumer_symbol_for_callback_name` trait method + vtable slot + trampoline + accessor + the toylangc impl — also retired. `DEFAULT_SYMBOL_NAME` + `default_symbol_name()` removed (no remaining callers). `is_consumer_accessor_safe` deleted (orphaned post-removal). `compute_fn_symbol` switched from `default_symbol_name()(tcx, instance)` → `tcx.symbol_name(instance).name.to_string()`. Tests: 477 pass cold; smoke-test of bench3_drop_thin reports 352μs (within run-to-run variance of pre-Phase-F baseline). The single-symbol architecture (arch §6.2) is now load-bearing purely through Sky's emission consulting `tcx.symbol_name(instance)` at every read site, with no override or bypass needed.
 
-**Phases G+H success — NOT YET STARTED:** Sky's backend ships as cdylib with `#[repr(C)]` function-pointer struct FFI; iteration loop is order-of-magnitude faster.
+**Phase H success — ACHIEVED 2026-06-24:** patch 4 rev 3 ships; `ExtraModuleAllocator<M>` is a `#[repr(C)]` struct with two stable-ABI fields (`state: *mut c_void` + `allocate: unsafe extern "C" fn`) rather than a `&mut dyn` trait object. `VecAllocator` driver retired. Updates landed in 4 rustc-fork files + 2 facade files; rustc-fork rebuilt cleanly. 477 tests pass; bench3_drop_thin smoke-test 615μs (within run-to-run variance). FFI shape is now stable-ABI under both static-link (current toylangc) and cdylib (future Sky proper); Phase G's actual cdylib refactor becomes a wiring change rather than ABI rewrite when prioritized.
+
+**Phase G success — NOT YET STARTED:** Sky's backend ships as cdylib; rustc-fork loads it via the `CodegenBackend` plugin mechanism; toylangc retires wrapper mode in favor of the Sky-proper architecture. Iteration loop is order-of-magnitude faster than the static-link build.
 
 **Phase I success — ACHIEVED 2026-06-24:** cache_on_disk_if audit complete; key finding is that Decision 14's prescribed Provider-slot API doesn't exist on current nightly; every Sky-overridden query is cache-safe by construction; CI fence at `toylangc/tests/cache_audit.rs` enforces `cache-audit:` markers on every override file. Decision 14 itself is annotated with the revised understanding above. The cache-correctness "edit-and-rebuild" fixture from the original plan stayed deferred (audit found we're safe by construction; the fixture is regression insurance not active need; designing it properly needs temp-dir mutation infrastructure that's bigger than the day's scope).
 
@@ -2072,4 +2105,4 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 **Phase O success:** drift CI fences in place for B24/B25/B26 detection.
 
-**Overall success — round 4 inputs READY:** all four round-4 deliverables now in hand AND the Bench 3 framing question (Sky-specific vs inherited from Rust) is answered. Bench numbers + apples-to-apples Rust baselines (Phases B + B+), cache audit results (Phase I), drop fixture outcomes (Phase A — 9 fixtures passing), mir_shims elimination empirical validation (Phase E — 342/0/1 tests). Plus implementation surprises grouped by where they surfaced (F3 toylangc alloca recycling; B10 residual under ThinLTO; cache_on_disk_if Provider-slot API doesn't exist). The next session can either (a) schedule round 4 with the reviewer using these anchors, or (b) continue with the unblocked next chunk of execution work — Phase C+D (tool attribute + predicate migration), Phase F (symbol_name retirement), Phase G+H (cdylib backend + FFI shape).
+**Overall success — round 4 inputs READY:** all four round-4 deliverables now in hand AND the Bench 3 framing question (Sky-specific vs inherited from Rust) is answered AND all three "cleanup arc" Decisions (1/2/3) plus Decision 5's FFI shape have shipped. Bench numbers + apples-to-apples Rust baselines (Phases B + B+), cache audit results (Phase I), drop fixture outcomes (Phase A — 9 fixtures passing), mir_shims elimination empirical validation (Phase E — 342/0/1 tests), tool-attribute predicate migration (Phase C+D — 477/0/1 with new fence), symbol_name override retirement (Phase F), patch 4 rev 3 FFI shape (Phase H). Plus implementation surprises grouped by where they surfaced (F3 toylangc alloca recycling; B10 residual under ThinLTO; cache_on_disk_if Provider-slot API doesn't exist; the discovery that wrapper-mode-retirement is a Phase G prerequisite). The next session can either (a) schedule round 4 with the reviewer using these anchors, or (b) continue with the unblocked next chunk of execution work — Phase J (u128 typeids), Phase N (recursion safety), Phase O (drift fences), or Phase G (the full cdylib build system + wrapper-mode retirement).

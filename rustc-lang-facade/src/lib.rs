@@ -92,10 +92,21 @@ pub struct BorrowedLlvmModule {
 /// [`LangCallbacks::consumer_fill_modules`] impl and call
 /// [`LlvmModuleFactory::fill_module`] once per Sky CGU to obtain borrowed
 /// LLVM pointers and fill in IR.
+///
+/// **Patch 4 rev 3 (2026-06-24, Phase H).** The inner allocator is now a
+/// `&ExtraModuleAllocator<ModuleLlvm>` (the `#[repr(C)]` function-pointer
+/// struct from `rustc_codegen_ssa::traits::backend`) rather than a
+/// `&mut dyn ExtraModuleAllocator<ModuleLlvm>` trait object. The struct's
+/// two fields (`state: *mut c_void` + `allocate: unsafe extern "C" fn`)
+/// are both stable-ABI, so the boundary is FFI-safe whether the facade is
+/// statically linked into toylangc (today) or eventually loaded as a
+/// cdylib by rustc-fork (Sky proper / handoff Phase G). Mutation happens
+/// inside the opaque `state` pointer; the struct itself doesn't need to be
+/// mutable from the consumer side.
 pub struct LlvmModuleFactory<'a> {
     // Private. `ModuleLlvm` + `ExtraModuleAllocator` are facade-internal types
     // the consumer never names.
-    inner: &'a mut (dyn ExtraModuleAllocator<ModuleLlvm> + 'a),
+    inner: &'a ExtraModuleAllocator<ModuleLlvm>,
 }
 
 impl<'a> LlvmModuleFactory<'a> {
@@ -103,9 +114,7 @@ impl<'a> LlvmModuleFactory<'a> {
     /// `extra_modules_hook` bridge to wrap the rustc-supplied allocator
     /// before handing it to the consumer. Not for consumer use.
     #[doc(hidden)]
-    pub fn new(
-        inner: &'a mut (dyn ExtraModuleAllocator<ModuleLlvm> + 'a),
-    ) -> Self {
+    pub fn new(inner: &'a ExtraModuleAllocator<ModuleLlvm>) -> Self {
         Self { inner }
     }
 
@@ -114,11 +123,22 @@ impl<'a> LlvmModuleFactory<'a> {
     /// Rustc retains ownership of the resources; the pointers are valid
     /// only for the duration of the closure call.
     ///
-    /// May be called multiple times to contribute multiple CGUs; each call
-    /// borrows the allocator independently so the closure's borrow ends
-    /// before the next `fill_module` runs.
+    /// May be called multiple times to contribute multiple CGUs; the
+    /// returned `*mut ModuleLlvm` borrow is reified into a `&mut ModuleLlvm`
+    /// scoped to this call so the closure cannot hold it past the next
+    /// `fill_module` invocation (which may invalidate the vec backing the
+    /// allocator state via realloc).
     pub fn fill_module<F: FnOnce(BorrowedLlvmModule)>(&mut self, name: &str, fill: F) {
-        let m = self.inner.allocate(name);
+        // SAFETY: the allocator's `state` pointer + `allocate` fn pointer
+        // were both constructed by `rustc_codegen_ssa::base::codegen_crate`
+        // (patch 4 rev 3) for the duration of this `consumer_fill_modules`
+        // call. The returned `*mut ModuleLlvm` points into a `Vec` rustc
+        // owns; the borrow we take is scoped to the closure body and ends
+        // before this fn returns, well within the allocator's lifetime.
+        let m_ptr = unsafe {
+            (self.inner.allocate)(self.inner.state, name.as_ptr(), name.len())
+        };
+        let m = unsafe { &mut *m_ptr };
         let handles = BorrowedLlvmModule {
             context: m.llcx_raw_mut(),
             module: m.llmod_raw(),

@@ -682,17 +682,18 @@ This makes the query a no-op for vanilla rustc. Without a plugin installing a re
 
 **Patch 4: `fill_extra_modules` allocator-callback hook for inline codegen (Approach B).** In
 `compiler/rustc_codegen_ssa/src/traits/backend.rs`, add two methods on
-`ExtraBackendMethods` plus a companion `ExtraModuleAllocator<M>`
-trait and a generic `VecAllocator<'a, M, F>` driver:
+`ExtraBackendMethods` plus a companion `#[repr(C)]` function-pointer
+struct `ExtraModuleAllocator<M>`:
 
 ```rust
-pub trait ExtraModuleAllocator<M> {
-    fn allocate(&mut self, name: &str) -> &mut M;
-}
-
-pub struct VecAllocator<'a, M, F: FnMut(&str) -> M> {
-    pub modules: &'a mut Vec<ModuleCodegen<M>>,
-    pub make_module: F,
+#[repr(C)]
+pub struct ExtraModuleAllocator<M> {
+    pub state: *mut std::ffi::c_void,
+    pub allocate: unsafe extern "C" fn(
+        state: *mut std::ffi::c_void,
+        name_ptr: *const u8,
+        name_len: usize,
+    ) -> *mut M,
 }
 
 pub trait ExtraBackendMethods: ... {
@@ -705,16 +706,37 @@ pub trait ExtraBackendMethods: ... {
     fn allocate_extra_module<'tcx>(&self, tcx: TyCtxt<'tcx>, name: &str) -> Self::Module { panic!(...) }
 
     /// Contribute extra modules to the codegen pipeline before
-    /// `start_async_codegen`. The consumer calls `allocator.allocate(name)`
-    /// to obtain a fresh rustc-owned `&mut Self::Module`, fills it in place
-    /// via its own IR API, and returns. Rustc retains ownership throughout.
+    /// `start_async_codegen`. The consumer reads `(allocator.allocate)
+    /// (allocator.state, name_ptr, name_len)` to obtain a fresh
+    /// rustc-owned `*mut Self::Module`, reborrows it briefly to fill in
+    /// IR via its own LLVM API, and returns. Rustc retains ownership
+    /// throughout.
     fn fill_extra_modules<'tcx>(
         &self,
         _tcx: TyCtxt<'tcx>,
-        _allocator: &mut dyn ExtraModuleAllocator<Self::Module>,
+        _allocator: &ExtraModuleAllocator<Self::Module>,
     ) { }
 }
 ```
+
+**Rev 3 (2026-06-24, Phase H / handoff Decision 5).** The shape above
+is the rev-3 `#[repr(C)]` function-pointer struct. Rev 2 used a
+`trait ExtraModuleAllocator<M> { fn allocate(&mut self, name: &str) ->
+&mut M; }` plus a `VecAllocator<'a, M, F: FnMut(&str) -> M>` driver,
+passed as `&mut dyn ExtraModuleAllocator<M>`. The trait-object shape
+worked under static linking (where caller and callee share rustc's
+internal vtable layout by construction) but would have failed across a
+future cdylib FFI boundary (where vtable layout depends on
+`rustc_codegen_ssa` source identity). Rev 3 collapses the
+trait/struct pair into a single `#[repr(C)]` struct with two
+stable-ABI fields. The construction site in `base.rs::codegen_crate`
+defines a per-`B` `unsafe extern "C" fn` thunk + a state struct
+carrying the in-flight `Vec<ModuleCodegen<B::Module>>` + the backend
+reference + the `TyCtxt`; the consumer side reads the struct's
+fields and calls the function pointer directly. Failure mode under a
+cdylib mismatch collapses from "subtle vtable layout reinterpretation
+at runtime" to "if it links, it works." Sky proper will switch the
+facade to a cdylib (handoff Phase G) without re-shaping this patch.
 
 Default-no-op so non-adopting backends are unaffected. The LLVM
 backend's impl in `compiler/rustc_codegen_llvm/src/lib.rs` consults a
@@ -730,11 +752,31 @@ hook **synchronously on the main thread BEFORE `start_async_codegen`**:
 ```rust
 let mut extra_modules: Vec<ModuleCodegen<B::Module>> = Vec::new();
 {
-    let mut allocator = VecAllocator {
-        modules: &mut extra_modules,
-        make_module: |name: &str| backend.allocate_extra_module(tcx, name),
+    struct AllocatorState<'a, 'tcx, B: ExtraBackendMethods + 'tcx> {
+        extras: &'a mut Vec<ModuleCodegen<B::Module>>,
+        backend: &'a B,
+        tcx: TyCtxt<'tcx>,
+    }
+    unsafe extern "C" fn allocate_thunk<B: ExtraBackendMethods>(
+        state: *mut std::ffi::c_void,
+        name_ptr: *const u8,
+        name_len: usize,
+    ) -> *mut B::Module {
+        let state = unsafe { &mut *(state as *mut AllocatorState<'_, '_, B>) };
+        let name = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len))
+        };
+        let module = state.backend.allocate_extra_module(state.tcx, name);
+        state.extras.push(ModuleCodegen::new_regular(name, module));
+        &mut state.extras.last_mut().unwrap().module_llvm as *mut B::Module
+    }
+    let mut state =
+        AllocatorState { extras: &mut extra_modules, backend: &backend, tcx };
+    let allocator: ExtraModuleAllocator<B::Module> = ExtraModuleAllocator {
+        state: &mut state as *mut _ as *mut std::ffi::c_void,
+        allocate: allocate_thunk::<B>,
     };
-    backend.fill_extra_modules(tcx, &mut allocator);
+    backend.fill_extra_modules(tcx, &allocator);
 }
 // extra_modules passed into start_async_codegen; processed via
 // execute_optimize_work_item before the worker pool starts.
@@ -1122,18 +1164,21 @@ impl CodegenBackend for SkyCodegenBackend {
     }
 }
 
-// The fill_extra_modules hook signature (Approach B / rev 2):
+// The fill_extra_modules hook signature (Approach B / rev 3):
 //
 // fn consumer_fill_modules<'tcx>(
 //     tcx: TyCtxt<'tcx>,
-//     allocator: &mut dyn ExtraModuleAllocator<ModuleLlvm>,
+//     allocator: &ExtraModuleAllocator<ModuleLlvm>,
 // ) {
-//     // Walk Sky's codegen queue (populated by the frontend at
-//     // after_expansion), allocate one rustc-owned ModuleLlvm per Sky
-//     // CGU via allocator.allocate(name), wrap its borrowed LLVMContext
-//     // + LLVMModule pointers in suppressed-Drop Inkwell handles, emit
-//     // IR directly. No bitcode serialization, no parse_from_tcx,
-//     // no context migration. See §C.4 + §F.15 for the full pattern.
+//     // allocator is a `#[repr(C)]` function-pointer struct (handoff
+//     // Phase H, 2026-06-24). Walk Sky's codegen queue (populated by the
+//     // frontend at after_expansion); per Sky CGU, call
+//     // `(allocator.allocate)(allocator.state, name.as_ptr(), name.len())`
+//     // to obtain a `*mut ModuleLlvm` rustc owns, reborrow it briefly to
+//     // read the LLVMContext + LLVMModule raw pointers, wrap them in
+//     // suppressed-Drop Inkwell handles, emit IR directly. No bitcode
+//     // serialization, no parse_from_tcx, no context migration. See §C.4
+//     // + §F.15 for the full pattern; §3.2 patch 4 for the rev-3 ABI.
 // }
 ```
 
@@ -5395,29 +5440,35 @@ providers.per_instance_mir = |_tcx, _instance| None;
 
 This makes the query a no-op for non-Sky use. Sky's codegen backend's `provide()` method overrides this with Sky's real provider.
 
-#### B.4 `fill_extra_modules` allocator-callback hook (Approach B)
+#### B.4 `fill_extra_modules` allocator-callback hook (Approach B, rev 3)
+
+**Rev 3 (Phase H, 2026-06-24).** The `ExtraModuleAllocator` surface is a
+`#[repr(C)]` function-pointer struct with stable-ABI fields, not a Rust
+trait object. Rev 2 used `trait ExtraModuleAllocator<M> { fn
+allocate(&mut self, name: &str) -> &mut M; }` plus `VecAllocator<'a, M,
+F: FnMut(&str) -> M>`; the trait-object boundary was static-link-safe
+but would have failed across an eventual cdylib FFI boundary (where
+rustc-internal vtable layout depends on `rustc_codegen_ssa` source).
+Rev 3 collapses to the FFI-safe shape below so a future cdylib refactor
+(handoff Phase G) doesn't have to re-shape the patch.
 
 `compiler/rustc_codegen_ssa/src/traits/backend.rs`:
 
 ```rust
-pub trait ExtraModuleAllocator<M> {
-    /// Allocate a fresh backend module owned by the codegen driver and
-    /// borrowed for the duration of the surrounding fill_extra_modules
-    /// call. Subsequent allocate calls invalidate prior references.
-    fn allocate(&mut self, name: &str) -> &mut M;
-}
-
-pub struct VecAllocator<'a, M, F: FnMut(&str) -> M> {
-    pub modules: &'a mut Vec<ModuleCodegen<M>>,
-    pub make_module: F,
-}
-
-impl<'a, M, F: FnMut(&str) -> M> ExtraModuleAllocator<M> for VecAllocator<'a, M, F> {
-    fn allocate(&mut self, name: &str) -> &mut M {
-        let module = (self.make_module)(name);
-        self.modules.push(ModuleCodegen::new_regular(name, module));
-        &mut self.modules.last_mut().unwrap().module_llvm
-    }
+/// Allocates per-CGU backend modules on behalf of plugins contributing
+/// extras through `ExtraBackendMethods::fill_extra_modules`. Two
+/// stable-ABI fields: an opaque `state` pointer (caller-managed
+/// allocator state — typically a struct carrying the in-flight
+/// `Vec<ModuleCodegen<M>>` + a backend reference + the `TyCtxt`) and
+/// an `unsafe extern "C" fn` callback.
+#[repr(C)]
+pub struct ExtraModuleAllocator<M> {
+    pub state: *mut std::ffi::c_void,
+    pub allocate: unsafe extern "C" fn(
+        state: *mut std::ffi::c_void,
+        name_ptr: *const u8,
+        name_len: usize,
+    ) -> *mut M,
 }
 
 pub trait ExtraBackendMethods: ... {
@@ -5438,16 +5489,26 @@ pub trait ExtraBackendMethods: ... {
     fn fill_extra_modules<'tcx>(
         &self,
         _tcx: TyCtxt<'tcx>,
-        _allocator: &mut dyn ExtraModuleAllocator<Self::Module>,
+        _allocator: &ExtraModuleAllocator<Self::Module>,
     ) { }
 }
 ```
 
-`compiler/rustc_codegen_ssa/src/base.rs::codegen_crate` constructs a `VecAllocator` around the in-flight extras vec, passes it to `backend.fill_extra_modules` (synchronously on the main thread before `start_async_codegen`), then forwards the filled vec into `start_async_codegen`. See §F.4 for the load-bearing detail about insertion-point timing.
+`compiler/rustc_codegen_ssa/src/base.rs::codegen_crate` constructs an
+`ExtraModuleAllocator` around the in-flight extras vec — a state struct
+(`AllocatorState<'a, 'tcx, B>` carrying the vec + backend reference +
+tcx) plus a per-`B` `unsafe extern "C" fn` thunk that reconstructs the
+state pointer, decodes the `(name_ptr, name_len)` slice into a `&str`,
+calls `backend.allocate_extra_module(tcx, name)`, pushes to the vec,
+and returns `*mut B::Module`. The constructed struct is passed by
+shared reference (`&ExtraModuleAllocator<B::Module>`) to
+`backend.fill_extra_modules` synchronously on the main thread before
+`start_async_codegen`. See §3.2 patch 4 for the full source + §F.4 for
+the load-bearing detail about insertion-point timing.
 
 `compiler/rustc_codegen_ssa/src/back/write.rs` is the largest patch-4 surface. `start_async_codegen` and `start_executing_work` each gain an `extra_modules: Vec<ModuleCodegen<B::Module>>` parameter; the value is threaded from `base.rs::codegen_crate` through to the body of `start_executing_work`'s `thread::JoinHandle`. Inside that body (i.e. on the **coordinator thread**, not the main thread), a `for extra_module in extra_modules` loop runs each module through `execute_optimize_work_item` synchronously, dispatching `Finished` to a `compiled_extra_modules` vec, `NeedsFatLto` to `needs_fat_lto`, and `NeedsThinLto` to `needs_thin_lto`. After the message loop completes, `compiled_modules.extend(compiled_extra_modules)` merges the finished extras into the regular-module list before the deterministic sort.
 
-`compiler/rustc_codegen_ssa/src/traits/mod.rs` re-exports `ExtraModuleAllocator` and `VecAllocator` alongside the existing `BackendTypes` / `CodegenBackend` / `ExtraBackendMethods`.
+`compiler/rustc_codegen_ssa/src/traits/mod.rs` re-exports `ExtraModuleAllocator` alongside the existing `BackendTypes` / `CodegenBackend` / `ExtraBackendMethods`. (Rev 2's `VecAllocator` re-export retired with the struct itself when the rev-3 `#[repr(C)]` struct subsumed it.)
 
 `compiler/rustc_codegen_llvm/src/lib.rs` adds:
 
@@ -5533,11 +5594,13 @@ Sky's codegen produces target-specific LLVM IR. The target triple comes from `tc
 
 Target-specific runtime support (e.g., the runtime's I/O implementation differs between Linux and Windows) is selected at runtime build time, similar to how Rust's stdlib has target-conditional code.
 
-#### C.4 Shipping patch 4 shape: rustc-owns-lends (Approach B)
+#### C.4 Shipping patch 4 shape: rustc-owns-lends (Approach B, rev 3)
 
 Rustc allocates each per-CGU `LLVMContext` + `LLVMModule` via the standard `ModuleLlvm::new(tcx, name)` path and lends the borrowed pointers to the consumer through an `ExtraModuleAllocator<M>` callback. The consumer wraps the borrowed handles in suppressed-Drop Inkwell wrappers (`ManuallyDrop<Context>` + `Module::new_borrowed`) and emits LLVM IR directly into the rustc-owned module. No bitcode serialization, no `parse_from_tcx` round-trip, no context migration; rustc retains ownership throughout. See `rustc-lang-facade/src/extra_modules_hook.rs` + `toylangc/src/llvm_gen.rs::fill_module` for the shipping code, and §B.4 + §F.15 for the patch surface, design history, and the vendored `Module::new_borrowed(LLVMModuleRef) -> ManuallyDrop<Module<'ctx>>` helper (~5 LOC vendor patch at `vendor/inkwell/src/module.rs`; retires together with the workspace `[patch."https://github.com/TheDan64/inkwell"]` override when upstream Inkwell lands an equivalent API).
 
-Fork patch surface: ~194 LOC across 5 files (the `ExtraModuleAllocator<M>` trait + generic `VecAllocator<'a, M, F>` driver + the `allocate_extra_module` + `fill_extra_modules` trait methods in `traits/backend.rs`; the re-exports in `traits/mod.rs`; the call-site change in `base.rs::codegen_crate`; the `extra_modules` parameter threading + coordinator-thread `execute_optimize_work_item` loop + `compiled_modules.extend` in `back/write.rs`; the `FillExtraModulesHook` OnceLock + installer + `ExtraBackendMethods` overrides + `ModuleLlvm::llcx_raw_mut` + `llmod_raw` raw-pointer accessors in `rustc_codegen_llvm::lib`). The earlier v1 bytes-in shape (`extra_modules() -> Vec<ModuleCodegen<M>>` plus `ModuleLlvm::parse_from_tcx`) was retired in the rev-2 rewrite — no backward-compatibility surface remains.
+**Rev 3 ABI shape (2026-06-24, Phase H).** The allocator is a `#[repr(C)]` struct with two stable-ABI fields (`state: *mut c_void` + `allocate: unsafe extern "C" fn`) rather than a `&mut dyn ExtraModuleAllocator<M>` trait object. The consumer's `consumer_fill_modules_hook` receives `&ExtraModuleAllocator<ModuleLlvm>` and the facade's `LlvmModuleFactory::fill_module` reads `(allocator.allocate)(allocator.state, name.as_ptr(), name.len())` to obtain a `*mut ModuleLlvm`, briefly reborrows it to read the raw LLVMContext + LLVMModule pointers, and hands them to the consumer closure. The reborrow scope ends before the closure returns, so subsequent `fill_module` calls (which may invalidate prior pointers via vec realloc inside rustc) are safe. See §3.2 patch 4 for the construction-site source.
+
+Fork patch surface: ~210 LOC across 5 files (the `#[repr(C)] struct ExtraModuleAllocator<M>` + the `allocate_extra_module` + `fill_extra_modules` trait methods in `traits/backend.rs`; the re-exports in `traits/mod.rs`; the call-site change in `base.rs::codegen_crate` — now includes a per-`B` `unsafe extern "C" fn` thunk + state struct, ~30 LOC more than rev 2; the `extra_modules` parameter threading + coordinator-thread `execute_optimize_work_item` loop + `compiled_modules.extend` in `back/write.rs`; the `FillExtraModulesHook` OnceLock + installer + `ExtraBackendMethods` overrides + `ModuleLlvm::llcx_raw_mut` + `llmod_raw` raw-pointer accessors in `rustc_codegen_llvm::lib`). The earlier rev-2 trait-object shape (`trait ExtraModuleAllocator<M> { fn allocate(&mut self, name: &str) -> &mut M; }` + `VecAllocator<'a, M, F>`) was retired in the rev-3 rewrite — no backward-compatibility surface remains. The v1 bytes-as-interface shape (`extra_modules() -> Vec<ModuleCodegen<M>>` + `ModuleLlvm::parse_from_tcx`) had already retired in rev 2.
 
 ### Appendix D. Reference: Temputs Schema
 
@@ -6089,9 +6152,17 @@ Option 4 in. Subsequent runs are stable (`CARGO_INCREMENTAL=0` in the
 three test helpers from the F2-era 11-failures fix keeps it solid
 across cold/warm).
 
-#### F.15 Patch 4 design history: from bytes-in to Approach B
+#### F.15 Patch 4 design history: from bytes-in to Approach B to rev 3
 
-**Status: Approach B is the shipping patch 4 design.** This subsection now reads as design history; the architectural conclusions below were locked in during the Phase 2 fork-patch rewrite and are reflected in §3.2 + §B.4 + §C.4.
+**Status: Approach B rev 3 is the shipping patch 4 design.** This subsection reads as design history; the architectural conclusions below were locked in during the Phase 2 fork-patch rewrite (rev 2, Approach B) and refined during Phase H (rev 3, 2026-06-24, handoff Decision 5). Current shape is reflected in §3.2 + §B.4 + §C.4.
+
+---
+
+**Three revisions to date.** v1 (rev 1) was bytes-in; rev 2 was Approach B with a Rust trait object; rev 3 (Phase H, 2026-06-24) replaced the trait object with a `#[repr(C)]` function-pointer struct.
+
+The rev-2 → rev-3 transition was forward-looking. Today the facade is statically linked into toylangc, so the rev-2 `&mut dyn ExtraModuleAllocator<M>` boundary works because caller and callee share rustc's internal vtable layout by construction (one compilation unit). The handoff's Decision 4 commits Sky proper to a cdylib-backend architecture; under that shape, vtable layout depends on `rustc_codegen_ssa` source identity, and a toolchain mismatch produces runtime vtable misinterpretation (segfault). Reviewer's Q2 raised this: cranelift's `CodegenBackend` trait works because rustc owns the vtable AND cranelift registers itself (callee-owns-vtable). Sky's allocator is the inverse direction — rustc constructs the trait object, cdylib receives and dispatches through it. That asymmetry is invisible at the type level.
+
+Rev 3 collapses the trait object into a `#[repr(C)]` struct with two stable-ABI fields (`state: *mut c_void` + `allocate: unsafe extern "C" fn(...)`). Both pass cleanly across any FFI boundary without rustc-internal type-layout dependencies. ~10 more lines of construction-site boilerplate (per-`B` `unsafe extern "C" fn` thunk + state struct + reborrow discipline in the consumer); failure mode under cdylib mismatch collapses from "subtle vtable layout mismatch at runtime" to "if it links, it works." The change is forward-portable: Sky proper's cdylib refactor (handoff Phase G) becomes a wiring change rather than an ABI-compatibility rewrite.
 
 ---
 
@@ -6132,7 +6203,7 @@ than a *substantive* problem (contexts that need merging).
 | `mem::forget` dance | yes | no |
 | Risk of leaked Inkwell-internal state | yes (skips Inkwell's Drop) | no |
 | Target-attr skew (B9) | possible (Sky configures independently) | impossible (inherited) |
-| Hook shape | `Vec<ModuleLlvm>` return (unchanged) | `fn(allocator: &mut ExtraModuleAllocator)` (callback) |
+| Hook shape | `Vec<ModuleLlvm>` return (unchanged) | `fn(allocator: &mut ExtraModuleAllocator)` callback (rev 2); `fn(allocator: &ExtraModuleAllocator)` `#[repr(C)]` struct (rev 3) |
 | Inkwell upstream PR difficulty | hard (ownership transfer out of Inkwell) | conservative (read-only borrowed wrapper) |
 | Fits rustc's lifecycle | awkward | natural |
 
@@ -6163,10 +6234,28 @@ architecturally correct.
    `*mut c_void` FFI bridges. The bitcode-bytes shape (`extra_modules`,
    `set_extra_modules_hook`, `parse_from_tcx`) was retired entirely;
    no backward-compatibility surface remains.
-3. **Toylangc consumes the borrowed `ModuleLlvm`** through
+3. **Patch 4 rev 3 (2026-06-24, Phase H).** The hook signature became
+   `fill_extra_modules(&self, tcx, allocator: &ExtraModuleAllocator<Self::Module>)`
+   where `ExtraModuleAllocator<M>` is now a `#[repr(C)]` struct with two
+   stable-ABI fields (`state: *mut c_void` + `allocate: unsafe extern "C"
+   fn(state, name_ptr, name_len) -> *mut M`). The `ExtraModuleAllocator`
+   trait and the `VecAllocator<'a, M, F>` driver retired entirely; the
+   `base.rs::codegen_crate` call site now defines a per-`B`
+   `unsafe extern "C" fn` thunk + a state struct (`AllocatorState<'a,
+   'tcx, B>`) carrying the in-flight vec + backend reference + tcx. The
+   consumer reads `(allocator.allocate)(allocator.state, name_ptr,
+   name_len)` and briefly reborrows the returned `*mut Self::Module` to
+   read raw pointers. Closes the latent cdylib-FFI risk that would have
+   bitten Sky proper's cdylib refactor (Phase G).
+4. **Toylangc consumes the borrowed `ModuleLlvm`** through
    `llvm_gen::fill_module`. Inkwell wrappers
    (`ManuallyDrop<Context>` + `Module::new_borrowed`) suppress Drop;
-   rustc retains ownership of the LLVM resources throughout.
+   rustc retains ownership of the LLVM resources throughout. The
+   consumer-side change for rev 3 was minimal: `LlvmModuleFactory`'s
+   inner field changed from `&mut dyn ExtraModuleAllocator<ModuleLlvm>`
+   to `&ExtraModuleAllocator<ModuleLlvm>` (the `#[repr(C)]` struct), and
+   `fill_module` now calls the function pointer through the struct
+   instead of dispatching through the trait object.
 
 **Architectural improvements that landed:**
 

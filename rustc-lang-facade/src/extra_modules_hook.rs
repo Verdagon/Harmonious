@@ -1,4 +1,4 @@
-//! patch 4 rev 2 (Approach B): hook that fills consumer-emitted modules into
+//! patch 4 rev 3 (Approach B): hook that fills consumer-emitted modules into
 //! rustc's optimization + ThinLTO + emission pipeline.
 //!
 //! The rustc fork patch adds `ExtraBackendMethods::fill_extra_modules` called
@@ -19,6 +19,18 @@
 //! No bitcode serialization, no LLVM-context migration, no `parse_from_tcx`
 //! round-trip — Approach B closes risks B9 / B10 / B11.
 //!
+//! **Rev-3 ABI change (2026-06-24, Phase H / handoff Decision 5).** Rustc's
+//! allocator surface became a `#[repr(C)]` function-pointer struct
+//! (`ExtraModuleAllocator<M> { state, allocate: unsafe extern "C" fn }`)
+//! instead of `&mut dyn ExtraModuleAllocator<M>`. The struct is two
+//! stable-ABI fields (one opaque pointer + one extern-C fn pointer), so the
+//! hook signature now takes `&ExtraModuleAllocator<ModuleLlvm>` (immutable
+//! reference — the struct doesn't need to be mutated; the state pointer it
+//! carries is what holds the mutable allocator state, opaque to us). The
+//! facade is still static-linked into toylangc today; rev 3 keeps the
+//! shape FFI-safe so the cdylib refactor (Sky-proper architecture / handoff
+//! Phase G) doesn't have to revisit the patch.
+//!
 //! TODO(revisit): the hook is stored as a process-global OnceLock in
 //! `rustc_codegen_llvm::FILL_EXTRA_MODULES_HOOK`, not in per-Session storage.
 //! This is forced by crate-graph constraints — `Session` can't typecheck a
@@ -35,13 +47,13 @@ use rustc_middle::ty::TyCtxt;
 
 use crate::LlvmModuleFactory;
 
-/// patch 4 rev 2 hook. Wraps rustc's `ExtraModuleAllocator<ModuleLlvm>` in
+/// patch 4 rev 3 hook. Wraps rustc's `ExtraModuleAllocator<ModuleLlvm>` in
 /// an [`LlvmModuleFactory`] (the LLVM-API-agnostic facade surface) and
 /// forwards into the consumer's `consumer_fill_modules` callback via the
 /// facade trampoline.
 pub fn consumer_fill_modules_hook<'tcx>(
     tcx: TyCtxt<'tcx>,
-    allocator: &mut dyn ExtraModuleAllocator<ModuleLlvm>,
+    allocator: &ExtraModuleAllocator<ModuleLlvm>,
 ) {
     let probe = std::env::var("LANG_FACADE_EXTRA_MODULES_PROBE").is_ok();
     if probe {
