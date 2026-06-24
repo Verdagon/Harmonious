@@ -329,12 +329,24 @@ fn write_stub_crate(
     // full integration suite passes 317/0/1, llvm-objdump confirms zero
     // `udf`/`brk` traps in Sky callers. If the matrix ever regresses
     // after a nightly rustc bump, this comment is the place to start.
+    //
+    // Phase C (2026-06-24): unconditionally register the `toylang` tool
+    // namespace so stub_gen can emit `#[toylang::emit_consumer_body]` on
+    // every Category B item (Sky-emitted body via `fill_extra_modules`).
+    // Decision 3 — the partition predicate is a two-gate conjunction:
+    // `is_from_lang_stubs(tcx, def_id) && tcx.has_attrs_with_path(def_id,
+    // &[Symbol::intern("toylang"), Symbol::intern("emit_consumer_body")])`.
+    // `register_tool` is `feature(register_tool)`-gated on current nightly;
+    // adding both crate-level attrs together. Tool attributes are encoded
+    // cross-crate by default (rustc_metadata's encode_cross_crate returns
+    // true for non-builtin attrs), so the predicate works for upstream
+    // DefIds too.
+    stubs_with_features.push_str("#![feature(register_tool)]\n");
+    stubs_with_features.push_str("#![register_tool(toylang)]\n");
     for feat in &manifest.project.features {
         stubs_with_features.push_str(&format!("#![feature({})]\n", feat));
     }
-    if !manifest.project.features.is_empty() {
-        stubs_with_features.push('\n');
-    }
+    stubs_with_features.push('\n');
     // Phase 3 E.6: force-link each toylang dep so rustc actually LOADS its
     // crate metadata during this rlib compile. Without this, cargo's
     // `--extern case6_lib=...` lists the rlib but rustc only loads it if

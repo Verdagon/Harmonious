@@ -1056,7 +1056,38 @@ This is a real architectural simplification. Sky doesn't need the post-partition
 
 **Sky overrides `collect_and_partition_mono_items` via `Config::override_queries`.** The override delegates to the default partitioner, then rebuilds each CGU with consumer-defined items removed. Rustc's LLVM backend processes the filtered partition normally and emits `.o` symbols only for items left after filtering — i.e. Rust items (including Phase-6 wrappers in the stub rlib). Sky's `fill_extra_modules` hook contributes the sole bodies for consumer items, with `External` linkage; the linker resolves cross-`.o` references at final link.
 
+**The filter predicate (Phase C/D, 2026-06-24; handoff Decision 3).** The "which items get removed" decision is a two-gate attribute conjunction, not a structural / name-based union:
+
+```rust
+pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+    is_from_lang_stubs(tcx, def_id)                    // Gate 1: marker-bearing crate
+        && tcx.has_attrs_with_path(def_id, &[          // Gate 2: tagged at emission
+            Symbol::intern("skyc"),
+            Symbol::intern("emit_consumer_body"),
+        ])
+}
+```
+
+Skyc's stub_gen emits `#![register_tool(skyc)]` at the stub source crate root (under `#![feature(register_tool)]`) and decorates each Category B item with `#[skyc::emit_consumer_body]` at emission time. Tool attributes encode cross-crate by default (rustc_metadata's `encode_cross_crate` returns `true` for any non-builtin attribute), so the predicate works at both stub-rlib compile and user-bin compile against any DefId.
+
+**Category A vs Category B (the items the filter sees).** Items in the stub rlib fall into two buckets:
+
+| Category | Examples | Tagged? | Filter behavior | Codegen source |
+|---|---|---|---|---|
+| **A: real Rust bodies** | `__SKY_STUBS_MARKER` const, `__ToylangOpaque<T>` wrapper struct, Sky struct declarations, `pub use` re-exports, `extern "C"` declarations, Phase-6 `__toylang_*_unwrap` `#[inline(never)]` helpers, `pub use core::ops::Drop` | **No** | LEAVE ALONE — survives the filter | Rustc's normal codegen (real source body or extern decl resolved at link) |
+| **B: `unreachable!()` placeholders** | exported Sky fns + `__sky_main` (toylang's `__toylang_main`), accessor methods on Sky types, trait-impl methods on Sky types (incl. `<SkyType as Drop>::drop`) | **Yes** | REMOVE from CGU list | Sky's `fill_extra_modules` emits the real body with `External` linkage under the same rustc-mangled name (single-symbol architecture, §6.2) |
+
+**The 1:1 invariant.** Every tagged item ↔ exactly one Sky emission per concrete Instance the cascade reaches. Skyc-side bugs in either direction are loud:
+- **Tag without emission**: link error (rustc filters body out; Sky never emits → undefined symbol).
+- **Emission without tag**: competing `.o` symbol (rustc emits the `unreachable!()` body, Sky emits the real body → linker error or, under LTO, non-deterministic IR-linker tiebreak that can pick the `unreachable!()` and panic at runtime).
+
+The toylang reference implementation enforces this both ways via `stub_gen::tests::emit_consumer_body_tags_only_category_b_items` (every `unreachable!()` body within 6 lines below a tag; every tag within 8 lines above an `unreachable!()` body; exactly 3 tags on a representative registry).
+
+**The same predicate must be used by both the partition filter AND the `per_instance_mir` override** — they must agree on what counts as consumer-owned. Sky's facade calls `is_consumer_codegen_target` from both sites; any future predicate variant would need a CI fence to keep them in lockstep.
+
 > **Design history.** This file resurrected the partition filter from `a51bd7c~1` after a brief 2026-06-21 → 2026-06-22 detour through Option 4 (a `codegen_fn_attrs` override that stamped `AvailableExternally` linkage on consumer items so they were IR-only). Option 4 was smaller in pure LOC but created a CGU-placement hazard: rustc's partitioner could co-locate the AvailableExternally `unreachable!()` body with `main` in the same CGU, and LLVM's intra-CGU inliner at -O3 would inline the panic body into main → runtime SBMNBIZ. Rustc-fork patch 5 papered over this by causing the partitioner to put the AvailableExternally body in a separate CGU. Retiring Option 4 + patch 5 together (2026-06-22) dropped the fork from 5 → 4 patches and eliminated the @SBMNBIZ invariant entirely (no AvailableExternally body to protect against). See §F.14.1 + §F.17 for the design history; `tmp/patch5-empirical-2026-06-21/VERDICT.md` for the empirical contrast probe.
+
+> **Predicate-shape history.** Pre-Phase-C/D (i.e. before 2026-06-24), `is_consumer_codegen_target` was a three-way union: `is_consumer_fn(name)` (name → universe lookup) || `is_consumer_accessor_safe(tcx, def_id)` (structural ADT walk + name check) || `is_consumer_trait_impl_method(tcx, def_id).is_some()` (structural walk for `impl <RustTrait> for <ConsumerType>` methods). The migration to the attribute-based two-gate conjunction (handoff Decision 3) shed the name-based universe dependency, the structural ADT walks, and the ambiguity between Drop-impl-bridge fns and Sky drop fns (both of which had similar name shapes). The three name-based matchers `is_consumer_fn` / `is_consumer_accessor_safe` / `is_consumer_trait_impl_method` remain alive in `queries/symbol_name.rs` (callback-name classification) and `queries/per_instance.rs` (callback-name routing) — they retire together with the symbol_name override in Phase F (handoff Decision 2).
 
 After the filter override is installed, the rebuilt CGU list reaches `LlvmCodegenBackend::codegen_crate` with consumer items already excised. Rustc compiles only the items that survive the filter (Rust items emitted as part of the stub rlib's source, like Phase-6 wrappers); consumer items never reach LLVM lowering at all.
 
@@ -1321,6 +1352,8 @@ export fn wrap<T>(x: T) -> Wrapper<T> {
 
 The stub rlib generates:
 ```rust
+#![feature(register_tool)]
+#![register_tool(skyc)]
 #![feature(rustc_private)] // for sky-specific items if any
 #![feature(fn_traits, unboxed_closures)] // for closures that may flow through
 // ... other features as needed
@@ -1329,10 +1362,13 @@ pub const __SKY_STUBS_MARKER: () = ();
 
 pub struct Wrapper<T>(::std::marker::PhantomData<T>);
 
+#[skyc::emit_consumer_body]
 pub fn wrap<T>(x: T) -> Wrapper<T> {
     ::std::unreachable!()
 }
 ```
+
+The `#[skyc::emit_consumer_body]` tool attribute is what the partition filter keys on; see §5.3 for the two-gate predicate. Items in the stub rlib that AREN'T tagged (the marker const, the `__SkyOpaqueType` wrapper, Sky struct declarations, `pub use` re-exports, `extern "C"` blocks, the Phase-6 `__sky_*_unwrap` helpers) survive the filter and rustc compiles their real bodies normally — they're "Category A" per the §5.3 split.
 
 For an exported Sky struct with public fields (note: Sky's "fields" don't surface to rustc by default; opacity is the default — see Section 10):
 ```sky
@@ -1366,13 +1402,14 @@ The stub rlib generates:
 pub struct Widget(());
 
 impl ::std::clone::Clone for Widget {
+    #[skyc::emit_consumer_body]
     fn clone(&self) -> Widget {
         ::std::unreachable!()
     }
 }
 ```
 
-The Clone impl is in Sky's stub rlib because Sky owns the Widget type (orphan rule satisfied; Section 6.6). The body is `unreachable!()` — Sky's `per_instance_mir` provider intercepts when rustc tries to use it, returning Sky's substituted body. Sky's codegen backend emits the real body into the binary's `.o`.
+The Clone impl is in Sky's stub rlib because Sky owns the Widget type (orphan rule satisfied; Section 6.6). The method body is `unreachable!()` and the method is tagged `#[skyc::emit_consumer_body]` — Sky's `per_instance_mir` provider intercepts when rustc tries to use it, returning Sky's substituted body; Sky's `fill_extra_modules` emits the real body into the same compile session's `.o` under the rustc-mangled symbol; the partition filter (§5.3) removes the `unreachable!()` placeholder so it never reaches LLVM.
 
 **Single-symbol architecture: Sky's bitcode emits each rustc-visible body under the *rustc-mangled name rustc would have given the stub fn*. Path B (empirically verified by toylang's `test_lto_smoke`).** The original design described a two-symbol scheme: stub fn `pub fn clone_widget` mangled by rustc as one name, Sky's bitcode emits the real body under a Sky-chosen name (`__sky_impl_clone_widget`), and the `symbol_name` query override redirects the rustc-mangled name to Sky's name at link time. **That scheme works under non-LTO but breaks under ThinLTO** — LLVM's IR linker sees two definitions of the logically-same function (the rustc-mangled stub with `unreachable!()` body, and Sky's `__sky_impl_*` with the real body) and non-deterministically picks the stub. Result: the binary panics at the inlined `unreachable!()`.
 

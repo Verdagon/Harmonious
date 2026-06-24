@@ -734,37 +734,45 @@ pub fn is_sky_active(tcx: TyCtxt<'_>) -> bool {
 /// comes from the consumer's backend `.o` rather than from rustc's
 /// codegen?
 ///
-/// True iff all three hold:
-/// 1. The DefId lives inside `__lang_stubs::` (cross-crate-safe check).
-/// 2. The item has a simple name (anonymous impl items etc. are excluded).
-/// 3. Either the name matches a consumer function (via `is_consumer_fn`)
-///    or it's an accessor method on a consumer type.
+/// **Phase C/D (2026-06-24, handoff Decision 3) — two-gate conjunction.**
+/// True iff BOTH hold:
+/// 1. The DefId lives inside a marker-bearing crate (cross-crate-safe
+///    check via `is_from_lang_stubs`).
+/// 2. The item carries the `#[toylang::emit_consumer_body]` tool
+///    attribute (registered crate-wide via `#![register_tool(toylang)]`
+///    in the stub source by `build.rs`).
 ///
-/// This is the filter the facade uses both (a) to decide whether to
-/// synthesize a dep-discovery body for the item in the `per_instance_mir`
-/// override (which drives rustc's monomorphization collector) and (b)
-/// to remove the item from the CGU slice in the partitioner override
-/// so rustc's codegen backend never sees it. Items inside
-/// `__lang_stubs` that are NOT consumer fns — notably the Phase-6
-/// `#[inline(never)]` wrappers like `__toylang_option_unwrap` — fall
-/// through to rustc's default codegen; they are real Rust functions
-/// whose symbol must be callable at link time.
+/// Items inside `__lang_stubs` that aren't tagged — notably the Phase-6
+/// `#[inline(never)]` wrappers like `__toylang_option_unwrap`, the
+/// `__SKY_STUBS_MARKER` const, the `__ToylangOpaque<T>` wrapper struct,
+/// `pub use` re-exports, `extern "C"` blocks, and Sky struct
+/// declarations — fall through to rustc's default codegen path. They
+/// are real Rust source whose symbols must be callable at link time.
+///
+/// This predicate is the filter both (a) the `per_instance_mir`
+/// override consults to decide whether to synthesize a dep-discovery
+/// body and (b) the `collect_and_partition_mono_items` override
+/// consults to remove items from the CGU list before LLVM codegen.
+/// The mandatory 1:1 invariant (tagged item ↔ Sky `fill_extra_modules`
+/// emission) is enforced by `toylangc/tests/predicate_consistency.rs`.
+///
+/// The pre-2026-06-24 shape used `is_consumer_fn` (name → universe
+/// lookup) || `is_consumer_accessor_safe` (structural ADT walk) ||
+/// `is_consumer_trait_impl_method` (structural walk). Those matchers
+/// remain alive because `queries/symbol_name.rs` still consults them
+/// for callback-name shape classification; they will retire together
+/// with the symbol_name override in Phase F (handoff Decision 2).
 pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
     if !is_from_lang_stubs(tcx, def_id) {
         return false;
     }
-    let Some(name) = tcx.opt_item_name(def_id) else {
-        return false;
-    };
-    if is_consumer_fn(&name.to_string()) {
-        return true;
-    }
-    if is_consumer_accessor_safe(tcx, def_id) {
-        return true;
-    }
-    // Phase 2 C.6 — trait-impl methods on consumer types are also
-    // consumer-owned codegen targets.
-    is_consumer_trait_impl_method(tcx, def_id).is_some()
+    tcx.has_attrs_with_path(
+        def_id,
+        &[
+            rustc_span::Symbol::intern("toylang"),
+            rustc_span::Symbol::intern("emit_consumer_body"),
+        ],
+    )
 }
 
 /// Accessor-method structural check (cross-crate-safe). Shared between

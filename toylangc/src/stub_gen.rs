@@ -234,7 +234,16 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             // matching the architecturally-promised "interop is free with
             // LTO" perf claim. The inlining matrix's
             // SKY_EXPORT_LTO_INLINING_FINDING markers retire.
+            // Phase C/D (Decision 3): tag accessor methods as Category B —
+            // Sky's `fill_extra_modules` emits the real body; the partition
+            // filter's two-gate predicate
+            //   is_from_lang_stubs(tcx, def_id)
+            //     && tcx.has_attrs_with_path(def_id, &[toylang, emit_consumer_body])
+            // removes the `unreachable!()` placeholder from rustc's CGU list
+            // before LLVM codegen. The marker is registered crate-wide via
+            // `#![register_tool(toylang)]` in build.rs.
             accessor_methods.push(quote! {
+                #[toylang::emit_consumer_body]
                 pub fn #field_ident(&self) -> &#field_ty {
                     unreachable!()
                 }
@@ -349,7 +358,13 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         // check in v1; restore the attribute (gated on a mode flag) when
         // v2 work begins.
         let fn_generics = fn_generics_clause(&toy_fn.type_params);
+        // Phase C/D (Decision 3): tag exported wrapper fns as Category B —
+        // Sky's body comes from `fill_extra_modules`; partition filter
+        // removes the `unreachable!()` placeholder. See the accessor
+        // emission site above for the full discipline + cross-crate
+        // encoding rationale.
         let wrapper: syn::Item = parse_quote! {
+            #[toylang::emit_consumer_body]
             pub fn #wrapper_ident #fn_generics (#(#user_params),*) -> #ret {
                 unreachable!()
             }
@@ -458,14 +473,24 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             // to `&mut self`. Today only `Drop::drop` needs this; the body
             // is still `unreachable!()` (the override / per_instance_mir
             // path supplies the real semantics).
+            //
+            // Phase C/D (Decision 3): tag trait-impl methods on consumer
+            // types as Category B. Sky's `fill_extra_modules` emits the
+            // real body (case4's Clone pattern; case6's cross-Sky-crate
+            // trait impl; the §15.7 `<Widget as Drop>::drop` path). The
+            // partition filter's two-gate predicate removes the
+            // `unreachable!()` placeholder from rustc's CGU list before
+            // LLVM codegen.
             if m.is_self_mut {
                 parse_quote! {
+                    #[toylang::emit_consumer_body]
                     fn #m_name(&mut self, #(#user_params),*) -> #ret {
                         unreachable!()
                     }
                 }
             } else {
                 parse_quote! {
+                    #[toylang::emit_consumer_body]
                     fn #m_name(&self, #(#user_params),*) -> #ret {
                         unreachable!()
                     }
@@ -677,5 +702,165 @@ mod tests {
             "stub_gen output missing `fn clone(&self)`:\n{}", src);
         assert!(src.contains("unreachable!()"),
             "stub_gen output missing `unreachable!()` body:\n{}", src);
+    }
+
+    /// Phase C/D (handoff Decision 3) — the 1:1 invariant fence.
+    ///
+    /// Every Category B item (exported toylang fn / accessor method /
+    /// trait-impl method on a consumer type) must carry the
+    /// `#[toylang::emit_consumer_body]` tool attribute. The facade's
+    /// `is_consumer_codegen_target` predicate is now a two-gate
+    /// conjunction
+    ///   `is_from_lang_stubs(tcx, def_id)
+    ///     && tcx.has_attrs_with_path(def_id, &[toylang, emit_consumer_body])`,
+    /// so any Category B emission missing the tag would let rustc's
+    /// `unreachable!()` body reach LLVM (competing with Sky's real body)
+    /// → runtime panic or non-deterministic LTO IR-linker tiebreak.
+    ///
+    /// Equally important: items that AREN'T Category B (the marker
+    /// const, the `__ToylangOpaque` wrapper, `pub use` re-exports, the
+    /// Phase-6 `__toylang_*_unwrap` helpers, `extern "C"` decls) must
+    /// NOT carry the tag, or the partition filter would remove them
+    /// from rustc's CGU list and the binary would fail to link
+    /// (rustc emits no body; Sky emits no body; symbol undefined).
+    ///
+    /// This test exercises both directions on a representative
+    /// registry covering all three Category B shapes.
+    #[test]
+    fn emit_consumer_body_tags_only_category_b_items() {
+        use crate::toylang::registry::{
+            ToyField, ToyFunction, ToyImpl, ToyImplMethod, ToyParam, ToyStruct,
+        };
+        use crate::toylang::typed_ast::ResolvedType;
+
+        let mut reg = ToylangRegistry::default();
+        // Struct with a field → triggers accessor method emission.
+        reg.structs.insert("Widget".to_string(), ToyStruct {
+            type_params: vec![],
+            fields: vec![ToyField { name: "id".to_string(), rust_type: ResolvedType::I32 }],
+        });
+        // Exported toylang fn → triggers wrapper fn emission.
+        reg.functions.insert("make_widget".to_string(), ToyFunction {
+            type_params: vec![],
+            params: vec![ToyParam { name: "id".to_string(), ty: ResolvedType::I32 }],
+            return_ty: Some(ResolvedType::StructRef {
+                name: "Widget".to_string(), type_args: vec![],
+            }),
+            body: Some(crate::toylang::ast::Block { stmts: vec![], ret: None }),
+            is_export: true,
+        });
+        // Body-less fn → triggers extern "C" decl (Category A, NOT tagged).
+        reg.functions.insert("println_i32".to_string(), ToyFunction {
+            type_params: vec![],
+            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
+            return_ty: None,
+            body: None,
+            is_export: false,
+        });
+        // Trait impl → triggers trait-impl-method emission.
+        reg.imports.push("std::ops::Drop".to_string());
+        reg.trait_impls.push(ToyImpl {
+            trait_name: "Drop".to_string(),
+            self_type_name: "Widget".to_string(),
+            is_export: true,
+            type_params: vec![],
+            type_param_bounds: vec![],
+            self_type_args: vec![],
+            methods: vec![ToyImplMethod {
+                name: "drop".to_string(),
+                is_self_mut: true,
+                func: ToyFunction {
+                    type_params: vec![],
+                    is_export: true,
+                    params: vec![ToyParam {
+                        name: "self".to_string(),
+                        ty: ResolvedType::Ref { inner: Box::new(
+                            ResolvedType::StructRef {
+                                name: "Widget".to_string(), type_args: vec![],
+                            },
+                        ) },
+                    }],
+                    return_ty: None,
+                    body: None,
+                },
+            }],
+        });
+
+        let src = generate(&reg);
+
+        // Category B: every fn whose body is `unreachable!()` must carry the
+        // tag. Walk the source; for each `fn ... { unreachable!()`, the
+        // preceding ~4 lines must include `#[toylang::emit_consumer_body]`.
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("unreachable!()") {
+                // Scan up to 6 lines back looking for the tag.
+                let window_start = i.saturating_sub(6);
+                let window: String = lines[window_start..i].join("\n");
+                assert!(
+                    window.contains("#[toylang::emit_consumer_body]"),
+                    "Category B 1:1 invariant violation: `unreachable!()` body \
+                     at line {} is missing the `#[toylang::emit_consumer_body]` \
+                     tag in the preceding 6 lines. Without the tag, the \
+                     partition filter won't remove this stub from rustc's CGU \
+                     list, and rustc's emitted body will compete with Sky's \
+                     `fill_extra_modules` body at link time.\n\
+                     Window:\n{}\n\
+                     Full source:\n{}",
+                    i + 1, window, src,
+                );
+            }
+        }
+
+        // Category A inverse: the tag must NOT appear on the marker const,
+        // the __ToylangOpaque wrapper, the Phase-6 unwrap helpers, the
+        // `pub use` re-export, or the `extern "C"` block. Asserting line-
+        // by-line: every line carrying the tag must be followed (within ~5
+        // lines) by `unreachable!()`. If the tag attached to a
+        // Category A item, the partition filter would silently delete it,
+        // breaking the build.
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("#[toylang::emit_consumer_body]") {
+                let window_end = (i + 8).min(lines.len());
+                let window: String = lines[i..window_end].join("\n");
+                assert!(
+                    window.contains("unreachable!()"),
+                    "Category A 1:1 invariant violation: \
+                     `#[toylang::emit_consumer_body]` at line {} is NOT \
+                     followed by `unreachable!()` within 8 lines, suggesting \
+                     it's attached to a real-bodied (Category A) item. The \
+                     partition filter would remove this item from rustc's CGU \
+                     list, but no Sky emission replaces it → undefined symbol \
+                     at link time.\n\
+                     Window:\n{}\n\
+                     Full source:\n{}",
+                    i + 1, window, src,
+                );
+            }
+        }
+
+        // Spot-checks: the three known Category B items must each be tagged
+        // exactly once. If stub_gen drifts in a way that produces zero or
+        // two tags for the same item, surface it loudly.
+        let tag_count = src.matches("#[toylang::emit_consumer_body]").count();
+        assert_eq!(
+            tag_count, 3,
+            "expected exactly 3 `#[toylang::emit_consumer_body]` tags \
+             (1 accessor + 1 wrapper fn + 1 trait-impl method), got {}.\n\
+             Full source:\n{}",
+            tag_count, src,
+        );
+
+        // And the crate-level `#![register_tool(toylang)]` must NOT live in
+        // stub_gen's output — it's added by build.rs before stubs_with_features
+        // is written. If a future change moves it INTO stub_gen, this assert
+        // will catch the duplication.
+        assert!(
+            !src.contains("#![register_tool(toylang)]"),
+            "stub_gen.generate() emitted `#![register_tool(toylang)]` — \
+             that attribute belongs at the build.rs prepend layer (which is \
+             where it currently lives). Two crate-level register_tool attrs \
+             is a duplicate-attribute error.",
+        );
     }
 }

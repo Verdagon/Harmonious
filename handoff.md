@@ -57,7 +57,7 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 - **Phase I (cache_on_disk_if audit)** — DONE 2026-06-24. **Decision 14's prescribed Provider-slot syntax (`providers.queries.layout_of_cache_on_disk_if = ...`) doesn't exist on current nightly.** `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit re-derived cache-safety: every Sky-overridden query is safe by construction (`per_instance_mir` declared `false` in fork patch; `layout_of` + `cross_crate_inlinable` default to `false`; `collect_and_partition_mono_items` is `eval_always`; `symbol_name` is disk-cached but its override is scheduled for removal per Decision 2 and the default mangler invalidates correctly). Annotated all 5 override files with `cache-audit:` marker comments. New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker. New §22.4.1 documents the policy table; new B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API." Decision 14 itself is revised below.
 
 **Not yet started (your work):**
-- Phases C (tool attribute), D (predicate migration), F (symbol_name elimination), G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences). Phase B+ is now also done; nothing in the perf-bench arc remains.
+- Phases F (symbol_name elimination), G (cdylib), H (FFI shape), J (u128 typeids), K (content-hash const args), L (per-view refs), M (async typestate), N (recursion safety), O (drift fences). Phase C+D done 2026-06-24 (tool attribute infra + partition predicate migration).
 
 **In flight from prior sessions (independent of this exchange):**
 - Patch 5 retirement (shipped 2026-06-22 per the historical section below).
@@ -81,9 +81,11 @@ Critical caveat (historical): **toylang had zero drop tests**, so the mir_shims 
 4. ~~cache_on_disk_if audit~~ — DONE (Phase I, 2026-06-24). Audit found prescribed API doesn't exist; all queries cache-safe by construction; CI fence in place.
 5. ~~Bench 3 pure-Rust baselines~~ — DONE (Phase B+, 2026-06-24, follow-up session). 6 new fixtures + test_widgets sibling crate. **Pure-Rust cross-crate Drop shows 27.5× LTO ratio** (within noise of Sky's 25.5×); the amplification is inherited from Rust, not Sky-specific. Round-4 framing for Bench 3 settled.
 
+6. ~~Tool attribute infrastructure + partition predicate migration (Phase C+D)~~ — DONE (2026-06-24). `#![register_tool(toylang)]` + `#[toylang::emit_consumer_body]` machinery in build.rs + stub_gen.rs; `is_consumer_codegen_target` rewritten as the two-gate conjunction `is_from_lang_stubs(tcx, def_id) && tcx.has_attrs_with_path(def_id, &[toylang, emit_consumer_body])`. New 1:1 invariant CI fence at `stub_gen::tests::emit_consumer_body_tags_only_category_b_items`. 477 tests pass (+1 from new fence). Smoke-test of `bench3_drop_thin` confirms runtime behavior unchanged.
+
 **NEXT — start here next session:**
 
-6. **Tool attribute infrastructure + partition predicate migration (Phase C+D)** — ~2-3 days. Wire up `#![register_tool(skyc)]` + `#[skyc::emit_consumer_body]`; migrate `is_consumer_codegen_target` to the two-gate attribute conjunction (Decision 3). With all four round-4 deliverables now in hand, the next session can either schedule round 4 OR continue execution work starting here.
+7. **Symbol_name override elimination (Phase F)** — ~½ day. Per Decision 2: delete `rustc-lang-facade/src/queries/symbol_name.rs`, remove from providers, delete `compute_consumer_symbol` + the `consumer_symbol_for_callback_name` callback. Audit orphaned matchers (`is_consumer_fn`, `is_consumer_accessor_safe`) — `queries/per_instance.rs` still calls `is_consumer_fn` for callback-name routing, so that may need rewiring too. Verify rustc's default mangler is what Sky's emission consults (it already is internally via `default_symbol_name()`). After Phase F, three of the four roundtrip-relevant cleanup arcs (Decisions 1/2/3) ship.
 
 After that: symbol_name elimination (Phase F, ½ day), cdylib build system + patch 4 rev 3 (Phases G+H, ~1 week), u128 typeids + content-hash const args (Phases J+K, ~1.5 weeks), per-view ref types + async typestate (Phases L+M, ~3 weeks).
 
@@ -1512,28 +1514,55 @@ The Bench 3 table extends with 6 new rows. The interpretation paragraph in §22.
 
 Fill in the actual numbers from the rerun.
 
-### Phase C: Tool attribute infrastructure (1-2 days)
+### Phase C: Tool attribute infrastructure — DONE 2026-06-24
 
-Wire up the `#![register_tool(skyc)]` + `#[skyc::emit_consumer_body]` tool attribute machinery.
+**Status: SHIPPED 2026-06-24.** Wired up `#![register_tool(toylang)]` + `#[toylang::emit_consumer_body]` machinery. (Toylang's namespace is `toylang`; Sky proper will use `skyc` per Decision 3.)
 
-Tasks:
-- Stub source's crate root emits `#![register_tool(skyc)]`.
-- Define `sym::skyc_emit_consumer_body` for the attribute name.
-- Verify rustc's `tcx.has_attr(def_id, sym::skyc_emit_consumer_body)` works correctly on tagged items.
+**What landed:**
+- `toylangc/src/build.rs`: unconditionally prepends `#![feature(register_tool)]\n#![register_tool(toylang)]\n` to every generated stub crate's `src/lib.rs`. Independent of the user's `[project] features` list (which adds additional `#![feature(...)]` lines).
+- The `tool` namespace works cross-crate by default: tool attributes encode into rmeta (rustc_metadata's `encode_cross_crate` returns `true` for any attr not in `BUILTIN_ATTRIBUTE_MAP`), so `tcx.has_attrs_with_path(upstream_def_id, &[toylang_sym, attr_sym])` returns the right answer at both the stub-rlib compile and the user-bin compile.
 
-**Output**: attribute machinery in place; partition predicate can be migrated next.
+**Verification:** generated stub source for `bench3_drop_thin` confirms the prepend works:
+```
+#![feature(register_tool)]
+#![register_tool(toylang)]
+#![feature(allocator_api)]
+...
+```
 
-### Phase D: Partition predicate migration (1 day, depends on C)
+### Phase D: Partition predicate migration — DONE 2026-06-24
 
-Replace `is_consumer_codegen_target` with the two-gate attribute conjunction (Decision 3). Update skyc's stub_gen to tag items per the Category A/B split.
+**Status: SHIPPED 2026-06-24.** Two-gate conjunction predicate + stub_gen tagging + 1:1 invariant fence all landed cleanly.
 
-Tasks:
-- Implement new predicate per Decision 3.
-- Update skyc's stub_gen: tag exported Sky functions, Sky drop fns, Sky trait-impl methods, Sky accessors. Do NOT tag bridges, Phase-6 wrappers, type/trait declarations, the marker.
-- AUDIT classification matchers (`is_consumer_fn`, `is_consumer_accessor_safe`); delete if orphaned post-symbol_name-elimination.
-- Build CI fence: verify 1:1 mapping between tagged items and Sky's emission list.
+**What landed:**
+- `rustc-lang-facade/src/lib.rs::is_consumer_codegen_target`: rewritten as the two-gate conjunction per Decision 3:
+  ```rust
+  pub fn is_consumer_codegen_target<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+      if !is_from_lang_stubs(tcx, def_id) { return false; }
+      tcx.has_attrs_with_path(def_id, &[
+          rustc_span::Symbol::intern("toylang"),
+          rustc_span::Symbol::intern("emit_consumer_body"),
+      ])
+  }
+  ```
+- `toylangc/src/stub_gen.rs`: three emission sites tagged with `#[toylang::emit_consumer_body]`:
+  - Accessor methods inside `impl Foo { ... }` blocks (line ~239)
+  - Exported wrapper fns + `__toylang_main` (line ~354)
+  - Trait-impl methods on consumer types — both `&self` and `&mut self` variants (line ~463/470)
+- Category A items deliberately UNTAGGED (verified via the new CI fence): `__SKY_STUBS_MARKER`, `__ToylangOpaque<T>`, `pub use` re-exports, `extern "C"` declarations, Sky struct declarations, `__toylang_option_unwrap` / `__toylang_result_unwrap` Phase-6 helpers, the `pub use core::ops::Drop` re-export.
+- New CI fence `stub_gen::tests::emit_consumer_body_tags_only_category_b_items` enforces the 1:1 invariant in both directions: every `unreachable!()` body must carry the tag within 6 lines above; every `#[toylang::emit_consumer_body]` must be followed by an `unreachable!()` body within 8 lines. Plus a spot-check that exactly 3 tags appear in a representative registry (1 accessor + 1 wrapper + 1 trait-impl-method) and that `#![register_tool(toylang)]` lives only at the build.rs layer, not in stub_gen output.
 
-**Output**: predicate migrated; classification matchers cleaned up; CI fence in place.
+**What stayed alive (will retire in Phase F per Decision 2):**
+- `is_consumer_fn` and `is_consumer_accessor_safe` matchers — still consulted by `queries/symbol_name.rs` (callback-name shape classification) and `queries/per_instance.rs` (callback-name routing). They retire together with the symbol_name override.
+
+**Test coverage:**
+- 477 tests pass (1 new test for the 1:1 fence; baseline was 476). 0 failures excluding the pre-existing rustdoc-not-installed doctest infrastructure error in rustc-fork.
+- Smoke-test of `bench3_drop_thin` (post-change) reports 419μs — within run-to-run variance of the 371μs pre-change baseline. The new attribute-based predicate produces identical runtime behavior to the old name/structural matchers.
+
+**Files touched:**
+- `toylangc/src/build.rs`: +5 / -2 (prepend the two crate-level attrs)
+- `toylangc/src/stub_gen.rs`: +160 / -10 (tag the three emission sites + the new CI fence test)
+- `rustc-lang-facade/src/lib.rs`: +18 / -23 (rewrite the predicate)
 
 ### Phase E: mir_shims elimination — DONE 2026-06-23
 
@@ -1991,7 +2020,7 @@ If you can't answer one, re-read the relevant section above. If you can, you're 
 
 **Phase B+ success — ACHIEVED 2026-06-24 (follow-up):** Bench 3 pure-Rust baselines confirm the ~26× drop-chain LTO speedup is INHERITED from Rust, not Sky-specific. Pure-Rust cross-crate Drop shows 27.5×; Sky shows 25.5×; Sky vs Rust at thin LTO = 3% delta (matching Bench 1's 0.3%). `single_crate` baseline (Widget in user_bin) and `inline_never` baseline (Drop `#[inline(never)]`) bracket the operating point cleanly. 6 new fixtures + new `test_widgets/` sibling crate; 23 total fixtures; runner extended; §22.4 + §22.4.3 + perf-bench-summary updated. Round-4 framing for Bench 3 settled: "Sky's drop emission gives LLVM the same elimination opportunity Rust's does."
 
-**Phases C+D success — NOT YET STARTED:** `#[skyc::emit_consumer_body]` attribute machinery in place; partition predicate migrated; orphaned classification matchers deleted; CI fence verifies 1:1 invariant.
+**Phases C+D success — ACHIEVED 2026-06-24:** `#[toylang::emit_consumer_body]` attribute machinery in place (build.rs prepends `#![feature(register_tool)] / #![register_tool(toylang)]`); stub_gen tags all three Category B emission sites (accessors, wrapper fns, trait-impl methods); `is_consumer_codegen_target` rewritten as the two-gate conjunction `is_from_lang_stubs && tcx.has_attrs_with_path(&[toylang, emit_consumer_body])`; new CI fence `stub_gen::tests::emit_consumer_body_tags_only_category_b_items` enforces the 1:1 invariant in both directions. 477 tests pass (+1 from the new fence; baseline was 476). The `is_consumer_fn` / `is_consumer_accessor_safe` matchers stayed alive because `queries/symbol_name.rs` + `queries/per_instance.rs` still consult them for callback-name routing; they retire together with the symbol_name override in Phase F (Decision 2). Sky proper will substitute `skyc` for `toylang` when stub_gen and build.rs ship Sky-side.
 
 **Phase E success — ACHIEVED 2026-06-23:** mir_shims override gone; all 9 drop fixtures pass under the new AST-rewrite model; no regressions in the 333 prior integration tests (now 342 total). The `project_raw_field` CI fence turned out unnecessary because the synth pass never directly accesses field storage.
 
