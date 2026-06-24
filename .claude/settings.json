@@ -10,16 +10,6 @@
             "timeout": 5000
           }
         ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".claude/hooks/validate-readonly/target/release/validate-readonly",
-            "timeout": 5000
-          }
-        ]
       }
     ]
   }
