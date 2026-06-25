@@ -4273,6 +4273,28 @@ testing, set `[profile.release] lto = "thin"`. Fat LTO trades faster
 runtime for slower compile and a 2× symbol table without materially
 beating thin LTO at these workloads.
 
+**v1 wrapper-attr posture.** Sky's `codegen_extern_wrapper` emits
+conservative ABI attrs on Sky exports — `sret`, `noalias`/`noundef`/
+`dereferenceable`/`align` where rustc's standard attr emission applies,
+nothing claimed about `readonly` / `captures(none)` (Phase P override
+returns `&[]` for `deduced_param_attrs` on Sky-tagged items, closing a
+silent-UB vector where rustc's MIR analysis on the `unreachable!()`
+stub would have wrongly inferred those attrs). The conservative posture
+is sufficient for v1 because Bench 1, Bench 4b, and the full Bench 3
+matrix show Sky's wrapper boundary inlines through under thin LTO for
+the bench-shaped workloads — LLVM has the full Sky body in its module
+pool and inlines aggressively, making per-call attr decoration moot.
+**v2 may revisit if profiling shows large-Sky-body workloads where the
+inliner DOESN'T fire** (bodies above LLVM's inlining cost threshold,
+panic=unwind builds with cleanup paths inhibiting inlining, etc.). The
+fix-path would be Sky's typechecker stamping ground-truth ABI attrs
+(`readonly`, `captures(none)`, `noalias`) at the wrapper based on
+explicit Sky-source-level mutability tracking, replacing Phase P's
+conservative default with a precise per-export answer. Track the
+option in handoff §Phase Q-adjacent; don't commit work to it without a
+bench showing the v1 conservative shape leaves measurable perf on the
+table.
+
 #### 22.4.1 Queries Sky touches and their cache policy
 
 Per the handoff's Decision 14 audit (2026-06-24): every Sky-overridden
@@ -4833,6 +4855,75 @@ Maintaining the invariant is a continuous discipline, not a one-time check. Thre
 Mismatch is a regression that blocks the toolchain release. The corpus is expanded as new threat patterns are identified.
 
 **This is the hardest invariant in the document.** Maintaining it requires that every change to Sky's startup, callback installation, and backend `init`/`provide` methods is reviewed against the pass-through requirement. Section 26 documents this as a cross-cutting invariant; new contributors learn to think about it before touching Sky's `init` paths.
+
+### 25.3.6 The reasoning-chains-must-be-discounted-against-empirical-surprises discipline
+
+Across the round-3 → round-4 → post-implementation arc (2026-06-23 →
+2026-06-25), **four silent-correctness bugs surfaced via empirical
+probing in code paths that prior reasoning had explicitly rationalized
+as correct**:
+
+1. **A.6 — the pre-Phase-E `mir_shims` override never fired.** Round 3
+   reviewed the override as live machinery worth simplifying. Phase A's
+   fixture pass found the override's lookup path never matched any
+   shipping test, so the "simplification" was replacing dead code with
+   live code — different framing, same correctness outcome but a
+   different reasoning baseline.
+
+2. **B10 — was Sky's emission bug, not LLVM's.** §25.2's original B10
+   entry framed this as "LLVM 21's bitcode writer drops FUNCTION
+   records under ABI-coerced extern call signatures." Round-4 prep's
+   empirical bench scaffolding surfaced the bug; investigation found
+   `push_arg_for_rust_call`'s `Direct` arm was emitting struct
+   aggregates where rustc's ABI declared scalars. LLVM was crashing on
+   our malformed IR; the root cause was our emission.
+
+3. **Bool accessor i1-storage.** While probing for a Phase R audit
+   finding (Site #8, sret-bridge alloca/load size mismatch), a fixture
+   with bool fields showed all-false output. Diagnosis: Sky's
+   synthesized `&self.bool_field` accessors lowered via `Ref(FieldAccess)`
+   load-realloc, returning a pointer to a fresh `alloca i1` whose
+   upper 7 bits are unspecified per LLVM IR semantics. Rust callers
+   reading `*&bool` as `i8` got undefined values. The fix had been
+   sitting in plain sight in rustc's source as the same correctness
+   pattern; we just didn't think to look until empirical work forced
+   the question.
+
+4. **IntLit widening on i64 zero stores.** While verifying whether
+   Bench 4's "Sky matches Rust at 0.1%" finding was real (it was loop-
+   fold artifact), disassembly inspection of the loop body revealed
+   `str wzr` (32-bit zero stores) for i64 struct fields initialized
+   with unsuffixed `0` literals. Diagnosis: toylang's type resolver
+   ignored the `_expected_ty` parameter (literally named with a leading
+   underscore because it had been treated as unused) when coercing
+   integer literals; field expressions stayed i32 when the field type
+   was i64; codegen emitted `store i32 0` to i64 slots, leaving upper
+   4 bytes uninitialized.
+
+**The pattern:** in three of the four cases, the bug existed in a code
+path that multi-agent reasoning, peer review, or design-doc walkthrough
+had explicitly confirmed correct. The reasoning was consistent with the
+code's stated behavior. The CODE itself was wrong in a way that didn't
+appear in the typed-AST view, the design doc, or the trait-level
+contract — only the IR-level disassembly or the runtime output exposed
+the divergence.
+
+**The discipline:** future phases must budget empirical-fixture work
+as load-bearing for catching premise errors, not just for confirming
+designed behavior. Build integration fixtures BEFORE writing the
+typechecker / codegen change those fixtures will validate. Use IR
+inspection (`llvm-dis`, disassembly) as a routine verification step
+when "the code looks right" but performance/correctness data is
+ambiguous. Discount any round-N reasoning chain against the rate of
+empirical surprises in prior rounds — the rate has been substantial
+enough through round 4 to be a planning input, not a footnote.
+
+This discipline is why Phase A (drop fixtures) preceded Phase E
+(mir_shims elimination), why Phase B (perf bench) preceded the §5.5
+lock, and why the next big design-arc work (Phase L's per-view ref
+types) is scheduled to build Send/Sync/'static integration fixtures
+first and the typechecker changes second. Trust the design only as
+far as the next empirical surprise lets you.
 
 ### 25.4 Mitigating factors
 

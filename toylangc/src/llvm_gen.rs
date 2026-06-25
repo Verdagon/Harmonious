@@ -2077,6 +2077,17 @@ fn lower_typed_expr<'ctx>(
         TypedExprKind::Ref(inner) => {
             // &expr — take a pointer to the inner expression.
             //
+            // **This is a CORRECTNESS fix, not an optimization** (reviewer
+            // round-4-followup note 2026-06-25). The natural-looking
+            // "alloca + store + return ptr" path is incorrect for any
+            // primitive type whose LLVM storage type's bit-padding bits are
+            // UNSPECIFIED — notably `i1` for `bool`, per LLVM's IR
+            // semantics. The fix returns the GEP pointer to the field's
+            // actual storage in the receiver struct, matching what rustc
+            // does for the same reason. Future readers MUST NOT "simplify"
+            // this back to the load-realloc shape — see the bool subtree
+            // below for the bit-level reasoning.
+            //
             // Special-case `&struct.field` for primitive-typed fields: the
             // FieldAccess primitive arm eagerly LOADS the field value (so
             // `let x = w.field` gets copy-by-value semantics). If we then

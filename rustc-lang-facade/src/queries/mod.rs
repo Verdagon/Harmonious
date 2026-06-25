@@ -65,7 +65,6 @@
 //! backend emits no `.o` symbol for them; the consumer's `fill_extra_modules`
 //! body (rustc fork patch 4) is the sole def at link time.
 
-pub mod codegen_fn_attrs;
 pub mod cross_crate_inlinable;
 pub mod deduce_param_attrs;
 // `drop_glue` module retired 2026-06-23 (Phase E — see module-level doc).
@@ -76,6 +75,21 @@ pub mod per_instance;
 // `upstream_monomorphization` module retired 2026-06-21 (A.2 retirement).
 // `codegen_fn_attrs` module retired 2026-06-22 (Option 4 retirement; see
 // arch §F.14.1 design history).
+// `codegen_fn_attrs` re-introduced 2026-06-25 (Phase Q) and RETIRED AGAIN
+// 2026-06-25 same day per reviewer's round-4-followup note: cargo enforces
+// panic-strategy consistency across the dep graph at build-graph resolution,
+// so the mixed-panic-strategy case Phase Q's NEVER_UNWIND flag defended
+// against is structurally impossible within Sky's tooling. Sky's
+// .skybuild/Cargo.toml pins panic=abort at the workspace root (§16.1);
+// cargo propagates to all members; mixed cases would fail at build-graph
+// resolution before any compile fires. Phase Q was a defensive correctness
+// no-op with no real failure mode. If Sky ever expands to support being
+// consumed by Rust users running pure-cargo workflows (§21.7 v2
+// precompiled-bodies story), the panic-strategy question reappears at the
+// cargo-package metadata layer (e.g. `package.required-features =
+// ["panic_abort"]`), NOT at the codegen-attr layer. Per Sky's "every
+// mechanism must be load-bearing" discipline, dead overrides incur
+// maintenance cost.
 
 /// Install query overrides. Called from `LangDriver::config`.
 pub fn lang_override_queries(
@@ -95,7 +109,6 @@ pub fn lang_override_queries(
         providers.queries.cross_crate_inlinable,
         providers.extern_queries.cross_crate_inlinable,
         providers.queries.deduced_param_attrs,
-        providers.queries.codegen_fn_attrs,
     );
 
     providers.queries.layout_of        = layout::lang_layout_of;
@@ -108,14 +121,6 @@ pub fn lang_override_queries(
     // a LIE → silent miscompile at -O2+. See the override module for the
     // full rationale.
     providers.queries.deduced_param_attrs = deduce_param_attrs::lang_deduced_param_attrs;
-    // Phase Q (2026-06-25, handoff §Phase Q): override `codegen_fn_attrs`
-    // to stamp `NEVER_UNWIND` on `#[toylang::emit_consumer_body]`-tagged
-    // items. Sky's panic=abort posture (arch §16.1) makes every Sky export
-    // genuinely never-unwind — LLVM applies `nounwind` at each Rust caller's
-    // call site, eliminating landing-pad emission. Significant under
-    // panic=unwind for tight callee-rich loops. See the override module
-    // for soundness rationale.
-    providers.queries.codegen_fn_attrs = codegen_fn_attrs::lang_codegen_fn_attrs;
     // `mir_shims` override retired 2026-06-23 (Phase E). Rustc's default
     // DropGlue path fires unchanged; per-type drop semantics come from
     // stub_gen-emitted Drop impl bridges + Sky drop fns via per_instance_mir.

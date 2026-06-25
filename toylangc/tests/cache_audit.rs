@@ -57,7 +57,8 @@ const EXPECTED_AUDIT_MARKERS: &[(&str, &str)] = &[
     ("partition.rs", "cache-audit:"),
     ("cross_crate_inlinable.rs", "cache-audit:"),
     ("deduce_param_attrs.rs", "cache-audit:"),
-    ("codegen_fn_attrs.rs", "cache-audit:"),
+    // `codegen_fn_attrs.rs` retired 2026-06-25 (Phase Q retirement; see
+    // `rustc-lang-facade/src/queries/mod.rs` header note).
 ];
 
 #[test]
