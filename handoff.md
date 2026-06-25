@@ -237,9 +237,16 @@ Status →
 
 **Bench 4 finding (key):** Sky's wrapper-boundary cost matches inlineable Rust at 0.1% delta for indirect-passed by-value structs. Path-b emission (Sky's ground-truth attrs at `codegen_extern_wrapper`) was the deferred perf recovery for Phase P's conservative `&[]` override; Bench 4 shows the gap is ~0 because LLVM inlines through Sky's wrapper at thin LTO. **Path-b is NOT measurably worth pursuing** for current Sky shapes. Phase P's safety override is sufficient. ⚠️ Caveat — Bench 4 may be artifactual; see "Session 2026-06-25 verification gaps" §7 below.
 
-**⚠️ IMPORTANT — read before next session:** Five of the six tasks shipped this session are **defensive correctness fixes whose trigger conditions are currently unreachable in toylang grammar**. They compile and pass existing tests but lack regression probes for the actual bugs they claim to close. See "Session 2026-06-25 verification gaps + suspected issues" below for the full list. The bool accessor fix is the only end-to-end verified bug fix.
+**⚠️ IMPORTANT — read before next session:** Of 9 verification gaps from this session's defensive correctness work, 5 are now closed via audit/IR-inspection + 4 remain genuinely blocked behind toylang grammar growth. Three silent-miscompile bug fixes were verified end-to-end (bool accessor, IntLit widening, B10 round-4). Path-b emission was de-prioritized after Bench 4b 20-run verification showed Sky-vs-Rust wrapper-boundary parity. See "Session 2026-06-25 verification gaps + suspected issues" below + "Follow-ups discovered during the continuation session" for unblocked open items (A1-A4).
 
-**Recommended ordering for next fresh-context session:** doc sweep (cheap, closes round-4 residuals) → Phase O drift CI fences (operational hygiene; protects the now-multiplied query overrides from rustc drift) → Phase G if iteration speed becomes the bottleneck. Re-probe the deferred items when toylang grammar growth makes their triggers reachable.
+**Recommended ordering for next fresh-context session:** 
+1. **A1 audit** (resolve_expr other arms for missing expected_ty coercion) — quick win; could surface more silent-miscompile bugs of the IntLit class. ~1 hour.
+2. **A2 rename** of misleading Bench 4 → bench4_artifactual_loopfold_only. ~half hour.
+3. **A3 Phase Q retire decision** — punt to user; cheap to ask, may simplify the override surface.
+4. **Doc sweep** (round-4 residuals: §22.4 reframe, §25.2 B10 rewrite, §15 dual-path para, lifecycle-traits registry).
+5. **Phase O drift CI fences** (operational hygiene; protects the now-multiplied query overrides from rustc drift).
+6. **Phase G** if iteration speed becomes the bottleneck.
+7. Re-probe Phase R deferred items when toylang grammar growth makes their triggers reachable.
 
 ---
 
@@ -2242,9 +2249,24 @@ This session shipped Phase P, Phase Q, Phase R (Sites #1/#5/#6/#8/#10), Bench 4,
 
 - ✅ **B10 round-4 fix** (yesterday, commit `3041ec8`) — 5 regression probes prove correctness.
 - ✅ **Bool accessor fix** (commit `736eeb5`) — `test_drop_bool_accessor_via_rust_caller` regression fixture proves correctness.
-- ✅ **All 7 commits compile cleanly + pass the existing 349 integration_projects + standalone tests** — no regressions introduced.
+- ✅ **IntLit widening fix** (commit `ae014d0`, found 2026-06-25 continuation) — `test_drop_intlit_widening_struct_field` regression fixture proves correctness; pre-fix Sky was emitting `store i32 0` to i64 fields silently.
+- ✅ **Phase P override** (commit `760b674`) — IR inspection of `bench4_largestruct_byval_thin` confirms attrs suppressed.
+- ✅ **Bench 4b Sky-vs-Rust parity** (post IntLit fix, 20-run sample) — inner loops byte-identical; trimmed-mean Sky 6505μs vs Rust 6658μs.
+- ✅ **All commits compile cleanly + pass 350 integration_projects + standalone tests** — no regressions introduced.
 
-The bool accessor fix is the only **end-to-end verified bug fix** this session. The rest is well-structured defensive code that should be re-probed when grammar growth makes the triggers reachable.
+Three real silent-miscompile bug fixes this session (yesterday's bool accessor, today's IntLit widening, yesterday's bool i1 accessor) — these would have shipped to users. Defensive correctness fixes (Phase P, Q, R Sites #1/#5/#6/#8/#10) remain unverified at their actual trigger conditions but the override+fix shapes are sound.
+
+### Follow-ups discovered during the continuation session
+
+These are open items found by the verification audit work itself; not blocked by grammar growth:
+
+- **A1. Audit other `resolve_expr` arms for missing `expected_ty` coercion.** The IntLit fix (commit `ae014d0`) added widen-against-expected_ty only to `Expr::IntLit`. Other arms (`BinaryOp`, `FnCall`, `MethodCall`, etc.) might have similar bugs where a sub-expression's actual type doesn't get coerced against the surrounding context's expected type. Concrete example to check: `let x: i64 = 1 + 2` where both literals default to i32 and the BinaryOp result is i32 stored into i64 — would produce `store i32` to i64 slot. **Audit:** search all arms of `resolve_expr` for ignored `expected_ty` and probe each. ~1 hour audit + targeted fixtures.
+
+- **A2. Bench 4 (original, non-`4b` variant) is now misleading.** Original Bench 4 measures loop overhead (LLVM folds the inner loop entirely). Bench 4b is the meaningful measurement. Three options: (a) delete Bench 4 + keep Bench 4b as the canonical measurement; (b) keep both and rename Bench 4 → `bench4_artifactual_loopfold_only` to make the limitation explicit; (c) keep both with cross-references in headers. Recommend (b) so the historical context survives but readers can't accidentally cite the wrong number. ~half hour rename + doc update.
+
+- **A3. Phase Q effective-no-op under uniform panic=abort suggests Phase Q could be RETIRED.** The interaction audit found that `fn_can_unwind`'s `panic_strategy().unwinds()` check makes Phase Q's `NEVER_UNWIND` flag redundant for uniform panic=abort builds (Sky's typical case). Phase Q only matters for mixed-strategy interop. **Open question:** is mixed-strategy interop a real use case Sky needs to support? If yes, Phase Q stays. If no, Phase Q can retire (the cleanup arc: less query override surface, smaller rmeta payload, fewer drift surfaces in Phase O). Punt to user decision; not blocking.
+
+- **A4. The 20-run Bench 4b sample suggests the test_widgets `#[inline]` helpers may not actually be inlining.** Looking at the trimmed means (Sky 6505 vs Rust 6658), Rust was slightly SLOWER than Sky. With byte-identical inner loops, that suggests something outside the loop differs slightly. Cache layout? Function alignment? Not pursuing because the gap is within noise, but worth noting as a curiosity for whoever next looks at perf benches.
 
 ---
 
