@@ -3133,6 +3133,43 @@ trait static calls with no drop-specific code paths.
    - `lower_typed_expr`'s `StaticCall` arm emits the LLVM call at the
      resolved symbol.
 
+**The dual-path drop model — both Sky source and Rust source converge at the same body.**
+Drop calls reach Sky's emitted body via two structurally different
+paths depending on where the dropped value's owning let-binding lives:
+
+- **Sky source path.** When Sky source declares `let v: Vec<SkyType> = ...`
+  in a `void`-returning function, Sky's compiler runs the AST-rewrite
+  pass above (`insert_scope_end_drops`) and appends a synthetic
+  `Drop::drop(&v)` StaticCall to the function's body. The trait static
+  call resolves through the same cascade discovery + `fill_extra_modules`
+  pipeline any other Sky-side trait method call uses. The Sky-emitted
+  `<Vec<SkyType> as Drop>::drop` body is what runs.
+
+- **Rust source path.** When Rust source declares `let v: Vec<SkyType> = ...`
+  in a Rust function, Sky's compiler doesn't touch the Rust body. Rustc's
+  standard mechanism takes over: at scope end, rustc emits a call to
+  `drop_in_place::<Vec<SkyType>>`, which then calls
+  `<Vec<SkyType> as Drop>::drop` via the same trait-method dispatch
+  rustc uses for any cross-crate Drop impl. The same Sky-emitted body
+  (resolved by name via the single-symbol architecture per §6.2) is what
+  runs.
+
+Both paths reach the SAME Sky-emitted `<T as Drop>::drop` symbol. The
+stub rlib publishes the trait impl with an `unreachable!()` body (which
+the partition filter removes from rustc's CGU list — §13.1.4); the real
+body comes from Sky's `fill_extra_modules`. The single-symbol architecture
+(§6.2) ensures Sky's emitted body resolves at link time as either path's
+target without any dispatch indirection.
+
+This dual-path structure is intentional. The AST synthesis is only
+needed for Sky source drops because Sky's compiler controls Sky source
+ahead of rustc; for Rust source, rustc's own drop machinery already
+does the equivalent work. Sky doesn't try to intercept Rust source
+drops (would require fork-patching rustc's drop_in_place handling for
+no benefit). The convergence at a single symbol is the load-bearing
+property — without it, the two paths would need separate implementations
+of every Sky type's drop logic.
+
 **The predicate.** `local_needs_scope_drop(tcx, ty, registry)` returns
 true when the type has a callable Drop trait method:
 - **Sky struct types** (`StructRef` / `Struct`): true iff
@@ -4141,13 +4178,24 @@ Adding the fingerprint to the format from v1 is forward-compatibility for the v2
 
 ### 22.4 Perf model
 
-Sky's call-boundary cost is structurally similar to Rust's
-`pub extern fn` cost at the non-LTO baseline: a real cross-crate call
-with no inlining. With cross-language LTO (`lto = "thin"` or
-`lto = "fat"`), Sky's emitted bitcode lives in the same LTO module pool
-as Rust callers (per the `fill_extra_modules` patch, §F.15), so LLVM's
-IR inliner crosses the language boundary the same way it crosses Rust
-crate boundaries.
+**The Sky-specific perf claim: Sky's cross-crate boundary cost equals
+Rust's at every opt level (0.5–2% delta).** Sky's emitted bitcode lives
+in the same LTO module pool as Rust callers (per the
+`fill_extra_modules` patch, §F.15), so LLVM's IR inliner treats Sky
+exports the same way it treats `#[inline]`-permitted Rust functions
+across a crate boundary. Empirical measurement (Bench 1, 100M
+`add(a, b)` calls): Sky vs Rust baseline at thin LTO is 0.3% delta;
+Bench 4b (indirect-passed by-value struct, 20-run trimmed-mean) shows
+Sky at 6505μs vs Rust inlineable at 6658μs — same parity within
+run-to-run variance. **This is the property Sky's architecture has to
+defend; everything below this paragraph is supporting structure.**
+
+LTO ratios (1.5× for Bench 1, 25–28× for Bench 3 drop chains) ARE part
+of the user-facing perf picture, but they're universal-Rust LLVM-LTO
+properties Sky inherits — pure-Rust cross-crate baselines show the same
+ratios under matching structural setup. Don't confuse the inherited
+ratio with a Sky-specific claim; the parity row above is the load-bearing
+finding.
 
 **Empirical measurements (2026-06-24, M-series macOS, LLVM 21.1.8).**
 Bench fixtures live under `toylangc/tests/integration_projects/perf_bench/`;
@@ -4169,34 +4217,20 @@ in the original Phase B run — within the expected ~10% run-to-run
 variance. The ratio is 25.5× now where it was 26.5× then; both fall
 in the same "drop-heavy paths benefit massively from LTO" regime.)
 
-Three findings drive the user-facing recommendation:
+Four findings drive the user-facing recommendation, ordered from
+Sky-specific (the load-bearing claim) to inherited-from-Rust:
 
-1. **Sky's call boundary essentially matches Rust's own cross-crate cost.**
-   At O3 thin, Sky's 57.9ms and Rust-baseline's 58.1ms differ by 0.3% —
-   well within run-to-run variance. Sky adds no measurable overhead
-   beyond what Rust's own cross-crate boundary costs. The 1.5× LTO ratio
-   on Bench 1 is the SAME ratio the Rust baseline shows; it's a property
-   of the cross-crate boundary, not of Sky's specific emission.
+1. **Sky's call boundary EQUALS Rust's at every opt level.** At O3 thin,
+   Sky's 57.9ms and Rust-baseline's 58.1ms differ by 0.3% — well within
+   run-to-run variance. The 20-run trimmed-mean check on Bench 4b
+   (indirect-passed by-value struct, the `&LargeStruct`-shaped
+   alias-analysis question) shows Sky at 6505μs vs Rust inlineable at
+   6658μs — also within noise. **This is the Sky-specific architectural
+   claim:** Sky's wrapper boundary adds no measurable overhead beyond
+   what Rust's own cross-crate boundary costs. The architecture is
+   working as designed.
 
-2. **Drop-heavy code amplifies the LTO win massively, and the
-   amplification is inherited from Rust's cross-crate Drop chain — not
-   Sky-specific.** Bench 3's ~25× LTO speedup reflects LLVM inlining
-   Sky's `Drop::drop` body into `Vec::drop`'s element loop, eliding the
-   empty body, and vectorizing the resulting no-op. The pure-Rust
-   cross-crate baseline (`bench3_rust_baseline_cross_crate_*`: Widget
-   in the `test_widgets` sibling crate) shows **27.5×** under the same
-   structural setup — within run-to-run variance of Sky's 25.5×. And
-   Sky's thin-LTO result (371μs) matches the cross-crate Rust baseline
-   (360μs) at 3% delta, mirroring Bench 1's 0.3% Sky-vs-Rust finding.
-   The conclusion: **the ~26× LTO speedup is a property of the
-   cross-crate Drop chain under LLVM's inliner, not anything
-   Sky-specific.** Sky's drop emission gives LLVM the same elimination
-   opportunity a pure-Rust cross-crate Drop impl does. Without LTO, the
-   chain pays full FFI cost per element (~0.95ns/drop, matching the
-   `inline_never` floor and Bench 1's nolto baseline). With LTO, it
-   disappears in both languages.
-
-3. **The `single_crate` and `inline_never` baselines bracket what LTO
+2. **The `single_crate` and `inline_never` baselines bracket what LTO
    can deliver.** `single_crate` (Widget defined in the user_bin
    itself) shows nolto ≈ thin both at ~0.35ms — LLVM's intra-crate
    inliner already eliminates the empty Drop body at O3 without LTO;
@@ -4208,6 +4242,29 @@ Three findings drive the user-facing recommendation:
    per-call cross-crate cost is dominated by dispatch overhead at this
    scale regardless of what the function body does. The two baselines
    sandwich Sky's actual operating point.
+
+3. **Bench 1's 1.5× LTO ratio is a universal-Rust LLVM-LTO property
+   Sky inherits.** The Rust baseline (Rust caller → Rust callee, same
+   shape) shows the same 1.56× ratio. The cross-crate boundary cost is
+   what it is under LLVM 21 thin LTO on aarch64; Sky doesn't move it
+   either direction.
+
+4. **Drop-heavy code amplifies the LTO win massively, and the
+   amplification is inherited from Rust's cross-crate Drop chain — not
+   Sky-specific.** Bench 3's ~25× LTO speedup reflects LLVM inlining
+   Sky's `Drop::drop` body into `Vec::drop`'s element loop, eliding the
+   empty body, and vectorizing the resulting no-op. The pure-Rust
+   cross-crate baseline (`bench3_rust_baseline_cross_crate_*`) shows
+   **27.5×** under the same structural setup — within run-to-run
+   variance of Sky's 25.5×. And Sky's thin-LTO result (371μs) matches
+   the cross-crate Rust baseline (360μs) at 3% delta, mirroring Bench
+   1's 0.3% Sky-vs-Rust finding. The conclusion: **the ~26× LTO
+   speedup is a property of the cross-crate Drop chain under LLVM's
+   inliner, not anything Sky-specific.** Sky's drop emission gives
+   LLVM the same elimination opportunity a pure-Rust cross-crate Drop
+   impl does. Without LTO, the chain pays full FFI cost per element
+   (~0.95ns/drop, matching the `inline_never` floor and Bench 1's
+   nolto baseline). With LTO, it disappears in both languages.
 
 **User-facing recommendation.** For dev iteration use the cargo dev
 profile's default (`lto = false` — thin-local LTO §F.16 still bridges

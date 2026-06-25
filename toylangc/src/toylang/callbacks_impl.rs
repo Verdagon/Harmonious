@@ -1568,17 +1568,58 @@ pub fn compute_internal_symbol_from_type_args(
 /// is `tcx.adt_destructor`-equivalent via lang-item lookup.
 ///
 /// Everything else (primitives, refs, unsized, type params): no.
+/// Lifecycle traits — traits whose methods Sky's compiler auto-synthesizes
+/// at specific code positions. Each entry maps a trait short-name to the
+/// method name + the AST node Sky must construct to invoke it.
+///
+/// Currently Drop is the only entry. Future additions (e.g., a comptime
+/// `Init` trait for placement construction, a `SkyDrop` marker for linear
+/// types, an async-Drop variant) extend by adding one entry — the
+/// synthesis pass itself never branches on which trait we're handling
+/// (per the reviewer's round-4-close note: "generalize the surface to
+/// 'lifecycle traits' rather than treating Drop as a one-off").
+///
+/// The Drop's scope-end-insertion policy lives in
+/// `insert_scope_end_drops`; other lifecycle traits would have their own
+/// synthesis-site policies (e.g., Init would synth after struct
+/// construction, not at scope end). When that diversity becomes real,
+/// promote this slice to a struct with a `LifecycleSite` variant per
+/// entry. For v1 with only Drop, the flat slice is sufficient.
+pub const LIFECYCLE_TRAITS: &[LifecycleTrait] = &[LifecycleTrait {
+    trait_name: "Drop",
+    method_name: "drop",
+}];
+
+#[derive(Copy, Clone, Debug)]
+pub struct LifecycleTrait {
+    pub trait_name: &'static str,
+    pub method_name: &'static str,
+}
+
+/// Look up a lifecycle trait by short-name. Returns `Some(entry)` if the
+/// given trait participates in Sky's auto-synthesis machinery. Used by
+/// the scope-end-drop synthesis to gate which trait impls are eligible.
+pub fn lifecycle_trait_by_name(trait_name: &str) -> Option<&'static LifecycleTrait> {
+    LIFECYCLE_TRAITS.iter().find(|lt| lt.trait_name == trait_name)
+}
+
 fn local_needs_scope_drop<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: &crate::toylang::typed_ast::ResolvedType,
     registry: &ToylangRegistry,
 ) -> bool {
     use crate::toylang::typed_ast::ResolvedType;
+    // Scope-end drop is currently the only lifecycle-trait insertion
+    // policy. When others land, this predicate will gain a `site`
+    // parameter and iterate matching entries.
+    let Some(drop_lt) = lifecycle_trait_by_name("Drop") else {
+        return false;
+    };
     match ty {
         ResolvedType::StructRef { name, .. }
         | ResolvedType::Struct { name, .. } => {
             registry.trait_impls.iter().any(|imp| {
-                imp.trait_name == "Drop" && &imp.self_type_name == name
+                imp.trait_name == drop_lt.trait_name && &imp.self_type_name == name
             })
         }
         ResolvedType::RustType { .. } => {
@@ -1611,6 +1652,13 @@ fn synth_scope_drop_call(
     ty: &crate::toylang::typed_ast::ResolvedType,
 ) -> crate::toylang::typed_ast::TypedStmt {
     use crate::toylang::typed_ast::*;
+    // Synthesis pulls the trait + method name from the lifecycle
+    // registry rather than hardcoding "Drop" / "drop". When other
+    // lifecycle traits land (Init, SkyDrop, AsyncDrop), this becomes
+    // a parameter; for v1 with only Drop, the registry lookup is the
+    // single point of trait-name truth.
+    let drop_lt = lifecycle_trait_by_name("Drop")
+        .expect("Drop must be registered as a lifecycle trait");
     let var = TypedExpr {
         kind: TypedExprKind::Var(name.to_string()),
         ty: ty.clone(),
@@ -1621,8 +1669,8 @@ fn synth_scope_drop_call(
     };
     let drop_call = TypedExpr {
         kind: TypedExprKind::StaticCall {
-            ty: "Drop".to_string(),
-            method: "drop".to_string(),
+            ty: drop_lt.trait_name.to_string(),
+            method: drop_lt.method_name.to_string(),
             type_args: vec![],
             args: vec![ref_to_var],
         },
