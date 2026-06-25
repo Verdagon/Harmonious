@@ -442,7 +442,7 @@ mod tests {
 
     use crate::toylang::ast::{BinOp, Block, Expr, Stmt};
     use crate::toylang::registry::{ToyField, ToyFunction, ToyParam, ToyStruct, ToylangRegistry};
-    use crate::toylang::typed_ast::ResolvedType;
+    use crate::toylang::typed_ast::SourceType;
 
     fn sample_registry() -> ToylangRegistry {
         let mut registry = ToylangRegistry::default();
@@ -454,7 +454,7 @@ mod tests {
                 type_params: vec![],
                 fields: vec![ToyField {
                     name: "id".to_string(),
-                    rust_type: ResolvedType::I32,
+                    rust_type: SourceType::I32,
                 }],
             },
         );
@@ -465,11 +465,11 @@ mod tests {
                 fields: vec![
                     ToyField {
                         name: "first".to_string(),
-                        rust_type: ResolvedType::TypeParam("A".to_string()),
+                        rust_type: SourceType::TypeParam("A".to_string()),
                     },
                     ToyField {
                         name: "second".to_string(),
-                        rust_type: ResolvedType::TypeParam("B".to_string()),
+                        rust_type: SourceType::TypeParam("B".to_string()),
                     },
                 ],
             },
@@ -481,16 +481,16 @@ mod tests {
                 is_export: false,
                 params: vec![ToyParam {
                     name: "x".to_string(),
-                    ty: ResolvedType::TypeParam("T".to_string()),
+                    ty: SourceType::TypeParam("T".to_string()),
                 }],
-                return_ty: Some(ResolvedType::TypeParam("T".to_string())),
+                return_ty: Some(SourceType::TypeParam("T".to_string())),
                 body: Some(Block {
                     stmts: vec![Stmt::Let {
                         name: "y".to_string(),
                         expr: Expr::BinaryOp {
                             op: BinOp::Add,
                             left: Box::new(Expr::Var("x".to_string())),
-                            right: Box::new(Expr::IntLit(1, ResolvedType::I32)),
+                            right: Box::new(Expr::IntLit(1, SourceType::I32)),
                         },
                     }],
                     ret: Some(Expr::Var("y".to_string())),

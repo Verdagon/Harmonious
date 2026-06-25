@@ -18,24 +18,28 @@ pub enum BinOp {
 }
 
 /// A Toylang expression.
+///
+/// Two-enum split (2026-06-25): `type_args` slots carry [`SourceType`]
+/// because the parser produces them. Promotion to `ResolvedType` happens
+/// during type resolution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum Expr {
-    IntLit(i64, crate::toylang::typed_ast::ResolvedType),
+    IntLit(i64, crate::toylang::typed_ast::SourceType),
     BoolLit(bool),
     StringLit(String),
     ByteStringLit(Vec<u8>),
     Var(String),
     /// `Vec::new<Point>()` — IDENT "::" IDENT "<" type_args ">" "(" args ")"
-    StaticCall { ty: String, method: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, args: Vec<Expr> },
+    StaticCall { ty: String, method: String, type_args: Vec<crate::toylang::typed_ast::SourceType>, args: Vec<Expr> },
     /// `v.push(x)` — expr "." IDENT "(" args ")"
     MethodCall { receiver: Box<Expr>, method: String, args: Vec<Expr> },
     /// `p.x` — expr "." IDENT
     FieldAccess { receiver: Box<Expr>, field: String },
     /// `Point { x: 1, y: 2 }` or `Pair<i32, i64> { first: 1, second: 2i64 }`
-    StructLit { name: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, fields: Vec<(String, Expr)> },
+    StructLit { name: String, type_args: Vec<crate::toylang::typed_ast::SourceType>, fields: Vec<(String, Expr)> },
     /// `wrap<i32>(x)` — IDENT "<" type_args ">" "(" args ")"
-    FnCall { name: String, type_args: Vec<crate::toylang::typed_ast::ResolvedType>, args: Vec<Expr> },
+    FnCall { name: String, type_args: Vec<crate::toylang::typed_ast::SourceType>, args: Vec<Expr> },
     /// `a + b`, `x * 2`
     BinaryOp { op: BinOp, left: Box<Expr>, right: Box<Expr> },
     /// `if cond { ... } else { ... }` — expression (like Rust)

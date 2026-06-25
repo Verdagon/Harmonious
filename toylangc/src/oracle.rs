@@ -37,19 +37,20 @@ pub enum RustTypeLookupContext {
     // not a user-facing error. See `UnresolvedRustType::is_deferred`.
     //
     // `query` is a human-readable description of which query was deferred,
-    // e.g. "trait call `Clone::clone`", "inherent method `Vec::push`",
-    // "free function `wrap`", "method `.clone()` on receiver containing
-    // TypeParam". Used in the Display impl for diagnostics if this ever leaks
-    // past `is_deferred()`.
-    DeferredTypeParam { query: String },
+    // Two-enum split + sunny-karp (2026-06-25): the `DeferredTypeParam`
+    // variant retired — the oracle no longer defers on Param-bearing args.
+    // `caller_type_params` threads the surrounding fn's type params through
+    // every query so `try_source_to_rustc_ty` rebuilds `ty::Ty::new_param`
+    // directly.
 }
 
 impl UnresolvedRustType {
-    /// True iff this error should be silently skipped at the eager-typecheck
-    /// pass because resolution depends on concrete args only known at the
-    /// per-Instance substituted pass.
+    /// Two-enum split (2026-06-25): no oracle path now returns a deferred
+    /// error, so this always returns `false`. Retained as a vestigial API
+    /// for the closures' `is_deferred()` arms in `after_rust_analysis`;
+    /// callers that want to retire the closure arms can delete those too.
     pub fn is_deferred(&self) -> bool {
-        matches!(self.context, RustTypeLookupContext::DeferredTypeParam { .. })
+        false
     }
 }
 
@@ -72,8 +73,6 @@ impl std::fmt::Display for RustTypeLookupContext {
                 write!(f, "as trait name in trait call `::{}`", method),
             Self::TraitMethodName { trait_name } =>
                 write!(f, "as method name on trait `{}`", trait_name),
-            Self::DeferredTypeParam { query } =>
-                write!(f, "as TypeParam in {} (deferred to substituted pass)", query),
         }
     }
 }
@@ -99,7 +98,7 @@ use rustc_span::def_id::DefId;
 // swallowed the deferred error and the typed AST was discarded, then re-run
 // from scratch at every per-Instance mono. The shortcut was implementation
 // laziness from the Approach A migration — `tcx.fn_sig(...).instantiate(...)`
-// accepts Param-bearing args and `rustc_ty_to_resolved_type` already converts
+// accepts Param-bearing args and `rustc_ty_to_source_type` already converts
 // `TyKind::Param` → `ResolvedType::TypeParam`. The current path threads the
 // caller's `type_params: &[String]` through `try_resolved_to_rustc_ty`; the
 // `TypeParam` arm rebuilds `ty::Ty::new_param(tcx, idx, name)` using the
@@ -245,8 +244,9 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
         ResolvedType::Bool => Ok(tcx.types.bool),
         ResolvedType::Usize => Ok(tcx.types.usize),
         ResolvedType::Void => Ok(tcx.types.unit),
-        ResolvedType::StructRef { name, type_args }
-        | ResolvedType::Struct { name, type_args, .. } => {
+        ResolvedType::Struct { name, type_args, .. } => {
+            // Two-enum split (2026-06-25): `field_types` is ignored here —
+            // rustc gets the ADT def + type args; field info is layout-side.
             let def_id = find_local_struct_def_id(tcx, name)
                 .unwrap_or_else(|| panic!("struct '{}' not found", name));
             let adt_def = tcx.adt_def(def_id);
@@ -258,7 +258,7 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
         }
         ResolvedType::RustType { name, type_args } => {
             // Primitive types that appear as type args in Rust generics
-            // (e.g., Option<u8>) are mapped to RustType by rustc_ty_to_resolved_type.
+            // (e.g., Option<u8>) are mapped to RustType by rustc_ty_to_source_type.
             // Convert them back to rustc primitives here.
             match name.as_str() {
                 "u8" => return Ok(tcx.types.u8),
@@ -289,13 +289,13 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
             Ok(ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty))
         }
         // Per @UTAIRZ, Str and ByteSlice round-trip through rustc identically;
-        // reverse maps at `rustc_ty_to_resolved_type` produce the matching variants.
+        // reverse maps at `rustc_ty_to_source_type` produce the matching variants.
         ResolvedType::Str => Ok(tcx.types.str_),
         ResolvedType::ByteSlice => Ok(ty::Ty::new_slice(tcx, tcx.types.u8)),
         ResolvedType::TypeParam(name) => {
             // Sunny-karp: rebuild rustc's `ParamTy` from the caller fn's
             // type-param list. The index is the param's position in the
-            // surrounding fn's generics; `rustc_ty_to_resolved_type`
+            // surrounding fn's generics; `rustc_ty_to_source_type`
             // round-trips this back to `TypeParam(name)` via the param's
             // name field. When `caller_type_params` is empty (post-mono /
             // codegen call sites), a TypeParam reaching here is a
@@ -321,78 +321,283 @@ pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::
         .unwrap_or_else(|e| panic!("{}", e))
 }
 
-/// Convert a rustc `Ty<'tcx>` to a `ResolvedType`. Inverse of `resolved_to_rustc_ty`.
-pub fn rustc_ty_to_resolved_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> crate::toylang::typed_ast::ResolvedType {
-    use crate::toylang::typed_ast::ResolvedType;
+/// Two-enum split (2026-06-25) — sibling of `try_resolved_to_rustc_ty`
+/// operating on `SourceType`. Used by the oracle queries that take
+/// `&[SourceType]` for type args. The arms mirror the resolved variant's
+/// structurally; `SourceType::StructRef` produces an ADT exactly as the
+/// resolved-shape `Struct` arm would (rustc only needs the ADT def +
+/// args; field info is layout-side).
+pub fn try_source_to_rustc_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    src: &crate::toylang::typed_ast::SourceType,
+    context: &RustTypeLookupContext,
+    caller_type_params: &[String],
+) -> Result<ty::Ty<'tcx>, UnresolvedRustType> {
+    use crate::toylang::typed_ast::SourceType;
+    match src {
+        SourceType::I32 => Ok(tcx.types.i32),
+        SourceType::I64 => Ok(tcx.types.i64),
+        SourceType::F64 => Ok(tcx.types.f64),
+        SourceType::Bool => Ok(tcx.types.bool),
+        SourceType::Usize => Ok(tcx.types.usize),
+        SourceType::Void => Ok(tcx.types.unit),
+        SourceType::StructRef { name, type_args } => {
+            let def_id = find_local_struct_def_id(tcx, name)
+                .unwrap_or_else(|| panic!("struct '{}' not found", name));
+            let adt_def = tcx.adt_def(def_id);
+            let nested = RustTypeLookupContext::NestedGenericArg { parent_type: name.clone() };
+            let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                .map(|ta| Ok(ty::GenericArg::from(try_source_to_rustc_ty(tcx, ta, &nested, caller_type_params)?)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args)))
+        }
+        SourceType::RustType { name, type_args } => {
+            match name.as_str() {
+                "u8" => return Ok(tcx.types.u8),
+                "u16" => return Ok(tcx.types.u16),
+                "u32" => return Ok(tcx.types.u32),
+                "u64" => return Ok(tcx.types.u64),
+                "i8" => return Ok(ty::Ty::new_int(tcx, ty::IntTy::I8)),
+                "i16" => return Ok(ty::Ty::new_int(tcx, ty::IntTy::I16)),
+                "f32" => return Ok(ty::Ty::new_float(tcx, ty::FloatTy::F32)),
+                _ => {}
+            }
+            let def_id = find_rust_type_def_id(tcx, name)
+                .ok_or_else(|| UnresolvedRustType {
+                    name: name.clone(),
+                    context: context.clone(),
+                })?;
+            let adt_def = tcx.adt_def(def_id);
+            let nested = RustTypeLookupContext::NestedGenericArg { parent_type: name.clone() };
+            let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
+                .map(|ta| Ok(ty::GenericArg::from(try_source_to_rustc_ty(tcx, ta, &nested, caller_type_params)?)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args)))
+        }
+        SourceType::Ref { inner } => {
+            let inner_ty = try_source_to_rustc_ty(tcx, inner, context, caller_type_params)?;
+            Ok(ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty))
+        }
+        SourceType::Str => Ok(tcx.types.str_),
+        SourceType::ByteSlice => Ok(ty::Ty::new_slice(tcx, tcx.types.u8)),
+        SourceType::TypeParam(name) => {
+            let idx = caller_type_params.iter().position(|p| p == name)
+                .unwrap_or_else(|| panic!(
+                    "TypeParam '{}' not found in caller_type_params {:?} — \
+                     either the caller fn's type-param list was not threaded \
+                     through, or substitution missed this Param",
+                    name, caller_type_params,
+                ));
+            Ok(ty::Ty::new_param(tcx, idx as u32, rustc_span::Symbol::intern(name)))
+        }
+    }
+}
+
+/// Panicking convenience wrapper for `try_source_to_rustc_ty`.
+pub fn source_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, src: &crate::toylang::typed_ast::SourceType) -> ty::Ty<'tcx> {
+    try_source_to_rustc_ty(tcx, src, &RustTypeLookupContext::Codegen, &[])
+        .unwrap_or_else(|e| panic!("{}", e))
+}
+
+/// Convert a rustc `Ty<'tcx>` to a parser-shape `SourceType`. Inverse of
+/// `try_source_to_rustc_ty`.
+///
+/// Two-enum split (2026-06-25): rustc hands us "a name + args" with no field
+/// info available without the registry, so the natural mapping is into
+/// `SourceType` (parser-shape). Callers that need a `ResolvedType` chain
+/// through [`resolve_source_type`] to promote.
+pub fn rustc_ty_to_source_type<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> crate::toylang::typed_ast::SourceType {
+    use crate::toylang::typed_ast::SourceType;
     use rustc_middle::ty::TyKind;
     match ty.kind() {
         TyKind::Int(int_ty) => match int_ty {
-            ty::IntTy::I32 => ResolvedType::I32,
-            ty::IntTy::I64 => ResolvedType::I64,
-            // Unsupported as toylang primitives but may appear as type args in
-            // Rust generic types (e.g., HashMap<i8, ...>). Map to opaque RustType.
-            other => ResolvedType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
+            ty::IntTy::I32 => SourceType::I32,
+            ty::IntTy::I64 => SourceType::I64,
+            other => SourceType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
         },
         TyKind::Uint(uint_ty) => match uint_ty {
-            ty::UintTy::Usize => ResolvedType::Usize,
-            other => ResolvedType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
+            ty::UintTy::Usize => SourceType::Usize,
+            other => SourceType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
         },
         TyKind::Float(float_ty) => match float_ty {
-            ty::FloatTy::F64 => ResolvedType::F64,
-            other => ResolvedType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
+            ty::FloatTy::F64 => SourceType::F64,
+            other => SourceType::RustType { name: format!("{}", other.name_str()), type_args: vec![] },
         },
-        TyKind::Bool => ResolvedType::Bool,
-        TyKind::Tuple(tys) if tys.is_empty() => ResolvedType::Void,
-        TyKind::Ref(_, inner, _) => ResolvedType::Ref {
-            inner: Box::new(rustc_ty_to_resolved_type(tcx, *inner)),
+        TyKind::Bool => SourceType::Bool,
+        TyKind::Tuple(tys) if tys.is_empty() => SourceType::Void,
+        TyKind::Ref(_, inner, _) => SourceType::Ref {
+            inner: Box::new(rustc_ty_to_source_type(tcx, *inner)),
         },
         TyKind::Adt(adt_def, args) => {
             let name = tcx.item_name(adt_def.did()).to_string();
-            let type_args: Vec<ResolvedType> = args.iter()
+            let type_args: Vec<SourceType> = args.iter()
                 .filter_map(|a| match a.kind() {
-                    ty::GenericArgKind::Type(t) => Some(rustc_ty_to_resolved_type(tcx, t)),
+                    ty::GenericArgKind::Type(t) => Some(rustc_ty_to_source_type(tcx, t)),
                     _ => None,
                 })
                 .collect();
-            // Check if this is a toylang struct (defined in __lang_stubs)
             if rustc_lang_facade::is_from_lang_stubs(tcx, adt_def.did()) {
-                ResolvedType::StructRef { name, type_args }
+                SourceType::StructRef { name, type_args }
             } else {
-                ResolvedType::RustType { name, type_args }
+                SourceType::RustType { name, type_args }
             }
         }
-        // Per @UTAIRZ, TyKind::Slice(u8) reverse-maps to ByteSlice, matching the
-        // forward map in `try_resolved_to_rustc_ty`.
         TyKind::Slice(elem_ty) => {
             if matches!(elem_ty.kind(), TyKind::Uint(ty::UintTy::U8)) {
-                ResolvedType::ByteSlice
+                SourceType::ByteSlice
             } else {
-                panic!("rustc_ty_to_resolved_type: unsupported slice element type {:?}", elem_ty)
+                panic!("rustc_ty_to_source_type: unsupported slice element type {:?}", elem_ty)
             }
         }
-        // Types that may appear as type args in Rust generic types (e.g., inside
-        // Result<(), Error> or HashMap internals). Toylang never inspects these —
-        // they pass through as opaque RustType values.
-        // Per @UTAIRZ, TyKind::Str reverse-maps to Str — NOT to RustType "str"
-        // (which would break type equality with the Ref-wrapped literal).
-        TyKind::Str => ResolvedType::Str,
-        TyKind::Never => ResolvedType::RustType { name: "never".to_string(), type_args: vec![] },
-        TyKind::RawPtr(inner, _) => ResolvedType::RustType {
+        TyKind::Str => SourceType::Str,
+        TyKind::Never => SourceType::RustType { name: "never".to_string(), type_args: vec![] },
+        TyKind::RawPtr(inner, _) => SourceType::RustType {
             name: "raw_ptr".to_string(),
-            type_args: vec![rustc_ty_to_resolved_type(tcx, *inner)],
+            type_args: vec![rustc_ty_to_source_type(tcx, *inner)],
         },
-        TyKind::Dynamic(..) => ResolvedType::RustType { name: "dyn_trait".to_string(), type_args: vec![] },
-        TyKind::Tuple(tys) => ResolvedType::RustType {
+        TyKind::Dynamic(..) => SourceType::RustType { name: "dyn_trait".to_string(), type_args: vec![] },
+        TyKind::Tuple(tys) => SourceType::RustType {
             name: "tuple".to_string(),
-            type_args: tys.iter().map(|t| rustc_ty_to_resolved_type(tcx, t)).collect(),
+            type_args: tys.iter().map(|t| rustc_ty_to_source_type(tcx, t)).collect(),
         },
-        // Type parameters surface here under the `optimized_mir` override path
-        // (stage-3 migration): rustc hands us a generic consumer body whose
-        // Params are placeholders the collector substitutes per caller. We
-        // represent them as `TypeParam(name)` and round-trip via the
-        // thread-local param_map installed in `collect_generic_rust_deps_inner`.
-        TyKind::Param(p) => ResolvedType::TypeParam(p.name.to_string()),
-        _ => panic!("rustc_ty_to_resolved_type: unsupported type {:?}", ty),
+        TyKind::Param(p) => SourceType::TypeParam(p.name.to_string()),
+        _ => panic!("rustc_ty_to_source_type: unsupported type {:?}", ty),
+    }
+}
+
+/// Two-enum split (2026-06-25) — the promotion fn. `SourceType` →
+/// `ResolvedType`: look up Sky struct fields (recursively), substitute
+/// `type_args` into each field's declared type, and produce a `Struct`
+/// with `field_types` populated.
+///
+/// Replaces the old `type_resolve::resolve_struct_fields` which operated
+/// on a `ResolvedType` carrying mixed shapes. Under the split, only
+/// `SourceType` can be promoted; `ResolvedType` is already fully resolved.
+///
+/// `caller_type_params` carries in-scope type-param names so any
+/// `SourceType::TypeParam(name)` survives promotion as
+/// `ResolvedType::TypeParam(name)` — promotion doesn't substitute Params,
+/// it only resolves struct fields. (Param substitution is a separate concern
+/// handled by `substitute_type_params` and friends at mono time.)
+pub fn resolve_source_type(
+    src: &crate::toylang::typed_ast::SourceType,
+    registry: &crate::toylang::registry::ToylangRegistry,
+) -> Result<crate::toylang::typed_ast::ResolvedType, crate::toylang::type_resolve::TypeResolveError> {
+    use crate::toylang::typed_ast::{ResolvedType, SourceType};
+    use std::collections::HashMap;
+    match src {
+        SourceType::I32 => Ok(ResolvedType::I32),
+        SourceType::I64 => Ok(ResolvedType::I64),
+        SourceType::F64 => Ok(ResolvedType::F64),
+        SourceType::Bool => Ok(ResolvedType::Bool),
+        SourceType::Void => Ok(ResolvedType::Void),
+        SourceType::Usize => Ok(ResolvedType::Usize),
+        SourceType::TypeParam(name) => Ok(ResolvedType::TypeParam(name.clone())),
+        SourceType::Str => Ok(ResolvedType::Str),
+        SourceType::ByteSlice => Ok(ResolvedType::ByteSlice),
+        SourceType::Ref { inner } => Ok(ResolvedType::Ref {
+            inner: Box::new(resolve_source_type(inner, registry)?),
+        }),
+        SourceType::RustType { name, type_args } => {
+            let resolved_args: Vec<ResolvedType> = type_args.iter()
+                .map(|a| resolve_source_type(a, registry))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ResolvedType::RustType { name: name.clone(), type_args: resolved_args })
+        }
+        SourceType::StructRef { name, type_args } => {
+            let toy_struct = registry.structs.get(name.as_str())
+                .ok_or_else(|| crate::toylang::type_resolve::TypeResolveError::UndefinedStruct {
+                    name: name.clone(),
+                })?;
+            // Recursively resolve the type_args first.
+            let resolved_args: Vec<ResolvedType> = type_args.iter()
+                .map(|a| resolve_source_type(a, registry))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Substitution map: type_param_name → ResolvedType from caller's args.
+            let subst: HashMap<String, ResolvedType> = toy_struct.type_params.iter()
+                .cloned()
+                .zip(resolved_args.iter().cloned())
+                .collect();
+            // For each field's declared SourceType, substitute Params at the
+            // SOURCE level and then recursively promote.
+            let field_types: Vec<ResolvedType> = toy_struct.fields.iter()
+                .map(|f| {
+                    let substituted_src = substitute_source_type(&f.rust_type, &subst);
+                    resolve_source_type(&substituted_src, registry)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ResolvedType::Struct {
+                name: name.clone(),
+                type_args: resolved_args,
+                field_types,
+            })
+        }
+    }
+}
+
+/// Substitute `TypeParam` slots in a `SourceType` by mapping them to entries
+/// in `subst`. Values in `subst` are `ResolvedType` (the form callers carry
+/// post-promotion); each substitution demotes the value to `SourceType` via
+/// `.to_source_type()` so the result stays parser-shape.
+///
+/// Used inside `resolve_source_type` when expanding a struct's field types
+/// in the context of a specific instantiation.
+pub fn substitute_source_type(
+    src: &crate::toylang::typed_ast::SourceType,
+    subst: &std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType>,
+) -> crate::toylang::typed_ast::SourceType {
+    use crate::toylang::typed_ast::SourceType;
+    match src {
+        SourceType::TypeParam(name) => {
+            // Demote the resolved subst value to source-shape.
+            subst.get(name)
+                .map(|r| r.to_source_type())
+                .unwrap_or_else(|| SourceType::TypeParam(name.clone()))
+        }
+        SourceType::StructRef { name, type_args } => SourceType::StructRef {
+            name: name.clone(),
+            type_args: type_args.iter().map(|a| substitute_source_type(a, subst)).collect(),
+        },
+        SourceType::RustType { name, type_args } => SourceType::RustType {
+            name: name.clone(),
+            type_args: type_args.iter().map(|a| substitute_source_type(a, subst)).collect(),
+        },
+        SourceType::Ref { inner } => SourceType::Ref {
+            inner: Box::new(substitute_source_type(inner, subst)),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Convert a SourceType to a string suitable for symbol mangling. Sibling
+/// of `resolved_type_to_mangled_name` for callsites that have parser-shape
+/// types (e.g. internal-symbol mangling driven by rustc Instance args
+/// converted via `rustc_ty_to_source_type` without registry promotion).
+///
+/// Mangling is name+args-only — `Struct.field_types` info is irrelevant —
+/// so both shapes produce identical mangled names for the same logical type.
+pub fn source_type_to_mangled_name(ty: &crate::toylang::typed_ast::SourceType) -> String {
+    use crate::toylang::typed_ast::SourceType;
+    match ty {
+        SourceType::I32 => "i32".to_string(),
+        SourceType::I64 => "i64".to_string(),
+        SourceType::F64 => "f64".to_string(),
+        SourceType::Bool => "bool".to_string(),
+        SourceType::Usize => "usize".to_string(),
+        SourceType::Void => "void".to_string(),
+        SourceType::StructRef { name, type_args }
+        | SourceType::RustType { name, type_args } => {
+            if type_args.is_empty() {
+                name.clone()
+            } else {
+                let args: Vec<String> = type_args.iter().map(source_type_to_mangled_name).collect();
+                format!("{}_LT_{}_GT_", name, args.join("_"))
+            }
+        }
+        SourceType::Ref { inner } => format!("ref_{}", source_type_to_mangled_name(inner)),
+        SourceType::TypeParam(name) => format!("P_{}", name),
+        SourceType::Str => "str".to_string(),
+        SourceType::ByteSlice => "byte_slice".to_string(),
     }
 }
 
@@ -406,8 +611,7 @@ pub fn resolved_type_to_mangled_name(ty: &crate::toylang::typed_ast::ResolvedTyp
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Usize => "usize".to_string(),
         ResolvedType::Void => "void".to_string(),
-        ResolvedType::StructRef { name, type_args }
-        | ResolvedType::Struct { name, type_args, .. }
+        ResolvedType::Struct { name, type_args, .. }
         | ResolvedType::RustType { name, type_args } => {
             if type_args.is_empty() {
                 name.clone()
@@ -497,12 +701,12 @@ pub fn redirect_to_wrapper<'tcx>(
     tcx: TyCtxt<'tcx>,
     type_name: &str,
     method_name: &str,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    type_args: &[crate::toylang::typed_ast::SourceType],
 ) -> Option<(DefId, ty::GenericArgsRef<'tcx>)> {
     let wrapper_name = wrapper_fn_name(type_name, method_name)?;
     let wrapper_def_id = find_wrapper_fn_def_id(tcx, wrapper_name)?;
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| ty::GenericArg::from(resolved_to_rustc_ty(tcx, ta)))
+        .map(|ta| ty::GenericArg::from(source_to_rustc_ty(tcx, ta)))
         .collect();
     // @ELASZ
     let args = build_generic_args_for_item(tcx, wrapper_def_id, &all_ty_args);
@@ -518,9 +722,9 @@ pub fn rust_method_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     type_name: &str,
     method_name: &str,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    type_args: &[crate::toylang::typed_ast::SourceType],
     caller_type_params: &[String],
-) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
+) -> Result<crate::toylang::typed_ast::SourceType, UnresolvedRustType> {
     let type_def_id = find_rust_type_def_id(tcx, type_name)
         .ok_or_else(|| UnresolvedRustType {
             name: type_name.to_string(),
@@ -536,20 +740,20 @@ pub fn rust_method_return_type<'tcx>(
         type_name: type_name.to_string(), method: method_name.to_string(),
     };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
+        .map(|ta| Ok(ty::GenericArg::from(try_source_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
         .collect::<Result<Vec<_>, _>>()?;
     // @ELASZ
     let args = build_generic_args_for_item(tcx, method_def_id, &all_ty_args);
 
     // Query fn_sig and extract return type. Param-bearing args flow through
     // `instantiate` cleanly (Params are normalization terminals); the output
-    // sig carries our Params and `rustc_ty_to_resolved_type` converts them
+    // sig carries our Params and `rustc_ty_to_source_type` converts them
     // back to `ResolvedType::TypeParam`.
     let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(
         ty::TypingEnv::fully_monomorphized(), sig,
     );
-    Ok(rustc_ty_to_resolved_type(tcx, sig.output()))
+    Ok(rustc_ty_to_source_type(tcx, sig.output()))
 }
 
 /// Find an extern (non-toylang) function by name among local definitions.
@@ -801,14 +1005,14 @@ fn try_instantiate_free_fn_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     fn_name: &str,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    type_args: &[crate::toylang::typed_ast::SourceType],
     caller_type_params: &[String],
 ) -> Result<ty::FnSig<'tcx>, UnresolvedRustType> {
     let arg_ctx = RustTypeLookupContext::FreeFunctionTypeArg {
         function_name: fn_name.to_string(),
     };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
+        .map(|ta| Ok(ty::GenericArg::from(try_source_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
         .collect::<Result<Vec<_>, _>>()?;
     // @ELASZ
     let args = build_generic_args_for_item(tcx, def_id, &all_ty_args);
@@ -821,12 +1025,12 @@ fn try_instantiate_free_fn_sig<'tcx>(
 pub fn rust_free_fn_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     name: &str,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    type_args: &[crate::toylang::typed_ast::SourceType],
     caller_type_params: &[String],
-) -> Result<Option<crate::toylang::typed_ast::ResolvedType>, UnresolvedRustType> {
+) -> Result<Option<crate::toylang::typed_ast::SourceType>, UnresolvedRustType> {
     let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
     let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args, caller_type_params)?;
-    Ok(Some(rustc_ty_to_resolved_type(tcx, sig.output())))
+    Ok(Some(rustc_ty_to_source_type(tcx, sig.output())))
 }
 
 /// Param types of a use-imported free function. None if not found.
@@ -834,12 +1038,12 @@ pub fn rust_free_fn_return_type<'tcx>(
 pub fn rust_free_fn_param_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     name: &str,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    type_args: &[crate::toylang::typed_ast::SourceType],
     caller_type_params: &[String],
-) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+) -> Result<Option<Vec<crate::toylang::typed_ast::SourceType>>, UnresolvedRustType> {
     let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
     let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args, caller_type_params)?;
-    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
+    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_source_type(tcx, t)).collect()))
 }
 
 /// Param types of a Rust inherent method. None if type or method not found.
@@ -848,22 +1052,22 @@ pub fn rust_method_param_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     type_name: &str,
     method_name: &str,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    type_args: &[crate::toylang::typed_ast::SourceType],
     caller_type_params: &[String],
-) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+) -> Result<Option<Vec<crate::toylang::typed_ast::SourceType>>, UnresolvedRustType> {
     let Some(type_def_id) = find_rust_type_def_id(tcx, type_name) else { return Ok(None) };
     let Some(method_def_id) = find_inherent_method(tcx, type_def_id, method_name) else { return Ok(None) };
     let arg_ctx = RustTypeLookupContext::InherentMethodTypeArg {
         type_name: type_name.to_string(), method: method_name.to_string(),
     };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
+        .map(|ta| Ok(ty::GenericArg::from(try_source_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
         .collect::<Result<Vec<_>, _>>()?;
     // @ELASZ
     let args = build_generic_args_for_item(tcx, method_def_id, &all_ty_args);
     let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
-    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
+    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_source_type(tcx, t)).collect()))
 }
 
 /// Param types of a trait method. None if trait/method not found.
@@ -872,16 +1076,16 @@ pub fn rust_trait_method_param_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_name: &str,
     method_name: &str,
-    receiver_ty: &crate::toylang::typed_ast::ResolvedType,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    receiver_ty: &crate::toylang::typed_ast::SourceType,
+    type_args: &[crate::toylang::typed_ast::SourceType],
     caller_type_params: &[String],
-) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
+) -> Result<Option<Vec<crate::toylang::typed_ast::SourceType>>, UnresolvedRustType> {
     let Some(trait_def_id) = find_use_imported_trait_def_id(tcx, trait_name) else { return Ok(None) };
-    let self_resolved = strip_ref(receiver_ty);
+    let self_resolved = strip_source_ref(receiver_ty);
     let self_ctx = RustTypeLookupContext::TraitCallSelf {
         trait_name: trait_name.to_string(), method: method_name.to_string(),
     };
-    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx, caller_type_params)?;
+    let self_ty = try_source_to_rustc_ty(tcx, self_resolved, &self_ctx, caller_type_params)?;
     let Some(trait_method_def_id) = tcx.associated_item_def_ids(trait_def_id)
         .iter()
         .find(|&&id| tcx.item_name(id).as_str() == method_name)
@@ -892,13 +1096,13 @@ pub fn rust_trait_method_param_types<'tcx>(
     };
     let mut all_ty_args: Vec<ty::GenericArg<'tcx>> = vec![ty::GenericArg::from(self_ty)];
     for ta in type_args {
-        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?));
+        all_ty_args.push(ty::GenericArg::from(try_source_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?));
     }
     // @ELASZ
     let args = build_generic_args_for_item(tcx, trait_method_def_id, &all_ty_args);
     let sig = tcx.fn_sig(trait_method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(ty::TypingEnv::fully_monomorphized(), sig);
-    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
+    Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_source_type(tcx, t)).collect()))
 }
 
 /// Strip `Ref` wrappers from a ResolvedType to get the underlying type.
@@ -911,23 +1115,19 @@ pub fn strip_ref(ty: &crate::toylang::typed_ast::ResolvedType) -> &crate::toylan
     }
 }
 
-/// Workstream B — does `ty` (anywhere reachable through nested generics or
-/// `Ref` wrappers) contain a `TypeParam`? The trait-method oracle queries use
-/// this to defer when Self or any type arg is still abstract at registry-build
-/// time. The per-Instance substituted pass redoes the query with concrete args.
-pub fn contains_type_param(ty: &crate::toylang::typed_ast::ResolvedType) -> bool {
-    use crate::toylang::typed_ast::ResolvedType;
+/// Strip `Ref` wrappers from a `SourceType`. Sibling of `strip_ref` for the
+/// parser-shape type used by oracle queries.
+pub fn strip_source_ref(ty: &crate::toylang::typed_ast::SourceType) -> &crate::toylang::typed_ast::SourceType {
+    use crate::toylang::typed_ast::SourceType;
     match ty {
-        ResolvedType::TypeParam(_) => true,
-        ResolvedType::Ref { inner } => contains_type_param(inner),
-        ResolvedType::StructRef { type_args, .. }
-        | ResolvedType::RustType { type_args, .. } => type_args.iter().any(contains_type_param),
-        ResolvedType::Struct { type_args, field_types, .. } =>
-            type_args.iter().any(contains_type_param)
-            || field_types.iter().any(contains_type_param),
-        _ => false,
+        SourceType::Ref { inner } => strip_source_ref(inner),
+        other => other,
     }
 }
+
+// `contains_type_param` retired 2026-06-25 (two-enum split + sunny-karp):
+// no callers remain after the oracle queries stopped deferring on Params
+// (`caller_type_params` thread-through handles the case directly).
 
 /// Query rustc for a trait method's return type.
 /// `trait_name` is the trait (e.g. "Write"), `receiver_ty` is the concrete receiver
@@ -937,10 +1137,10 @@ pub fn rust_trait_method_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_name: &str,
     method_name: &str,
-    receiver_ty: &crate::toylang::typed_ast::ResolvedType,
-    type_args: &[crate::toylang::typed_ast::ResolvedType],
+    receiver_ty: &crate::toylang::typed_ast::SourceType,
+    type_args: &[crate::toylang::typed_ast::SourceType],
     caller_type_params: &[String],
-) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
+) -> Result<crate::toylang::typed_ast::SourceType, UnresolvedRustType> {
     // Per @IVTDBTZ, this lookup can legitimately fail when the dispatch
     // classifier misfires or when the trait isn't `use`-imported; return
     // a structured error instead of panicking so the user sees an
@@ -956,11 +1156,11 @@ pub fn rust_trait_method_return_type<'tcx>(
     // Per @RTMEIZ, the Self type of a trait call must be `use`-imported in the toylang
     // source even though the source never names it — try_resolved_to_rustc_ty needs it
     // findable in the type registry.
-    let self_resolved = strip_ref(receiver_ty);
+    let self_resolved = strip_source_ref(receiver_ty);
     let self_ctx = RustTypeLookupContext::TraitCallSelf {
         trait_name: trait_name.to_string(), method: method_name.to_string(),
     };
-    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx, caller_type_params)?;
+    let self_ty = try_source_to_rustc_ty(tcx, self_resolved, &self_ctx, caller_type_params)?;
 
     // Per @IVTDBTZ, method-not-found on an imported trait is a source-level
     // error (typo at the call site), not an invariant violation.
@@ -986,7 +1186,7 @@ pub fn rust_trait_method_return_type<'tcx>(
     };
     let mut all_ty_args: Vec<ty::GenericArg<'tcx>> = vec![ty::GenericArg::from(self_ty)];
     for ta in type_args {
-        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?));
+        all_ty_args.push(ty::GenericArg::from(try_source_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?));
     }
     // @ELASZ
     let args = build_generic_args_for_item(tcx, trait_method_def_id, &all_ty_args);
@@ -995,7 +1195,7 @@ pub fn rust_trait_method_return_type<'tcx>(
     let sig = tcx.normalize_erasing_late_bound_regions(
         ty::TypingEnv::fully_monomorphized(), sig,
     );
-    Ok(rustc_ty_to_resolved_type(tcx, sig.output()))
+    Ok(rustc_ty_to_source_type(tcx, sig.output()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,43 +1358,9 @@ mod tests {
     use super::*;
     use crate::toylang::typed_ast::ResolvedType;
 
-    #[test]
-    fn contains_type_param_detects_direct() {
-        assert!(contains_type_param(&ResolvedType::TypeParam("T".into())));
-        assert!(!contains_type_param(&ResolvedType::I32));
-    }
-
-    #[test]
-    fn contains_type_param_walks_ref_and_generics() {
-        let inner = ResolvedType::Ref { inner: Box::new(ResolvedType::TypeParam("T".into())) };
-        assert!(contains_type_param(&inner));
-        let nested = ResolvedType::RustType {
-            name: "Vec".into(),
-            type_args: vec![ResolvedType::TypeParam("T".into())],
-        };
-        assert!(contains_type_param(&nested));
-        let concrete = ResolvedType::RustType {
-            name: "Vec".into(),
-            type_args: vec![ResolvedType::I32],
-        };
-        assert!(!contains_type_param(&concrete));
-    }
-
-    #[test]
-    fn unresolved_rust_type_is_deferred_only_for_deferred_context() {
-        let deferred = UnresolvedRustType {
-            name: "<TypeParam>".into(),
-            context: RustTypeLookupContext::DeferredTypeParam {
-                query: "trait call `Clone::clone`".into(),
-            },
-        };
-        assert!(deferred.is_deferred());
-        let non_deferred = UnresolvedRustType {
-            name: "Foo".into(),
-            context: RustTypeLookupContext::TraitCallSelf {
-                trait_name: "Clone".into(), method: "clone".into(),
-            },
-        };
-        assert!(!non_deferred.is_deferred());
-    }
+    // `contains_type_param_*` retired 2026-06-25 (two-enum split + sunny-karp):
+    // the helper itself retired (oracle queries no longer defer on Params).
+    // `unresolved_rust_type_is_deferred_only_for_deferred_context` retired
+    // same day: `DeferredTypeParam` variant gone; `is_deferred()` is now
+    // a vestigial `false` constant.
 }

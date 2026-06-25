@@ -2,7 +2,7 @@ use super::ast::{BinOp, Expr, Block, Stmt};
 use super::registry::{
     ToyField, ToyFunction, ToyParam, ToyStruct, ToylangRegistry,
 };
-use super::typed_ast::ResolvedType;
+use super::typed_ast::SourceType;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -59,7 +59,7 @@ enum Token {
     PipePipe,  // ||
     LBracket,  // [
     RBracket,  // ]
-    IntLit(i64, ResolvedType),
+    IntLit(i64, SourceType),
     StringLit(String),
     ByteStringLit(Vec<u8>),
     Eof,
@@ -211,18 +211,18 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
                 }
                 let suffix: String = chars[suf_start..i].iter().collect();
                 let ty = match suffix.as_str() {
-                    "i32" => ResolvedType::I32,
-                    "i64" => ResolvedType::I64,
-                    "usize" => ResolvedType::Usize,
+                    "i32" => SourceType::I32,
+                    "i64" => SourceType::I64,
+                    "usize" => SourceType::Usize,
                     _ => return Err(ParseError::UnknownIntSuffix { suffix }),
                 };
                 tokens.push(Token::IntLit(value, ty));
             } else {
                 // No suffix: default to i32 unless value overflows
                 let ty = if value > i32::MAX as i64 || value < i32::MIN as i64 {
-                    ResolvedType::I64
+                    SourceType::I64
                 } else {
-                    ResolvedType::I32
+                    SourceType::I32
                 };
                 tokens.push(Token::IntLit(value, ty));
             }
@@ -556,7 +556,7 @@ impl Parser {
         impl_block_self_type_args: &[String],
     ) -> Result<(String, ToyFunction, bool), ParseError> {
         use crate::toylang::registry::{ToyParam};
-        use crate::toylang::typed_ast::ResolvedType;
+        use crate::toylang::typed_ast::SourceType;
 
         self.consume(); // eat "fn"
         let name = self.expect_ident()?;
@@ -579,7 +579,7 @@ impl Parser {
         // The method's `type_params` (stored on the ToyFunction) carries
         // only the method-level set; the impl-block's params live on the
         // enclosing ToyImpl. The body parser sees the union so `Wrapper<T>`
-        // (with T from the impl block) resolves to `ResolvedType::TypeParam`.
+        // (with T from the impl block) resolves to `SourceType::TypeParam`.
         let mut body_scope_type_params = impl_block_type_params.to_vec();
         body_scope_type_params.extend(method_type_params.iter().cloned());
 
@@ -611,16 +611,16 @@ impl Parser {
                     got: format!("{:?}", t),
                 }),
             }
-            let self_struct = ResolvedType::StructRef {
+            let self_struct = SourceType::StructRef {
                 name: self_type_name.to_string(),
                 type_args: impl_block_self_type_args
                     .iter()
-                    .map(|p| ResolvedType::TypeParam(p.clone()))
+                    .map(|p| SourceType::TypeParam(p.clone()))
                     .collect(),
             };
             params.push(ToyParam {
                 name: "self".to_string(),
-                ty: ResolvedType::Ref { inner: Box::new(self_struct) },
+                ty: SourceType::Ref { inner: Box::new(self_struct) },
             });
             if self.peek() == &Token::Comma { self.consume(); }
         } else {
@@ -1052,7 +1052,7 @@ impl Parser {
     }
 
     /// Parse `<T1, T2>` type argument list. Consumes the `<` and `>`.
-    fn parse_type_arg_list(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<ResolvedType>, ParseError> {
+    fn parse_type_arg_list(&mut self, type_params: &[String], struct_names: &[String]) -> Result<Vec<SourceType>, ParseError> {
         self.expect(Token::LAngle)?;
         let mut type_args = Vec::new();
         while self.peek() != &Token::RAngle && self.peek() != &Token::Eof {
@@ -1090,8 +1090,8 @@ impl Parser {
         Ok(params)
     }
 
-    /// Parse a type expression and return a ResolvedType.
-    fn parse_type(&mut self, type_params: &[String], struct_names: &[String]) -> Result<ResolvedType, ParseError> {
+    /// Parse a type expression and return a SourceType.
+    fn parse_type(&mut self, type_params: &[String], struct_names: &[String]) -> Result<SourceType, ParseError> {
         match self.peek().clone() {
             Token::Ampersand => {
                 self.consume();
@@ -1102,7 +1102,7 @@ impl Parser {
                     }
                 }
                 let inner = self.parse_type(type_params, struct_names)?;
-                Ok(ResolvedType::Ref { inner: Box::new(inner) })
+                Ok(SourceType::Ref { inner: Box::new(inner) })
             }
             Token::Star => {
                 self.consume();
@@ -1111,7 +1111,7 @@ impl Parser {
                     return Err(ParseError::ExpectedPointerQualifier { got: qualifier });
                 }
                 let inner = self.parse_type(type_params, struct_names)?;
-                Ok(ResolvedType::Ref { inner: Box::new(inner) })
+                Ok(SourceType::Ref { inner: Box::new(inner) })
             }
             Token::LBracket => {
                 // Per @UTAIRZ, `[u8]` parses to the unsized ByteSlice variant;
@@ -1122,7 +1122,7 @@ impl Parser {
                     return Err(ParseError::ExpectedType { got: format!("[{}]", elem) });
                 }
                 self.expect(Token::RBracket)?;
-                Ok(ResolvedType::ByteSlice)
+                Ok(SourceType::ByteSlice)
             }
             Token::Ident(s) => {
                 let s = s.clone();
@@ -1141,27 +1141,27 @@ impl Parser {
                     self.expect(Token::RAngle)?;
 
                     return if struct_names.contains(&s) {
-                        Ok(ResolvedType::StructRef { name: s, type_args: args })
+                        Ok(SourceType::StructRef { name: s, type_args: args })
                     } else {
-                        Ok(ResolvedType::RustType { name: s, type_args: args })
+                        Ok(SourceType::RustType { name: s, type_args: args })
                     };
                 }
 
                 // Non-generic names
                 match s.as_str() {
-                    "i32"   => Ok(ResolvedType::I32),
-                    "i64"   => Ok(ResolvedType::I64),
-                    "f64"   => Ok(ResolvedType::F64),
-                    "bool"  => Ok(ResolvedType::Bool),
-                    "usize" => Ok(ResolvedType::Usize),
+                    "i32"   => Ok(SourceType::I32),
+                    "i64"   => Ok(SourceType::I64),
+                    "f64"   => Ok(SourceType::F64),
+                    "bool"  => Ok(SourceType::Bool),
+                    "usize" => Ok(SourceType::Usize),
                     // Per @UTAIRZ, `str` parses to the unsized Str variant;
                     // the `Ref` wrapper comes from the enclosing `&` in `&str`.
-                    "str"   => Ok(ResolvedType::Str),
-                    _ if type_params.contains(&s) => Ok(ResolvedType::TypeParam(s)),
-                    _ if struct_names.contains(&s) => Ok(ResolvedType::StructRef {
+                    "str"   => Ok(SourceType::Str),
+                    _ if type_params.contains(&s) => Ok(SourceType::TypeParam(s)),
+                    _ if struct_names.contains(&s) => Ok(SourceType::StructRef {
                         name: s, type_args: vec![],
                     }),
-                    _ => Ok(ResolvedType::RustType { name: s, type_args: vec![] }),
+                    _ => Ok(SourceType::RustType { name: s, type_args: vec![] }),
                 }
             }
             t => Err(ParseError::ExpectedType { got: format!("{:?}", t) }),

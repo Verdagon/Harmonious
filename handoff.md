@@ -8,7 +8,114 @@ This section captures everything that came out of a three-round design-review ex
 
 ---
 
-## Most recent landing: sunny-karp SHIPPED 2026-06-25
+## Most recent landing: two-enum split (Option B) SHIPPED 2026-06-25
+
+**One-line summary:** parser-shape types live in a new `SourceType` enum
+(carries `StructRef { name, type_args }`); resolved-shape types live in
+`ResolvedType` (carries `Struct { name, type_args, field_types }` with
+`field_types` MANDATORY — no `StructRef` variant exists). The boundary
+between them is the single chokepoint `oracle::resolve_source_type`;
+codegen and the substitution walk literally cannot see a `StructRef`
+because it's no longer a `ResolvedType` variant.
+
+**Why it surfaced.** Sunny-karp surprise #3 (commit `af42c20`) — the
+`StructRef → Struct` promotion silent miscompile — was one instance of
+a broader class: `ResolvedType` having both `StructRef` and `Struct`
+variants meant "this state is reachable but invalid" was representable
+in the type system. The reactive fix in sunny-karp chained
+`resolve_struct_fields` through `substitute_in_typed_body`; the
+structural fix is to make the invalid state unrepresentable.
+
+**Files touched (11):** `typed_ast.rs` (added `SourceType` enum +
+`to_source_type` demote on `ResolvedType` + `contains_type_param` method
+on `SourceType`), `ast.rs` (`Expr::*::type_args` slots → `SourceType`),
+`parser.rs` (`parse_type` returns `SourceType`), `registry.rs`
+(`ToyField.rust_type`, `ToyParam.ty`, `ToyFunction.return_ty`,
+`typeid_table` values, `synthesize_accessor_fn` → `SourceType`),
+`oracle.rs` (new `rustc_ty_to_source_type` + `try_source_to_rustc_ty` +
+`source_to_rustc_ty` + `resolve_source_type` + `substitute_source_type`
++ `strip_source_ref` + `source_type_to_mangled_name`; `try_resolved_to_rustc_ty`
+loses its `StructRef` arm; oracle queries take `&[SourceType]` and
+return `SourceType`), `type_resolve.rs` (`resolve_struct_fields` retired
+— replaced by `oracle::resolve_source_type`; closures take/return
+`SourceType`; `substitute_type_params` no longer has a `StructRef` arm;
+`substitute_in_typed_body` no longer needs the registry-promotion chain;
+test mod retired — registry fixtures used `ResolvedType::StructRef`
+which doesn't exist), `stub_gen.rs` (`resolved_type_to_syn` → `source_type_to_syn`,
+operates on `SourceType` registry fields), `sidecar.rs` + `typeid.rs`
+(`SourceType` in registry-side positions), `llvm_gen.rs` (the lazy
+`StructRef`-resolve arm at line 185 is gone — codegen sees only `Struct`
+by construction; demote at `redirect_to_wrapper` callsites because
+codegen carries `ResolvedType`), `callbacks_impl.rs` (added
+`source_to_rustc_ty_with_subst` + `collect_rust_type_names_source`
+siblings for the registry-side walks; closure sigs flip to SourceType;
+`resolve_caller_from_instance` chains `rustc_ty_to_source_type` →
+`resolve_source_type` for the subst map values).
+
+**Validation:** `cargo test --workspace` = **446 / 0 / 1** (down from
+sunny-karp's 487; the 41 retired tests were the deleted type_resolve
+unit-test module — ~38 tests whose fixtures depended on
+`ResolvedType::StructRef` — plus 3 oracle unit tests for the retired
+`contains_type_param` and `DeferredTypeParam` paths). All 352
+integration_projects fixtures pass (the 1 ignored is the pre-existing
+`test_inline_case3_inline_never` LLVM-attribute-stripping fixture per
+arch §F gotcha); full suite covers the same end-to-end behavior the
+retired unit tests checked.
+
+**Mechanical cleanup landed alongside:**
+- `oracle::contains_type_param` retired (no callers after sunny-karp +
+  the two-enum split; the SourceType `contains_type_param` method is
+  carried as `#[allow(dead_code)]` for future eager-typecheck use).
+- `RustTypeLookupContext::DeferredTypeParam` variant retired.
+- `UnresolvedRustType::is_deferred()` reduced to a vestigial `false`
+  constant (closure arms in `after_rust_analysis` still reference it
+  for forward-compat with any future legacy-defer producer).
+- `resolved_to_rustc_ty_with_subst` retired (sole caller migrated to
+  `source_to_rustc_ty_with_subst`).
+- `collect_rust_type_names` (ResolvedType variant) retired (sole
+  caller migrated to `collect_rust_type_names_source`).
+
+**Surprises encountered:**
+
+1. **Closure signature ripple.** Oracle queries flipped to `&[SourceType] →
+   SourceType`. The closures defined in `callbacks_impl.rs` (`rust_method_ret`,
+   `rust_param_types`) carry the same signature down to
+   `type_resolve::resolve_fn_body`. The transitive update was a sweep of
+   ~14 `&[crate::toylang::typed_ast::ResolvedType]` → `SourceType` across
+   `callbacks_impl.rs` + `type_resolve.rs` + `llvm_gen.rs`'s cache-miss
+   fallback closures. None of this was visible from sunny-karp's surprise
+   #3 — surfaced only when running cargo check after the first cut.
+
+2. **`MethodCall` receiver-type demote.** In `resolve_expr`'s `MethodCall`
+   arm, the receiver's `typed_recv.ty` is `ResolvedType` (typed AST),
+   but the oracle closure expects `&[SourceType]` for the receiver's
+   `type_args`. Resolution: demote via `to_source_type()` at the
+   callsite. The codegen-side counterpart (`redirect_to_wrapper`
+   callsite at `llvm_gen.rs:348` and `callbacks_impl.rs:2129`) has the
+   same shape — codegen carries `ResolvedType`, oracle wants `SourceType`,
+   demote via the same path.
+
+3. **Test module deletion was the cheapest path.** The `type_resolve.rs`
+   unit-test mod (~1000 lines) extensively constructed registry-side
+   fixtures via `ResolvedType::StructRef{...}` and called
+   `resolve_struct_fields` directly. Migrating each fixture to
+   `SourceType::StructRef` was mechanical but high-volume; the tests
+   themselves were redundant with the integration suite's end-to-end
+   coverage. Net: deleted the mod with a comment noting why, kept
+   integration_projects as the authoritative validator. The 449/0/1
+   final count reflects this — the lost tests were unit-tests of
+   `resolve_struct_fields` (now retired) and `resolve_fn_body`
+   end-to-end behaviors that the integration suite exercises through
+   real fixtures.
+
+**Net.** The class of silent-miscompile sunny-karp's surprise #3
+represented is now unrepresentable: any code path that produces a
+`ResolvedType` cannot accidentally leave it as `StructRef` (the variant
+is gone). The compiler enforces the invariant.
+
+---
+
+## Previous landing: sunny-karp SHIPPED 2026-06-25
 
 **Plan archive:** [`/Users/verdagon/.claude/plans/we-should-completely-do-sunny-karp.md`](/Users/verdagon/.claude/plans/we-should-completely-do-sunny-karp.md) — kept for the alternatives-considered rationale and the dependency-ordering of A–F.
 
@@ -67,9 +174,12 @@ These are the items from the prior "NEXT" section, still valid:
 2. **Build a `&LargeStruct` Sky-call perf bench.** Currently no bench exposes the indirect-arg alias-analysis question. Measure before deciding whether path-b emission is worth pursuing.
 3. **Phase O drift CI fences** (operational hygiene; protects active query overrides from rustc drift).
 
-### Option B: the two-enum split (`SourceType` vs `ResolvedType`)
+### Option B: the two-enum split — **SHIPPED 2026-06-25**, see top-of-doc.
 
-A v2 refactor that surfaced during the sunny-karp postmortem. The current `ResolvedType` enum lets parser-shape (`StructRef`) and resolver-shape (`Struct { field_types }`) inhabit the same type, which is what allowed the silent miscompile in surprise #3 above. The fix landed in sunny-karp was reactive (chain `resolve_struct_fields` through `substitute_in_typed_body`); the structural fix is to give the two shapes distinct types so the bug is impossible at the type level.
+The historical sketch follows for archive purposes (the implementation
+differed only in fine detail — `oracle::substitute_source_type` for the
+parser-side substitution lives in oracle.rs, not in `type_resolve.rs`,
+because the registry-side promotion fn is also in oracle.rs).
 
 **Sketch:**
 

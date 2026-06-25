@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
-use crate::toylang::typed_ast::ResolvedType;
+use crate::toylang::typed_ast::{ResolvedType, SourceType};
 
 /// A Toylang struct field.
+///
+/// Two-enum split: the field's declared type is parser-shape `SourceType`;
+/// resolution to `ResolvedType` happens at type-resolve time when the field
+/// is read in the context of a specific `Struct.type_args` instantiation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToyField {
     pub name: String,
-    pub rust_type: ResolvedType,
+    pub rust_type: SourceType,
 }
 
 /// A Toylang struct definition.
@@ -50,7 +54,7 @@ pub struct ToylangRegistry {
     /// don't carry the field; loading one yields an empty table, which is
     /// harmless until Phase 3 starts referencing typeids that would need it.
     #[serde(default)]
-    pub typeid_table: BTreeMap<u64, (String, Vec<ResolvedType>)>,
+    pub typeid_table: BTreeMap<u64, (String, Vec<SourceType>)>,
     /// Tier 3 #3: synthesized accessor pairs — one entry per Sky struct ×
     /// each field. Populated by `synthesize_accessor_pairs` after parsing.
     /// Each `(struct_name, field_name)` becomes a regular Sky function
@@ -138,23 +142,23 @@ pub fn synthesize_accessor_fn(
     field: &ToyField,
 ) -> ToyFunction {
     use crate::toylang::ast::{Block, Expr};
-    use crate::toylang::typed_ast::ResolvedType;
+    use crate::toylang::typed_ast::SourceType;
 
-    let self_struct_ty = ResolvedType::StructRef {
+    let self_struct_ty = SourceType::StructRef {
         name: struct_name.to_string(),
         type_args: toy_struct
             .type_params
             .iter()
-            .map(|p| ResolvedType::TypeParam(p.clone()))
+            .map(|p| SourceType::TypeParam(p.clone()))
             .collect(),
     };
     ToyFunction {
         type_params: toy_struct.type_params.clone(),
         params: vec![ToyParam {
             name: "self".to_string(),
-            ty: ResolvedType::Ref { inner: Box::new(self_struct_ty) },
+            ty: SourceType::Ref { inner: Box::new(self_struct_ty) },
         }],
-        return_ty: Some(ResolvedType::Ref {
+        return_ty: Some(SourceType::Ref {
             inner: Box::new(field.rust_type.clone()),
         }),
         body: Some(Block {
@@ -224,17 +228,19 @@ pub struct ToyImplMethod {
 }
 
 /// A parsed parameter in a Toylang function signature.
+///
+/// Two-enum split: parameter types are parser-shape `SourceType`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToyParam {
     pub name: String,
-    pub ty: ResolvedType,
+    pub ty: SourceType,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToyFunction {
     pub type_params: Vec<String>,   // e.g. ["T"]; empty for non-generic functions
     pub params: Vec<ToyParam>,
-    pub return_ty: Option<ResolvedType>,
+    pub return_ty: Option<SourceType>,
     pub body: Option<crate::toylang::ast::Block>,
     /// Session 10 — Sky architecture §9. True iff the source declared
     /// `export fn …`. Non-export body-bearing fns get NO `pub fn` shell in

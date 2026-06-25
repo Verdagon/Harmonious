@@ -18,7 +18,7 @@
 //! compiler invocation that has access to the type. See §10.8 of the
 //! architecture doc for the cross-compile-stability argument.
 
-use crate::toylang::typed_ast::ResolvedType;
+use crate::toylang::typed_ast::SourceType;
 use serde::Serialize;
 
 /// Compute the content-addressed typeid for a Sky type identified by name +
@@ -36,11 +36,11 @@ use serde::Serialize;
 /// interpreted as a little-endian u64. Truncation collision probability is
 /// 2^-32 across a 4-billion-type universe — negligible for any realistic Sky
 /// project.
-pub fn compute(name: &str, type_args: &[ResolvedType]) -> u64 {
+pub fn compute(name: &str, type_args: &[SourceType]) -> u64 {
     #[derive(Serialize)]
     struct PreImage<'a> {
         name: &'a str,
-        type_args: &'a [ResolvedType],
+        type_args: &'a [SourceType],
     }
     let preimage = PreImage { name, type_args };
     let bytes = bincode::serde::encode_to_vec(&preimage, bincode_cfg())
@@ -82,22 +82,22 @@ mod tests {
 
     #[test]
     fn different_args_different_typeid() {
-        let w_i32 = compute("Wrapper", &[ResolvedType::I32]);
-        let w_i64 = compute("Wrapper", &[ResolvedType::I64]);
+        let w_i32 = compute("Wrapper", &[SourceType::I32]);
+        let w_i64 = compute("Wrapper", &[SourceType::I64]);
         assert_ne!(w_i32, w_i64);
     }
 
     #[test]
     fn args_order_matters() {
-        let ab = compute("Pair", &[ResolvedType::I32, ResolvedType::I64]);
-        let ba = compute("Pair", &[ResolvedType::I64, ResolvedType::I32]);
+        let ab = compute("Pair", &[SourceType::I32, SourceType::I64]);
+        let ba = compute("Pair", &[SourceType::I64, SourceType::I32]);
         assert_ne!(ab, ba, "type-arg order must affect typeid");
     }
 
     #[test]
     fn empty_args_distinct_from_singleton_args() {
         let nullary = compute("X", &[]);
-        let unary_i32 = compute("X", &[ResolvedType::I32]);
+        let unary_i32 = compute("X", &[SourceType::I32]);
         assert_ne!(nullary, unary_i32);
     }
 

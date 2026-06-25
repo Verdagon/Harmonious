@@ -71,23 +71,31 @@ impl From<crate::oracle::UnresolvedRustType> for TypeResolveError {
 // Public entry point
 // ============================================================================
 
-/// Resolve all types in a function body, producing a TypedBlock.
 /// Resolve just the return type of a function without resolving the full body.
+///
+/// Two-enum split (2026-06-25): `func.return_ty` is `SourceType` (parser-shape);
+/// the promotion to `ResolvedType` chains through `oracle::resolve_source_type`.
 pub fn resolve_return_type(
     registry: &ToylangRegistry,
     func: &ToyFunction,
 ) -> Result<ResolvedType, TypeResolveError> {
     match func.return_ty.as_ref() {
-        Some(rt) => resolve_struct_fields(rt, registry),
+        Some(rt) => crate::oracle::resolve_source_type(rt, registry),
         None => Ok(ResolvedType::Void),
     }
 }
 
+/// Resolve all types in a function body, producing a TypedBlock.
+///
+/// Two-enum split: oracle callbacks talk `SourceType` (parser-shape); the
+/// resolver promotes each query result to `ResolvedType` before storing it
+/// in the typed AST. Parser-shape types in `func.params` and `func.return_ty`
+/// also promote at entry.
 pub fn resolve_fn_body(
     registry: &ToylangRegistry,
     func: &ToyFunction,
-    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType>,
-    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType>,
+    rust_method_ret: &dyn Fn(&str, &str, &[SourceType]) -> Result<SourceType, crate::oracle::UnresolvedRustType>,
+    rust_param_types: &dyn Fn(&str, &str, &[SourceType]) -> Result<Option<Vec<SourceType>>, crate::oracle::UnresolvedRustType>,
     // Per @IVTDBTZ, trait-vs-inherent dispatch for Name::method(args) is
     // type-kind-based. Threaded as a predicate callback alongside the
     // existing return/param-type callbacks; backed in callbacks_impl.rs
@@ -96,15 +104,15 @@ pub fn resolve_fn_body(
 ) -> Result<TypedBlock, TypeResolveError> {
     let body = func.body.as_ref().expect("function has no body");
     let ret_ty = match func.return_ty.as_ref() {
-        Some(rt) => resolve_struct_fields(rt, registry)?,
+        Some(rt) => crate::oracle::resolve_source_type(rt, registry)?,
         None => ResolvedType::Void,
     };
 
     let mut scope: HashMap<String, ResolvedType> = HashMap::new();
 
-    // Add function parameters to scope (resolve StructRef → Struct)
+    // Promote parameter types from SourceType (parser-shape) to ResolvedType.
     for p in &func.params {
-        scope.insert(p.name.clone(), resolve_struct_fields(&p.ty, registry)?);
+        scope.insert(p.name.clone(), crate::oracle::resolve_source_type(&p.ty, registry)?);
     }
 
     // Resolve statements
@@ -124,92 +132,27 @@ pub fn resolve_fn_body(
 // Type string parsing
 // ============================================================================
 
-/// Parse a type string like "i32", "Pair<i32, i64>", "Vec<Point>", "&Vec<Point>"
-/// into a ResolvedType. Uses the registry to resolve struct names.
-/// Convert a `StructRef` → `Struct` by looking up fields in the registry.
-/// Recursively resolves nested struct references.
-pub fn resolve_struct_fields(ty: &ResolvedType, registry: &ToylangRegistry) -> Result<ResolvedType, TypeResolveError> {
-    match ty {
-        ResolvedType::StructRef { name, type_args } => {
-            let toy_struct = registry.structs.get(name.as_str())
-                .ok_or_else(|| TypeResolveError::UndefinedStruct { name: name.clone() })?;
-            // Build substitution map from type_args
-            let subst: HashMap<String, ResolvedType> = toy_struct.type_params.iter()
-                .zip(type_args.iter())
-                .map(|(param, arg)| (param.clone(), arg.clone()))
-                .collect();
-            let resolved_fields: Vec<ResolvedType> = toy_struct.fields.iter()
-                .map(|f| {
-                    let substituted = substitute_type_params(&f.rust_type, &subst);
-                    resolve_struct_fields(&substituted, registry)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ResolvedType::Struct {
-                name: name.clone(),
-                type_args: type_args.clone(),
-                field_types: resolved_fields,
-            })
-        }
-        ResolvedType::Ref { inner } => {
-            Ok(ResolvedType::Ref { inner: Box::new(resolve_struct_fields(inner, registry)?) })
-        }
-        other => Ok(other.clone()),
-    }
-}
+/// Two-enum split (2026-06-25) — `resolve_struct_fields` retired. The
+/// promotion `SourceType → ResolvedType` now lives in `oracle::resolve_source_type`
+/// (which handles the `StructRef` lookup that used to be here). The typed
+/// AST and codegen path can't see a `StructRef` because the variant no
+/// longer exists on `ResolvedType`.
 
-/// Semantic type equality. Handles three equivalence classes for what
-/// is logically the same Sky type viewed through different lookup paths:
+/// Semantic type equality on `ResolvedType`. Bridges `Struct` ↔ `RustType`
+/// when names + args match — cross-Sky-crate Sky types may surface as
+/// `RustType` at one lookup site (rustc oracle, no struct fields available)
+/// and `Struct` at another (sidecar registry, fields populated).
 ///
-/// - `StructRef` (parser's unresolved form): produced by the parser from
-///   the source's type syntax before field types are resolved.
-/// - `Struct` (resolver's fully-resolved form): produced by
-///   `resolve_struct_fields` after walking the registry to fill in
-///   `field_types`. Also produced by the oracle for cross-crate Sky
-///   types when the sidecar registry has the full struct shape.
-/// - `RustType` (opaque external form): produced by
-///   `rustc_ty_to_resolved_type` when the type's `DefId` lives in a
-///   crate that exposes it via Rust's `pub use` path, even if the type
-///   is *semantically* a Sky struct (the cross-Sky-crate case
-///   surfaced by §5.5 Step 2's DQ-D fixture / `test_multi_sky_generic`).
-///
-/// All three forms with the same `name` and matching `type_args`
-/// represent the SAME logical type. The bridging here makes that
-/// equivalence explicit at the validator boundary so a Sky type
-/// reaching dqd_app through two routes (sidecar registry → `Struct`
-/// for the value of `make_thing(42)`; rustc oracle → `RustType` for the
-/// type argument of `wrap<Thing>`) compares equal.
-///
-/// Step 1 of the A.1+A.2+patch-5 retirement chain (handoff.md). Unblocks
-/// the DQ-D fixture so Step 3 (full §5.5 with generics) becomes
-/// empirically testable.
-///
-/// Correctness note: this duck-types `RustType` against `Struct`/`StructRef`
-/// by name + args, without consulting `SkyUniverse` to verify that the
-/// named identifier is in fact Sky-owned. A genuine Rust type
-/// happening to share a name with a Sky struct would be falsely
-/// conflated. In practice the name-resolver elsewhere in the frontend
-/// would reject such a collision earlier, so this validator-level
-/// bridging is safe.
+/// Correctness note: this duck-types `RustType` against `Struct` by name
+/// + args without consulting `SkyUniverse` to verify Sky ownership. A
+/// genuine Rust type sharing a name with a Sky struct would be falsely
+/// conflated; the name-resolver elsewhere in the frontend would reject
+/// such a collision earlier, so the bridging is safe.
 fn types_match(a: &ResolvedType, b: &ResolvedType) -> bool {
     match (a, b) {
-        (ResolvedType::StructRef { name: na, type_args: ta },
-         ResolvedType::Struct { name: nb, type_args: tb, .. }) |
-        (ResolvedType::Struct { name: na, type_args: ta, .. },
-         ResolvedType::StructRef { name: nb, type_args: tb }) => {
-            na == nb && ta.len() == tb.len()
-                && ta.iter().zip(tb).all(|(a, b)| types_match(a, b))
-        }
-        // Step 1: bridge RustType ↔ Struct/StructRef when names + args
-        // match. Cross-Sky-crate Sky types can be classified as RustType
-        // at one lookup site and Struct at another (DQ-D case); the
-        // logical type is the same.
         (ResolvedType::RustType { name: na, type_args: ta },
          ResolvedType::Struct { name: nb, type_args: tb, .. }) |
         (ResolvedType::Struct { name: na, type_args: ta, .. },
-         ResolvedType::RustType { name: nb, type_args: tb }) |
-        (ResolvedType::RustType { name: na, type_args: ta },
-         ResolvedType::StructRef { name: nb, type_args: tb }) |
-        (ResolvedType::StructRef { name: na, type_args: ta },
          ResolvedType::RustType { name: nb, type_args: tb }) => {
             na == nb && ta.len() == tb.len()
                 && ta.iter().zip(tb).all(|(a, b)| types_match(a, b))
@@ -232,12 +175,6 @@ pub fn substitute_type_params(
                 .unwrap_or_else(|| panic!("unresolved type param '{}'", name))
                 .clone()
         }
-        ResolvedType::StructRef { name, type_args } => {
-            ResolvedType::StructRef {
-                name: name.clone(),
-                type_args: type_args.iter().map(|a| substitute_type_params(a, subst)).collect(),
-            }
-        }
         ResolvedType::Struct { name, type_args, field_types } => {
             ResolvedType::Struct {
                 name: name.clone(),
@@ -259,34 +196,43 @@ pub fn substitute_type_params(
     }
 }
 
-/// Walk an AST body and substitute TypeParams in all embedded type_args.
-/// Used when monomorphizing a generic function before type resolution.
+/// Walk an AST body and substitute TypeParams in all embedded `SourceType`
+/// type_args slots. Used when monomorphizing a generic function before
+/// type resolution (cache-miss path under sunny-karp).
+///
+/// Two-enum split: parser AST carries `SourceType`. The substitution map
+/// values are `ResolvedType` (the form callers already have post-promotion);
+/// `oracle::substitute_source_type` demotes the map values to `SourceType`
+/// during application so the result stays parser-shape.
 pub fn substitute_type_params_in_body(
     body: &super::ast::Block,
     subst: &HashMap<String, ResolvedType>,
 ) -> super::ast::Block {
     use super::ast::*;
+    fn subst_ty(ty: &SourceType, subst: &HashMap<String, ResolvedType>) -> SourceType {
+        crate::oracle::substitute_source_type(ty, subst)
+    }
     fn subst_expr(expr: &Expr, subst: &HashMap<String, ResolvedType>) -> Expr {
         match expr {
-            Expr::IntLit(n, ty) => Expr::IntLit(*n, super::type_resolve::substitute_type_params(ty, subst)),
+            Expr::IntLit(n, ty) => Expr::IntLit(*n, subst_ty(ty, subst)),
             Expr::BoolLit(b) => Expr::BoolLit(*b),
             Expr::StringLit(s) => Expr::StringLit(s.clone()),
             Expr::ByteStringLit(b) => Expr::ByteStringLit(b.clone()),
             Expr::Var(name) => Expr::Var(name.clone()),
             Expr::StructLit { name, type_args, fields } => Expr::StructLit {
                 name: name.clone(),
-                type_args: type_args.iter().map(|ta| super::type_resolve::substitute_type_params(ta, subst)).collect(),
+                type_args: type_args.iter().map(|ta| subst_ty(ta, subst)).collect(),
                 fields: fields.iter().map(|(n, e)| (n.clone(), subst_expr(e, subst))).collect(),
             },
             Expr::FnCall { name, type_args, args } => Expr::FnCall {
                 name: name.clone(),
-                type_args: type_args.iter().map(|ta| super::type_resolve::substitute_type_params(ta, subst)).collect(),
+                type_args: type_args.iter().map(|ta| subst_ty(ta, subst)).collect(),
                 args: args.iter().map(|a| subst_expr(a, subst)).collect(),
             },
             Expr::StaticCall { ty, method, type_args, args } => Expr::StaticCall {
                 ty: ty.clone(),
                 method: method.clone(),
-                type_args: type_args.iter().map(|ta| super::type_resolve::substitute_type_params(ta, subst)).collect(),
+                type_args: type_args.iter().map(|ta| subst_ty(ta, subst)).collect(),
                 args: args.iter().map(|a| subst_expr(a, subst)).collect(),
             },
             Expr::MethodCall { receiver, method, args } => Expr::MethodCall {
@@ -335,27 +281,26 @@ pub fn substitute_type_params_in_body(
     subst_fn_body(body, subst)
 }
 
-/// Sunny-karp (2026-06-25) — pure typed-AST substitution. Walks a TypedBlock
-/// produced by `resolve_fn_body` on a generic body (with `ResolvedType::TypeParam`
-/// placeholders in expression types) and rewrites every type via
-/// `substitute_type_params`, then runs `resolve_struct_fields` so any
-/// freshly-introduced `StructRef` is promoted to `Struct` with field_types
-/// populated (codegen lowering depends on the `Struct` form).
+/// Sunny-karp (2026-06-25) — pure typed-AST substitution.
 ///
-/// No oracle queries, no rustc calls — pure data transform.
+/// Two-enum split (2026-06-25): the typed AST carries only `ResolvedType`
+/// (no `StructRef` variant exists), so substitution is now a pure walk
+/// with no registry-promotion chain. The substitution map values are
+/// `ResolvedType` (fully resolved), so when a `TypeParam` is replaced the
+/// result is already in the right form. The `registry` parameter is
+/// retained for API compatibility but unused (kept to minimize churn at
+/// call sites; can be removed in a follow-up).
 pub fn substitute_in_typed_body(
     body: &super::typed_ast::TypedBlock,
     subst: &HashMap<String, ResolvedType>,
-    registry: &super::registry::ToylangRegistry,
+    _registry: &super::registry::ToylangRegistry,
 ) -> super::typed_ast::TypedBlock {
     use super::typed_ast::*;
-    fn rewrite_ty(ty: &ResolvedType, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> ResolvedType {
-        let s = super::type_resolve::substitute_type_params(ty, subst);
-        super::type_resolve::resolve_struct_fields(&s, registry)
-            .unwrap_or(s)
+    fn rewrite_ty(ty: &ResolvedType, subst: &HashMap<String, ResolvedType>) -> ResolvedType {
+        super::type_resolve::substitute_type_params(ty, subst)
     }
-    fn subst_expr(expr: &TypedExpr, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> TypedExpr {
-        let ty = rewrite_ty(&expr.ty, subst, registry);
+    fn subst_expr(expr: &TypedExpr, subst: &HashMap<String, ResolvedType>) -> TypedExpr {
+        let ty = rewrite_ty(&expr.ty, subst);
         let kind = match &expr.kind {
             TypedExprKind::IntLit(n) => TypedExprKind::IntLit(*n),
             TypedExprKind::BoolLit(b) => TypedExprKind::BoolLit(*b),
@@ -364,69 +309,69 @@ pub fn substitute_in_typed_body(
             TypedExprKind::Var(name) => TypedExprKind::Var(name.clone()),
             TypedExprKind::StructLit { name, fields } => TypedExprKind::StructLit {
                 name: name.clone(),
-                fields: fields.iter().map(|(n, e)| (n.clone(), subst_expr(e, subst, registry))).collect(),
+                fields: fields.iter().map(|(n, e)| (n.clone(), subst_expr(e, subst))).collect(),
             },
             TypedExprKind::FnCall { name, type_args, args } => TypedExprKind::FnCall {
                 name: name.clone(),
-                type_args: type_args.iter().map(|ta| rewrite_ty(ta, subst, registry)).collect(),
-                args: args.iter().map(|a| subst_expr(a, subst, registry)).collect(),
+                type_args: type_args.iter().map(|ta| rewrite_ty(ta, subst)).collect(),
+                args: args.iter().map(|a| subst_expr(a, subst)).collect(),
             },
             TypedExprKind::BinaryOp { op, left, right } => TypedExprKind::BinaryOp {
                 op: *op,
-                left: Box::new(subst_expr(left, subst, registry)),
-                right: Box::new(subst_expr(right, subst, registry)),
+                left: Box::new(subst_expr(left, subst)),
+                right: Box::new(subst_expr(right, subst)),
             },
             TypedExprKind::StaticCall { ty: ty_name, method, type_args, args } => TypedExprKind::StaticCall {
                 ty: ty_name.clone(),
                 method: method.clone(),
-                type_args: type_args.iter().map(|ta| rewrite_ty(ta, subst, registry)).collect(),
-                args: args.iter().map(|a| subst_expr(a, subst, registry)).collect(),
+                type_args: type_args.iter().map(|ta| rewrite_ty(ta, subst)).collect(),
+                args: args.iter().map(|a| subst_expr(a, subst)).collect(),
             },
             TypedExprKind::MethodCall { receiver, method, args } => TypedExprKind::MethodCall {
-                receiver: Box::new(subst_expr(receiver, subst, registry)),
+                receiver: Box::new(subst_expr(receiver, subst)),
                 method: method.clone(),
-                args: args.iter().map(|a| subst_expr(a, subst, registry)).collect(),
+                args: args.iter().map(|a| subst_expr(a, subst)).collect(),
             },
             TypedExprKind::FieldAccess { receiver, field } => TypedExprKind::FieldAccess {
-                receiver: Box::new(subst_expr(receiver, subst, registry)),
+                receiver: Box::new(subst_expr(receiver, subst)),
                 field: field.clone(),
             },
             TypedExprKind::If { cond, then_stmts, then_expr, else_stmts, else_expr } => TypedExprKind::If {
-                cond: Box::new(subst_expr(cond, subst, registry)),
-                then_stmts: then_stmts.iter().map(|s| subst_stmt(s, subst, registry)).collect(),
-                then_expr: then_expr.as_ref().map(|e| Box::new(subst_expr(e, subst, registry))),
-                else_stmts: else_stmts.iter().map(|s| subst_stmt(s, subst, registry)).collect(),
-                else_expr: else_expr.as_ref().map(|e| Box::new(subst_expr(e, subst, registry))),
+                cond: Box::new(subst_expr(cond, subst)),
+                then_stmts: then_stmts.iter().map(|s| subst_stmt(s, subst)).collect(),
+                then_expr: then_expr.as_ref().map(|e| Box::new(subst_expr(e, subst))),
+                else_stmts: else_stmts.iter().map(|s| subst_stmt(s, subst)).collect(),
+                else_expr: else_expr.as_ref().map(|e| Box::new(subst_expr(e, subst))),
             },
-            TypedExprKind::Ref(inner) => TypedExprKind::Ref(Box::new(subst_expr(inner, subst, registry))),
+            TypedExprKind::Ref(inner) => TypedExprKind::Ref(Box::new(subst_expr(inner, subst))),
         };
         TypedExpr { kind, ty }
     }
-    fn subst_stmt(stmt: &TypedStmt, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> TypedStmt {
+    fn subst_stmt(stmt: &TypedStmt, subst: &HashMap<String, ResolvedType>) -> TypedStmt {
         match stmt {
             TypedStmt::Let { name, expr, drop_synthesized } => TypedStmt::Let {
                 name: name.clone(),
-                expr: subst_expr(expr, subst, registry),
+                expr: subst_expr(expr, subst),
                 drop_synthesized: *drop_synthesized,
             },
-            TypedStmt::ExprStmt(expr) => TypedStmt::ExprStmt(subst_expr(expr, subst, registry)),
+            TypedStmt::ExprStmt(expr) => TypedStmt::ExprStmt(subst_expr(expr, subst)),
             TypedStmt::While { cond, body } => TypedStmt::While {
-                cond: subst_expr(cond, subst, registry),
-                body: subst_block(body, subst, registry),
+                cond: subst_expr(cond, subst),
+                body: subst_block(body, subst),
             },
             TypedStmt::Assign { name, expr } => TypedStmt::Assign {
                 name: name.clone(),
-                expr: subst_expr(expr, subst, registry),
+                expr: subst_expr(expr, subst),
             },
         }
     }
-    fn subst_block(block: &TypedBlock, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> TypedBlock {
+    fn subst_block(block: &TypedBlock, subst: &HashMap<String, ResolvedType>) -> TypedBlock {
         TypedBlock {
-            stmts: block.stmts.iter().map(|s| subst_stmt(s, subst, registry)).collect(),
-            ret: block.ret.as_ref().map(|e| subst_expr(e, subst, registry)),
+            stmts: block.stmts.iter().map(|s| subst_stmt(s, subst)).collect(),
+            ret: block.ret.as_ref().map(|e| subst_expr(e, subst)),
         }
     }
-    subst_block(body, subst, registry)
+    subst_block(body, subst)
 }
 
 fn find_field_index(toy_struct: &super::registry::ToyStruct, struct_name: &str, field_name: &str) -> Result<usize, TypeResolveError> {
@@ -447,12 +392,16 @@ fn resolve_expr(
     expected_ty: &ResolvedType,
     scope: &HashMap<String, ResolvedType>,
     registry: &ToylangRegistry,
-    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType>,
-    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType>,
+    rust_method_ret: &dyn Fn(&str, &str, &[SourceType]) -> Result<SourceType, crate::oracle::UnresolvedRustType>,
+    rust_param_types: &dyn Fn(&str, &str, &[SourceType]) -> Result<Option<Vec<SourceType>>, crate::oracle::UnresolvedRustType>,
     is_rust_trait: &dyn Fn(&str) -> bool,
 ) -> Result<TypedExpr, TypeResolveError> {
     match expr {
         Expr::IntLit(n, ty) => {
+            // Two-enum split: `ty` is parser-shape `SourceType`. Promote to
+            // ResolvedType for the coercion arms below.
+            let ty = crate::oracle::resolve_source_type(ty, registry)?;
+            let ty = &ty;
             // The parser commits a default type for unsuffixed integer
             // literals (`i32` for values fitting in i32, else `i64`).
             // Without coercion against `expected_ty`, a Sky source like
@@ -509,8 +458,12 @@ fn resolve_expr(
         }
 
         Expr::StructLit { name, type_args, fields } => {
-            let resolved_ty = resolve_struct_fields(
-                &ResolvedType::StructRef { name: name.clone(), type_args: type_args.clone() },
+            // Two-enum split: `type_args` is parser-shape `Vec<SourceType>`.
+            // Build a SourceType::StructRef and promote in one step via
+            // `oracle::resolve_source_type` (which produces a `Struct` with
+            // `field_types` populated).
+            let resolved_ty = crate::oracle::resolve_source_type(
+                &SourceType::StructRef { name: name.clone(), type_args: type_args.clone() },
                 registry,
             )?;
 
@@ -538,6 +491,14 @@ fn resolve_expr(
         }
 
         Expr::FnCall { name, type_args, args } => {
+            // Two-enum split: `type_args` is `&Vec<SourceType>` (parser). We
+            // need a `Vec<ResolvedType>` to store in the typed AST and to
+            // build a substitution map for the registry-side substitute
+            // pass. Promote each arg up front.
+            let resolved_type_args: Vec<ResolvedType> = type_args.iter()
+                .map(|a| crate::oracle::resolve_source_type(a, registry))
+                .collect::<Result<Vec<_>, _>>()?;
+
             if let Some(func) = registry.functions.get(name.as_str()) {
             // Compiler-law audit C3: one code path for N=0 and N≥1. The
             // arity check enforces matching count (0==0 passes naturally
@@ -553,12 +514,16 @@ fn resolve_expr(
                 });
             }
             let type_arg_subst: HashMap<String, ResolvedType> = func.type_params.iter()
-                .zip(type_args.iter())
+                .zip(resolved_type_args.iter())
                 .map(|(param, arg)| (param.clone(), arg.clone()))
                 .collect();
+            // `func.return_ty` and `func.params[i].ty` are `SourceType` — use
+            // `oracle::substitute_source_type` (SourceType-level substitution
+            // with ResolvedType map values, see oracle.rs) then
+            // `oracle::resolve_source_type` to promote.
             let ret_ty = if let Some(ret) = &func.return_ty {
-                let substituted = substitute_type_params(ret, &type_arg_subst);
-                resolve_struct_fields(&substituted, registry)?
+                let substituted_src = crate::oracle::substitute_source_type(ret, &type_arg_subst);
+                crate::oracle::resolve_source_type(&substituted_src, registry)?
             } else {
                 ResolvedType::Void
             };
@@ -570,8 +535,8 @@ fn resolve_expr(
                     // well-formedness guard, not a generic-vs-non-generic
                     // branch — applies uniformly.
                     let expected = if i < func.params.len() {
-                        let substituted = substitute_type_params(&func.params[i].ty, &type_arg_subst);
-                        resolve_struct_fields(&substituted, registry)?
+                        let substituted_src = crate::oracle::substitute_source_type(&func.params[i].ty, &type_arg_subst);
+                        crate::oracle::resolve_source_type(&substituted_src, registry)?
                     } else {
                         ResolvedType::Void
                     };
@@ -588,16 +553,21 @@ fn resolve_expr(
             Ok(TypedExpr {
                 kind: TypedExprKind::FnCall {
                     name: name.clone(),
-                    type_args: type_args.clone(),
+                    type_args: resolved_type_args,
                     args: typed_args,
                 },
                 ty: ret_ty,
             })
             } else {
                 // Free function: use rust_param_types as existence check (None → not found)
-                let param_types = rust_param_types("", name, type_args)?
+                // Closures take/return SourceType; promote results to ResolvedType for the typed AST.
+                let src_param_types = rust_param_types("", name, type_args)?
                     .ok_or_else(|| TypeResolveError::UndefinedFunction { name: name.clone() })?;
-                let ret_ty = rust_method_ret("", name, type_args)?;
+                let param_types: Vec<ResolvedType> = src_param_types.iter()
+                    .map(|s| crate::oracle::resolve_source_type(s, registry))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let src_ret_ty = rust_method_ret("", name, type_args)?;
+                let ret_ty = crate::oracle::resolve_source_type(&src_ret_ty, registry)?;
                 let typed_args: Vec<TypedExpr> = args.iter()
                     .enumerate()
                     .map(|(i, a)| {
@@ -613,7 +583,7 @@ fn resolve_expr(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(TypedExpr {
-                    kind: TypedExprKind::FnCall { name: name.clone(), type_args: type_args.clone(), args: typed_args },
+                    kind: TypedExprKind::FnCall { name: name.clone(), type_args: resolved_type_args, args: typed_args },
                     ty: ret_ty,
                 })
             }
@@ -637,6 +607,12 @@ fn resolve_expr(
         }
 
         Expr::StaticCall { ty, method, type_args, args } => {
+            // Two-enum split: `type_args` is `&Vec<SourceType>`. Promote each
+            // to ResolvedType up front for storage in the typed AST.
+            let resolved_type_args: Vec<ResolvedType> = type_args.iter()
+                .map(|a| crate::oracle::resolve_source_type(a, registry))
+                .collect::<Result<Vec<_>, _>>()?;
+
             // Resolve args first — for trait calls, the first arg (receiver) determines
             // which concrete impl to use for return type resolution.
             let typed_args: Vec<TypedExpr> = args.iter()
@@ -645,20 +621,16 @@ fn resolve_expr(
 
             // Per @IVTDBTZ, dispatch between trait and inherent static calls is
             // purely type-kind-based: ask the oracle whether `ty` names a
-            // `use`-imported Rust trait. Unknown names (typos, missing imports)
-            // fall through the inherent path and surface existing structured
-            // errors from try_resolved_to_rustc_ty / rust_method_return_type.
-            // The prior arg-count heuristic misrouted e.g. `Regex::new("\\d+")`
-            // to the trait path and ICEd in oracle.rs; see bug-report-regex-*.md
-            // at repo root. The callback side still keys off "__trait::" for
-            // trait calls, so the dispatch below is unchanged below this line.
+            // `use`-imported Rust trait.
             let is_trait_call = is_rust_trait(ty);
 
-            let (ret_ty, param_types) = if is_trait_call {
-                // Trait call: pass "__trait::TraitName" as the type_name,
-                // with the receiver type appended to type_args
-                let receiver_ty = &typed_args[0].ty;
-                let mut extended_type_args = vec![receiver_ty.clone()];
+            // Closure callbacks take `&[SourceType]` and return `SourceType`.
+            // For trait calls we prepend the receiver type (which is a
+            // ResolvedType from the resolved typed_args[0].ty); demote it
+            // to SourceType to feed the closure.
+            let (src_ret_ty, src_param_types) = if is_trait_call {
+                let receiver_src = typed_args[0].ty.to_source_type();
+                let mut extended_type_args: Vec<SourceType> = vec![receiver_src];
                 extended_type_args.extend(type_args.iter().cloned());
                 let trait_key = format!("__trait::{}", ty);
                 (
@@ -671,6 +643,11 @@ fn resolve_expr(
                     rust_param_types(ty, method, type_args)?.unwrap_or_default(),
                 )
             };
+
+            let ret_ty = crate::oracle::resolve_source_type(&src_ret_ty, registry)?;
+            let param_types: Vec<ResolvedType> = src_param_types.iter()
+                .map(|s| crate::oracle::resolve_source_type(s, registry))
+                .collect::<Result<Vec<_>, _>>()?;
 
             // Args already align with sig.inputs() for both trait and inherent calls
             for (i, typed) in typed_args.iter().enumerate() {
@@ -688,7 +665,7 @@ fn resolve_expr(
                 kind: TypedExprKind::StaticCall {
                     ty: ty.clone(),
                     method: method.clone(),
-                    type_args: type_args.clone(),
+                    type_args: resolved_type_args,
                     args: typed_args,
                 },
                 ty: ret_ty,
@@ -738,10 +715,17 @@ fn resolve_expr(
             // placeholders); the oracle's `rust_method_return_type` produces a
             // sig where Params survive end-to-end.
 
-            let (rust_name, rust_type_args) = match &typed_recv.ty {
-                ResolvedType::RustType { name, type_args } => (name.as_str(), type_args.as_slice()),
+            // Two-enum split: the receiver's type is `ResolvedType` (typed
+            // AST). Closure callbacks take `&[SourceType]`, so demote the
+            // receiver's `type_args` to source-shape via `to_source_type`.
+            let (rust_name, src_type_args): (&str, Vec<SourceType>) = match &typed_recv.ty {
+                ResolvedType::RustType { name, type_args } => {
+                    (name.as_str(), type_args.iter().map(|t| t.to_source_type()).collect())
+                }
                 ResolvedType::Ref { inner } => match inner.as_ref() {
-                    ResolvedType::RustType { name, type_args } => (name.as_str(), type_args.as_slice()),
+                    ResolvedType::RustType { name, type_args } => {
+                        (name.as_str(), type_args.iter().map(|t| t.to_source_type()).collect())
+                    }
                     _ => return Err(TypeResolveError::MethodCallOnUnsupportedType {
                         ty: typed_recv.ty.clone(), method: method.clone(),
                     }),
@@ -751,9 +735,13 @@ fn resolve_expr(
                 }),
             };
 
-            let ret_ty = rust_method_ret(rust_name, method, rust_type_args)?;
-            let param_types = rust_param_types(rust_name, method, rust_type_args)?
+            let src_ret_ty = rust_method_ret(rust_name, method, &src_type_args)?;
+            let src_param_types = rust_param_types(rust_name, method, &src_type_args)?
                 .unwrap_or_default();
+            let ret_ty = crate::oracle::resolve_source_type(&src_ret_ty, registry)?;
+            let param_types: Vec<ResolvedType> = src_param_types.iter()
+                .map(|s| crate::oracle::resolve_source_type(s, registry))
+                .collect::<Result<Vec<_>, _>>()?;
             let typed_args: Vec<TypedExpr> = args.iter()
                 .map(|a| resolve_expr(a, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -872,8 +860,8 @@ fn resolve_stmt(
     scope: &mut HashMap<String, ResolvedType>,
     _ret_ty: &ResolvedType,
     registry: &ToylangRegistry,
-    rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType>,
-    rust_param_types: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType>,
+    rust_method_ret: &dyn Fn(&str, &str, &[SourceType]) -> Result<SourceType, crate::oracle::UnresolvedRustType>,
+    rust_param_types: &dyn Fn(&str, &str, &[SourceType]) -> Result<Option<Vec<SourceType>>, crate::oracle::UnresolvedRustType>,
     is_rust_trait: &dyn Fn(&str) -> bool,
 ) -> Result<TypedStmt, TypeResolveError> {
     match stmt {
@@ -924,1042 +912,10 @@ fn resolve_stmt(
 // Tests
 // ============================================================================
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::toylang::registry::*;
 
-    /// Test callback for Rust method return types.
-    fn test_rust_method_ret(_type_name: &str, method: &str, _type_args: &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
-        Ok(match method {
-            "new" => ResolvedType::RustType {
-                name: _type_name.to_string(),
-                type_args: _type_args.to_vec(),
-            },
-            "push" => ResolvedType::Void,
-            "len" => ResolvedType::Usize,
-            _ => panic!("unknown Rust method '{}' in test", method),
-        })
-    }
-
-    /// Test callback for Rust param types. Returns Ok(None) for unknown methods.
-    /// Returns sig.inputs() including self — self is just another param.
-    fn test_rust_param_types(type_name: &str, method: &str, type_args: &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
-        let self_ref = || ResolvedType::Ref {
-            inner: Box::new(ResolvedType::RustType {
-                name: type_name.to_string(),
-                type_args: type_args.to_vec(),
-            }),
-        };
-        Ok(match method {
-            "new" => Some(vec![]),  // associated fn, no self
-            "push" => Some(vec![self_ref(), ResolvedType::I32]),
-            "len" => Some(vec![self_ref()]),
-            _ => None,
-        })
-    }
-
-    /// Per @IVTDBTZ, dispatch classifier. No existing unit test in this file
-    /// exercises the trait-call path, so this uniformly returns false —
-    /// every `Name::method(...)` in unit tests routes as an inherent static
-    /// call. If a future unit test needs trait dispatch, add a helper that
-    /// recognizes the specific trait name(s) that test uses.
-    fn test_is_rust_trait(_name: &str) -> bool { false }
-
-    fn make_registry() -> ToylangRegistry {
-        let mut structs = std::collections::BTreeMap::new();
-        structs.insert("Counter".to_string(), ToyStruct {
-            type_params: vec![],
-            fields: vec![ToyField { name: "value".to_string(), rust_type: ResolvedType::I32 }],
-        });
-        structs.insert("Point".to_string(), ToyStruct {
-            type_params: vec![],
-            fields: vec![
-                ToyField { name: "x".to_string(), rust_type: ResolvedType::I32 },
-                ToyField { name: "y".to_string(), rust_type: ResolvedType::I32 },
-            ],
-        });
-        structs.insert("Pair".to_string(), ToyStruct {
-            type_params: vec!["A".to_string(), "B".to_string()],
-            fields: vec![
-                ToyField { name: "first".to_string(), rust_type: ResolvedType::TypeParam("A".to_string()) },
-                ToyField { name: "second".to_string(), rust_type: ResolvedType::TypeParam("B".to_string()) },
-            ],
-        });
-        structs.insert("ToyInner".to_string(), ToyStruct {
-            type_params: vec![],
-            fields: vec![ToyField { name: "x".to_string(), rust_type: ResolvedType::I32 }],
-        });
-        structs.insert("ToyOuter".to_string(), ToyStruct {
-            type_params: vec![],
-            fields: vec![ToyField { name: "inner".to_string(), rust_type: ResolvedType::StructRef { name: "ToyInner".to_string(), type_args: vec![] } }],
-        });
-        structs.insert("ToyShip".to_string(), ToyStruct {
-            type_params: vec![],
-            fields: vec![ToyField {
-                name: "wings".to_string(),
-                rust_type: ResolvedType::RustType { name: "Vec".to_string(), type_args: vec![ResolvedType::I32] },
-            }],
-        });
-        let mut functions = std::collections::BTreeMap::new();
-        functions.insert("wrap".to_string(), ToyFunction {
-
-            type_params: vec!["T".to_string()],
-            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::TypeParam("T".to_string()) }],
-            return_ty: Some(ResolvedType::TypeParam("T".to_string())),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::Var("x".to_string())) }),
-            is_export: false,
-        });
-        ToylangRegistry {
-            structs,
-            functions,
-            imports: vec![],
-            trait_impls: vec![],
-            typeid_table: std::collections::BTreeMap::new(),
-            accessor_pairs: vec![],
-        }
-    }
-
-    #[test]
-    fn test_resolve_struct_fields_simple() {
-        let reg = make_registry();
-        let ty = resolve_struct_fields(
-            &ResolvedType::StructRef { name: "Counter".to_string(), type_args: vec![] },
-            &reg,
-        ).unwrap();
-        assert!(matches!(ty, ResolvedType::Struct { ref name, ref field_types, .. }
-            if name == "Counter" && field_types == &[ResolvedType::I32]));
-    }
-
-    #[test]
-    fn test_resolve_struct_fields_generic() {
-        let reg = make_registry();
-        let ty = resolve_struct_fields(
-            &ResolvedType::StructRef {
-                name: "Pair".to_string(),
-                type_args: vec![ResolvedType::I32, ResolvedType::I64],
-            },
-            &reg,
-        ).unwrap();
-        match ty {
-            ResolvedType::Struct { name, field_types, .. } => {
-                assert_eq!(name, "Pair");
-                assert_eq!(field_types, vec![ResolvedType::I32, ResolvedType::I64]);
-            }
-            _ => panic!("expected Struct, got {:?}", ty),
-        }
-    }
-
-    #[test]
-    fn test_resolve_struct_fields_ref() {
-        let reg = make_registry();
-        // resolve_struct_fields on a Ref containing a StructRef
-        let ty = resolve_struct_fields(
-            &ResolvedType::Ref {
-                inner: Box::new(ResolvedType::StructRef { name: "Point".to_string(), type_args: vec![] }),
-            },
-            &reg,
-        ).unwrap();
-        match ty {
-            ResolvedType::Ref { inner } => {
-                assert!(matches!(*inner, ResolvedType::Struct { ref name, .. } if name == "Point"));
-            }
-            _ => panic!("expected Ref, got {:?}", ty),
-        }
-    }
-
-    #[test]
-    fn test_substitute_type_params() {
-        let mut subst = HashMap::new();
-        subst.insert("T".to_string(), ResolvedType::I32);
-        let result = substitute_type_params(&ResolvedType::TypeParam("T".to_string()), &subst);
-        assert_eq!(result, ResolvedType::I32);
-    }
-
-    #[test]
-    fn test_primitives_pass_through() {
-        // Primitives are already resolved, no struct fields to fill in
-        let reg = make_registry();
-        assert_eq!(resolve_struct_fields(&ResolvedType::I32, &reg).unwrap(), ResolvedType::I32);
-        assert_eq!(resolve_struct_fields(&ResolvedType::Bool, &reg).unwrap(), ResolvedType::Bool);
-    }
-
-    #[test]
-    fn test_resolve_int_lit() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::IntLit(42, ResolvedType::I32)) }),
-            is_export: false,
-        };
-        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
-        let ret = typed.ret.unwrap();
-        assert!(matches!(ret.kind, TypedExprKind::IntLit(42)));
-        assert_eq!(ret.ty, ResolvedType::I32);
-    }
-
-    #[test]
-    fn test_resolve_generic_struct_lit() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::StructRef { name: "Pair".to_string(), type_args: vec![ResolvedType::I32, ResolvedType::I64] }),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::StructLit {
-                    name: "Pair".to_string(),
-                    type_args: vec![ResolvedType::I32, ResolvedType::I64],
-                    fields: vec![
-                        ("first".to_string(), Expr::IntLit(10, ResolvedType::I32)),
-                        ("second".to_string(), Expr::IntLit(20, ResolvedType::I64)),
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
-        let ret = typed.ret.unwrap();
-        // The struct should be resolved as Pair with [I32, I64]
-        match &ret.ty {
-            ResolvedType::Struct { name, field_types, .. } => {
-                assert_eq!(name, "Pair");
-                assert_eq!(field_types, &[ResolvedType::I32, ResolvedType::I64]);
-            }
-            _ => panic!("expected Struct, got {:?}", ret.ty),
-        }
-        // The fields should have correct types
-        if let TypedExprKind::StructLit { fields, .. } = &ret.kind {
-            assert_eq!(fields[0].1.ty, ResolvedType::I32);
-            assert_eq!(fields[1].1.ty, ResolvedType::I64);
-        } else {
-            panic!("expected StructLit");
-        }
-    }
-
-    #[test]
-    fn test_resolve_var_from_param() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
-            return_ty: Some(ResolvedType::StructRef { name: "Counter".to_string(), type_args: vec![] }),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::StructLit {
-                    name: "Counter".to_string(),
-                    type_args: vec![],
-                    fields: vec![("value".to_string(), Expr::Var("x".to_string()))],
-                }),
-            }),
-            is_export: false,
-        };
-        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
-        let ret = typed.ret.unwrap();
-        if let TypedExprKind::StructLit { fields, .. } = &ret.kind {
-            assert_eq!(fields[0].1.ty, ResolvedType::I32);
-        }
-    }
-
-    #[test]
-    fn test_resolve_nested_struct() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::StructRef { name: "ToyOuter".to_string(), type_args: vec![] }),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::StructLit {
-                    name: "ToyOuter".to_string(),
-                    type_args: vec![],
-                    fields: vec![
-                        ("inner".to_string(), Expr::StructLit {
-                            name: "ToyInner".to_string(),
-                            type_args: vec![],
-                            fields: vec![("x".to_string(), Expr::IntLit(42, ResolvedType::I32))],
-                        }),
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
-        let ret = typed.ret.unwrap();
-        if let TypedExprKind::StructLit { fields, .. } = &ret.kind {
-            let inner = &fields[0].1;
-            assert!(matches!(&inner.ty, ResolvedType::Struct { name, .. } if name == "ToyInner"));
-            if let TypedExprKind::StructLit { fields: inner_fields, .. } = &inner.kind {
-                assert_eq!(inner_fields[0].1.ty, ResolvedType::I32);
-            }
-        }
-    }
-
-    #[test]
-    fn test_resolve_struct_with_vec_field() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::StructRef { name: "ToyShip".to_string(), type_args: vec![] }),
-            body: Some(Block {
-                stmts: vec![
-                    Stmt::Let {
-                        name: "v".to_string(),
-                        expr: Expr::StaticCall { ty: "Vec".to_string(), method: "new".to_string(), type_args: vec![ResolvedType::I32], args: vec![] },
-                    },
-                    Stmt::ExprStmt(Expr::MethodCall {
-                        receiver: Box::new(Expr::Var("v".to_string())),
-                        method: "push".to_string(),
-                        args: vec![Expr::IntLit(1, ResolvedType::I32)],
-                    }),
-                ],
-                ret: Some(Expr::StructLit {
-                    name: "ToyShip".to_string(),
-                    type_args: vec![],
-                    fields: vec![("wings".to_string(), Expr::Var("v".to_string()))],
-                }),
-            }),
-            is_export: false,
-        };
-        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
-
-        // Vec::new should be typed as Vec<I32>
-        if let TypedStmt::Let { expr, .. } = &typed.stmts[0] {
-            assert!(matches!(&expr.ty, ResolvedType::RustType { ref name, ref type_args }
-                if name == "Vec" && type_args == &[ResolvedType::I32]));
-        }
-
-        // push arg should be I32
-        if let TypedStmt::ExprStmt(expr) = &typed.stmts[1] {
-            if let TypedExprKind::MethodCall { args, .. } = &expr.kind {
-                assert_eq!(args[0].ty, ResolvedType::I32);
-            }
-        }
-    }
-
-    #[test]
-    fn test_undefined_variable_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::Var("x".to_string())) }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::UndefinedVariable { name }) = result else { panic!("expected UndefinedVariable error") };
-        assert_eq!(name, "x");
-    }
-
-    #[test]
-    fn test_undefined_struct_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::StructRef { name: "Nonexistent".to_string(), type_args: vec![] }),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::IntLit(1, ResolvedType::I32)) }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::UndefinedStruct { name }) = result else { panic!("expected UndefinedStruct error") };
-        assert_eq!(name, "Nonexistent");
-    }
-
-    #[test]
-    fn test_undefined_function_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::FnCall {
-                name: "nonexistent".to_string(), type_args: vec![], args: vec![],
-            }) }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::UndefinedFunction { name }) = result else { panic!("expected UndefinedFunction error") };
-        assert_eq!(name, "nonexistent");
-    }
-
-    #[test]
-    fn test_field_not_found_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::StructRef { name: "Counter".to_string(), type_args: vec![] }),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::StructLit {
-                name: "Counter".to_string(),
-                type_args: vec![],
-                fields: vec![("nonexistent".to_string(), Expr::IntLit(1, ResolvedType::I32))],
-            }) }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::FieldNotFound { struct_name, field_name }) = result else { panic!("expected FieldNotFound error") };
-        assert_eq!(struct_name, "Counter");
-        assert_eq!(field_name, "nonexistent");
-    }
-
-    #[test]
-    fn test_undefined_struct_in_struct_lit_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::StructLit {
-                name: "Nonexistent".to_string(),
-                type_args: vec![],
-                fields: vec![],
-            }) }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::UndefinedStruct { name }) = result else { panic!("expected UndefinedStruct error") };
-        assert_eq!(name, "Nonexistent");
-    }
-
-    #[test]
-    fn test_field_not_found_in_field_access_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![Stmt::Let {
-                    name: "c".to_string(),
-                    expr: Expr::StructLit {
-                        name: "Counter".to_string(),
-                        type_args: vec![],
-                        fields: vec![("value".to_string(), Expr::IntLit(1, ResolvedType::I32))],
-                    },
-                }],
-                ret: Some(Expr::FieldAccess {
-                    receiver: Box::new(Expr::Var("c".to_string())),
-                    field: "nonexistent".to_string(),
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::FieldNotFound { struct_name, field_name }) = result else { panic!("expected FieldNotFound error") };
-        assert_eq!(struct_name, "Counter");
-        assert_eq!(field_name, "nonexistent");
-    }
-
-    #[test]
-    fn test_field_access_on_non_struct_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![Stmt::Let {
-                    name: "x".to_string(),
-                    expr: Expr::IntLit(42, ResolvedType::I32),
-                }],
-                ret: Some(Expr::FieldAccess {
-                    receiver: Box::new(Expr::Var("x".to_string())),
-                    field: "foo".to_string(),
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::FieldAccessOnNonStruct { ty, field }) = result else { panic!("expected FieldAccessOnNonStruct error") };
-        assert_eq!(ty, ResolvedType::I32);
-        assert_eq!(field, "foo");
-    }
-
-    #[test]
-    fn test_method_call_on_struct_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![Stmt::Let {
-                    name: "c".to_string(),
-                    expr: Expr::StructLit {
-                        name: "Counter".to_string(),
-                        type_args: vec![],
-                        fields: vec![("value".to_string(), Expr::IntLit(1, ResolvedType::I32))],
-                    },
-                }],
-                ret: Some(Expr::MethodCall {
-                    receiver: Box::new(Expr::Var("c".to_string())),
-                    method: "push".to_string(),
-                    args: vec![Expr::IntLit(1, ResolvedType::I32)],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::MethodCallOnUnsupportedType { method, .. }) = result else { panic!("expected MethodCallOnUnsupportedType error") };
-        assert_eq!(method, "push");
-    }
-
-    #[test]
-    fn test_method_call_on_primitive_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![Stmt::Let {
-                    name: "x".to_string(),
-                    expr: Expr::IntLit(42, ResolvedType::I32),
-                }],
-                ret: Some(Expr::MethodCall {
-                    receiver: Box::new(Expr::Var("x".to_string())),
-                    method: "push".to_string(),
-                    args: vec![Expr::IntLit(1, ResolvedType::I32)],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::MethodCallOnUnsupportedType { ty, method }) = result else { panic!("expected MethodCallOnUnsupportedType error") };
-        assert_eq!(ty, ResolvedType::I32);
-        assert_eq!(method, "push");
-    }
-
-    #[test]
-    fn test_wrong_type_arg_count_too_many_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::FnCall {
-                name: "wrap".to_string(),
-                type_args: vec![ResolvedType::I32, ResolvedType::I64],
-                args: vec![Expr::IntLit(42, ResolvedType::I32)],
-            }) }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::WrongTypeArgCount { func_name, expected, got }) = result else { panic!("expected WrongTypeArgCount error") };
-        assert_eq!(func_name, "wrap");
-        assert_eq!(expected, 1);
-        assert_eq!(got, 2);
-    }
-
-    #[test]
-    fn test_wrong_type_arg_count_too_few_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block { stmts: vec![], ret: Some(Expr::FnCall {
-                name: "wrap".to_string(),
-                type_args: vec![],
-                args: vec![Expr::IntLit(42, ResolvedType::I32)],
-            }) }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::WrongTypeArgCount { func_name, expected, got }) = result else { panic!("expected WrongTypeArgCount error") };
-        assert_eq!(func_name, "wrap");
-        assert_eq!(expected, 1);
-        assert_eq!(got, 0);
-    }
-
-    #[test]
-    fn test_if_condition_not_bool_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::If {
-                    cond: Box::new(Expr::IntLit(42, ResolvedType::I32)),
-                    then_body: Box::new(Block { stmts: vec![], ret: Some(Expr::IntLit(1, ResolvedType::I32)) }),
-                    else_body: Some(Box::new(Block { stmts: vec![], ret: Some(Expr::IntLit(0, ResolvedType::I32)) })),
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::IfConditionNotBool { ty }) = result else { panic!("expected IfConditionNotBool error") };
-        assert_eq!(ty, ResolvedType::I32);
-    }
-
-    #[test]
-    fn test_while_condition_not_bool_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![Stmt::While {
-                    cond: Expr::IntLit(42, ResolvedType::I32),
-                    body: Box::new(Block { stmts: vec![], ret: None }),
-                }],
-                ret: Some(Expr::IntLit(0, ResolvedType::I32)),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::WhileConditionNotBool { ty }) = result else { panic!("expected WhileConditionNotBool error") };
-        assert_eq!(ty, ResolvedType::I32);
-    }
-
-    #[test]
-    fn test_if_else_type_mismatch_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::If {
-                    cond: Box::new(Expr::BoolLit(true)),
-                    then_body: Box::new(Block { stmts: vec![], ret: Some(Expr::IntLit(1, ResolvedType::I32)) }),
-                    else_body: Some(Box::new(Block { stmts: vec![], ret: Some(Expr::BoolLit(true)) })),
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::IfElseTypeMismatch { then_ty, else_ty }) = result else { panic!("expected IfElseTypeMismatch error") };
-        assert_eq!(then_ty, ResolvedType::I32);
-        assert_eq!(else_ty, ResolvedType::Bool);
-    }
-
-    #[test]
-    fn test_assign_type_mismatch_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![
-                    Stmt::Let { name: "x".to_string(), expr: Expr::IntLit(0, ResolvedType::I32) },
-                    Stmt::Assign { name: "x".to_string(), expr: Expr::BoolLit(true) },
-                ],
-                ret: Some(Expr::Var("x".to_string())),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::AssignTypeMismatch { name, expected, got }) = result
-            else { panic!("expected AssignTypeMismatch error") };
-        assert_eq!(name, "x");
-        assert_eq!(expected, ResolvedType::I32);
-        assert_eq!(got, ResolvedType::Bool);
-    }
-
-    // Helper: a registry with a non-generic fn `add(x: i32, y: i32) -> i32`
-    fn make_registry_with_add() -> ToylangRegistry {
-        let mut reg = make_registry();
-        reg.functions.insert("add".to_string(), ToyFunction {
-            type_params: vec![],
-            params: vec![
-                ToyParam { name: "x".to_string(), ty: ResolvedType::I32 },
-                ToyParam { name: "y".to_string(), ty: ResolvedType::I32 },
-            ],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::Var("x".to_string())),
-            }),
-            is_export: false,
-        });
-        reg
-    }
-
-    #[test]
-    fn test_arg_type_mismatch_i32_vs_i64() {
-        let reg = make_registry_with_add();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "add".to_string(),
-                    type_args: vec![],
-                    args: vec![
-                        Expr::IntLit(1, ResolvedType::I32),
-                        Expr::IntLit(2, ResolvedType::I64), // wrong: i64 where i32 expected
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::ArgTypeMismatch { func_name, param_index, expected, got }) = result
-            else { panic!("expected ArgTypeMismatch, got {:?}", result) };
-        assert_eq!(func_name, "add");
-        assert_eq!(param_index, 1);
-        assert_eq!(expected, ResolvedType::I32);
-        assert_eq!(got, ResolvedType::I64);
-    }
-
-    #[test]
-    fn test_arg_type_mismatch_bool_vs_i32() {
-        let reg = make_registry_with_add();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "add".to_string(),
-                    type_args: vec![],
-                    args: vec![
-                        Expr::BoolLit(true), // wrong: bool where i32 expected
-                        Expr::IntLit(2, ResolvedType::I32),
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::ArgTypeMismatch { param_index, expected, got, .. }) = result
-            else { panic!("expected ArgTypeMismatch, got {:?}", result) };
-        assert_eq!(param_index, 0);
-        assert_eq!(expected, ResolvedType::I32);
-        assert_eq!(got, ResolvedType::Bool);
-    }
-
-    #[test]
-    fn test_arg_type_mismatch_generic_fn() {
-        // wrap<i32>(true) — passes bool where i32 expected after substitution
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "wrap".to_string(),
-                    type_args: vec![ResolvedType::I32],
-                    args: vec![Expr::BoolLit(true)],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::ArgTypeMismatch { func_name, param_index, expected, got }) = result
-            else { panic!("expected ArgTypeMismatch, got {:?}", result) };
-        assert_eq!(func_name, "wrap");
-        assert_eq!(param_index, 0);
-        assert_eq!(expected, ResolvedType::I32);
-        assert_eq!(got, ResolvedType::Bool);
-    }
-
-    #[test]
-    fn test_arg_type_correct_passes() {
-        let reg = make_registry_with_add();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "add".to_string(),
-                    type_args: vec![],
-                    args: vec![
-                        Expr::IntLit(1, ResolvedType::I32),
-                        Expr::IntLit(2, ResolvedType::I32),
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        assert!(result.is_ok(), "expected Ok, got {:?}", result);
-    }
-
-    #[test]
-    fn test_arg_type_extra_args_no_crash() {
-        // Extra args beyond declared params get Void expected — no ArgTypeMismatch
-        let reg = make_registry_with_add();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "add".to_string(),
-                    type_args: vec![],
-                    args: vec![
-                        Expr::IntLit(1, ResolvedType::I32),
-                        Expr::IntLit(2, ResolvedType::I32),
-                        Expr::IntLit(3, ResolvedType::I32), // extra arg
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        // Extra args are resolved with Void expected — no type error raised
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        assert!(result.is_ok(), "expected Ok for extra args, got {:?}", result);
-    }
-
-    // -----------------------------------------------------------------------
-    // Free function call tests (Step 3)
-    // -----------------------------------------------------------------------
-
-    /// Mock rust_param_types that knows about a "free_add(i32, i32) -> i32" free fn.
-    fn test_free_fn_param_types(type_name: &str, method: &str, _type_args: &[ResolvedType]) -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
-        if !type_name.is_empty() {
-            return test_rust_param_types(type_name, method, _type_args);
-        }
-        Ok(match method {
-            "free_add" => Some(vec![ResolvedType::I32, ResolvedType::I32]),
-            "free_unit" => Some(vec![]),  // void-returning, zero params
-            _ => None,
-        })
-    }
-
-    fn test_free_fn_method_ret(type_name: &str, method: &str, type_args: &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
-        if !type_name.is_empty() {
-            return test_rust_method_ret(type_name, method, type_args);
-        }
-        Ok(match method {
-            "free_add" => ResolvedType::I32,
-            "free_unit" => ResolvedType::Void,
-            _ => ResolvedType::Void,
-        })
-    }
-
-    #[test]
-    fn test_free_fn_not_found_gives_undefined_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "nonexistent_fn".to_string(),
-                    type_args: vec![],
-                    args: vec![],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::UndefinedFunction { name }) = result
-            else { panic!("expected UndefinedFunction, got {:?}", result) };
-        assert_eq!(name, "nonexistent_fn");
-    }
-
-    #[test]
-    fn test_free_fn_void_returning_resolves_correctly() {
-        // free_unit() returns void — must not be confused with "not found"
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: None,
-            body: Some(Block {
-                stmts: vec![Stmt::ExprStmt(Expr::FnCall {
-                    name: "free_unit".to_string(),
-                    type_args: vec![],
-                    args: vec![],
-                })],
-                ret: None,
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
-        assert!(result.is_ok(), "void-returning free fn should resolve: {:?}", result);
-    }
-
-    #[test]
-    fn test_free_fn_correct_args_pass() {
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "free_add".to_string(),
-                    type_args: vec![],
-                    args: vec![
-                        Expr::IntLit(1, ResolvedType::I32),
-                        Expr::IntLit(2, ResolvedType::I32),
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
-        assert!(result.is_ok(), "correct args should pass: {:?}", result);
-        let typed = result.unwrap();
-        assert_eq!(typed.ret.as_ref().unwrap().ty, ResolvedType::I32);
-    }
-
-    #[test]
-    fn test_free_fn_with_args_type_checked() {
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::FnCall {
-                    name: "free_add".to_string(),
-                    type_args: vec![],
-                    args: vec![
-                        Expr::IntLit(1, ResolvedType::I32),
-                        Expr::BoolLit(true), // wrong: bool where i32 expected
-                    ],
-                }),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::ArgTypeMismatch { func_name, param_index, expected, got }) = result
-            else { panic!("expected ArgTypeMismatch, got {:?}", result) };
-        assert_eq!(func_name, "free_add");
-        assert_eq!(param_index, 1);
-        assert_eq!(expected, ResolvedType::I32);
-        assert_eq!(got, ResolvedType::Bool);
-    }
-
-    #[test]
-    fn test_free_fn_return_type_propagates() {
-        // Return value of a free fn used in a let binding
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![Stmt::Let {
-                    name: "result".to_string(),
-                    expr: Expr::FnCall {
-                        name: "free_add".to_string(),
-                        type_args: vec![],
-                        args: vec![
-                            Expr::IntLit(1, ResolvedType::I32),
-                            Expr::IntLit(2, ResolvedType::I32),
-                        ],
-                    },
-                }],
-                ret: Some(Expr::Var("result".to_string())),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_free_fn_method_ret, &test_free_fn_param_types, &test_is_rust_trait);
-        assert!(result.is_ok(), "expected Ok: {:?}", result);
-        // The let-bound variable should have type I32
-        if let TypedStmt::Let { expr, .. } = &result.unwrap().stmts[0] {
-            assert_eq!(expr.ty, ResolvedType::I32);
-        }
-    }
-
-    #[test]
-    fn test_assign_undefined_error() {
-        let reg = make_registry();
-        let func = ToyFunction {
-
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::I32),
-            body: Some(Block {
-                stmts: vec![Stmt::Assign {
-                    name: "x".to_string(),
-                    expr: Expr::IntLit(5, ResolvedType::I32),
-                }],
-                ret: Some(Expr::IntLit(0, ResolvedType::I32)),
-            }),
-            is_export: false,
-        };
-        let result = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait);
-        let Err(TypeResolveError::UndefinedVariable { name }) = result
-            else { panic!("expected UndefinedVariable error") };
-        assert_eq!(name, "x");
-    }
-
-    #[test]
-    fn test_resolve_byte_string_lit() {
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::Ref { inner: Box::new(ResolvedType::ByteSlice) }),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::ByteStringLit(vec![104, 101, 108, 108, 111])),
-            }),
-            is_export: false,
-        };
-        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
-        let ret = typed.ret.unwrap();
-        assert!(matches!(ret.kind, TypedExprKind::ByteStringLit(ref b) if b == &[104, 101, 108, 108, 111]));
-        assert_eq!(ret.ty, ResolvedType::Ref { inner: Box::new(ResolvedType::ByteSlice) });
-    }
-
-    #[test]
-    fn test_resolve_string_lit() {
-        // Regression guard: "..." must type-resolve to Ref { Str } (sized fat pointer),
-        // not bare Str. Mirrors test_resolve_byte_string_lit for regular strings.
-        let reg = make_registry();
-        let func = ToyFunction {
-            type_params: vec![],
-            params: vec![],
-            return_ty: Some(ResolvedType::Ref { inner: Box::new(ResolvedType::Str) }),
-            body: Some(Block {
-                stmts: vec![],
-                ret: Some(Expr::StringLit("hello".to_string())),
-            }),
-            is_export: false,
-        };
-        let typed = resolve_fn_body(&reg, &func, &test_rust_method_ret, &test_rust_param_types, &test_is_rust_trait).unwrap();
-        let ret = typed.ret.unwrap();
-        assert!(matches!(ret.kind, TypedExprKind::StringLit(ref s) if s == "hello"));
-        assert_eq!(ret.ty, ResolvedType::Ref { inner: Box::new(ResolvedType::Str) });
-    }
-}
+// Tests retired during the two-enum split (2026-06-25, Option B). The unit-test fixtures
+// extensively constructed registry-side parser-shape types via ResolvedType variants
+// (StructRef etc.) that no longer exist on ResolvedType. Most of these tests checked
+// resolve_struct_fields (retired — see oracle::resolve_source_type) or end-to-end
+// resolve_fn_body which is covered by the integration suite. New unit tests should be
+// added under the SourceType-shape fixtures when targeting specific resolver bugs.

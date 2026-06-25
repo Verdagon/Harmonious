@@ -7192,11 +7192,118 @@ the substituted value, walk the children, done. The trap was in the
 shape of the substituted value relative to consumer expectations. IR
 inspection and runtime output were the only signals.
 
-**Residual cleanup post-sunny-karp** (low-priority follow-ups):
-`RustTypeLookupContext::DeferredTypeParam` variant + `oracle::contains_type_param`
-function + `UnresolvedRustType::is_deferred()` + `TypeResolveError::RustTypeDeferred`
-all retain a small dead-code footprint; no callers exercise them post-sunny-karp.
-Mechanical to delete in a sweep.
+**Residual cleanup post-sunny-karp** (mostly retired by §F.21's two-enum
+split): `RustTypeLookupContext::DeferredTypeParam` variant +
+`oracle::contains_type_param` function + the unit tests for both were
+deleted in §F.21 alongside the broader cleanup. `UnresolvedRustType::is_deferred()`
+reduced to a vestigial `false` constant retained for the closure arms in
+`after_rust_analysis`; `TypeResolveError::RustTypeDeferred` retains a
+small dead-code footprint but has no live producers post-§F.21.
+
+#### F.21 Two-enum split: SourceType vs ResolvedType (2026-06-25, Option B)
+
+The structural follow-up to §F.20 surprise #3 — the `StructRef → Struct`
+promotion silent miscompile in the substitute walk. Sunny-karp's
+reactive fix chained `resolve_struct_fields` through
+`substitute_in_typed_body`; this implementation arc replaces the
+single `ResolvedType` enum with two distinct types so the silent
+miscompile becomes unrepresentable.
+
+**The split.** `typed_ast.rs` now defines:
+- **`SourceType`** — parser-shape. Carries `StructRef { name, type_args }`
+  for any Sky struct reference. Field info has not been looked up.
+  Lives in: the parser AST (`Expr::*::type_args`), the registry
+  (`ToyField.rust_type`, `ToyParam.ty`, `ToyFunction.return_ty`,
+  `typeid_table` args, `synthesize_accessor_fn`), stub_gen's rendering
+  layer, the sidecar (via the registry), and the immediate output of
+  `oracle::rustc_ty_to_source_type`.
+- **`ResolvedType`** — resolved-shape. Sky structs MUST appear as
+  `Struct { name, type_args, field_types }` with `field_types`
+  mandatory and fully expanded. No `StructRef` variant exists. Lives
+  in: the typed AST (`TypedExpr.ty`), codegen, the layout query, the
+  substitution walk, the cached typed bodies on
+  `ToylangState.typed_bodies`.
+
+**The chokepoint.** `oracle::resolve_source_type(src, registry)`
+promotes `SourceType → ResolvedType` by looking up Sky struct fields
+recursively. This is the SINGLE site where the SourceType→ResolvedType
+transition happens. Any pure-AST walk that produces fresh
+`ResolvedType` values now provably cannot produce a `StructRef` (the
+variant is gone), so the sunny-karp #3 bug class is closed at the
+type level.
+
+**Sibling fns the oracle gained (~200 LOC):** `try_source_to_rustc_ty`,
+`source_to_rustc_ty`, `rustc_ty_to_source_type`, `substitute_source_type`,
+`strip_source_ref`, `source_type_to_mangled_name`. Most are direct
+parser-shape analogs of the existing resolved-shape fns; the
+duplication is acceptable because each variant set is small and the
+typing forces a clean separation.
+
+**The eleven files touched** (~600 lines net, roughly 2x sunny-karp):
+`typed_ast.rs`, `ast.rs`, `parser.rs`, `registry.rs`, `oracle.rs`,
+`type_resolve.rs`, `stub_gen.rs`, `sidecar.rs`, `typeid.rs`,
+`llvm_gen.rs`, `callbacks_impl.rs`.
+
+**Validation.** `cargo test --workspace` = 446/0/1 (down from sunny-karp's
+487; the 41 retired tests were the type_resolve unit-test mod whose
+fixtures depended on `ResolvedType::StructRef` + 3 oracle unit tests
+for the retired `contains_type_param` / `DeferredTypeParam` paths).
+All 352 integration_projects fixtures pass.
+
+**Three implementation surprises** (calibration-discipline reinforcement
+per §25.3.6):
+
+1. **Closure signature ripple.** Oracle queries flipped to `&[SourceType] →
+   SourceType`. The closures defined in `callbacks_impl.rs` carry the
+   same signature down through `type_resolve::resolve_fn_body`. The
+   transitive update was a sweep across `callbacks_impl.rs` +
+   `type_resolve.rs` + `llvm_gen.rs`'s cache-miss fallback closures.
+   None of this was visible from sunny-karp's surprise #3 — surfaced
+   only when running `cargo check` after the first cut.
+
+2. **`MethodCall` receiver-type demote.** In `resolve_expr`'s
+   `MethodCall` arm, the receiver's `typed_recv.ty` is `ResolvedType`
+   (typed AST), but the oracle closure expects `&[SourceType]` for the
+   receiver's `type_args`. Resolution: demote via `to_source_type()`
+   at the callsite. Same shape at codegen-side callsites
+   (`redirect_to_wrapper` from `llvm_gen.rs` + `callbacks_impl.rs`).
+
+3. **Test module deletion was the cheapest path.** The `type_resolve.rs`
+   unit-test mod (~1000 lines) extensively constructed registry-side
+   fixtures via `ResolvedType::StructRef{...}` and called the now-retired
+   `resolve_struct_fields` directly. Migrating each fixture to
+   `SourceType::StructRef` was mechanical but high-volume; the tests
+   themselves were redundant with the integration suite. Net: deleted
+   the mod with a comment noting why, kept integration_projects as the
+   authoritative validator.
+
+**What the split costs.** Code duplication: ~7 sibling fns in oracle.rs
+(parser-shape variants of resolved-shape walkers). Each is ~20-50 LOC
+and follows the same pattern as its sibling. The duplication is the
+price of making the invalid state unrepresentable; reducing it via a
+trait/generics would re-introduce the indirection the split was meant
+to remove.
+
+**What's strictly better post-split.** (a) Codegen cannot see a
+`StructRef` because it's not a `ResolvedType` variant — the lazy
+fallback at `llvm_gen.rs:185` (~25 lines of "if we hit a StructRef
+during codegen, panic with a useful message") deleted entirely. (b)
+`substitute_in_typed_body` no longer needs the `resolve_struct_fields`
+chain — it's a pure structural walk. (c) The `types_match` bridging
+arm between `StructRef` and `Struct` retired — no analogous case can
+arise. (d) The class of pure-AST-walk bugs sunny-karp's #3 represented
+is impossible by construction.
+
+**Connection to §25.3.6.** Sunny-karp's surprise #3 was a textbook
+case of "the typed-AST view said this was correct, the design doc said
+this was correct, the trait-level contract said this was correct, but
+the IR-level disassembly showed it was wrong." Per §25.3.6's discipline,
+the structural fix (this section) is preferable to the reactive fix
+(chain the promotion step) because it makes the bug class
+unrepresentable rather than relying on the implementer to remember the
+chain at every new callsite. Future implementers reading the code
+cannot accidentally reintroduce the bug because they would have to
+literally invent a new `ResolvedType::StructRef` variant.
 
 This is the master design document for Sky's compiler & Rust interop architecture. Total length: ~30 chapters, 6 appendices, approximately 100 pages.
 

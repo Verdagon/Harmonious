@@ -39,8 +39,10 @@ fn internal_symbol_for_instance<'tcx>(
     let mut sym = format!("__toylang_internal_{}", registry_name);
     for arg in instance.args.iter() {
         if let ty::GenericArgKind::Type(ty) = arg.kind() {
-            let resolved = crate::oracle::rustc_ty_to_resolved_type(tcx, ty);
-            sym.push_str(&format!("__{}", crate::oracle::resolved_type_to_mangled_name(&resolved)));
+            // Two-enum split: rustc Ty → SourceType (no registry needed for
+            // mangling); name+args alone are mangled.
+            let source = crate::oracle::rustc_ty_to_source_type(tcx, ty);
+            sym.push_str(&format!("__{}", crate::oracle::source_type_to_mangled_name(&source)));
         }
     }
     sym
@@ -182,34 +184,11 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
             ResolvedType::TypeParam(name) => panic!("TypeParam '{}' should be substituted before codegen", name),
-            ResolvedType::StructRef { name, type_args } => {
-                // Session 9 sharpening — when the call-site lowering surfaces
-                // a `StructRef` (e.g., the return type of a Rust generic
-                // intermediary like `duplicate<Widget>(&w)` where the oracle
-                // produced `StructRef "Widget"` rather than the fully-flattened
-                // `Struct`), resolve it lazily via the registry instead of
-                // bailing. The registry has the struct definition by name;
-                // we only need to mirror `resolve_struct_fields`' work for
-                // this one type.
-                //
-                // The eager `resolve_struct_fields` calls at function
-                // boundaries (params + return type) still fire — this fallback
-                // catches transient StructRefs in expression positions that
-                // the earlier pass didn't reach.
-                let resolved = crate::toylang::type_resolve::resolve_struct_fields(
-                    &ResolvedType::StructRef { name: name.clone(), type_args: type_args.clone() },
-                    self.registry,
-                ).unwrap_or_else(|e| {
-                    panic!("failed to resolve StructRef '{}' lazily in codegen: {:?}", name, e)
-                });
-                if matches!(&resolved, ResolvedType::StructRef { .. }) {
-                    // Registry didn't have the struct — that's the original
-                    // "should be resolved before codegen" condition, surface
-                    // the panic so the diagnostic remains useful.
-                    panic!("StructRef '{}' could not be resolved by registry", name);
-                }
-                self.resolved_to_inkwell(&resolved)
-            }
+            // Two-enum split (2026-06-25): the old lazy-resolve fallback for
+            // `ResolvedType::StructRef` is gone — the variant doesn't exist
+            // on `ResolvedType`. Codegen sees only `Struct { field_types }`
+            // by construction; the typed AST and substitution paths
+            // structurally guarantee it.
         }
     }
 
@@ -365,8 +344,11 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             // helper as collect_toylang_fn_deps_inner so tcx.symbol_name
             // produces identical output on the dep-registration and codegen
             // paths.
+            // Two-enum split: `redirect_to_wrapper` takes `&[SourceType]`;
+            // codegen carries `&[ResolvedType]` so demote each.
+            let src_type_args: Vec<SourceType> = type_args.iter().map(|t| t.to_source_type()).collect();
             if let Some((wdef, wargs)) = crate::oracle::redirect_to_wrapper(
-                self.tcx, type_name, method_name, type_args,
+                self.tcx, type_name, method_name, &src_type_args,
             ) {
                 (wdef, wargs)
             } else {
@@ -452,7 +434,9 @@ impl<'ctx, 'tcx, 'reg> CodegenCtx<'ctx, 'tcx, 'reg> {
             let sig = self.tcx.normalize_erasing_late_bound_regions(
                 ty::TypingEnv::fully_monomorphized(), sig,
             );
-            let ret_resolved = crate::oracle::rustc_ty_to_resolved_type(self.tcx, sig.output());
+            let ret_src = crate::oracle::rustc_ty_to_source_type(self.tcx, sig.output());
+            let ret_resolved = crate::oracle::resolve_source_type(&ret_src, self.registry)
+                .expect("oracle resolve_source_type failed for sret return type");
             Some(self.rust_ty_to_llvm_opaque(&ret_resolved))
         } else {
             None
@@ -851,10 +835,10 @@ fn codegen_internal_function<'ctx, 'tcx>(
         let caller_type_params = func.type_params.clone();
         let caller_a = caller_type_params.clone();
         let caller_b = caller_type_params.clone();
-        let rust_method_ret = move |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
+        let rust_method_ret = move |type_name: &str, method: &str, type_args: &[SourceType]| -> Result<SourceType, crate::oracle::UnresolvedRustType> {
             if type_name.is_empty() {
                 crate::oracle::rust_free_fn_return_type(tcx, method, type_args, &caller_a)
-                    .map(|opt| opt.unwrap_or(ResolvedType::Void))
+                    .map(|opt| opt.unwrap_or(SourceType::Void))
             } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
                 let receiver_ty = &type_args[0];
                 let explicit_args = &type_args[1..];
@@ -863,7 +847,7 @@ fn codegen_internal_function<'ctx, 'tcx>(
                 crate::oracle::rust_method_return_type(tcx, type_name, method, type_args, &caller_a)
             }
         };
-        let rust_param_types = move |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
+        let rust_param_types = move |type_name: &str, method: &str, type_args: &[SourceType]| -> Result<Option<Vec<SourceType>>, crate::oracle::UnresolvedRustType> {
             if type_name.is_empty() {
                 crate::oracle::rust_free_fn_param_types(tcx, method, type_args, &caller_b)
             } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
@@ -880,7 +864,7 @@ fn codegen_internal_function<'ctx, 'tcx>(
         ).expect("type resolution should succeed (already validated)");
         let returns_void = matches!(
             &func.return_ty,
-            None | Some(ResolvedType::Void),
+            None | Some(SourceType::Void),
         );
         crate::toylang::callbacks_impl::insert_scope_end_drops(
             tcx, &mut body, registry, returns_void, &caller_type_params,
@@ -926,7 +910,7 @@ fn codegen_internal_function<'ctx, 'tcx>(
 
     // Real parameters
     for p in &func.params {
-        let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry)
+        let resolved = crate::oracle::resolve_source_type(&p.ty, ctx.registry)
             .expect("param type resolution should succeed (already validated)");
         let ty: BasicMetadataTypeEnum<'ctx> = ctx.resolved_to_inkwell(&resolved).into();
         param_types.push(ty);
@@ -1053,11 +1037,11 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     // the internal form's body has a non-void tail, this wrapper will
     // call internal with a missing sret pointer and the internal body
     // will SIGBUS on its final sret store.
-    // Resolve the return type for internal ABI decisions
+    // Resolve the return type for internal ABI decisions.
+    // Two-enum split: `resolve_return_type` already returns `ResolvedType`
+    // via `oracle::resolve_source_type`; no further chaining needed.
     let ret_resolved = crate::toylang::type_resolve::resolve_return_type(ctx.registry, func)
         .expect("return type resolution should succeed (already validated)");
-    let ret_resolved = crate::toylang::type_resolve::resolve_struct_fields(&ret_resolved, ctx.registry)
-        .expect("return type struct resolution should succeed (already validated)");
     let internal_sret = is_internal_sret(&ret_resolved);
 
     // Query Rust ABI for the extern wrapper's return convention
@@ -1079,10 +1063,11 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
     assert_eq!(coerced_params.len(), func.params.len(),
         "fn_abi.args length mismatch for {}", extern_symbol);
 
-    // Resolve internal types for each param (what the internal function expects)
+    // Resolve internal types for each param (what the internal function expects).
+    // Two-enum split: `p.ty` is `SourceType`; promote via `oracle::resolve_source_type`.
     let internal_param_types: Vec<BasicTypeEnum<'ctx>> = func.params.iter()
         .map(|p| {
-            let resolved = crate::toylang::type_resolve::resolve_struct_fields(&p.ty, ctx.registry)
+            let resolved = crate::oracle::resolve_source_type(&p.ty, ctx.registry)
                 .expect("param type resolution should succeed (already validated)");
             ctx.resolved_to_inkwell(&resolved)
         })
@@ -1536,7 +1521,9 @@ fn lower_typed_expr<'ctx>(
                     let sig = ctx.tcx.normalize_erasing_late_bound_regions(
                         ty::TypingEnv::fully_monomorphized(), sig,
                     );
-                    let ret_resolved = crate::oracle::rustc_ty_to_resolved_type(ctx.tcx, sig.output());
+                    let ret_src = crate::oracle::rustc_ty_to_source_type(ctx.tcx, sig.output());
+                    let ret_resolved = crate::oracle::resolve_source_type(&ret_src, ctx.registry)
+                        .expect("oracle resolve_source_type failed for sret return type");
                     Some(ctx.rust_ty_to_llvm_opaque(&ret_resolved))
                 } else {
                     None

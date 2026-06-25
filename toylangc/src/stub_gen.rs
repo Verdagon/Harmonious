@@ -3,7 +3,7 @@ use quote::{format_ident, quote};
 use syn::parse_quote;
 
 use crate::toylang::registry::ToylangRegistry;
-use crate::toylang::typed_ast::ResolvedType;
+use crate::toylang::typed_ast::SourceType;
 
 /// Course-correct #17: zero-param is the degenerate case of N-param.
 /// Returns `(impl_generics, ty_generics)` for an `impl ... Name ... { … }`
@@ -73,39 +73,43 @@ fn fn_generics_clause(type_params: &[String]) -> TokenStream {
 // divergences (impl-block header, fn declaration header) ARE unified
 // above.
 
-/// Convert a ResolvedType to a syn::Type for use in Rust stub code.
-fn resolved_type_to_syn(ty: &ResolvedType) -> syn::Type {
+/// Convert a SourceType to a syn::Type for use in Rust stub code.
+///
+/// Two-enum split (2026-06-25): stub_gen operates on parser-shape types
+/// (the registry stores `SourceType`); `Struct` (resolved-shape with
+/// field_types) doesn't reach here. Conversion is straightforward: each
+/// variant maps to its Rust syntax form.
+fn source_type_to_syn(ty: &SourceType) -> syn::Type {
     match ty {
-        ResolvedType::I32 => parse_quote!(i32),
-        ResolvedType::I64 => parse_quote!(i64),
-        ResolvedType::F64 => parse_quote!(f64),
-        ResolvedType::Bool => parse_quote!(bool),
-        ResolvedType::Usize => parse_quote!(usize),
-        ResolvedType::Void => parse_quote!(()),
-        ResolvedType::TypeParam(name) => {
+        SourceType::I32 => parse_quote!(i32),
+        SourceType::I64 => parse_quote!(i64),
+        SourceType::F64 => parse_quote!(f64),
+        SourceType::Bool => parse_quote!(bool),
+        SourceType::Usize => parse_quote!(usize),
+        SourceType::Void => parse_quote!(()),
+        SourceType::TypeParam(name) => {
             let ident = format_ident!("{}", name);
             parse_quote!(#ident)
         }
-        ResolvedType::StructRef { name, type_args }
-        | ResolvedType::Struct { name, type_args, .. }
-        | ResolvedType::RustType { name, type_args } => {
+        SourceType::StructRef { name, type_args }
+        | SourceType::RustType { name, type_args } => {
             let ident = format_ident!("{}", name);
             // arch-fence-allow: degenerate-case-fast-path (skip the `<>` decoration when empty).
             if type_args.is_empty() {
                 parse_quote!(#ident)
             } else {
-                let args: Vec<syn::Type> = type_args.iter().map(resolved_type_to_syn).collect();
+                let args: Vec<syn::Type> = type_args.iter().map(source_type_to_syn).collect();
                 parse_quote!(#ident<#(#args),*>)
             }
         }
-        ResolvedType::Ref { inner } => {
-            let inner_ty = resolved_type_to_syn(inner);
+        SourceType::Ref { inner } => {
+            let inner_ty = source_type_to_syn(inner);
             parse_quote!(&#inner_ty)
         }
         // Per @UTAIRZ, Str and ByteSlice render as bare Rust types; the `&` comes
         // from the `Ref` arm above when they're wrapped at use sites.
-        ResolvedType::Str => parse_quote!(str),
-        ResolvedType::ByteSlice => parse_quote!([u8]),
+        SourceType::Str => parse_quote!(str),
+        SourceType::ByteSlice => parse_quote!([u8]),
     }
 }
 
@@ -194,7 +198,7 @@ pub fn generate(registry: &ToylangRegistry) -> String {
 
         for field in &toy_struct.fields {
             let field_ident = format_ident!("{}", field.name);
-            let field_ty = resolved_type_to_syn(&field.rust_type);
+            let field_ty = source_type_to_syn(&field.rust_type);
 
             // unreachable!() body — the `optimized_mir` override synthesizes
             // dep-registering bodies for every accessor DefId; the partitioner
@@ -295,11 +299,11 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             // accept rustc's `improper_ctypes` warning.
             let extern_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
                 let pname = format_ident!("{}", p.name);
-                let pty = resolved_type_to_syn(&p.ty);
+                let pty = source_type_to_syn(&p.ty);
                 quote! { #pname: #pty }
             }).collect();
             let ret: syn::Type = match &toy_fn.return_ty {
-                Some(ty) => resolved_type_to_syn(ty),
+                Some(ty) => source_type_to_syn(ty),
                 None => parse_quote!(()),
             };
             let fn_ident = format_ident!("{}", _name);
@@ -327,7 +331,7 @@ pub fn generate(registry: &ToylangRegistry) -> String {
 
         // Public wrapper function (user-facing signature) — for ALL functions
         let ret: syn::Type = match &toy_fn.return_ty {
-            Some(ty) => resolved_type_to_syn(ty),
+            Some(ty) => source_type_to_syn(ty),
             None => parse_quote!(()),
         };
         // Per @MBMRVZ, `main` is renamed to `__toylang_main` so the
@@ -339,7 +343,7 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         let wrapper_ident = format_ident!("{}", wrapper_name);
         let user_params: Vec<TokenStream> = toy_fn.params.iter().map(|p| {
             let pname = format_ident!("{}", p.name);
-            let pty = resolved_type_to_syn(&p.ty);
+            let pty = source_type_to_syn(&p.ty);
             quote! { #pname: #pty }
         }).collect();
 
@@ -408,7 +412,7 @@ pub fn generate(registry: &ToylangRegistry) -> String {
     // `&self` is reified to a `&Self` parameter in the generated Rust
     // (rustc requires the receiver syntax, not a `self: &Self` explicit
     // form). The remaining params and return type pass through
-    // `resolved_type_to_syn` unchanged.
+    // `source_type_to_syn` unchanged.
     for toy_impl in &registry.trait_impls {
         // Session 10 — Sky architecture §9. Non-export impl blocks get no
         // stub-rlib presence. Today every Rust caller path through a trait
@@ -459,11 +463,11 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             // emit it as the receiver instead.
             let user_params: Vec<TokenStream> = m.func.params.iter().skip(1).map(|p| {
                 let pname = format_ident!("{}", p.name);
-                let pty = resolved_type_to_syn(&p.ty);
+                let pty = source_type_to_syn(&p.ty);
                 quote! { #pname: #pty }
             }).collect();
             let ret: syn::Type = match &m.func.return_ty {
-                Some(ty) => resolved_type_to_syn(ty),
+                Some(ty) => source_type_to_syn(ty),
                 None => parse_quote!(()),
             };
             // No `#[inline(never)]` — see the accessor emission site
@@ -600,23 +604,23 @@ mod tests {
     #[test]
     fn non_export_body_bearing_fn_gets_no_stub_shell() {
         use crate::toylang::registry::{ToyFunction, ToyParam};
-        use crate::toylang::typed_ast::ResolvedType;
+        use crate::toylang::typed_ast::SourceType;
         use crate::toylang::ast::Block;
 
         let mut reg = ToylangRegistry::default();
         // An export fn — should appear in the stub source.
         reg.functions.insert("exported_fn".to_string(), ToyFunction {
             type_params: vec![],
-            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
-            return_ty: Some(ResolvedType::I32),
+            params: vec![ToyParam { name: "x".to_string(), ty: SourceType::I32 }],
+            return_ty: Some(SourceType::I32),
             body: Some(Block { stmts: vec![], ret: None }),
             is_export: true,
         });
         // A NON-export fn — must NOT appear.
         reg.functions.insert("internal_only".to_string(), ToyFunction {
             type_params: vec![],
-            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
-            return_ty: Some(ResolvedType::I32),
+            params: vec![ToyParam { name: "x".to_string(), ty: SourceType::I32 }],
+            return_ty: Some(SourceType::I32),
             body: Some(Block { stmts: vec![], ret: None }),
             is_export: false,
         });
@@ -655,12 +659,12 @@ mod tests {
         use crate::toylang::registry::{
             ToyField, ToyFunction, ToyImpl, ToyImplMethod, ToyParam, ToyStruct,
         };
-        use crate::toylang::typed_ast::ResolvedType;
+        use crate::toylang::typed_ast::SourceType;
 
         let mut reg = ToylangRegistry::default();
         reg.structs.insert("Widget".to_string(), ToyStruct {
             type_params: vec![],
-            fields: vec![ToyField { name: "id".to_string(), rust_type: ResolvedType::I32 }],
+            fields: vec![ToyField { name: "id".to_string(), rust_type: SourceType::I32 }],
         });
         reg.imports.push("std::clone::Clone".to_string());
         reg.trait_impls.push(ToyImpl {
@@ -678,15 +682,15 @@ mod tests {
                     params: vec![
                         ToyParam {
                             name: "self".to_string(),
-                            ty: ResolvedType::Ref { inner: Box::new(
-                                ResolvedType::StructRef {
+                            ty: SourceType::Ref { inner: Box::new(
+                                SourceType::StructRef {
                                     name: "Widget".to_string(),
                                     type_args: vec![],
                                 },
                             ) },
                         },
                     ],
-                    return_ty: Some(ResolvedType::StructRef {
+                    return_ty: Some(SourceType::StructRef {
                         name: "Widget".to_string(), type_args: vec![],
                     }),
                     body: None, // body irrelevant for stub emission (always unreachable!())
@@ -731,19 +735,19 @@ mod tests {
         use crate::toylang::registry::{
             ToyField, ToyFunction, ToyImpl, ToyImplMethod, ToyParam, ToyStruct,
         };
-        use crate::toylang::typed_ast::ResolvedType;
+        use crate::toylang::typed_ast::SourceType;
 
         let mut reg = ToylangRegistry::default();
         // Struct with a field → triggers accessor method emission.
         reg.structs.insert("Widget".to_string(), ToyStruct {
             type_params: vec![],
-            fields: vec![ToyField { name: "id".to_string(), rust_type: ResolvedType::I32 }],
+            fields: vec![ToyField { name: "id".to_string(), rust_type: SourceType::I32 }],
         });
         // Exported toylang fn → triggers wrapper fn emission.
         reg.functions.insert("make_widget".to_string(), ToyFunction {
             type_params: vec![],
-            params: vec![ToyParam { name: "id".to_string(), ty: ResolvedType::I32 }],
-            return_ty: Some(ResolvedType::StructRef {
+            params: vec![ToyParam { name: "id".to_string(), ty: SourceType::I32 }],
+            return_ty: Some(SourceType::StructRef {
                 name: "Widget".to_string(), type_args: vec![],
             }),
             body: Some(crate::toylang::ast::Block { stmts: vec![], ret: None }),
@@ -752,7 +756,7 @@ mod tests {
         // Body-less fn → triggers extern "C" decl (Category A, NOT tagged).
         reg.functions.insert("println_i32".to_string(), ToyFunction {
             type_params: vec![],
-            params: vec![ToyParam { name: "x".to_string(), ty: ResolvedType::I32 }],
+            params: vec![ToyParam { name: "x".to_string(), ty: SourceType::I32 }],
             return_ty: None,
             body: None,
             is_export: false,
@@ -774,8 +778,8 @@ mod tests {
                     is_export: true,
                     params: vec![ToyParam {
                         name: "self".to_string(),
-                        ty: ResolvedType::Ref { inner: Box::new(
-                            ResolvedType::StructRef {
+                        ty: SourceType::Ref { inner: Box::new(
+                            SourceType::StructRef {
                                 name: "Widget".to_string(), type_args: vec![],
                             },
                         ) },
