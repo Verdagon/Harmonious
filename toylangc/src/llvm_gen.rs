@@ -1970,7 +1970,74 @@ fn lower_typed_expr<'ctx>(
         }
 
         TypedExprKind::Ref(inner) => {
-            // &expr — take a pointer to the inner expression
+            // &expr — take a pointer to the inner expression.
+            //
+            // Special-case `&struct.field` for primitive-typed fields: the
+            // FieldAccess primitive arm eagerly LOADS the field value (so
+            // `let x = w.field` gets copy-by-value semantics). If we then
+            // round-trip through `into_ptr` (alloca + store + return ptr),
+            // the returned pointer points to a FRESH alloca of the
+            // primitive's LLVM storage type — NOT to the original field
+            // location.
+            //
+            // For most primitives that round-trip preserves observable
+            // behavior. For `bool`, Sky maps `ResolvedType::Bool` to LLVM
+            // `i1`, whose in-memory storage is 1 byte with the bool's value
+            // in the LSB and the upper 7 bits *unspecified* (LLVM Lang Ref:
+            // "the type-bit-padding bits are unspecified"). When a Rust
+            // caller dereferences the returned `&bool` via a safe
+            // reference, rustc emits `load i8` — reading those unspecified
+            // upper bits. Even though the LSB carries the correct value,
+            // the resulting `i8` is unreliable (LLVM may exploit the
+            // unspecified bits during optimization) → `*&w.bool_field`
+            // reads as `false` regardless of the actual stored value.
+            //
+            // Symptom of the unfixed shape: any Sky export with a `bool`
+            // field, called from Rust through the accessor `w.field()`,
+            // returned undefined bool values to the Rust caller. Surfaced
+            // during Phase R Site #8 probing 2026-06-25.
+            //
+            // Fix: when the inner expression is a FieldAccess on a struct,
+            // return the GEP pointer directly — same shape as the
+            // FieldAccess Struct/RustType arms, which already produce
+            // `ExprResult::Ptr(gep, _)`. The returned `&field` now points
+            // into the receiver struct's actual memory, where the byte's
+            // value matches what was stored (no unspecified upper bits).
+            if let TypedExprKind::FieldAccess { receiver, field } = &inner.kind {
+                let recv_struct_ty = match &receiver.ty {
+                    ResolvedType::Ref { inner: r }
+                        if matches!(**r, ResolvedType::Struct { .. }) => &**r,
+                    other => other,
+                };
+                if let ResolvedType::Struct { name: struct_name, .. } = recv_struct_ty {
+                    let toy_struct = ctx.registry.structs.get(struct_name.as_str()).unwrap();
+                    let field_idx = toy_struct.fields.iter()
+                        .position(|f| f.name == *field)
+                        .unwrap() as u32;
+                    let struct_ty = ctx.resolved_to_struct_type(recv_struct_ty);
+                    let recv_result = lower_typed_expr(ctx, receiver);
+                    let struct_ptr = match &receiver.ty {
+                        ResolvedType::Ref { inner: r }
+                            if matches!(**r, ResolvedType::Struct { .. }) =>
+                        {
+                            let ptr_ty = ctx.context.ptr_type(inkwell::AddressSpace::default());
+                            let slot = recv_result.into_ptr(
+                                &ctx.builder, ptr_ty.as_basic_type_enum(), "ref_fa_slot");
+                            ctx.builder.build_load(ptr_ty, slot, "ref_fa_deref")
+                                .unwrap().into_pointer_value()
+                        }
+                        _ => recv_result.into_ptr(
+                            &ctx.builder, struct_ty.as_basic_type_enum(), "ref_fa_recv"),
+                    };
+                    let gep = ctx.builder
+                        .build_struct_gep(struct_ty, struct_ptr, field_idx, field)
+                        .unwrap();
+                    return ExprResult::Value(gep.into());
+                }
+            }
+            // Default path (non-field-access referents): the round-trip
+            // remains observable-correct for primitives whose storage
+            // type matches the in-memory representation (i32/i64/f64/etc).
             let inner_result = lower_typed_expr(ctx, inner);
             let inner_ty = ctx.resolved_to_inkwell(&inner.ty);
             let ptr = inner_result.into_ptr(&ctx.builder, inner_ty, "ref_val");

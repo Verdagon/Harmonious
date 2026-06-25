@@ -1,0 +1,33 @@
+// Regression fixture for the bool accessor bug found during Phase R
+// Site #8 probing 2026-06-25.
+//
+// Bug: Sky maps `ResolvedType::Bool` to LLVM `i1`. Sky's auto-synthesized
+// field accessors (`pub fn a(&self) -> &bool { &self.a }`) were emitting
+// `&self.field` via `Ref(FieldAccess)`'s default path — load the bool
+// value (i1), alloca i1, store, return ptr. The returned pointer pointed
+// to a freshly-alloca'd i1 buffer whose LSB held the bool but whose
+// upper 7 bits were unspecified per LLVM's i1 storage semantics.
+//
+// When a Rust caller dereferenced the returned `&bool`, rustc emitted
+// `load i8` (Rust's bool is i8 in memory) — reading those unspecified
+// upper bits. LLVM was free to exploit the unspecified bits during
+// optimization → `*w.a()` reads as `false` regardless of the value Sky
+// actually stored.
+//
+// Fix (Ref(FieldAccess) special-case in llvm_gen.rs): when the inner
+// expression of a Ref is a struct FieldAccess, return the GEP pointer to
+// the field's actual storage in the receiver struct, NOT a load+realloc
+// roundtrip. For bool, the byte's value matches what was stored at the
+// struct level (no fresh alloca with unspecified upper bits).
+
+struct W {
+    a: bool,
+    b: bool,
+    c: bool,
+    d: bool,
+    e: bool,
+}
+
+export fn make_w() -> W {
+    W { a: true, b: false, c: true, d: false, e: true }
+}

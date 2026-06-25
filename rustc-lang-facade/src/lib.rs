@@ -476,6 +476,8 @@ static DEFAULT_COLLECT_AND_PARTITION: OnceLock<CollectAndPartitionFn> = OnceLock
 // overrides are no longer installed, so saving the defaults is moot).
 static DEFAULT_DEDUCED_PARAM_ATTRS: OnceLock<queries::deduce_param_attrs::DeducedParamAttrsFn>
     = OnceLock::new();
+static DEFAULT_CODEGEN_FN_ATTRS: OnceLock<queries::codegen_fn_attrs::CodegenFnAttrsFn>
+    = OnceLock::new();
 static DEFAULT_CROSS_CRATE_INLINABLE:
     OnceLock<queries::cross_crate_inlinable::CrossCrateInlinableFn> = OnceLock::new();
 static DEFAULT_EXTERN_CROSS_CRATE_INLINABLE:
@@ -1071,6 +1073,7 @@ pub(crate) fn install_query_defaults(
     extern_cross_crate_inlinable:
         queries::cross_crate_inlinable::ExternCrossCrateInlinableFn,
     deduced_param_attrs: queries::deduce_param_attrs::DeducedParamAttrsFn,
+    codegen_fn_attrs: queries::codegen_fn_attrs::CodegenFnAttrsFn,
 ) {
     let _ = DEFAULT_LAYOUT_OF.set(layout_of);
     // mir_shims default retired 2026-06-23 (Phase E).
@@ -1082,6 +1085,7 @@ pub(crate) fn install_query_defaults(
     let _ = DEFAULT_CROSS_CRATE_INLINABLE.set(cross_crate_inlinable);
     let _ = DEFAULT_EXTERN_CROSS_CRATE_INLINABLE.set(extern_cross_crate_inlinable);
     let _ = DEFAULT_DEDUCED_PARAM_ATTRS.set(deduced_param_attrs);
+    let _ = DEFAULT_CODEGEN_FN_ATTRS.set(codegen_fn_attrs);
 }
 
 /// Accessor for the saved upstream `cross_crate_inlinable` provider.
@@ -1104,6 +1108,14 @@ pub fn default_extern_cross_crate_inlinable()
 pub fn default_deduced_param_attrs() -> queries::deduce_param_attrs::DeducedParamAttrsFn {
     *DEFAULT_DEDUCED_PARAM_ATTRS.get()
         .expect("default_deduced_param_attrs: not installed yet")
+}
+
+/// Accessor for the saved upstream `codegen_fn_attrs` provider.
+/// Used by the override to clone-and-modify when the DefId is a Sky stub,
+/// or to delegate when it's not.
+pub fn default_codegen_fn_attrs() -> queries::codegen_fn_attrs::CodegenFnAttrsFn {
+    *DEFAULT_CODEGEN_FN_ATTRS.get()
+        .expect("default_codegen_fn_attrs: not installed yet")
 }
 
 // default_codegen_fn_attrs / default_extern_codegen_fn_attrs accessors

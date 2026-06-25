@@ -65,6 +65,7 @@
 //! backend emits no `.o` symbol for them; the consumer's `fill_extra_modules`
 //! body (rustc fork patch 4) is the sole def at link time.
 
+pub mod codegen_fn_attrs;
 pub mod cross_crate_inlinable;
 pub mod deduce_param_attrs;
 // `drop_glue` module retired 2026-06-23 (Phase E — see module-level doc).
@@ -94,6 +95,7 @@ pub fn lang_override_queries(
         providers.queries.cross_crate_inlinable,
         providers.extern_queries.cross_crate_inlinable,
         providers.queries.deduced_param_attrs,
+        providers.queries.codegen_fn_attrs,
     );
 
     providers.queries.layout_of        = layout::lang_layout_of;
@@ -106,6 +108,14 @@ pub fn lang_override_queries(
     // a LIE → silent miscompile at -O2+. See the override module for the
     // full rationale.
     providers.queries.deduced_param_attrs = deduce_param_attrs::lang_deduced_param_attrs;
+    // Phase Q (2026-06-25, handoff §Phase Q): override `codegen_fn_attrs`
+    // to stamp `NEVER_UNWIND` on `#[toylang::emit_consumer_body]`-tagged
+    // items. Sky's panic=abort posture (arch §16.1) makes every Sky export
+    // genuinely never-unwind — LLVM applies `nounwind` at each Rust caller's
+    // call site, eliminating landing-pad emission. Significant under
+    // panic=unwind for tight callee-rich loops. See the override module
+    // for soundness rationale.
+    providers.queries.codegen_fn_attrs = codegen_fn_attrs::lang_codegen_fn_attrs;
     // `mir_shims` override retired 2026-06-23 (Phase E). Rustc's default
     // DropGlue path fires unchanged; per-type drop semantics come from
     // stub_gen-emitted Drop impl bridges + Sky drop fns via per_instance_mir.

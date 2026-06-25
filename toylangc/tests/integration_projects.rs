@@ -3329,3 +3329,18 @@ fn test_drop_b10_probe_fat() {
 fn test_drop_phase_p_indirect_arg_o3_thin() {
     run_drop_project("phase_p_indirect_arg_o3_thin");
 }
+
+/// Regression fixture for the bool accessor bug — Sky's synthesized
+/// `&self.bool_field` accessors were returning pointers to freshly-
+/// alloca'd `i1` storage with unspecified upper 7 bits. Rust callers
+/// dereferencing the returned `&bool` got undefined values. Surfaced
+/// during Phase R Site #8 probing 2026-06-25; fix is in `llvm_gen.rs`'s
+/// `TypedExprKind::Ref(inner)` arm — when `inner` is a struct field
+/// access, return the GEP pointer to the original field rather than a
+/// load+realloc roundtrip. Probe shape: Sky export returning a struct
+/// with 5 bool fields, Rust caller deref's each accessor's return.
+/// Pre-fix output was all `false`; post-fix matches Sky's stored values.
+#[test]
+fn test_drop_bool_accessor_via_rust_caller() {
+    run_drop_project("bool_accessor_via_rust_caller");
+}
