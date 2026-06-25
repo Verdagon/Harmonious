@@ -1,0 +1,10 @@
+[project]
+name = "bench4_rust_baseline_inlineable"
+source = "main.toylang"
+rust_caller = "rust_caller.rs"
+opt-level = "3"
+lto = "thin"
+codegen-units = 16
+
+[rust-dependencies]
+test_widgets = { path = "../../test_widgets" }

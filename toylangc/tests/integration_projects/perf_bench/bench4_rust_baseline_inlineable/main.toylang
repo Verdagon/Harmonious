@@ -1,0 +1,10 @@
+// Bench 4 pure-Rust baseline. LargeStruct + helpers live in the
+// test_widgets sibling crate. Apples-to-apples cross-crate by-value
+// indirect-passed struct call shape, matching Sky's Bench 4 wrapper-
+// boundary structure but with both ends in Rust source.
+//
+// Toylang requires a main.toylang; we export an unused anchor.
+
+export fn unused_anchor() -> i32 {
+    0
+}

@@ -52,3 +52,40 @@ pub extern "C" fn make_test_widget(id: i32) -> Widget {
 pub extern "C" fn make_test_widget_no_inline(id: i32) -> WidgetNoInline {
     WidgetNoInline { id }
 }
+
+// 32-byte struct mirroring Sky's bench4 `LargeStruct` for the
+// pure-Rust apples-to-apples baseline. Cross-crate by-value passing
+// hits PassMode::Indirect on aarch64.
+#[repr(C)]
+pub struct LargeStruct {
+    pub a: i64,
+    pub b: i64,
+    pub c: i64,
+    pub d: i64,
+}
+
+#[allow(improper_ctypes_definitions)]
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn make_test_large(a: i64) -> LargeStruct {
+    LargeStruct { a, b: 0, c: 0, d: 0 }
+}
+
+#[allow(improper_ctypes_definitions)]
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn first_field_test_large(x: LargeStruct) -> i64 {
+    x.a
+}
+
+// Inline-permitted variants — measure the natural cross-crate cost
+// when LLVM is free to inline through under thin LTO.
+#[inline]
+pub fn make_test_large_inlineable(a: i64) -> LargeStruct {
+    LargeStruct { a, b: 0, c: 0, d: 0 }
+}
+
+#[inline]
+pub fn first_field_test_large_inlineable(x: LargeStruct) -> i64 {
+    x.a
+}
