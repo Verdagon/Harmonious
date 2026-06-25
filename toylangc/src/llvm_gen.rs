@@ -536,14 +536,37 @@ fn push_arg_for_rust_call<'ctx>(
             call_args.push(second.into());
         }
         CoercedParam::Direct(llvm_ty_str) => {
-            // Pass by value, coerced to the LLVM type rustc declared. For
-            // primitive scalars (i32, i64, etc.) this is the toylang value
-            // possibly width-adjusted; for `ptr`-typed Direct (e.g. `&T`),
-            // the toylang value is already a pointer.
-            let val = lower_typed_expr(ctx, arg_expr).into_value(&ctx.builder);
+            // Pass by value, coerced to the LLVM type rustc declared. Three sub-cases:
+            //   (a) Source toylang type matches target_ty directly (e.g. i32 → i32,
+            //       &T → ptr): pass the loaded value possibly width-adjusted.
+            //   (b) Source is an aggregate (struct) in memory, target_ty is a
+            //       scalar (e.g. Widget = { i32 } coerced to i32 by rustc's ABI):
+            //       reinterpret via the source allocation's memory — load as
+            //       target_ty directly. This mirrors @ACRTFDZ's pattern used for
+            //       incoming params in codegen_extern_wrapper. Without this, the
+            //       call instruction's arg type ({ i32 }) doesn't match the
+            //       declared param type (i32) and LLVM's BitcodeWriter produces
+            //       malformed bitcode that fails to round-trip at opt-level≥1
+            //       (B10's residual trigger).
+            //   (c) Source is a scalar but width-differs from target (e.g. i64
+            //       literal → i32 param): trunc/sext via coerce_int_to_type.
             let target_ty = parse_coerced_type(ctx, llvm_ty_str);
-            let coerced = coerce_int_to_type(ctx, val, target_ty);
-            call_args.push(coerced.into());
+            let arg_toylang_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
+
+            if arg_toylang_ty != target_ty && matches!(arg_toylang_ty, BasicTypeEnum::StructType(_)) {
+                // (b) Aggregate → scalar coercion via memory reinterpretation.
+                let arg_result = lower_typed_expr(ctx, arg_expr);
+                let arg_ptr = arg_result.into_ptr(&ctx.builder, arg_toylang_ty, "abi_coerce_src");
+                let coerced = ctx.builder
+                    .build_load(target_ty, arg_ptr, "abi_coerce_load")
+                    .unwrap();
+                call_args.push(coerced.into());
+            } else {
+                // (a) and (c): scalar passthrough or width adjustment.
+                let val = lower_typed_expr(ctx, arg_expr).into_value(&ctx.builder);
+                let coerced = coerce_int_to_type(ctx, val, target_ty);
+                call_args.push(coerced.into());
+            }
         }
         CoercedParam::Ignore => {
             // ZST — no LLVM param. Lower for side effects only.

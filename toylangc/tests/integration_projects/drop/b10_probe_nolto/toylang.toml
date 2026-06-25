@@ -1,0 +1,9 @@
+[project]
+name = "b10_probe_nolto"
+source = "main.toylang"
+features = ["allocator_api"]
+opt-level = "3"
+codegen-units = 16
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

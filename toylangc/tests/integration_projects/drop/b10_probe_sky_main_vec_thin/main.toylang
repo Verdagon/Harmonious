@@ -1,0 +1,35 @@
+// B10 residual probe — Sky main + Vec<SkyStruct> + opt-level >= 1 + thin LTO.
+//
+// Per handoff §25.2 B10 and arch §F.18, this is the trigger shape for the
+// LLVM 21 BitcodeWriter bug under ThinLTO's cross-CGU import phase. The
+// existing bench3_drop_thin sidesteps it by routing Vec allocation through
+// a Rust caller; this fixture deliberately drives the allocation from Sky
+// main to exercise the bug pattern directly.
+//
+// Expected behavior at time of writing (2026-06-24): build fails or
+// produces incorrect runtime behavior. If this fixture starts passing,
+// either the upstream LLVM bug was fixed or Sky's emission stopped
+// producing the trigger pattern — either way, audit B10's status.
+
+use std::alloc::Global
+use std::ops::Drop
+use std::vec::Vec
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn main() {
+    let v = Vec::new<Widget, Global>();
+    v.push(Widget { id: 1 });
+    v.push(Widget { id: 2 });
+    v.push(Widget { id: 3 });
+}

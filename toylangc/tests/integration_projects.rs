@@ -3261,3 +3261,54 @@ fn test_drop_fixture8_sky_local_no_drop_impl() {
 fn test_drop_fixture9_sky_local_in_helper_fn() {
     run_drop_project("fixture9_sky_local_in_helper_fn");
 }
+
+// B10 trigger-pattern regression probes — added 2026-06-24 alongside the
+// fix to `push_arg_for_rust_call`'s `Direct` arm. Before the fix, Sky
+// emitted aggregate values (e.g. a Widget struct loaded as `{ i32 }`)
+// where rustc's ABI declared a coerced scalar (`i32`), producing IR that
+// LLVM accepted at -O0 but whose bitcode failed to round-trip at
+// opt-level≥1 — manifesting as "failed to parse bitcode for LTO module:
+// Invalid record" (thin LTO / default thin-local LTO) or "Callee is not a
+// pointer type" (fat LTO). These five probes exercise the trigger pattern
+// (Sky main driving Vec<Widget> + Widget Drop impl) across the LTO matrix
+// + a default-cargo-dev O0 control. All five should build + run and
+// print `1\n2\n3\n`.
+
+/// B10 probe (default cargo dev shape, O0) — control case that always
+/// worked. Locks in that the fix didn't regress the trivial path.
+#[test]
+fn test_drop_b10_probe_o0() {
+    run_drop_project("b10_probe_o0");
+}
+
+/// B10 probe (cargo release shape: opt-level=3, default `lto = false`).
+/// Pre-fix: failed at __lang_stubs compile with "Invalid record"
+/// (thin-local LTO trips even without explicit `lto = "thin"`).
+#[test]
+fn test_drop_b10_probe_nolto() {
+    run_drop_project("b10_probe_nolto");
+}
+
+/// B10 probe (`lto = "thin"`, codegen-units=16). The most-likely user
+/// release config given the §22.4 recommendation. Pre-fix: failed at
+/// user_bin compile with "Invalid record".
+#[test]
+fn test_drop_b10_probe_sky_main_vec_thin() {
+    run_drop_project("b10_probe_sky_main_vec_thin");
+}
+
+/// B10 probe (`lto = "thin"`, codegen-units=1). Confirms the trigger
+/// isn't specifically about ThinLTO's cross-CGU import — it's about any
+/// post-opt bitcode round-trip with the mismatched signature.
+#[test]
+fn test_drop_b10_probe_cgu1_thin() {
+    run_drop_project("b10_probe_cgu1_thin");
+}
+
+/// B10 probe (`lto = "fat"`). Same trigger; pre-fix manifested as a
+/// different LLVM error ("Callee is not a pointer type") because fat LTO
+/// runs a different bitcode reader path. Same root cause, same fix.
+#[test]
+fn test_drop_b10_probe_fat() {
+    run_drop_project("b10_probe_fat");
+}
