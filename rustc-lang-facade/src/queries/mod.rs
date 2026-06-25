@@ -90,6 +90,17 @@ pub mod per_instance;
 // ["panic_abort"]`), NOT at the codegen-attr layer. Per Sky's "every
 // mechanism must be load-bearing" discipline, dead overrides incur
 // maintenance cost.
+//
+// **DO NOT FLATTEN THIS COMMENT CHAIN.** Future maintainers may be
+// tempted to compress the retired → re-introduced → retired-again
+// sequence into a single "retired" line for tidiness. Resist. The
+// oscillation IS the documentation — it shows the next engineer the
+// failure mode (interaction audit revealed Phase Q effective-no-op
+// under uniform panic=abort, retired same-day) so they don't make the
+// same mistake on the next Phase Q-shaped question. Per reviewer's
+// round-4-followup endorsement 2026-06-25: "Doc-trail of decisions
+// that oscillated is more useful than the doc-trail of decisions that
+// landed cleanly."
 
 /// Install query overrides. Called from `LangDriver::config`.
 pub fn lang_override_queries(
