@@ -1,0 +1,7 @@
+[project]
+name = "fence_b24_field_drop_order"
+source = "main.toylang"
+features = ["allocator_api"]
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

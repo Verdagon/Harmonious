@@ -172,7 +172,7 @@ These are the items from the prior "NEXT" section, still valid:
 
 1. **Phase P — `deduce_param_attrs` soundness override (~half day).** Highest-priority latent silent-UB vector. Override returns `&[]` for `#[toylang::emit_consumer_body]`-tagged items + fixture with `&mut LargeStruct` Sky export. (See line 86 in the original Not-yet-started section.)
 2. **Build a `&LargeStruct` Sky-call perf bench.** Currently no bench exposes the indirect-arg alias-analysis question. Measure before deciding whether path-b emission is worth pursuing.
-3. **Phase O drift CI fences** (operational hygiene; protects active query overrides from rustc drift).
+3. ~~Phase O drift CI fences~~ — **SHIPPED 2026-06-25**. B24/B25/B26 fences all landed. See "Phase O: Drift-observation CI fences" section below.
 
 ### Option B: the two-enum split — **SHIPPED 2026-06-25**, see top-of-doc.
 
@@ -320,7 +320,7 @@ User's stated priority is **rustc-integration quality, especially perf/inlining 
 **Lower priority (defer unless one becomes blocking):**
 - **Phase G (cdylib build system, ~5-7 days)** — engineering-velocity win, not perf. Pairs with the now-shipped Phase H ABI rewrite. Defer until backend iteration speed becomes the bottleneck.
 - **Phase N (recursion safety, ~2-3 days)** — bounded fix to runaway-walker risk; no perf impact; low priority.
-- **Phase O (drift CI fences, ~3-5 days)** — operational; B24/B25/B26 detection tests; no perf impact.
+- ~~Phase O (drift CI fences, ~3-5 days)~~ — **SHIPPED 2026-06-25.** B24/B25/B26 fences all landed; ~1 day actual (vs 3-5 day estimate). Three new test files + arch §25 updates.
 
 **Skip per user's stated priorities** (Sky language design, not rustc integration):
 - Phase J (u128 typeids), Phase K (content-hash const args), Phase L (per-view ref types), Phase M (async typestate).
@@ -534,7 +534,7 @@ For each decision: **WHAT** (the commitment), **WHY** (the load-bearing reason),
 | 12 | Narrowed `#[may_dangle]` syntactic rule | **OPEN** | Subset of L/M | T behind pointer indirection only. |
 | 13 | Sky-side recursion limit alignment | **OPEN** | N (~2-3 days) | No fork changes. Bounded fix to known runaway-walker risk. |
 | 14 | `cache_on_disk_if(false)` audit | **AUDIT SHIPPED** | I (2026-06-24) | Audit found prescribed Provider-slot API doesn't exist on current nightly; every override safe by construction. |
-| 15 | Drift-observation discipline + B24/B25/B26 | **PARTIAL** | O (~3-5 days for active CI fences) | B24/B25/B26 risk entries landed in arch §25; active fence tests still TODO. |
+| 15 | Drift-observation discipline + B24/B25/B26 | **SHIPPED** | O (2026-06-25) | B24/B25/B26 risk entries landed in arch §25; fences: `drop/fence_b24_field_drop_order/` (B24), `tests/mangler_version_fence.rs` (B25), `tests/instance_kind_coverage_fence.rs` (B26). |
 | 16 | §1.7 reframe — backend pluralism leads | **SHIPPED** | Doc-only landed pre-Phase-E. | No code impact. |
 | 17 | Stub-type contract — Sky drop doesn't invalidate field storage | **OPEN** | Subset of L | Vacuously satisfied today (ZST-only stubs); revisit if stub-gen evolves. |
 
@@ -2210,17 +2210,18 @@ Tasks:
 
 **Output**: Sky-side walkers safe from runaway recursion.
 
-### Phase O: Drift-observation CI fences (3-5 days)
+### Phase O: Drift-observation CI fences — SHIPPED 2026-06-25
 
-Build the detection tests for B24/B25/B26 (Decision 15).
+Detection fences for B24/B25/B26 (Decision 15) all landed.
 
-Tasks:
-- Cross-crate symbol-name test (B25 detection).
-- Drop-instance-kind coverage tests (B26 detection).
-- Confirm Fixtures 1-9 cover B24 detection requirements.
-- Document fences in §25 risk entries.
+**Shipped:**
+- **B24 (drop-glue shape stability):** `toylangc/tests/integration_projects/drop/fence_b24_field_drop_order/` — `Vec<Vec<Widget>>` exercising rustc's `<Vec<T> as Drop>::drop` iteration order at two nested levels. Expected sequence locks in forward-iteration semantics. Sentinel companions: fixtures 1, 2, 7, 10 (Vec element drops; LIFO order; generic drop).
+- **B25 (default symbol mangling stability):** `toylangc/tests/mangler_version_fence.rs` — grep-based assertion that emission paths use `tcx.symbol_name(...)` (rustc-default mangler) + no hardcoded `--symbol-mangling-version` flag. The ~352 cross-crate integration fixtures are the inherent sentinels; the fence makes the dependency on rustc's default explicit.
+- **B26 (`MonoItem` / `InstanceKind` variant coverage):** `toylangc/tests/instance_kind_coverage_fence.rs` — compile-time exhaustive match over both enums. rustc's E0004 fires at build time when a new variant lands, forcing a maintainer to consciously add an arm. Currently covers 3 `MonoItem` variants (`Fn`, `Static`, `GlobalAsm`) and 15 `InstanceKind` variants (`DropGlue` is Sky-load-bearing; `AsyncDropGlue` + `AsyncDropGlueCtorShim` are emergent, TODO Phase M).
 
-**Output**: drift-observation safety net in place.
+**Doc impact:**
+- Arch §25.2 gained B24/B25/B26 entries with probability, impact, detection fence pointers, reaction plan.
+- This handoff section's status flipped from PARTIAL to SHIPPED.
 
 ### Phase P: `deduce_param_attrs` soundness override (~half day) — surfaced during round-4 close
 

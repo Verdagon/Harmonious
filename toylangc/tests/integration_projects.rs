@@ -3380,3 +3380,15 @@ fn test_drop_bool_accessor_via_rust_caller() {
 fn test_drop_intlit_widening_struct_field() {
     run_drop_project("intlit_widening_struct_field");
 }
+
+/// Phase O Fence 1 (B24 drop-glue shape stability) — exercises rustc's
+/// auto-generated `drop_in_place::<WidgetPair>` field iteration order
+/// via a `Vec<WidgetPair>` whose elements have two Widget fields with
+/// observable destructor side effects. Rust's spec says fields drop in
+/// declaration order; the fixture's expected output locks that in. If
+/// rustc changes `build_drop_shim`'s field iteration order, the output
+/// flips and this fence fires. See arch §25.2 B24 and handoff Decision 15.
+#[test]
+fn test_drop_fence_b24_field_drop_order() {
+    run_drop_project("fence_b24_field_drop_order");
+}

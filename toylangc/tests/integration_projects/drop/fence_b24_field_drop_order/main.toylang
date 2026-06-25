@@ -1,0 +1,62 @@
+// Phase O Fence 1 (B24 drop-glue shape stability) — Vec-of-Vec nested drop
+// iteration order.
+//
+// Sky relies on rustc's `<Vec<T> as Drop>::drop` iterating elements in
+// FORWARD index order (0 to len-1) and recursively calling drop_in_place
+// on each element. A `Vec<Vec<Widget>>` exercises two levels of that
+// iteration: outer Vec walks its Vec<Widget> elements, each inner Vec walks
+// its Widget elements. The total observed drop sequence is forward iteration
+// at both levels.
+//
+// Why this is the right B24 fence shape for Sky:
+//   - Sky structs themselves are OPAQUE to rustc (per §10.4 opaque-with-size
+//     LayoutData), so rustc's `drop_in_place` can't iterate a Sky struct's
+//     fields directly. Sky-side field drops would have to be synthesized by
+//     Sky's compiler, but `insert_scope_end_drops` only fires the user-written
+//     `<T as Drop>::drop` body — it doesn't auto-synthesize field drops.
+//   - The drop chain Sky genuinely relies on is rustc's: Vec-of-X drop walks X
+//     elements forward and calls drop_in_place on each. If rustc reshapes
+//     that — e.g. reverse iteration, or skipping the per-element call when X
+//     has no obvious Drop impl — Sky's destructor sequencing breaks silently.
+//
+// Expected drop sequence at scope end:
+//   Outer Vec drops, calling drop on inner Vec[0] first.
+//     inner[0]'s drop fires: prints 10, 11.
+//   Then drop on inner Vec[1].
+//     inner[1]'s drop fires: prints 20, 21.
+//
+// If rustc changes Vec's drop iteration order (B24 regression), the per-pair
+// sequence reverses (11, 10 then 21, 20) and the fence fires.
+
+use std::alloc::Global
+use std::ops::Drop
+use std::vec::Vec
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn main() {
+    println_i32(1);
+    let outer = Vec::new<Vec<Widget, Global>, Global>();
+
+    let inner0 = Vec::new<Widget, Global>();
+    inner0.push(Widget { id: 10 });
+    inner0.push(Widget { id: 11 });
+    outer.push(inner0);
+
+    let inner1 = Vec::new<Widget, Global>();
+    inner1.push(Widget { id: 20 });
+    inner1.push(Widget { id: 21 });
+    outer.push(inner1);
+
+    println_i32(2);
+}
