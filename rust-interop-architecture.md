@@ -1293,7 +1293,7 @@ Sky's `.o` content is produced at every crate compile where Sky's machinery acti
 
 This is the post-§5.5-Step-2 split. The locked architectural commitment is that Sky libraries do not ship precompiled bodies *for items whose final emission depends on the downstream's concrete args* — i.e. generic items, comptime-dependent items. Non-generic items, whose emission is the same regardless of downstream usage, emit at the owning crate's compile. Every Sky body in the final binary is still codegenned by *some* invocation of Sky's compiler from the library's Sky AST; the question Step 2 answered is "which invocation" — owning-crate for non-generics, binary for generics.
 
-**Trade-off the split introduced.** Cross-library Sky-body inlining at `lto = false` (cargo dev profile default) is lost. Pre-Step-2, the binary's compile owned every Sky body and rustc's thin-local LTO (Level 3, §F.16) could inline Sky bodies into the bin's `main` because they were peer CGUs of the same invocation. Post-Step-2, non-generic Sky bodies live in the upstream rlib's invocation; cross-crate visibility requires `lto = "thin"` or `"fat"` (Levels 4–5). The 8 `_no_lto` inlining-matrix fixtures were flipped from "Sky body inlined / constant-folded" to "tail-jump present" to lock in this honest semantics. See §F.16 for the full ladder. Empirical perf cost (2026-06-24 benches, see §22.4): **~1.5× slowdown on hot Sky-call paths at `lto = false`** (Bench 1: O3 nolto 86.7ms vs O3 thin 57.9ms) and **~25.5× slowdown on drop-heavy paths** (Bench 3: O3 nolto 9.5ms vs O3 thin 0.4ms). The Bench 1 ratio matches what a pure-Rust cross-crate baseline shows (Sky's emission gives LLVM the same inlining opportunity Rust's does, 0.3% delta at thin LTO). **The Bench 3 ratio is similarly INHERITED from Rust — Phase B+ (2026-06-24) added apples-to-apples pure-Rust baselines and measured R_rust_cross = 27.5× under the same cross-crate structural setup (Widget in a sibling `test_widgets` crate); Sky's 25.5× and the Rust baseline 27.5× are within run-to-run variance, and Sky vs Rust at thin LTO is a 3% delta — same range as Bench 1's 0.3%.** The amplification is a property of the cross-crate Drop chain under LLVM's LTO inliner, not Sky-specific overhead. **Recommendation: use `[profile.release] lto = "thin"`** for any perf-sensitive build.
+**Trade-off the split introduced.** Cross-library Sky-body inlining at `lto = false` (cargo dev profile default) is lost. Pre-Step-2, the binary's compile owned every Sky body and rustc's thin-local LTO (Level 3, §F.16) could inline Sky bodies into the bin's `main` because they were peer CGUs of the same invocation. Post-Step-2, non-generic Sky bodies live in the upstream rlib's invocation; cross-crate visibility requires `lto = "thin"` or `"fat"` (Levels 4–5). The 8 `_no_lto` inlining-matrix fixtures were flipped from "Sky body inlined / constant-folded" to "tail-jump present" to lock in this honest semantics. See §F.16 for the full ladder. Empirical perf cost (2026-06-24 benches, see §22.4): **~1.5× slowdown on hot Sky-call paths at `lto = false`** (Bench 1: O3 nolto 86.7ms vs O3 thin 57.9ms) and **~25.5× slowdown on drop-heavy paths** (Bench 3: O3 nolto 9.5ms vs O3 thin 0.4ms). The Bench 1 ratio matches what a pure-Rust cross-crate baseline shows (Sky's emission gives LLVM the same inlining opportunity Rust's does — 0.3% Bench 1 delta and Bench 4b 20-run trimmed-mean parity (Sky 6505μs vs Rust 6658μs, within run-to-run variance) confirm the wrapper-boundary cost equals inlineable Rust's at thin LTO). **The Bench 3 ratio is similarly INHERITED from Rust — Phase B+ (2026-06-24) added apples-to-apples pure-Rust baselines and measured R_rust_cross = 27.5× under the same cross-crate structural setup (Widget in a sibling `test_widgets` crate); Sky's 25.5× and the Rust baseline 27.5× are within run-to-run variance, and Sky vs Rust at thin LTO is a 3% delta — same range as Bench 1's 0.3%.** The amplification is a property of the cross-crate Drop chain under LLVM's LTO inliner, not Sky-specific overhead. **Recommendation: use `[profile.release] lto = "thin"`** for any perf-sensitive build.
 
 **Qualifier — what "library-owned Sky bodies" does and doesn't mean.** The stub rlib's `.o` carries Sky-emitted bodies only for items owned by *that* library (non-generic exports + cascade-discovered trait-impl methods whose impl is in that library). It also carries Rust-side machinery rustc emits during its own flow:
 
@@ -3175,7 +3175,7 @@ paths depending on where the dropped value's owning let-binding lives:
 
 Both paths reach the SAME Sky-emitted `<T as Drop>::drop` symbol. The
 stub rlib publishes the trait impl with an `unreachable!()` body (which
-the partition filter removes from rustc's CGU list — §13.1.4); the real
+the partition filter removes from rustc's CGU list — §5.3 / §C.2); the real
 body comes from Sky's `fill_extra_modules`. The single-symbol architecture
 (§6.2) ensures Sky's emitted body resolves at link time as either path's
 target without any dispatch indirection.
@@ -3246,10 +3246,19 @@ sometimes auto-calls" is honored at ~95%:
   as ordinary `StaticCall` AST nodes. No drop-specific code paths in:
   type resolution, dep walker, mono cascade, per_instance_mir, codegen,
   symbol resolution, link.
-- Remaining 5% leak: the predicate hardcodes the trait name "Drop"
-  (and method name "drop") at the registry lookup. Could be
-  generalized to a marker-trait registry, but Drop is the only such
-  trait Sky needs today.
+- Remaining 5% leak (mostly closed 2026-06-25, commit `8f85622`): the
+  predicate now consults a `LIFECYCLE_TRAITS` const-slice registry
+  (`toylangc/src/toylang/callbacks_impl.rs`) rather than hardcoding
+  the trait name. Currently one entry: `Drop → drop`. Future planned
+  entries: `Init → init` (comptime placement construction), `SkyDrop`
+  (linear-type marker that lets the compiler enforce panic-on-drop
+  without requiring user-written panic bodies), and an async-Drop
+  variant. Per the round-4-close reviewer endorsement: adding a new
+  lifecycle trait is one registry-entry append; the synthesis pass
+  itself never branches on which trait it's handling. Promoting the
+  flat slice to a struct with per-entry insertion-site policy (e.g.
+  `Init` would synth after struct construction, not at scope end)
+  is the work item when the second entry lands.
 
 **Historical (pre-2026-06-23): the retired mir_shims model.** Before
 Phase E, Sky's `mir_shims` query override generated synthetic
@@ -4794,7 +4803,11 @@ The general posture: Category A risks are unlikely but catastrophic; Category B 
 
 **B10 (Sky-specific). Sky's emission produced ABI-coerced extern call sites whose arg type didn't match the declared param type; LLVM 21's bitcode pipeline failed loudly when asked to round-trip the malformed IR.** **CLOSED 2026-06-25 (commit `3041ec8`).** Reframed from the pre-2026-06-25 framing ("LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures") per reviewer's round-4-followup note: malformed IR is Sky's output; LLVM crashing on it is downstream robustness. Root cause: `push_arg_for_rust_call`'s `Direct` arm in `toylangc/src/llvm_gen.rs` emitted struct aggregate values where rustc's ABI declared a scalar param (e.g. for `v.push(Widget { id: 1 })` where Widget = `{ i32 }` coerces to `i32`, the call instruction passed `{ i32 }` aggregate to a function declared `void(ptr, i32)`). LLVM accepted at -O0 but bitcode round-trip failed at -O1+ with "failed to parse bitcode for LTO module: Invalid record" (thin LTO) or "Callee is not a pointer type" (fat LTO). Fix: when source toylang type is `StructType` and target ABI type differs, reinterpret via memory (alloca + store + load-as-target-type) — same @ACRTFDZ pattern `codegen_extern_wrapper` already uses for incoming params. 5 regression probes enrolled (`test_drop_b10_probe_*`). Reframing details captured in §25.3.6 (the four-bugs-with-rationalization-priors discipline). See §F.18 for the empirical narrative.
 
-**B10's progeny — Phase R Site #8 (sret-bridge alloca/load size mismatch).** Same B10 shape, asymmetric direction. `codegen_extern_wrapper`'s sret-bridge alloca was sized as the internal toylang struct type; the post-call load read as `rust_ret_type`. When rust_ret_type was larger (e.g. 3-byte struct coerced to i32 direct return), the load read past the alloca → stack garbage at -O1+. Defensive fix shipped 2026-06-25 (commit `04e98c7`); trigger condition unreachable in current toylang grammar (requires i8/i16 field types). See Phase R audit in §F.18.
+**B10's progeny — Phase R Site #8 (sret-bridge alloca/load size mismatch).** Same B10 shape, asymmetric direction. `codegen_extern_wrapper`'s sret-bridge alloca was sized as the internal toylang struct type; the post-call load read as `rust_ret_type`. When rust_ret_type was larger (e.g. 3-byte struct coerced to i32 direct return), the load read past the alloca → stack garbage at -O1+. Defensive fix shipped 2026-06-25 (commit `04e98c7`); trigger condition unreachable in current toylang grammar (requires i8/i16 field types). See §F.19 for the full Phase R audit (Sites #1, #5/#6, #8, #10 + the bool accessor + IntLit widening surprise findings).
+
+**B22 (Sky-specific). Primitive-field accessor load-realloc roundtrip drops unspecified high bits.** **CLOSED 2026-06-25 (commit `736eeb5`).** Sky's auto-synthesized `&self.bool_field` accessors lowered via `Ref(FieldAccess)` did "load bool value as i1, alloca fresh i1, store, return pointer to alloca" — but LLVM's i1 storage has unspecified upper 7 bits per IR semantics. Rust callers reading `*&bool` as `i8` got undefined values; in practice typically false (LLVM zeroes uninitialized stack in modes Sky tested), but UB by LLVM spec. Generalizes beyond bool to any primitive narrower than its ABI byte (`bool`, sub-byte enums, packed-struct fields, future i1/i2 SIMD lanes). Fix: `Ref(FieldAccess)` now returns the GEP pointer to the field's original storage in the receiver struct, not a fresh-alloca copy. Same correctness pattern rustc uses. Canary: regression fixture at `test_drop_bool_accessor_via_rust_caller` (Sky struct with 5 bool fields exported, Rust caller deref's each accessor's `&bool`, must observe the values Sky stored). Reaction plan length if regression: 1-3 days (audit every `Ref(_)` lowering site for "is this returning a pointer to *the* storage, or to a copy?"). See §F.19 + §25.3.6 calibration discipline; the bug was found while probing for Site #8 (a different B10-class issue) and surfaced because the bool fixture exposed it.
+
+**B23 (Sky-specific). Type resolver silently fails to widen literal types against expected_ty context.** **CLOSED 2026-06-25 (commit `ae014d0`).** Toylang's parser default-typed unsuffixed integer literals as `i32` (fitting) or `i64` (overflowing). The type resolver's `Expr::IntLit` arm ignored the `expected_ty` parameter (literally underscore-prefixed: `_expected_ty`). A Sky source `struct W { a: i64, b: i64 } ... W { a: x, b: 0 }` produced a typed AST where `b`'s expression had type `i32` (parser default) — even though the field type was `i64`. Codegen emitted `store i32 0` to i64 fields, leaving the upper 4 bytes uninitialized. Silent miscompile for any caller reading the affected field. Generalizes to any literal kind whose default type doesn't match its sink (f32-default literals into f64 fields, char-vs-u32, future literal kinds). Fix: `Expr::IntLit` widens i32 → i64/usize when expected_ty calls for it; narrowing still errors (preserves explicit-mismatch detection). Canary: regression fixture at `test_drop_intlit_widening_struct_field` (construct a struct with i64 fields initialized to unsuffixed `0` literals, read back; must observe `0` everywhere, not stack garbage). Reaction plan length: 1-3 days (audit every `_expected_ty`/`_hint`/`_target_ty` underscore-prefixed param in the resolver for the same pattern). See §F.19 + §25.3.6; the bug was found via disassembly inspection of Bench 4's inner loop (was checking whether Bench 4's "0.1% delta" finding was real; it wasn't, but the disassembly showed `str wzr` (32-bit zero stores) for i64 fields, exposing this bug).
 
 **B11 (Sky-specific). Round-trip workaround scaling cost unmeasured.** **CLOSED — no round-trip occurs.** B11 was the meta-risk that B10's mitigation might scale poorly. With B10's mitigation retired (no bitcode is written, no IR text is printed, no parse happens), the question of round-trip cost at production scale is moot. The per-build cost contributed by Approach B is whatever Inkwell's direct IR construction already costs — the same path Sky was using to build the in-memory module before the round-trip, minus the round-trip itself. Memory pressure also returns to baseline (no triple-buffered original-module + IR-text + re-parsed-module peak).
 
@@ -5274,14 +5287,29 @@ This chapter describes the order in which Sky's implementation should be built. 
 
 **v1 scope (recommended phasing for the initial implementation):**
 
+**Note on toylangc reference implementation status.** As of 2026-06-25,
+toylangc has shipped the Phase 1 fork + codegen plugin scaffolding plus
+the Phase 3-equivalent generics work and most of Phase 5's drop synthesis.
+Appendix F.13–F.19 captures the toylangc implementation arcs; new
+implementers should treat toylangc as the reference for "this is what
+shipped" while §28 stays forward-looking phasing for Sky proper.
+
 **Phase 1: Fork + minimal codegen plugin (4-8 weeks).**
 - Apply the four fork patches: the three `per_instance_mir` patches + the `fill_extra_modules` allocator-callback hook on `ExtraBackendMethods` (see §3.2). (Historical patch 5 — the `consumer_lang_active` gated escape — was retired 2026-06-22; the partition filter restoration replaces its function.)
 - Build the Sky codegen backend as a CodegenBackend impl that wraps LlvmCodegenBackend.
 - Implement the marker-based per-crate activation.
 - Install the `fill_extra_modules` hook (via `set_fill_extra_modules_hook` / `install_consumer_modules_hook`) as a no-op (no Sky-side bitcode contribution yet).
+- **Install the five query overrides** (4 distinct queries; `cross_crate_inlinable` overridden in both `queries` and `extern_queries`):
+  - `per_instance_mir` — Sky's custom Instance-keyed MIR query (per_instance.rs).
+  - `layout_of` — Sky type layouts (layout.rs).
+  - `collect_and_partition_mono_items` — the partition filter (partition.rs).
+  - `cross_crate_inlinable` (local + extern) — `false` in Sky-active compiles to keep real `.o` symbols (cross_crate_inlinable.rs).
+  - `deduced_param_attrs` — `&[]` for Sky-tagged items, closing the silent-UB vector where rustc's MIR analysis on `unreachable!()` stub bodies would have wrongly inferred `readonly` + `captures(none)` for indirect-passed params (deduce_param_attrs.rs, Phase P).
 - Skip Sky's frontend for now: Sky's per_instance_mir provider always returns None (effectively, Sky's machinery activates but does nothing).
 - Verify the byte-identical pass-through invariant for pure-Rust crates (Section 4.4). Set up the CI corpus from day one — pass-through is the single hardest invariant to maintain (§25.3.5).
 - **Set up the architecture fence CI test from day one** (§26.15 NNGZ enforcement). The grep-based check that flags unannotated `type_params.is_empty()` branches is cheap to write and catches drift before any generic-shape surface exists; retrofitting the discipline after several months of "we'll get to it" produces dozens of fence-allow markers that all need re-evaluation. Toylang's session 11 wrote it after several violations had accumulated; Sky should write it first.
+- **Set up the cache audit CI fence from day one** (§22.4.1 / `toylangc/tests/cache_audit.rs`). The fence asserts every override file carries a `cache-audit:` marker comment describing its cache-on-disk policy and why it's safe. Adding a new override forces a fresh audit at that time. Catches the failure mode where someone adds a Sky override on a disk-cached query without considering Sky's universe-state-changes-invalidation problem (B21).
+- **Internalize the §25.3.6 calibration discipline from day one.** Build empirical integration fixtures BEFORE writing the typechecker/codegen change those fixtures will validate. Use IR inspection (`llvm-dis`, disassembly, `cargo build -C save-temps`) as a routine verification step when reasoning suggests the code is right but you don't have data confirming behavior. Four bugs (mir_shims-never-fired, B10-was-our-bug, bool-accessor-i1-storage, IntLit-widening-on-zeros) surfaced in the toylangc reference because empirical work caught what reasoning had explicitly rationalized as correct; Sky's phases should budget empirical work as load-bearing, not just confirming.
 
 **Phase 2: Sky frontend MVP (8-12 weeks).**
 - Parser for `.sky` source files.
@@ -5537,6 +5565,14 @@ This chapter defines terms used throughout the document. Where a term is specifi
 **Marker-detection** — Sky's mechanism for "is this a Sky stub rlib?" Walks the crate root for `__SKY_STUBS_MARKER`.
 
 **Forked rustc** — Sky's rustc binary, statically linking the codegen backend and frontend, plus the four fork patches (the `per_instance_mir` trio of patches 1-3 + the `fill_extra_modules` allocator-callback hook patch 4, now at rev 3 with the `#[repr(C)]` ABI; see §3.2). Cargo invokes this binary for every crate compile.
+
+**`deduced_param_attrs` override [Sky, Phase P]** — Sky's `Config::override_queries` registration that returns `&[]` for items tagged `#[skyc::emit_consumer_body]`. Closes a silent-UB vector where rustc's MIR analysis on the stub's `unreachable!()` body would have wrongly inferred `readonly` + `captures(none)` for `PassMode::Indirect` params; without the override, LLVM would apply these attrs at every Rust caller's call site, and Sky's actual body (supplied by `fill_extra_modules`) could mutate the indirect-passed param → silent miscompile at -O2+. The conservative `&[]` default is sufficient for v1; v2's path-b emission may revisit for large-Sky-body workloads. See §F.19, §22.4 v1 wrapper-attr posture, and `rustc-lang-facade/src/queries/deduce_param_attrs.rs`.
+
+**`LIFECYCLE_TRAITS` registry [Sky]** — `const`-slice + `lifecycle_trait_by_name` lookup in `toylangc/src/toylang/callbacks_impl.rs` that names each trait whose method Sky's compiler auto-synthesizes at specific code positions. Currently one entry: `Drop → drop` (scope-end synthesis). Future planned entries: `Init` (comptime placement construction), `SkyDrop` (linear-type marker), async Drop variant. Adding a new lifecycle trait is one registry-entry append; the synthesis pass itself never branches on which trait it's handling. Per reviewer's round-4-close endorsement.
+
+**path-b emission [Sky, v2 option]** — The deferred v2 perf-recovery option where Sky's `codegen_extern_wrapper` would stamp ground-truth ABI attrs (`readonly`, `captures(none)`, `noalias`) at the wrapper boundary based on explicit Sky-source-level mutability tracking, replacing Phase P's conservative `&[]` default with a precise per-export answer. Not pursued for v1 because Bench 1, Bench 4b, and the full Bench 3 matrix show Sky's wrapper boundary inlines through under thin LTO for bench-shaped workloads, making per-call attr decoration moot. v2 may revisit if profiling shows large-Sky-body workloads where the inliner DOESN'T fire (bodies above LLVM's inlining cost threshold, panic=unwind builds with cleanup paths inhibiting inlining). See §22.4.
+
+**Phase letter [Sky implementation]** — The implementation arcs for toylangc (Sky's reference implementation) are named with Phase letters A through R. Major phases: Phase A (drop fixtures, 2026-06-23), Phase E (mir_shims elimination, 2026-06-23, §F.18), Phase F (symbol_name retirement, 2026-06-24), Phase H (cdylib FFI rev 3, 2026-06-24, §F.15), Phase P (deduced_param_attrs override, 2026-06-25, §F.19), Phase Q (codegen_fn_attrs same-day double-bounce, 2026-06-25, §F.14.1 + §F.19), Phase R (B10-class emission audit, 2026-06-25, §F.19). The toylangc reference treats Phase letters as first-class vocabulary; Sky proper inherits the Phase numbering when it implements the same arcs. See §28 for Sky-proper phasing and Appendix F for toylangc implementation history.
 
 **v1 / v2** — Sky version. v1 is the first usable release; v2 adds features that aren't blocking initial usability. Sky 1.0 is the first stable release.
 
@@ -5914,11 +5950,23 @@ passed 317/0/1; `llvm-objdump` confirmed zero `udf`/`brk` traps in
 Sky callers across every Sky-export fixture.
 
 **If a future nightly rustc bump reintroduces a similar collision:**
-the place to start is to verify (a) Sky's `codegen_fn_attrs` override
-still produces `Some(AvailableExternally)` for Sky items, and (b)
-LLVM still honors the External-over-AvailableExternally preference
-at the IR linker. If both hold and the bug returns, restoring
-`#![no_builtins]` is a one-line emit in `build.rs`.
+the recovery instruction below was written in 2026-06-21 when Sky's
+Option 4 `codegen_fn_attrs` override was active; that override was
+retired 2026-06-22 alongside patch 5, and the partition filter was
+restored as the mechanism keeping consumer items out of rustc's
+LLVM-codegen path. **Updated recovery path 2026-06-22:** the place to
+start is to verify (a) Sky's `collect_and_partition_mono_items`
+override (the partition filter) still removes every consumer item
+from the CGU list before LLVM codegen sees it (`is_consumer_codegen_target`
+predicate via `#[skyc::emit_consumer_body]` tool attribute), and (b)
+no AvailableExternally bodies are being emitted for consumer items
+(verify via `llvm-objdump` that consumer symbols come from
+`fill_extra_modules` alone, not rustc's normal codegen path). If both
+hold and the bug returns, restoring `#![no_builtins]` is a one-line
+emit in `build.rs`. (Re-introducing the Option 4 `codegen_fn_attrs`
+override would re-introduce its CGU-placement hazard and require
+re-applying patch 5; the partition filter is the load-bearing
+mechanism now and should not be retired.)
 
 #### F.4 Patch (c) — synchronous submission BEFORE async codegen
 
@@ -6259,6 +6307,34 @@ CGU + main's disassembly inlining `core::panicking::panic`) that drove
 the decision. The text below is preserved as the design history of
 Option 4 itself for archive purposes.
 
+**Update (2026-06-25, Phase Q same-day double-bounce).** `codegen_fn_attrs`
+was re-introduced as a query override on 2026-06-25 (Phase Q) to stamp
+`NEVER_UNWIND` on Sky-tagged items under reviewer's hypothesis that
+Sky's panic=abort posture (§16.1) made every Sky export genuinely
+never-unwind, which would unlock landing-pad elimination at every
+Rust caller's call site. The override shipped (commit `736eeb5`) and
+was RETIRED THE SAME DAY (commit `f88aa84`) after an interaction
+audit found `fn_can_unwind` (`rustc_middle/src/ty/layout.rs:1233-1257`)
+already early-returns false for ALL non-foreign items when
+`tcx.sess.panic_strategy().unwinds()` is false. Sky's enforced
+panic=abort posture makes that the case → Phase Q's `NEVER_UNWIND`
+flag was redundant under uniform panic=abort. Reviewer's
+round-4-followup additionally observed that cargo enforces
+panic-strategy consistency at build-graph resolution, so even the
+mixed-panic-strategy edge case Phase Q would have helped was
+structurally impossible within Sky's tooling.
+
+Phase Q's same-day double-bounce is preserved in this design history
+section AND in `rustc-lang-facade/src/queries/mod.rs` header with an
+explicit DO NOT FLATTEN annotation per reviewer's endorsement:
+"Doc-trail of decisions that oscillated is more useful than the
+doc-trail of decisions that landed cleanly — it shows future
+engineers the failure mode that drove the re-introduction, so they
+don't make the same mistake on Phase Q-shaped future questions."
+
+The text below is preserved as the design history of Option 4 itself
+for archive purposes.
+
 ---
 
 The "A.3 partition filter" — the `collect_and_partition_mono_items`
@@ -6580,6 +6656,8 @@ LLVM's intra-CGU inliner at -O3 aggressively inlines `AvailableExternally` bodie
 
 None of these is clearly more attractive than keeping patch 5. The retirement arc is closed for the foreseeable future; patch 5 stays.
 
+> **REVERSED 2026-06-22.** This concluding sentence was overruled the next day: Option 4 (the `codegen_fn_attrs` override stamping `AvailableExternally` linkage) was retired in favor of the restored partition filter, and patch 5 (the `consumer_lang_active` gated escape that papered over Option 4's CGU-placement hazard) was retired together with it. The reasoning above (a)–(d) about why retirement options weren't attractive applied to a world where Option 4's `AvailableExternally` bodies still reached LLVM IR. Retiring Option 4 entirely (restoring the partition filter so consumer items never reach rustc's LLVM-codegen path) eliminated the CGU-placement hazard structurally — there's no `AvailableExternally` body to misplace — and made patch 5's defense unnecessary. See §F.14.1 for the full reversal narrative.
+
 **Side observation:** patch 5's gated escape clause condition `(consumer_lang_active && map.contains_key)` requires `contains_key` to be true for the escape to actually change behavior. For the case5 probe, `contains_key(store_in_vec<i32>)` must be true at user_bin compile time — but `__lang_stubs.rlib`'s `.o` files don't contain a `store_in_vec<i32>` symbol (verified via `ar x` + `llvm-objdump -t`), implying __lang_stubs's compile didn't mono it. So the natural `upstream_monomorphizations_for` map gets its entry from somewhere else — possibly rustc's local mono at user_bin populating the map mid-compile, possibly interactions between Option 4's AvailableExternally stamping and rustc's rmeta-encoded share_generics tracking. Pinning down the exact source of the natural-map entry was not done in this investigation but is the next probe if someone re-opens the retirement question.
 
 #### F.18 Phase E: mir_shims elimination + AST-rewrite drop synthesis (2026-06-23)
@@ -6629,10 +6707,14 @@ every downstream stage treats drop calls as ordinary `StaticCall`
 AST nodes. No drop-specific paths in: dep walker, mono cascade,
 per_instance_mir, codegen, symbol resolution, link.
 
-The remaining 5% leak: the predicate hardcodes the trait name "Drop"
-(and method name "drop") at the registry lookup. Could be generalized
-to a marker-trait registry but Drop is the only such trait Sky needs
-today.
+The remaining 5% leak (mostly closed 2026-06-25 in commit `8f85622`
+per reviewer's round-4-close endorsement): the predicate now consults
+a `LIFECYCLE_TRAITS` const-slice registry rather than hardcoding the
+trait name. Currently one entry: `Drop → drop`. Adding a new lifecycle
+trait (Init, SkyDrop, async-Drop variant, etc.) is one registry-entry
+append; the synthesis pass itself never branches on which trait it's
+handling. See §15.7 for the post-Phase-E mechanism description with
+the registry hookup.
 
 **Two surprises caught during implementation.**
 
@@ -6748,6 +6830,184 @@ emitted `Drop::drop` extern declaration's signature exactly with the
 call-site type so no ABI coercion occurs in IR. Until then, Sky-main
 + Vec-of-Sky-drop fixtures should be restructured with Rust callers,
 as Bench 3 does.
+
+#### F.19 Phase R + Phase P + bool accessor + IntLit widening (2026-06-25 round-4-followup arc)
+
+The implementation arc that surfaced via round-4's parallel-agent
+investigation and the subsequent verification work. Five distinct
+work items, two of which surfaced real silent-miscompile bugs that
+prior reasoning had explicitly rationalized as correct (per §25.3.6).
+The implementation history is the strongest empirical case for
+§25.3.6's calibration discipline.
+
+**Phase P (`deduced_param_attrs` query override).** Surfaced via the
+round-4-close parallel-agent investigation: rustc's `deduce_param_attrs`
+query analyzes Sky's `unreachable!()` stub MIR and concludes that
+`PassMode::Indirect` params are `readonly` + `captures(none)` (the
+stub never reads/writes them, so `UsageSummary` stays `empty()`).
+`apply_deduced_attributes` in `rustc_ty_utils/src/abi.rs:646-672` then
+sets these attrs on the LLVM IR at every Rust caller's call site. If
+Sky's actual `fill_extra_modules`-emitted body mutates an indirect-passed
+param (e.g. `fn f(x: &mut LargeStruct)`), the `readonly` attr is a
+lie that LLVM trusts → silent miscompile at -O2+. Override returns
+`&[]` for `#[skyc::emit_consumer_body]`-tagged items as the
+conservative safe default. Path-b emission (Sky stamping ground-truth
+attrs at the wrapper boundary) is deferred to v2; current bench-shaped
+workloads inline through the wrapper at thin LTO making per-call
+attr decoration moot (see §22.4's v1 wrapper-attr posture paragraph).
+Verification: IR inspection of the existing `bench4_largestruct_byval_thin`
+fixture confirms the override fires. Sky's tagged-item declarations
+show `captures(address)` (default for `&T`/sret) not `captures(none)`
+(which `deduce_param_attrs` would have added), and no `readonly` attr.
+File: `rustc-lang-facade/src/queries/deduce_param_attrs.rs`. Cache
+audit: `false` upstream default, never disk-cached. Shipped 2026-06-25
+commit `760b674`.
+
+**Phase Q (`codegen_fn_attrs` override for `NEVER_UNWIND`) — shipped same
+day, retired same day.** Hypothesis: Sky's panic=abort posture (§16.1)
+makes every Sky export genuinely never-unwind, so stamping `NEVER_UNWIND`
+on tagged items would unlock landing-pad elimination at every Rust
+caller's call site under panic=unwind builds. Shipped (commit `736eeb5`)
+then RETIRED THE SAME DAY (commit `f88aa84`) after interaction audit:
+`fn_can_unwind` (`rustc_middle/src/ty/layout.rs:1233-1257`) already
+early-returns false for ALL non-foreign items when
+`tcx.sess.panic_strategy().unwinds()` is false. Sky's panic=abort
+makes that the case → `NEVER_UNWIND` flag is redundant under uniform
+panic=abort. Reviewer's round-4-followup additionally observed: cargo
+enforces panic-strategy consistency at build-graph resolution, so the
+mixed-panic-strategy case Phase Q would have helped was structurally
+impossible within Sky's tooling. Phase Q joined the codegen_fn_attrs
+double-retirement history (Option 4 era 2026-06-22 + Phase Q
+2026-06-25). The provenance comment chain is pinned in
+`rustc-lang-facade/src/queries/mod.rs` with explicit DO NOT FLATTEN
+annotation per reviewer's endorsement: "Doc-trail of decisions that
+oscillated is more useful than the doc-trail of decisions that landed
+cleanly."
+
+**Phase R defensive emission audit (Sites #1, #5/#6, #8, #10).** Surfaced
+via round-4-close agent emission audit looking for B10-class
+signature-mismatch bugs in `toylangc/src/llvm_gen.rs`. Seven candidate
+sites identified; defensive fixes shipped for the four most concerning:
+
+- **Site #1** (`push_arg_for_rust_call`'s `Pair` arm, commit `52ee0a3`).
+  Pre-fix the arm assumed source was always a struct via `into_struct_value()`.
+  For Pair-coerced thin-pointer types (e.g. fat-pointer receivers
+  toylang grammar might surface later), the source could be a
+  non-struct LLVM type. Defensive memory-reinterpret added: when
+  source toylang type doesn't match the expected Pair struct shape,
+  reinterpret via alloca + memcpy + load (same @ACRTFDZ pattern Site #8
+  uses).
+
+- **Sites #5/#6** (trait-call / method-call receiver as `Pair`,
+  commit `52ee0a3`). Pre-fix the receiver `recv_ptr` was pushed as a
+  single thin pointer unconditionally. For trait methods where rustc
+  coerces `&self` to Pair (e.g. `impl Trait for [T] { fn f(&self) }`
+  where `self: &[T]` → fat-pointer Pair), pushing a single ptr where
+  the function expects two scalars would produce malformed IR.
+  Defensive: when `coerced_params[0]` is `Pair`, dispatch through
+  `push_arg_for_rust_call` to extract both scalars and push them in
+  sequence. Direct/Indirect shapes keep the existing thin-pointer push.
+
+- **Site #8** (`codegen_extern_wrapper` sret-bridge alloca/load size
+  mismatch, commit `04e98c7`). Same B10 shape, asymmetric direction.
+  Pre-fix the alloca was sized as the internal toylang struct type;
+  the post-call load read as `rust_ret_type`. When `rust_ret_type` is
+  larger (e.g. 3-byte struct coerced to i32 direct return), the load
+  reads past the alloca → stack garbage at -O1+. Fix: two-alloca +
+  memcpy(min) pattern (mirrors the existing @ACRTFDZ approach for
+  incoming params). Trigger condition unreachable in current toylang
+  grammar (requires i8/i16 field types); fix is defensive.
+
+- **Site #10** (`parse_coerced_type` missing float/vector arms,
+  commit `52ee0a3`). Pre-fix only handled `ptr`, `double`, `i{bits}`,
+  arrays, structs. Missing `half`, `float`, `fp128`, `<N x T>` (vector).
+  Rustc's abi_helpers produce all of these; any Sky export with f32/f16/f128
+  or SIMD would have ICE'd at codegen. Defensive arms added.
+
+Trigger conditions for all four sites are currently unreachable in
+toylang grammar; they prevent ICE/silent miscompile if Sky proper's
+broader grammar (non-power-of-2 byte structs, traits on slices, SIMD,
+f32) hits any of them. See `static_size_bytes` helper at the bottom
+of `llvm_gen.rs` for the codegen-time byte-size walker used by Sites
+#1 and #8 (audited to match LLVM's actual layout rules for all
+currently-emitted Sky types; known divergences for types Sky doesn't
+emit yet are documented in the helper's doc-comment).
+
+**Bool accessor silent miscompile (surfaced while probing Site #8,
+fixed commit `736eeb5`).** Sky's auto-synthesized field accessors
+(`pub fn a(&self) -> &bool { &self.a }`) lowered `&self.a` via the
+default `Ref(FieldAccess)` codepath: load the bool value (LLVM `i1`),
+alloca fresh `i1`, store, return pointer to fresh alloca. LLVM's i1
+storage has unspecified upper 7 bits per IR semantics; Rust callers
+reading `*&bool` as `i8` got undefined values. The probe fixture for
+Site #8 used a Sky struct with 5 bool fields; expected output
+"true false true false true" came back all-false. Diagnostic showed
+the raw byte at each accessor's returned pointer was correctly 0x01/0x00,
+but `*ptr_to_bool` evaluated to false anyway — the type-system-level
+read of `*&bool` was where the corruption surfaced. Fix:
+`Ref(FieldAccess)` now returns the GEP pointer to the field's actual
+storage in the receiver struct, not a load-realloc roundtrip. Same
+correctness pattern rustc uses for the same reason. Regression
+fixture: `test_drop_bool_accessor_via_rust_caller`. **B22** in §25.2.
+
+**IntLit widening silent miscompile (surfaced via Bench 4 IR
+inspection, fixed commit `ae014d0`).** While investigating whether
+Bench 4's "Sky matches Rust at 0.1%" finding was real (it wasn't —
+LLVM constant-folded the inner loop), the disassembly showed Sky
+emitting `str wzr` (32-bit zero stores) for i64 struct fields
+initialized with unsuffixed `0` literals. Root cause: toylang's
+parser default-typed unsuffixed integer literals as `i32`; the type
+resolver's `Expr::IntLit` arm ignored the `expected_ty` parameter
+(literally underscored: `_expected_ty`). A Sky source `LargeStruct
+{ a: x, b: 0, c: 0, d: 0 }` produced a typed AST where `b`/`c`/`d`
+were `i32`-typed; codegen emitted `store i32 0` to the i64 fields,
+leaving the upper 4 bytes uninitialized stack garbage. Fix: type
+resolver's `Expr::IntLit` arm now widens i32 → i64/usize when
+`expected_ty` calls for it; narrowing still errors (preserves
+explicit-mismatch detection per the existing
+`test_arg_type_mismatch_i32_vs_i64` test). Regression fixture:
+`test_drop_intlit_widening_struct_field`. **B23** in §25.2.
+
+**Bench 4 / Bench 4b (canonical wrapper-boundary perf measurement).**
+Original Bench 4 (commit `d9248c7`) was artifactual — LLVM constant-folded
+the inner loop and the measured time was loop-overhead, not the
+cross-crate boundary cost. Bench 4b (commit `ae014d0`) adds
+`std::hint::black_box` between maker + reader to defeat the fold.
+Post-IntLit-fix verification (20-run trimmed-mean comparison): Sky
+6505μs vs Rust inlineable baseline 6658μs — Sky ~2% faster, within
+run-to-run variance. Inner-loop disassembly is byte-identical
+between Sky and Rust binaries (10 instructions: stur counter, add,
+ldur, stp xzr xzr, stur xzr, str result, ldr result, add acc, cmp,
+b.ne — same registers, same addressing modes). **Sky's cross-crate
+boundary cost equals inlineable Rust at thin LTO for shapes LLVM can
+inline through.** Path-b emission unnecessary for v1. See §22.4 v1
+wrapper-attr posture for the v2 path-b deferral.
+
+**Meta-pattern (§25.3.6 calibration discipline).** All four bugs
+above existed in code paths that prior reasoning had explicitly
+rationalized as correct. Multi-agent investigation, peer review, and
+design-doc walkthrough all concluded "this is fine" for each. The
+CODE itself was wrong in ways that didn't appear in the typed-AST
+view, the design doc, or the trait-level contract — only IR-level
+disassembly or runtime output exposed the divergence. §25.3.6 makes
+the discipline explicit: integration fixtures are load-bearing for
+catching premise errors, not just for confirming designed behavior.
+Use IR inspection (`llvm-dis`, disassembly, `cargo build -C
+save-temps`) as a routine verification step. Discount round-N
+reasoning chains against the rate of empirical surprises in prior
+rounds. Build fixtures BEFORE the typechecker / codegen change those
+fixtures will validate.
+
+**Lifecycle-traits registry (round-4-close residual, commit `8f85622`).**
+Per reviewer's endorsement, generalized the previously-hardcoded `Drop`
+trait-name string in `local_needs_scope_drop` and `synth_scope_drop_call`
+to a `LIFECYCLE_TRAITS` const-slice + `lifecycle_trait_by_name`
+lookup. Currently one entry (`Drop → drop`); future planned entries
+are `Init` (comptime placement construction), `SkyDrop` (linear-type
+marker), async Drop variant. The synthesis pass no longer branches on
+which trait it's emitting for. Per §15.7 step "remaining 5% leak"
+paragraph: adding the next lifecycle trait is one registry-entry
+append.
 
 This is the master design document for Sky's compiler & Rust interop architecture. Total length: ~30 chapters, 6 appendices, approximately 100 pages.
 
