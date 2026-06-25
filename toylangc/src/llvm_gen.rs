@@ -822,60 +822,78 @@ fn static_size_bytes(ty: BasicTypeEnum<'_>, pointer_bytes: u64) -> u64 {
 /// Codegen a toylang function body with the simple internal ABI.
 /// Structs/Vec always use sret (ptr first param, void return).
 /// Primitives return directly. No Rust ABI coercion.
+///
+/// Sunny-karp (2026-06-25): accepts `precomputed_typed_body` produced at
+/// populate time by `resolve_caller_from_instance`/`from_type_args` (which
+/// substituted the cached typed body + ran the late drop-synth pass). When
+/// the caller can't supply one (rare — synthesized accessor before the
+/// populate channel fills the cache), we fall back to re-running
+/// `resolve_fn_body` + `insert_scope_end_drops` here. The fallback exists
+/// only for compatibility while the cache fills incrementally.
 fn codegen_internal_function<'ctx, 'tcx>(
     ctx: &mut CodegenCtx<'ctx, 'tcx, '_>,
     func: &crate::toylang::registry::ToyFunction,
     internal_symbol: &str,
+    precomputed_typed_body: Option<&crate::toylang::typed_ast::TypedBlock>,
 ) {
     // Per @MBMRVZ, this function's return type is inferred from the
     // body's tail expression. For `main`, that must be void, or the
     // extern wrapper (whose signature is pinned to `fn __toylang_main()`
     // by the Rust shim) will call us with a missing sret buffer and
     // SIGBUS during our final return-value store.
-    // Query rustc for Rust method return types
-    let rust_method_ret = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
-        if type_name.is_empty() {
-            crate::oracle::rust_free_fn_return_type(ctx.tcx, method, type_args)
-                .map(|opt| opt.unwrap_or(ResolvedType::Void))
-        } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
-            let receiver_ty = &type_args[0];
-            let explicit_args = &type_args[1..];
-            crate::oracle::rust_trait_method_return_type(ctx.tcx, trait_name, method, receiver_ty, explicit_args)
-        } else {
-            crate::oracle::rust_method_return_type(ctx.tcx, type_name, method, type_args)
-        }
+    let owned_fallback: Option<crate::toylang::typed_ast::TypedBlock> = if precomputed_typed_body.is_some() {
+        None
+    } else {
+        // Fallback: re-resolve. Bind tcx/registry locally to dodge the
+        // `move` requirement on `ctx`.
+        let tcx = ctx.tcx;
+        let registry: &crate::toylang::registry::ToylangRegistry = ctx.registry;
+        let caller_type_params = func.type_params.clone();
+        let caller_a = caller_type_params.clone();
+        let caller_b = caller_type_params.clone();
+        let rust_method_ret = move |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<ResolvedType, crate::oracle::UnresolvedRustType> {
+            if type_name.is_empty() {
+                crate::oracle::rust_free_fn_return_type(tcx, method, type_args, &caller_a)
+                    .map(|opt| opt.unwrap_or(ResolvedType::Void))
+            } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+                let receiver_ty = &type_args[0];
+                let explicit_args = &type_args[1..];
+                crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args, &caller_a)
+            } else {
+                crate::oracle::rust_method_return_type(tcx, type_name, method, type_args, &caller_a)
+            }
+        };
+        let rust_param_types = move |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
+            if type_name.is_empty() {
+                crate::oracle::rust_free_fn_param_types(tcx, method, type_args, &caller_b)
+            } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
+                crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..], &caller_b)
+            } else {
+                crate::oracle::rust_method_param_types(tcx, type_name, method, type_args, &caller_b)
+            }
+        };
+        let is_rust_trait = move |name: &str| {
+            crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
+        };
+        let mut body = crate::toylang::type_resolve::resolve_fn_body(
+            registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait,
+        ).expect("type resolution should succeed (already validated)");
+        let returns_void = matches!(
+            &func.return_ty,
+            None | Some(ResolvedType::Void),
+        );
+        crate::toylang::callbacks_impl::insert_scope_end_drops(
+            tcx, &mut body, registry, returns_void, &caller_type_params,
+        );
+        Some(body)
     };
-    let rust_param_types = |type_name: &str, method: &str, type_args: &[ResolvedType]| -> Result<Option<Vec<ResolvedType>>, crate::oracle::UnresolvedRustType> {
-        if type_name.is_empty() {
-            crate::oracle::rust_free_fn_param_types(ctx.tcx, method, type_args)
-        } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
-            crate::oracle::rust_trait_method_param_types(ctx.tcx, trait_name, method, &type_args[0], &type_args[1..])
-        } else {
-            crate::oracle::rust_method_param_types(ctx.tcx, type_name, method, type_args)
-        }
+    let typed_body: &crate::toylang::typed_ast::TypedBlock = match precomputed_typed_body {
+        Some(tb) => tb,
+        None => owned_fallback.as_ref().expect("fallback body was built above"),
     };
-    // Per @IVTDBTZ, trait-vs-inherent dispatch predicate.
-    let is_rust_trait = |name: &str| {
-        crate::oracle::find_use_imported_trait_def_id(ctx.tcx, name).is_some()
-    };
-    let mut typed_body = crate::toylang::type_resolve::resolve_fn_body(ctx.registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait)
-        .expect("type resolution should succeed (already validated)");
-
-    // Phase E.d — insert scope-end `Drop::drop(&local)` calls into the
-    // typed AST. Mirrors `callbacks_impl::type_resolve_body`'s wrapper
-    // so both the dep-collection and codegen paths see identical
-    // typed ASTs (the synth must be applied at BOTH sites or the dep
-    // queue and the emitted body will disagree on what's called).
-    let returns_void = matches!(
-        &func.return_ty,
-        None | Some(ResolvedType::Void),
-    );
-    crate::toylang::callbacks_impl::insert_scope_end_drops(
-        ctx.tcx, &mut typed_body, ctx.registry, returns_void,
-    );
 
     // Resolve any Rust method symbols used in this function by walking the typed body
-    resolve_rust_methods_from_typed_body(ctx, &typed_body);
+    resolve_rust_methods_from_typed_body(ctx, typed_body);
 
     // Determine internal return type from the typed AST
     let ret_resolved = typed_body.ret.as_ref()
@@ -2170,7 +2188,7 @@ fn lower_typed_expr<'ctx>(
 
 fn lower_typed_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>, stmt: &TypedStmt) {
     match stmt {
-        TypedStmt::Let { name, expr } => {
+        TypedStmt::Let { name, expr, drop_synthesized: _ } => {
             let result = lower_typed_expr(ctx, expr);
             match result {
                 ExprResult::Ptr(ptr, ty) => {
@@ -2389,6 +2407,11 @@ pub fn fill_module<'tcx, 'ctx>(
     // Collect all toylang mono items (accessors and functions) first, then codegen.
     struct FnItem<'tcx> {
         resolved_func: crate::toylang::registry::ToyFunction,
+        /// Sunny-karp (2026-06-25) — substituted typed body produced at
+        /// populate time. `None` only for extern declarations (which have
+        /// no Sky body to lower). Codegen reads this directly rather than
+        /// re-running `type_resolve_body` at the per-Instance step.
+        typed_body: Option<crate::toylang::typed_ast::TypedBlock>,
         /// Some for entry-point functions (Rust calls them), None for internal-only.
         /// Used to generate extern ABI wrappers.
         instance: Option<ty::Instance<'tcx>>,
@@ -2468,17 +2491,21 @@ pub fn fill_module<'tcx, 'ctx>(
                 &registry_name, tcx, instance,
             );
             if !seen_symbols.insert(extern_symbol.clone()) { continue; }
-            let resolved_func = if let Some(inst) = state.toylang_instances
+            let (resolved_func, typed_body) = if let Some(inst) = state.toylang_instances
                 .iter()
                 .find(|i| i.extern_symbol == extern_symbol)
             {
-                inst.resolved_func.clone()
+                (inst.resolved_func.clone(), inst.typed_body.clone())
             } else {
-                crate::toylang::callbacks_impl::resolve_caller_from_instance(toy_fn, instance, tcx)
+                let resolved_caller = crate::toylang::callbacks_impl::resolve_caller_from_instance(
+                    tcx, registry, &state.typed_bodies, &registry_name, toy_fn, instance,
+                );
+                (resolved_caller.func, resolved_caller.typed_body)
             };
             let internal_symbol = internal_symbol_for_instance(&registry_name, tcx, instance);
             fn_items.push(FnItem {
                 resolved_func,
+                typed_body,
                 instance: Some(instance),
                 extern_symbol,
                 internal_symbol,
@@ -2523,6 +2550,7 @@ pub fn fill_module<'tcx, 'ctx>(
             // skips them anyway).
             fn_items.push(FnItem {
                 resolved_func: inst.resolved_func.clone(),
+                typed_body: inst.typed_body.clone(),
                 instance,
                 extern_symbol: inst.extern_symbol.clone(),
                 internal_symbol: inst.internal_symbol.clone(),
@@ -2535,7 +2563,7 @@ pub fn fill_module<'tcx, 'ctx>(
     // Extern wrappers adapt to Rust ABI and delegate to the internal function.
     // Only entry-point functions (with Instance) get extern wrappers.
     for item in &fn_items {
-        codegen_internal_function(&mut ctx, &item.resolved_func, &item.internal_symbol);
+        codegen_internal_function(&mut ctx, &item.resolved_func, &item.internal_symbol, item.typed_body.as_ref());
     }
     for item in &fn_items {
         if let Some(instance) = item.instance {

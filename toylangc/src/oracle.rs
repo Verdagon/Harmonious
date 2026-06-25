@@ -93,14 +93,19 @@ use rustc_hir::def::DefKind;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::DefId;
 
-// ActiveParamMap retired in W3 (course-correct.md item #1 / Approach A
-// restoration). Under Approach B's identity-args path, `try_resolved_to_rustc_ty`
-// could hit a `ResolvedType::TypeParam("T")` and needed a thread-local index
-// map to rebuild the rustc `TyKind::Param`. Under Approach A, Sky-side
-// substitution in `collect_generic_rust_deps_inner` replaces every TypeParam
-// with the concrete `ResolvedType` *before* this converter sees it. The
-// TypeParam arm in `try_resolved_to_rustc_ty` now panics unconditionally —
-// a Param reaching it is a substitution bug, not a routine case to recover from.
+// Sunny-karp refactor (2026-06-25): TypeParam-bearing oracle queries.
+// Previously every oracle query short-circuited with `DeferredTypeParam` the
+// moment it saw a `ResolvedType::TypeParam` in its args; `after_rust_analysis`
+// swallowed the deferred error and the typed AST was discarded, then re-run
+// from scratch at every per-Instance mono. The shortcut was implementation
+// laziness from the Approach A migration — `tcx.fn_sig(...).instantiate(...)`
+// accepts Param-bearing args and `rustc_ty_to_resolved_type` already converts
+// `TyKind::Param` → `ResolvedType::TypeParam`. The current path threads the
+// caller's `type_params: &[String]` through `try_resolved_to_rustc_ty`; the
+// `TypeParam` arm rebuilds `ty::Ty::new_param(tcx, idx, name)` using the
+// index from the caller's param list. The early-returns are gone; generic
+// bodies type-resolve fully once at `after_rust_analysis`, cached on
+// `ToyFunction.typed_body`, and at mono we substitute the typed AST directly.
 
 /// Cross-crate-aware DefId resolver. Searches for an item named `name` whose
 /// `Res::Def` kind passes `kind_filter`. Search order:
@@ -219,10 +224,18 @@ pub fn find_inherent_method(tcx: TyCtxt<'_>, type_def_id: DefId, method: &str) -
 /// Convert a `ResolvedType` to a rustc `Ty<'tcx>`. Used for layout_of queries
 /// and dependency resolution. Returns `Err(UnresolvedRustType)` per @RTMEIZ
 /// when a Rust type isn't `use`-imported in the toylang source.
+///
+/// `caller_type_params` is the list of in-scope type-param names (from the
+/// surrounding consumer fn / impl block). When the input contains
+/// `ResolvedType::TypeParam(name)`, this list determines the `ParamTy` index
+/// passed to `ty::Ty::new_param`. Pass `&[]` at non-generic / post-mono call
+/// sites (most codegen + layout sites) — hitting a TypeParam with empty
+/// param_names is a substitution bug and panics.
 pub fn try_resolved_to_rustc_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
     resolved: &crate::toylang::typed_ast::ResolvedType,
     context: &RustTypeLookupContext,
+    caller_type_params: &[String],
 ) -> Result<ty::Ty<'tcx>, UnresolvedRustType> {
     use crate::toylang::typed_ast::ResolvedType;
     match resolved {
@@ -239,7 +252,7 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
             let adt_def = tcx.adt_def(def_id);
             let nested = RustTypeLookupContext::NestedGenericArg { parent_type: name.clone() };
             let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-                .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &nested)?)))
+                .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &nested, caller_type_params)?)))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args)))
         }
@@ -267,12 +280,12 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
             let adt_def = tcx.adt_def(def_id);
             let nested = RustTypeLookupContext::NestedGenericArg { parent_type: name.clone() };
             let args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-                .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &nested)?)))
+                .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &nested, caller_type_params)?)))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ty::Ty::new_adt(tcx, adt_def, tcx.mk_args(&args)))
         }
         ResolvedType::Ref { inner } => {
-            let inner_ty = try_resolved_to_rustc_ty(tcx, inner, context)?;
+            let inner_ty = try_resolved_to_rustc_ty(tcx, inner, context, caller_type_params)?;
             Ok(ty::Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, inner_ty))
         }
         // Per @UTAIRZ, Str and ByteSlice round-trip through rustc identically;
@@ -280,29 +293,31 @@ pub fn try_resolved_to_rustc_ty<'tcx>(
         ResolvedType::Str => Ok(tcx.types.str_),
         ResolvedType::ByteSlice => Ok(ty::Ty::new_slice(tcx, tcx.types.u8)),
         ResolvedType::TypeParam(name) => {
-            // Approach A invariant: Sky-side substitution in
-            // `callbacks_impl::collect_generic_rust_deps_inner` (or the layout
-            // / type-resolution paths that use this converter) has already
-            // replaced every TypeParam with the concrete ResolvedType from
-            // the relevant Instance's args. A Param reaching this converter
-            // means upstream substitution missed an entry — that's a bug, not
-            // something to recover from.
-            panic!(
-                "TypeParam '{}' reached try_resolved_to_rustc_ty; \
-                 Sky-side substitution should have replaced it with the \
-                 concrete ResolvedType before this point (course-correct.md \
-                 item #1, Approach A invariant)",
-                name,
-            )
+            // Sunny-karp: rebuild rustc's `ParamTy` from the caller fn's
+            // type-param list. The index is the param's position in the
+            // surrounding fn's generics; `rustc_ty_to_resolved_type`
+            // round-trips this back to `TypeParam(name)` via the param's
+            // name field. When `caller_type_params` is empty (post-mono /
+            // codegen call sites), a TypeParam reaching here is a
+            // substitution bug.
+            let idx = caller_type_params.iter().position(|p| p == name)
+                .unwrap_or_else(|| panic!(
+                    "TypeParam '{}' not found in caller_type_params {:?} — \
+                     either the caller fn's type-param list was not threaded \
+                     through, or substitution missed this Param",
+                    name, caller_type_params,
+                ));
+            Ok(ty::Ty::new_param(tcx, idx as u32, rustc_span::Symbol::intern(name)))
         }
     }
 }
 
 /// Convenience wrapper that panics on error — for call sites where context
 /// is unavailable or errors have already been validated away (e.g., codegen
-/// after `after_rust_analysis` passed).
+/// after `after_rust_analysis` passed). Post-mono / codegen path; passes an
+/// empty `caller_type_params` to `try_resolved_to_rustc_ty`.
 pub fn resolved_to_rustc_ty<'tcx>(tcx: TyCtxt<'tcx>, resolved: &crate::toylang::typed_ast::ResolvedType) -> ty::Ty<'tcx> {
-    try_resolved_to_rustc_ty(tcx, resolved, &RustTypeLookupContext::Codegen)
+    try_resolved_to_rustc_ty(tcx, resolved, &RustTypeLookupContext::Codegen, &[])
         .unwrap_or_else(|e| panic!("{}", e))
 }
 
@@ -495,22 +510,17 @@ pub fn redirect_to_wrapper<'tcx>(
 }
 
 /// Query rustc for a Rust method's return type, converting to ResolvedType.
+///
+/// `caller_type_params` carries the in-scope type-param names so
+/// `try_resolved_to_rustc_ty` can rebuild `ParamTy` for `ResolvedType::TypeParam`
+/// args (sunny-karp). Pass `&[]` from post-mono / non-generic call sites.
 pub fn rust_method_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     type_name: &str,
     method_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
+    caller_type_params: &[String],
 ) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
-    // Phase B — if any type arg is still a TypeParam, defer to the
-    // per-Instance substituted pass.
-    if type_args.iter().any(contains_type_param) {
-        return Err(UnresolvedRustType {
-            name: "<TypeParam>".to_string(),
-            context: RustTypeLookupContext::DeferredTypeParam {
-                query: format!("inherent method `{}::{}`", type_name, method_name),
-            },
-        });
-    }
     let type_def_id = find_rust_type_def_id(tcx, type_name)
         .ok_or_else(|| UnresolvedRustType {
             name: type_name.to_string(),
@@ -526,12 +536,15 @@ pub fn rust_method_return_type<'tcx>(
         type_name: type_name.to_string(), method: method_name.to_string(),
     };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
+        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
         .collect::<Result<Vec<_>, _>>()?;
     // @ELASZ
     let args = build_generic_args_for_item(tcx, method_def_id, &all_ty_args);
 
-    // Query fn_sig and extract return type
+    // Query fn_sig and extract return type. Param-bearing args flow through
+    // `instantiate` cleanly (Params are normalization terminals); the output
+    // sig carries our Params and `rustc_ty_to_resolved_type` converts them
+    // back to `ResolvedType::TypeParam`.
     let sig = tcx.fn_sig(method_def_id).instantiate(tcx, args);
     let sig = tcx.normalize_erasing_late_bound_regions(
         ty::TypingEnv::fully_monomorphized(), sig,
@@ -789,12 +802,13 @@ fn try_instantiate_free_fn_sig<'tcx>(
     def_id: DefId,
     fn_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
+    caller_type_params: &[String],
 ) -> Result<ty::FnSig<'tcx>, UnresolvedRustType> {
     let arg_ctx = RustTypeLookupContext::FreeFunctionTypeArg {
         function_name: fn_name.to_string(),
     };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
+        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
         .collect::<Result<Vec<_>, _>>()?;
     // @ELASZ
     let args = build_generic_args_for_item(tcx, def_id, &all_ty_args);
@@ -808,18 +822,10 @@ pub fn rust_free_fn_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
+    caller_type_params: &[String],
 ) -> Result<Option<crate::toylang::typed_ast::ResolvedType>, UnresolvedRustType> {
-    // Phase B — if any type arg is still a TypeParam, defer.
-    if type_args.iter().any(contains_type_param) {
-        return Err(UnresolvedRustType {
-            name: "<TypeParam>".to_string(),
-            context: RustTypeLookupContext::DeferredTypeParam {
-                query: format!("free function `{}`", name),
-            },
-        });
-    }
     let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
-    let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args)?;
+    let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args, caller_type_params)?;
     Ok(Some(rustc_ty_to_resolved_type(tcx, sig.output())))
 }
 
@@ -829,18 +835,10 @@ pub fn rust_free_fn_param_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
+    caller_type_params: &[String],
 ) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
-    // Phase B — if any type arg is still a TypeParam, defer.
-    if type_args.iter().any(contains_type_param) {
-        return Err(UnresolvedRustType {
-            name: "<TypeParam>".to_string(),
-            context: RustTypeLookupContext::DeferredTypeParam {
-                query: format!("free function `{}`", name),
-            },
-        });
-    }
     let Some(def_id) = find_use_imported_fn_def_id(tcx, name) else { return Ok(None) };
-    let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args)?;
+    let sig = try_instantiate_free_fn_sig(tcx, def_id, name, type_args, caller_type_params)?;
     Ok(Some(sig.inputs().iter().map(|&t| rustc_ty_to_resolved_type(tcx, t)).collect()))
 }
 
@@ -851,23 +849,15 @@ pub fn rust_method_param_types<'tcx>(
     type_name: &str,
     method_name: &str,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
+    caller_type_params: &[String],
 ) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
-    // Phase B — if any type arg is still a TypeParam, defer.
-    if type_args.iter().any(contains_type_param) {
-        return Err(UnresolvedRustType {
-            name: "<TypeParam>".to_string(),
-            context: RustTypeLookupContext::DeferredTypeParam {
-                query: format!("inherent method `{}::{}`", type_name, method_name),
-            },
-        });
-    }
     let Some(type_def_id) = find_rust_type_def_id(tcx, type_name) else { return Ok(None) };
     let Some(method_def_id) = find_inherent_method(tcx, type_def_id, method_name) else { return Ok(None) };
     let arg_ctx = RustTypeLookupContext::InherentMethodTypeArg {
         type_name: type_name.to_string(), method: method_name.to_string(),
     };
     let all_ty_args: Vec<ty::GenericArg<'tcx>> = type_args.iter()
-        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?)))
+        .map(|ta| Ok(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?)))
         .collect::<Result<Vec<_>, _>>()?;
     // @ELASZ
     let args = build_generic_args_for_item(tcx, method_def_id, &all_ty_args);
@@ -884,23 +874,14 @@ pub fn rust_trait_method_param_types<'tcx>(
     method_name: &str,
     receiver_ty: &crate::toylang::typed_ast::ResolvedType,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
+    caller_type_params: &[String],
 ) -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, UnresolvedRustType> {
-    // Workstream B — if Self or any type arg is still a TypeParam, defer.
-    // The per-Instance substituted pass will redo the query with concrete args.
-    if contains_type_param(receiver_ty) || type_args.iter().any(contains_type_param) {
-        return Err(UnresolvedRustType {
-            name: "<TypeParam>".to_string(),
-            context: RustTypeLookupContext::DeferredTypeParam {
-                query: format!("trait call `{}::{}`", trait_name, method_name),
-            },
-        });
-    }
     let Some(trait_def_id) = find_use_imported_trait_def_id(tcx, trait_name) else { return Ok(None) };
     let self_resolved = strip_ref(receiver_ty);
     let self_ctx = RustTypeLookupContext::TraitCallSelf {
         trait_name: trait_name.to_string(), method: method_name.to_string(),
     };
-    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx)?;
+    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx, caller_type_params)?;
     let Some(trait_method_def_id) = tcx.associated_item_def_ids(trait_def_id)
         .iter()
         .find(|&&id| tcx.item_name(id).as_str() == method_name)
@@ -911,7 +892,7 @@ pub fn rust_trait_method_param_types<'tcx>(
     };
     let mut all_ty_args: Vec<ty::GenericArg<'tcx>> = vec![ty::GenericArg::from(self_ty)];
     for ta in type_args {
-        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?));
+        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?));
     }
     // @ELASZ
     let args = build_generic_args_for_item(tcx, trait_method_def_id, &all_ty_args);
@@ -958,17 +939,8 @@ pub fn rust_trait_method_return_type<'tcx>(
     method_name: &str,
     receiver_ty: &crate::toylang::typed_ast::ResolvedType,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
+    caller_type_params: &[String],
 ) -> Result<crate::toylang::typed_ast::ResolvedType, UnresolvedRustType> {
-    // Workstream B — if Self or any type arg is still a TypeParam, defer.
-    // The per-Instance substituted pass will redo the query with concrete args.
-    if contains_type_param(receiver_ty) || type_args.iter().any(contains_type_param) {
-        return Err(UnresolvedRustType {
-            name: "<TypeParam>".to_string(),
-            context: RustTypeLookupContext::DeferredTypeParam {
-                query: format!("trait call `{}::{}`", trait_name, method_name),
-            },
-        });
-    }
     // Per @IVTDBTZ, this lookup can legitimately fail when the dispatch
     // classifier misfires or when the trait isn't `use`-imported; return
     // a structured error instead of panicking so the user sees an
@@ -988,7 +960,7 @@ pub fn rust_trait_method_return_type<'tcx>(
     let self_ctx = RustTypeLookupContext::TraitCallSelf {
         trait_name: trait_name.to_string(), method: method_name.to_string(),
     };
-    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx)?;
+    let self_ty = try_resolved_to_rustc_ty(tcx, self_resolved, &self_ctx, caller_type_params)?;
 
     // Per @IVTDBTZ, method-not-found on an imported trait is a source-level
     // error (typo at the call site), not an invariant violation.
@@ -1014,7 +986,7 @@ pub fn rust_trait_method_return_type<'tcx>(
     };
     let mut all_ty_args: Vec<ty::GenericArg<'tcx>> = vec![ty::GenericArg::from(self_ty)];
     for ta in type_args {
-        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx)?));
+        all_ty_args.push(ty::GenericArg::from(try_resolved_to_rustc_ty(tcx, ta, &arg_ctx, caller_type_params)?));
     }
     // @ELASZ
     let args = build_generic_args_for_item(tcx, trait_method_def_id, &all_ty_args);

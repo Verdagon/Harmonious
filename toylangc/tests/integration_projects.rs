@@ -3262,6 +3262,25 @@ fn test_drop_fixture9_sky_local_in_helper_fn() {
     run_drop_project("fixture9_sky_local_in_helper_fn");
 }
 
+/// Sunny-karp (2026-06-25) Fixture 10 — generic `consume<T>(x: T)` where
+/// the eager pass sees `x: TypeParam("T")` and can't decide drop status.
+/// The late drop-synth pass at mono substitutes T → Widget and
+/// synthesizes the scope-end drop. Without the late pass, the Widget
+/// silently leaks.
+#[test]
+fn test_drop_fixture10_generic_consume_t_with_drop() {
+    run_drop_project("fixture10_generic_consume_t_with_drop");
+}
+
+/// Sunny-karp (2026-06-25) Fixture 11 — companion negative case. Same
+/// `consume<T>(x: T)` shape with `T = i32`. The late pass must NOT
+/// synthesize a drop call (i32 has no destructor); bookend prints fire
+/// uninterrupted.
+#[test]
+fn test_drop_fixture11_generic_consume_t_no_drop() {
+    run_drop_project("fixture11_generic_consume_t_no_drop");
+}
+
 // B10 trigger-pattern regression probes — added 2026-06-24 alongside the
 // fix to `push_arg_for_rust_call`'s `Direct` arm. Before the fix, Sky
 // emitted aggregate values (e.g. a Widget struct loaded as `{ i32 }`)

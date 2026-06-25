@@ -8,6 +8,104 @@ This section captures everything that came out of a three-round design-review ex
 
 ---
 
+## Most recent landing: sunny-karp SHIPPED 2026-06-25
+
+**Plan archive:** [`/Users/verdagon/.claude/plans/we-should-completely-do-sunny-karp.md`](/Users/verdagon/.claude/plans/we-should-completely-do-sunny-karp.md) — kept for the alternatives-considered rationale and the dependency-ordering of A–F.
+
+**One-line summary:** generic Sky bodies type-resolve **once** at `after_rust_analysis`; the typed result lives on `ToylangState.typed_bodies`; per-Instance mono substitutes the cached typed body via a new pure typed-AST walk (`substitute_in_typed_body`) instead of re-running `resolve_fn_body` + `insert_scope_end_drops` per monomorphization. Bare-`TypeParam` locals get a late drop-synth pass (`insert_late_scope_end_drops`) at mono once their concrete type is known.
+
+**Six work items shipped:**
+
+- **A (oracle accepts Param-bearing queries):** Six `contains_type_param` early-returns deleted from `oracle.rs:506,813,834,856,890,964`. `try_resolved_to_rustc_ty` takes a new `caller_type_params: &[String]` arg; the `TypeParam(name)` arm rebuilds `ty::Ty::new_param(tcx, idx, name)` from the param's position in the surrounding fn's generics. All six query functions thread the arg through. The matching `contains_type_param` guard at `type_resolve.rs:730` (MethodCall resolver) was also deleted — not enumerated in the plan but had the same effect of forcing deferral.
+- **B (cache typed body):** added `pub typed_bodies: BTreeMap<String, TypedBlock>` to `ToylangState` (NOT to `ToyFunction` as the plan suggested — `&self` on `after_rust_analysis` forbids `Arc::make_mut` through a shared registry handle; see "Trade-offs" below). Filled once at `after_rust_analysis` for every body-bearing fn and impl method (keyed by `"<Self>::<method>"`). `#[serde(skip)]`-equivalent: not serialized, downstream rederives at its own compile.
+- **C (`substitute_in_typed_body`):** new pure typed-AST walk in `type_resolve.rs`. Each `TypedExpr.ty`, each `type_args` slot, runs through `rewrite_ty` = `substitute_type_params` → `resolve_struct_fields` (the second step is load-bearing; see "Surprises" below). Takes `&ToylangRegistry` for the field-resolution step.
+- **D (mono substitution):** `resolve_caller_from_instance` / `resolve_caller_from_type_args` now return `ResolvedCaller { func, typed_body }`. Cache hit → substitute typed AST + `insert_late_scope_end_drops`. Cache miss (synthesized accessors not eager-typed) → fall back to `type_resolve_body`. All call sites threaded: per_instance_mir, populate channels, cascade drain, llvm_gen.
+- **E (drop-synth split):** new `drop_synthesized: bool` field on `TypedStmt::Let`. Eager `insert_scope_end_drops` at `after_rust_analysis` sets it `true` on emitted drops. New `insert_late_scope_end_drops` at mono re-checks any `false`-flagged let against its now-concrete substituted type. `local_needs_scope_drop` takes `caller_type_params` so `Vec<T>`-style RustTypes resolve at the eager pass (Vec's destructor is an ADT property, valid regardless of args).
+- **F (unify call sites):** `collect_rust_deps_recursive`, `walk_and_stash_internal_callees`, `codegen_internal_function` all read the precomputed substituted typed body. `codegen_internal_function` retains the re-resolve path as a cache-miss fallback. `ToylangInstance` and `FnItem` gained `typed_body: Option<TypedBlock>` fields.
+
+**Validation:** `cargo test --workspace` = **487 / 0 / 1** (baseline 485 + 2 new sunny-karp fixtures). No existing fixture needed expected-output updates. The two new fixtures:
+
+- `drop/fixture10_generic_consume_t_with_drop` — `consume<T>(x: T)` with `T = Widget` (Widget has `impl Drop`). Proves the late pass synthesizes the scope-end drop once the bare-T type becomes concrete.
+- `drop/fixture11_generic_consume_t_no_drop` — same shape with `T = i32`. Proves no spurious synth.
+
+**Trade-offs from the state-based cache (vs the plan's `ToyFunction.typed_body` design):**
+
+- **Lost: locality.** A `&ToyFunction` no longer carries everything you need; consumers need `&ToylangState.typed_bodies` too. Sibling-fields-in-different-structs.
+- **Lost: clone-on-merge for effective registries.** When `effective_registry` merges in upstreams, typed bodies wouldn't auto-travel from the upstream registries' Arcs (they don't even exist there). Today this doesn't bite because upstream sidecars don't ship typed bodies anyway (`#[serde(skip)]` was the plan), so downstream rederives at its own `after_rust_analysis`. The cost is paying the type-resolve once per crate in the dep graph instead of caching across crates.
+- **Lost: cache-key cleanliness for impl methods.** With the field on `ToyFunction`, `method.func.typed_body` is one struct, one key. On state, I introduced `"<Self>::<method>"` as a string key. The namespace now needs a no-collision invariant — `impl Foo for Widget { fn drop() }` and `impl Drop for Widget { fn drop() }` would both produce `"Widget::drop"`. Not exercised by current fixtures but the discipline is now a thing.
+- **Lost: borrow geometry.** `walk_and_stash_internal_callees` mutates `state.toylang_instances` while wanting recursive read access to `state.typed_bodies`. I clone the map into a `typed_bodies_snapshot` at entry. Per-walk-root cost, not per-callee.
+- **Gained: no LangCallbacks trait change.** `Arc::make_mut(&mut self.registry)` would have required `&mut self` on `after_rust_analysis`, which is a facade-trait signature change. State-based avoids that entirely.
+- **Gained: no serialization discipline to litigate.** `typed_bodies` simply doesn't exist on `ToylangRegistry`, so it can't be accidentally serialized.
+
+**Net.** Acceptable for toylang. If Sky proper grows multi-crate generics where downstream compile time matters, or richer impl-method namespacing, the calculus shifts toward the plan's original design — and at that point either change the callback trait or move to interior mutability (`RwLock<ToylangRegistry>`).
+
+**Surprises encountered:**
+
+1. **State vs registry pivot.** `&self` on `after_rust_analysis` made the plan's `Arc::make_mut(&mut self.registry)` impossible. I wrote ~60 lines of "Practical fix..." comments trying to talk myself into a workaround before pivoting to state-based, which the plan had explicitly considered and rejected. See trade-offs above.
+2. **Seventh `contains_type_param` guard outside the oracle.** First test run failed 28 case5 tests with `RustTypeDeferred { context: "method '.push' on receiver containing TypeParam" }`. The plan listed six oracle early-returns to delete, but there was a seventh in `type_resolve.rs:730` (`MethodCall` resolver) doing the same defer-on-TypeParam check. Deleted; case5 recovered.
+3. **`StructRef → Struct` promotion in substitute_in_typed_body.** First test run after the case5 fix still failed `test_generic_callee_with_struct` — output was stack garbage (`1835591808\n1` instead of `10\n20`). The cached typed body has `TypeParam("T")` placeholders. Substitution replaces them with the instance arg, which arrives as `StructRef` (parser-shape, no `field_types`) from `rustc_ty_to_resolved_type`. Codegen depends on `Struct{field_types}`. Original re-resolve path got this for free via `resolve_struct_fields`. I had to chain it into `substitute_in_typed_body`, which is why that function ended up taking `registry: &ToylangRegistry`. The deeper smell — `ResolvedType` having both `StructRef` and `Struct` variants means "this state is reachable but invalid" is representable — is documented as a v2 cleanup target below.
+
+**Residual dead code (harmless warnings) post-sunny-karp:**
+
+- `RustTypeLookupContext::DeferredTypeParam` variant in `oracle.rs:44`
+- `oracle::contains_type_param` (no callers after sunny-karp)
+- `UnresolvedRustType::is_deferred()` and `TypeResolveError::RustTypeDeferred` are still alive (the closures' `is_deferred()` arms in `after_rust_analysis` are kept for forward-compat with any future legacy-defer producer; not exercised today).
+
+Mechanical to delete in a follow-up sweep.
+
+---
+
+## Next thing to do when picking up (queued 2026-06-25, post-sunny-karp)
+
+Two candidates, user-pick:
+
+### Option A: queued items from the round-4 close (rustc-integration quality)
+
+These are the items from the prior "NEXT" section, still valid:
+
+1. **Phase P — `deduce_param_attrs` soundness override (~half day).** Highest-priority latent silent-UB vector. Override returns `&[]` for `#[toylang::emit_consumer_body]`-tagged items + fixture with `&mut LargeStruct` Sky export. (See line 86 in the original Not-yet-started section.)
+2. **Build a `&LargeStruct` Sky-call perf bench.** Currently no bench exposes the indirect-arg alias-analysis question. Measure before deciding whether path-b emission is worth pursuing.
+3. **Phase O drift CI fences** (operational hygiene; protects active query overrides from rustc drift).
+
+### Option B: the two-enum split (`SourceType` vs `ResolvedType`)
+
+A v2 refactor that surfaced during the sunny-karp postmortem. The current `ResolvedType` enum lets parser-shape (`StructRef`) and resolver-shape (`Struct { field_types }`) inhabit the same type, which is what allowed the silent miscompile in surprise #3 above. The fix landed in sunny-karp was reactive (chain `resolve_struct_fields` through `substitute_in_typed_body`); the structural fix is to give the two shapes distinct types so the bug is impossible at the type level.
+
+**Sketch:**
+
+```rust
+// parser-shape: registry, sidecar, stub_gen output
+pub enum SourceType {
+    I32, I64, F64, Bool, Void, Usize, TypeParam(String),
+    StructRef { name: String, type_args: Vec<SourceType> },
+    RustType  { name: String, type_args: Vec<SourceType> },
+    Ref       { inner: Box<SourceType> },
+    Str, ByteSlice,
+}
+
+// resolved-shape: typed AST, codegen, substitution
+pub enum ResolvedType {
+    I32, I64, F64, Bool, Void, Usize, TypeParam(String),
+    Struct    { name: String, type_args: Vec<ResolvedType>,
+                field_types: Vec<ResolvedType> },   // mandatory
+    RustType  { name: String, type_args: Vec<ResolvedType> },
+    Ref       { inner: Box<ResolvedType> },
+    Str, ByteSlice,
+}
+
+pub fn resolve_source_type(t: &SourceType, reg: &ToylangRegistry) -> ResolvedType;
+```
+
+The 8 shared variants are intentionally duplicated. The compiler then refuses to substitute a `SourceType::StructRef` into a `Vec<ResolvedType>` slot. `oracle::rustc_ty_to_resolved_type` takes `&ToylangRegistry` and promotes at the mint site.
+
+**Scope estimate:** ~600–800 lines across 11 files. Roughly 2x sunny-karp. Files: `typed_ast.rs`, `ast.rs`, `parser.rs`, `registry.rs`, `type_resolve.rs`, `oracle.rs`, `callbacks_impl.rs`, `llvm_gen.rs`, `stub_gen.rs`, `sidecar.rs`, `typeid.rs`. The sidecar bincode format changes (variant tags shift); `cargo clean`-equivalent on the cache before re-running tests. `typeid.rs` (8 refs, content-hashes types) deserves a look before committing — table is registry-side so probably `SourceType`, but cross-references may want `ResolvedType`.
+
+**Started in this session, then reverted.** Type defs were sketched in `typed_ast.rs` — both enums defined with the right variants — but the full surgery is genuinely a fresh-context-budget task. The aborted attempt taught me the scope; a fresh session can use the sketches above as the starting point.
+
+**Recommendation if you pick this:** budget a full session for it. The end state catches the entire class of silent-miscompiles that sunny-karp's surprise #3 was one instance of.
+
+---
+
 ## What this handoff is for
 
 You are picking up the transition from "design exchange concluded" to "Sky's actual architecture implemented in the toylang reference + ready for Sky proper."
@@ -60,6 +158,7 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 - **Phase I (cache_on_disk_if audit)** — DONE 2026-06-24. **Decision 14's prescribed Provider-slot syntax (`providers.queries.layout_of_cache_on_disk_if = ...`) doesn't exist on current nightly.** `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit re-derived cache-safety: every Sky-overridden query is safe by construction (`per_instance_mir` declared `false` in fork patch; `layout_of` + `cross_crate_inlinable` default to `false`; `collect_and_partition_mono_items` is `eval_always`; `symbol_name` was disk-cached but its override later retired in Phase F). Annotated all 4 surviving override files with `cache-audit:` marker comments. New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker. New §22.4.1 documents the policy table; new B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API." Decision 14 itself is revised below.
 - **Round 4 with the reviewer** — CLOSED 2026-06-24. Five deliverables landed (bench numbers, cache audit, drop fixtures, mir_shims empirical validation, surprises). Reviewer signed off; round 5 awaits Phase L or Phase G to surface real implementation reality. Two minor doc/code residuals queued for post-round-4 sweep: lifecycle-traits registry (generalize `local_needs_scope_drop`'s hardcoded "Drop" string, ~5 LOC), and §15 dual-path drop narrative paragraph.
 - **B10 root cause identified + fixed** — DONE 2026-06-24, commit `3041ec8`. The arch doc had framed B10 as an LLVM bug ("LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures"). It was a Sky emission bug we caused. `push_arg_for_rust_call`'s `Direct` arm in `llvm_gen.rs` was emitting struct aggregate values where rustc's ABI declared a scalar param (e.g. for `v.push(Widget { id: 1 })` where Widget = `{ i32 }` coerces to `i32`, the call instruction passed `{ i32 }` aggregate to a function declared `void(ptr, i32)`). Verifier accepted it; bitcode round-trip failed at -O1+ with "failed to parse bitcode for LTO module: Invalid record" (thin LTO) or "Callee is not a pointer type" (fat LTO). Fix: when source toylang type is `StructType` and target ABI type differs, reinterpret via memory (alloca + store + load-as-target-type). Same pattern `codegen_extern_wrapper` already uses for incoming params (@ACRTFDZ). 5 regression probes (`test_drop_b10_probe_{o0,nolto,sky_main_vec_thin,cgu1_thin,fat}`) enrolled covering the failing matrix; all 5 pass; 482 tests total cold. Bench rerun confirms perf holds within run-to-run variance. **§25.2 B10 doc reframing follows in the post-round-4 sweep.**
+- **Sunny-karp (eager type-resolve + typed-body cache + bare-T drop closure)** — DONE 2026-06-25. Six work items (A–F) per `/Users/verdagon/.claude/plans/we-should-completely-do-sunny-karp.md`. Headline mechanism change: generic Sky bodies type-resolve **once** at `after_rust_analysis`; the typed result is cached on `ToylangState.typed_bodies` (NOT on `ToyFunction` as the plan proposed — `&self` on the callback forbade `Arc::make_mut`); per-Instance mono substitutes the cached typed AST via a new `substitute_in_typed_body` pure walk; a late `insert_late_scope_end_drops` pass at mono closes the long-standing bare-`TypeParam` local drop gap. Oracle queries (`oracle.rs`'s six type-arg-checking queries + `try_resolved_to_rustc_ty`) gained a `caller_type_params: &[String]` arg; the previously-panicking `TypeParam(name)` arm now rebuilds `ty::Ty::new_param(tcx, idx, name)`. 485 → **487 / 0 / 1** (2 new fixtures: `drop/fixture10_generic_consume_t_with_drop` + `drop/fixture11_generic_consume_t_no_drop`). Three implementation surprises documented in the top-of-doc section: (a) state-vs-registry pivot, (b) seventh `contains_type_param` guard in `type_resolve.rs:730`, (c) `StructRef → Struct` promotion required inside the new substitution walk (silent-miscompile trap motivated the v2 two-enum split queued as Option B above). Per-Instance computational savings: K monomorphizations of a generic body went from 2K+1 type-resolves + 2K drop-synths to 1 type-resolve + 1 drop-synth + K substitutions. Negligible for toylang fixtures; load-bearing at Sky scale. Arch §19.5 memoization status flips from "not implemented in toylang" to "implemented for typed-body caching."
 
 **Not yet started (your work):**
 - Phases **G** (cdylib build system — when Sky proper's architecture migration begins; ~5-7 days because retiring toylangc's wrapper mode is a prerequisite), **J** (u128 typeids), **K** (content-hash const args), **L** (per-view refs), **M** (async typestate), **N** (recursion safety), **O** (drift fences).
@@ -140,7 +239,7 @@ User's stated priority is **rustc-integration quality, especially perf/inlining 
 | **Bench 3 drop chain LTO ratio (pure-Rust cross-crate)** | **27.5×** — apples-to-apples baseline from Phase B+ | arch §22.4.3 + handoff Phase B+ entry |
 | **Sky vs Rust at thin LTO (Bench 3)** | **3% delta** — drop-chain LTO speedup is INHERITED from Rust, not Sky-specific | arch §22.4 finding #2 |
 | **Bench 2 K=100 LTO ratio** | **1.48×** — realistic-workload anchor matches Bench 1's structural prediction | arch §22.4 |
-| **Total test count** | **477 / 0 / 1 cold** (Phase C+D added the 1:1 fence; Phases F + H preserved the count) | toylangc workspace |
+| **Total test count** | **487 / 0 / 1 cold** (sunny-karp added 2 generic-T drop fixtures; baseline at handoff freeze 485 + 2) | toylangc workspace |
 
 **Decision-gate verdict (handoff Bench 1 ladder):** ratio 1.50× falls firmly in the "<2× → lock §5.5 confidently" band. **Recommendation: `[profile.release] lto = "thin"`**.
 
@@ -173,6 +272,12 @@ Listed in rough order of how-load-bearing for the reviewer:
 12. **Seven B10-class candidate sites in toylangc's emission (round-4-close agent audit, 2026-06-24).** Beyond the `Direct` arm we fixed, the agent emission audit identified 7 more sites where signature mismatch could lurk. Top priority: Site #8 (codegen_extern_wrapper sret-bridge alloca/load size mismatch — same B10 shape, asymmetric direction we didn't cover). Phase R.
 
 13. **Bool accessor silent miscompile — FIXED 2026-06-25 (commit `736eeb5`).** Surfaced during Phase R Site #8 probing. Root cause: Sky's auto-synthesized field accessors (`pub fn a(&self) -> &bool { &self.a }`) used the default `Ref(FieldAccess)` codegen path — load the bool value (i1), alloca i1, store, return pointer to fresh alloca. The fresh i1 alloca's upper 7 bits were unspecified per LLVM's i1 storage semantics. When Rust callers dereferenced the returned `&bool`, rustc emitted `load i8` (Rust's bool is i8 in memory), and LLVM exploited the unspecified bits → `*w.field()` returned `false` regardless of stored value. Fix: `Ref(FieldAccess)` now returns the GEP pointer to the field's actual storage in the receiver struct rather than a load-realloc roundtrip. Regression fixture at `test_drop_bool_accessor_via_rust_caller`. Phase R-adjacent finding that surfaced alongside Site #8 work; would have shipped silent UB to any Sky user defining a struct with a bool field accessed from Rust.
+
+14. **Sunny-karp #1: `&self` callback shape forbade the plan's `Arc::make_mut` design.** The plan called for caching `typed_body` on `ToyFunction` via `Arc::make_mut(&mut self.registry)` at `after_rust_analysis`. The callback's signature is `fn after_rust_analysis(&self, ...)` — there's no `&mut self` handle to take. Wrote ~60 lines of "Practical fix..." comments trying to talk myself into a workaround (interior mutability, `Arc::get_mut`, shadow handles) before pivoting to `ToylangState.typed_bodies`, which the plan had explicitly considered and rejected. Trade-offs are detailed at the top of this doc; net for toylang's scale is acceptable, but Sky proper at multi-crate-generic scale may want to revisit and either change the callback trait signature or move to `RwLock<ToylangRegistry>` interior mutability.
+
+15. **Sunny-karp #2: seventh `contains_type_param` guard outside the oracle.** First test run after the A–F implementation failed 28 case5 tests with `RustTypeDeferred { context: "method '.push' on receiver containing TypeParam" }`. The plan enumerated six oracle early-returns at `oracle.rs:506,813,834,856,890,964` to delete; it missed a seventh in `type_resolve.rs:730` (the `MethodCall` resolver) that did the same defer-on-TypeParam check independently. Once the oracle stopped deferring, the resolver's guard caught the same pattern and turned it back into an error. Fix: deleted the guard; the match arms below it handle `RustType { ... Param-bearing args }` cleanly through the now-Param-aware oracle. **Lesson:** `git grep contains_type_param` once before declaring "I deleted all the guards." Reasoning from the plan's enumeration alone missed this.
+
+16. **Sunny-karp #3: `StructRef → Struct` promotion required inside `substitute_in_typed_body` — silent miscompile trap.** First test run after the seventh-guard fix still failed `test_generic_callee_with_struct` with stack-garbage output (`1835591808\n1` instead of `10\n20`). The cached typed body has `TypeParam("T")` placeholders in expression types. `substitute_in_typed_body` walks and replaces them with the instance arg's `ResolvedType` value. The arg comes from `rustc_ty_to_resolved_type(tcx, instance.args.types()[i])` — which mints `StructRef { name, type_args }` for Sky types (parser-shape, no `field_types`). Codegen consumes `Struct { name, type_args, field_types }` (resolver-shape, mandatory `field_types`). The original re-resolve path passed `StructRef`-bearing source through `resolve_struct_fields` for free. The new pure-substitution path didn't, so the substituted typed body had `StructRef{Point}` where codegen needed `Struct{Point, [I32, I32]}` — codegen treated the field-less form as opaque/zero-sized, returned stack garbage. **Reactive fix:** chained `resolve_struct_fields` after `substitute_type_params` inside the walk, which required passing `registry: &ToylangRegistry` through. **Deeper smell:** `ResolvedType` having both `StructRef` and `Struct` as variants means "this state is reachable but invalid" is representable in the type system. The bug class is broader than this one instance — any pure-AST-walk substitution that produces fresh `ResolvedType` values has to remember the promotion step, with no compile-time enforcement. The structural fix (two distinct types: `SourceType` for parser-shape, `ResolvedType` strictly for resolved-shape, conversion at one chokepoint) is queued as Option B at the top of this doc.
 
 ### What contradicts the round 1-3 analysis (READ THIS BEFORE ROUND 4)
 
@@ -208,13 +313,13 @@ NONE of these decisions have shipped yet. No empirical work has touched them sin
 - **Phase H patch 4 rev 3:** arch §3.2 (patch 4) + §B.4 (patch source) + §C.4 (shipping shape) + §F.15 (design history with rev 2 → rev 3 transition) + Decision 5 SHIPPED entry.
 - **Risks status:** arch §25.2 entries A1-A3, B1-B27 (every risk has CLOSED / partial / probability annotation). B21, B24, B25, B26, B27 are NEW from 2026-06-24; B5, B8, B9, B10 (partial), B11, B12 (gated), B13, B14, B15, B16, B17 all CLOSED architecturally.
 
-### What's left — at-a-glance decision tree (refreshed 2026-06-25)
+### What's left — at-a-glance decision tree (refreshed 2026-06-25 post-sunny-karp)
 
-User's stated priority: **rustc-integration quality, especially perf/inlining**. All 5 round-4-close-driven rustc-integration tasks closed 2026-06-25 — Phase P shipped + verified, Phase Q shipped-then-retired per reviewer's interaction audit, Phase R Sites #1/#5/#6/#8/#10 shipped defensively, Bench 4 shipped (artifactual; Bench 4b is the meaningful measurement), plus two SURPRISE silent-miscompile bug fixes (bool accessor, IntLit widening) found via the empirical-fixture-first discipline.
+User's stated priority: **rustc-integration quality, especially perf/inlining**. Round-4-close-driven rustc-integration tasks closed 2026-06-25. Sunny-karp (eager type-resolve + cache + bare-T drop closure) shipped same day.
 
 ```
 Status →
-├── rustc-integration (USER PRIORITY) — DONE this session
+├── rustc-integration (USER PRIORITY) — DONE earlier sessions
 │   ├── ✅ Phase P: deduce_param_attrs soundness override (commit 760b674)
 │   ├── ✅ Phase R Site #8: sret-bridge defensive fix (commit 04e98c7)
 │   ├── ⚰️ Phase Q: codegen_fn_attrs NEVER_UNWIND override (shipped 736eeb5 then RETIRED f88aa84)
@@ -222,21 +327,42 @@ Status →
 │   ├── ✅ Bool accessor silent miscompile FIX (commit 736eeb5)
 │   └── ✅ Bench 4 LargeStruct (commit d9248c7) — artifactual; Bench 4b (ae014d0) is the meaningful measurement: 20-run trimmed-mean Sky-Rust parity at 2% delta within noise
 │
+├── ✅ Sunny-karp (eager type-resolve + typed-body cache + bare-T drop closure) — DONE 2026-06-25
+│   ├── ✅ A: oracle accepts Param-bearing queries (6 early-returns deleted; TypeParam → ty::Ty::new_param)
+│   ├── ✅ B: typed-body cache on ToylangState.typed_bodies (pivoted from ToyFunction per &self callback shape)
+│   ├── ✅ C: substitute_in_typed_body pure walk (chains resolve_struct_fields for StructRef→Struct promotion)
+│   ├── ✅ D: mono path substitutes cached typed AST instead of re-resolving
+│   ├── ✅ E: drop_synthesized flag + insert_late_scope_end_drops closes bare-TypeParam drop gap
+│   ├── ✅ F: collect_rust_deps_recursive + walk_and_stash + codegen_internal_function all read cached body
+│   └── Fixtures: drop/fixture10_generic_consume_t_with_drop + fixture11 (negative). 487/0/1.
+│
 ├── ✅ Doc sweep — COMPLETED 2026-06-25
 │   ├── §22.4 reframed to lead with Sky-Rust parity (commit 8f85622 + 33aeae4)
 │   ├── §25.2 B10 rewrite (commit 33aeae4) — "was Sky's bug, not LLVM's" framing
 │   ├── §15.7 dual-path drop narrative paragraph (commit 8f85622)
 │   ├── Lifecycle-traits registry (commit 8f85622) — generalizes "Drop" hardcoding
 │   ├── §25.3.6 calibration discipline (commit f88aa84) — 4-bugs-with-rationalization-priors pattern
-│   └── §22.4 v2 path-b note (commit f88aa84) — preserves v2 perf-recovery option
+│   ├── §22.4 v2 path-b note (commit f88aa84) — preserves v2 perf-recovery option
+│   └── §19.5 memoization status update + §F sunny-karp lesson — sunny-karp post-landing sweep
 │
-├── Operational / drift hygiene (medium priority — NEXT SESSION)
+├── Type-system hardening (queued, optional — NEXT SESSION candidate)
+│   └── Two-enum split (SourceType vs ResolvedType) — closes the silent-miscompile class
+│       that sunny-karp's surprise #3 was one instance of. ~600-800 lines, 11 files,
+│       roughly 2x sunny-karp. See "Option B" near the top of this doc for the sketch.
+│
+├── Operational / drift hygiene (medium priority — NEXT SESSION candidate)
 │   ├── Phase N (recursion safety, ~2-3 days)
 │   └── Phase O (drift CI fences for B24/B25/B26, ~3-5 days)
 │
 ├── Engineering velocity (lower priority unless blocking)
 │   └── Phase G (cdylib + wrapper-mode retirement, ~5-7 days)
 │       └── ~10× iteration speed for backend changes; not perf
+│
+├── Mechanical cleanup (cheap, anytime)
+│   ├── Delete RustTypeLookupContext::DeferredTypeParam variant (no constructors after sunny-karp)
+│   ├── Delete oracle::contains_type_param (no callers after sunny-karp)
+│   └── Delete or revisit UnresolvedRustType::is_deferred() + TypeResolveError::RustTypeDeferred
+│       (kept for forward-compat with any future legacy-defer producer; not exercised today)
 │
 └── Sky language design (USER WANTS TO SKIP)
     └── Phases J/K/L/M — u128 typeids → content-hash → SkyRef → async typestate
@@ -246,14 +372,15 @@ Status →
 
 **⚠️ IMPORTANT — read before next session:** Of 9 verification gaps from this session's defensive correctness work, 5 closed via audit/IR-inspection + 4 remain genuinely blocked behind toylang grammar growth. **Three silent-miscompile bug fixes were verified end-to-end** (bool accessor, IntLit widening, B10 round-4). Bench 4b 20-run verification established Sky-vs-Rust wrapper-boundary parity (path-b emission unnecessary for v1). Phase Q shipped-then-retired same day per reviewer's audit (cargo enforces panic-strategy consistency; mixed case structurally impossible). Of the four continuation follow-ups (A1-A4), A3 + A4 closed; A1 + A2 remain open and grammar-unblocked. See "Session 2026-06-25 verification gaps + suspected issues" below for the full state.
 
-**Recommended ordering for next fresh-context session:** 
-1. **A1 audit** (resolve_expr other arms for missing expected_ty coercion) — quick win; could surface more silent-miscompile bugs of the IntLit class. ~1 hour. **OPEN.**
-2. **A2 rename** of misleading Bench 4 → bench4_artifactual_loopfold_only. ~half hour. **OPEN.**
-3. ~~A3 Phase Q retire decision~~ — **RESOLVED (commit `f88aa84`)**: reviewer's round-4-followup confirmed retirement; deleted.
-4. ~~Doc sweep~~ — **COMPLETED 2026-06-25** (commits `8f85622` + `33aeae4` + `f88aa84` + `5c0a6b2`). §22.4 reframed to lead with Sky-Rust parity; §25.2 B10 rewrite ("was our bug"); §15.7 dual-path drop narrative; lifecycle-traits registry; §25.3.6 calibration discipline; §22.4 v2 path-b note; arch doc post-Phase-Q-retirement sweep.
-5. **Phase O drift CI fences** (operational hygiene; protects the active query overrides from rustc drift). 5 active overrides post-Phase-Q-retirement (4 distinct queries).
-6. **Phase G** if iteration speed becomes the bottleneck.
-7. Re-probe Phase R deferred items when toylang grammar growth makes their triggers reachable.
+**Recommended ordering for next fresh-context session (refreshed 2026-06-25 post-sunny-karp):**
+1. **Mechanical cleanup** (10 min): delete `RustTypeLookupContext::DeferredTypeParam` variant + `oracle::contains_type_param` (no callers after sunny-karp). Frees up dead-code warnings. Optionally retire `UnresolvedRustType::is_deferred()` + `TypeResolveError::RustTypeDeferred`.
+2. **A1 audit** (resolve_expr other arms for missing expected_ty coercion) — quick win; could surface more silent-miscompile bugs of the IntLit class. ~1 hour. **OPEN.**
+3. **A2 rename** of misleading Bench 4 → bench4_artifactual_loopfold_only. ~half hour. **OPEN.**
+4. ~~A3 Phase Q retire decision~~ — **RESOLVED (commit `f88aa84`)**: reviewer's round-4-followup confirmed retirement; deleted.
+5. ~~Doc sweep~~ — **COMPLETED 2026-06-25** (commits `8f85622` + `33aeae4` + `f88aa84` + `5c0a6b2`) + post-sunny-karp landing sweep (§19.5 + §F appendix entry).
+6. **Either** the two-enum split (Option B at the top of this doc — structural fix for the silent-miscompile class sunny-karp's surprise #3 represented) **or** **Phase O drift CI fences** (operational hygiene; protects active query overrides). User pick.
+7. **Phase G** if iteration speed becomes the bottleneck.
+8. Re-probe Phase R deferred items when toylang grammar growth makes their triggers reachable.
 
 ---
 

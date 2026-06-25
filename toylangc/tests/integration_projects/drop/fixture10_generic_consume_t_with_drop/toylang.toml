@@ -1,0 +1,6 @@
+[project]
+name = "fixture10_generic_consume_t_with_drop"
+source = "main.toylang"
+
+[rust-dependencies]
+test_helpers = { path = "../../test_helpers" }

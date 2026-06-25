@@ -1,0 +1,17 @@
+// Sunny-karp (2026-06-25) Fixture 11 — bare TypeParam local with
+// concrete type that has NO Drop impl. Companion to fixture10. The late
+// drop-synth pass must NOT synthesize a drop call for `consume<i32>`,
+// since i32 has no destructor.
+//
+// Expected stdout: `1\n2`. Bookend prints only.
+
+fn println_i32(x: i32)
+
+fn consume<T>(x: T) {
+}
+
+fn main() {
+    println_i32(1);
+    consume<i32>(99);
+    println_i32(2);
+}

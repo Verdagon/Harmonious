@@ -68,6 +68,11 @@ pub struct ToylangRegistry {
     /// but everything below the source surface is unified.
     #[serde(default)]
     pub accessor_pairs: Vec<(String, String)>,
+    // Sunny-karp (2026-06-25): the typed-body cache lives on `ToylangState`,
+    // not here. ToylangRegistry is `Arc`-shared (and serialized to the
+    // sidecar); ToylangState is `&mut` at every consumer call site and is
+    // per-invocation. The cache is per-invocation by design, so state is
+    // its natural home.
     // `discovered_trait_impl_instances` field retired 2026-06-21
     // (post-§5.5 Step 3 cleanup). Replaced by a local `Vec` in
     // `consumer_fill_modules` populated by

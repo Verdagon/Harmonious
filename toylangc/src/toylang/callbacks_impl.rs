@@ -146,6 +146,12 @@ pub struct ToylangInstance {
     /// to build the rustc `Instance` at codegen time via
     /// `oracle::build_generic_args_for_item`.
     pub instance_args: Vec<crate::toylang::typed_ast::ResolvedType>,
+    /// Sunny-karp (2026-06-25) — substituted typed body produced at the
+    /// populate-time call to `resolve_caller_from_instance` /
+    /// `resolve_caller_from_type_args`. `fill_module`'s codegen reads
+    /// this directly rather than re-running `type_resolve_body` on the
+    /// substituted source. `None` only for extern declarations.
+    pub typed_body: Option<crate::toylang::typed_ast::TypedBlock>,
 }
 
 /// Mutable state accumulated during compilation. Stored in the facade's global
@@ -174,6 +180,21 @@ pub struct ToylangState {
     /// `BTreeMap` (rather than `HashMap`) so iteration order is
     /// deterministic — same reasoning as `ToylangRegistry` (S.2 §7.4).
     pub upstream_registries: BTreeMap<String, ToylangRegistry>,
+    /// Sunny-karp (2026-06-25) — cached typed AST per consumer fn (and
+    /// per impl method, keyed by `"<self_type>::<method>"`). Filled once
+    /// at `after_rust_analysis` by re-running `type_resolve_body` on
+    /// every body-bearing fn and impl method; consumed by
+    /// `resolve_caller_from_instance` / `resolve_caller_from_type_args`
+    /// to substitute the typed body rather than re-resolving the source
+    /// per Instance.
+    ///
+    /// Lives on state rather than the registry because the registry is
+    /// `Arc<ToylangRegistry>` shared with sidecar serialization (which
+    /// must stay byte-identical), while state is single-writer per
+    /// invocation. Per-invocation is the right scope: typed bodies are
+    /// not serialized cross-crate (downstream rederives from the source
+    /// `body` at its own `after_rust_analysis`).
+    pub typed_bodies: BTreeMap<String, crate::toylang::typed_ast::TypedBlock>,
 }
 
 pub struct ToylangCallbacks {
@@ -288,7 +309,9 @@ impl ToylangCallbacks {
         // `identity_for_item` here and installed an `ActiveParamMap`
         // thread-local so the converter could rebuild Params; that whole
         // mechanism is gone.
-        let resolved_caller = resolve_caller_from_instance(toy_fn, instance, tcx);
+        let resolved_caller = resolve_caller_from_instance(
+            tcx, &effective_registry, &state.typed_bodies, registry_name, toy_fn, instance,
+        );
         let extern_symbol = compute_fn_symbol(registry_name, tcx, instance);
         // Local cycle guard — prevents infinite recursion on cyclic consumer
         // code. Intentionally NOT shared with `state.walked_entry_points`; see
@@ -297,7 +320,7 @@ impl ToylangCallbacks {
         let mut cycle_guard: HashSet<String> = HashSet::new();
         cycle_guard.insert(extern_symbol);
         collect_rust_deps_recursive(
-            tcx, &effective_registry, &resolved_caller, registry_name, &mut cycle_guard,
+            tcx, &effective_registry, &state.typed_bodies, &resolved_caller, registry_name, &mut cycle_guard,
         )
     }
 
@@ -470,12 +493,20 @@ impl ToylangCallbacks {
                     continue;
                 }
                 let internal_symbol = compute_internal_symbol_from_type_args(name, &[]);
+                // Sunny-karp: for non-generic roots, the cached typed_body
+                // (populated at after_rust_analysis) is what we want; the
+                // empty-args resolve is a no-op substitution.
+                let resolved_caller = resolve_caller_from_type_args(
+                    tcx, &effective_registry, &state.typed_bodies, name, toy_fn,
+                    &std::collections::HashMap::new(),
+                );
                 state.toylang_instances.push(ToylangInstance {
                     extern_symbol,
                     internal_symbol,
-                    resolved_func: toy_fn.clone(),
+                    resolved_func: resolved_caller.func.clone(),
                     stub_def_id,
                     instance_args: vec![],
+                    typed_body: resolved_caller.typed_body.clone(),
                 });
                 // Transitive walk: surfaces non-export Sky callees + generic
                 // monomorphizations reachable from this root.
@@ -483,7 +514,7 @@ impl ToylangCallbacks {
                 // callees are found (e.g., dqd_app main calling dqd_lib_a::wrap).
                 // local_registry is self.registry so walk_and_stash can
                 // discriminate owning-crate (Step 2's rule).
-                walk_and_stash_internal_callees(tcx, &effective_registry, self.registry.as_ref(), toy_fn, name, state);
+                walk_and_stash_internal_callees(tcx, &effective_registry, self.registry.as_ref(), &resolved_caller, name, state);
             }
             // Trait-impl method monomorphizations flow uniformly through the
             // Option B discovered-instances loop below — captured at the
@@ -540,12 +571,22 @@ impl ToylangCallbacks {
                     "__toylang_internal__accessor__{}__{}",
                     struct_name, field_name,
                 );
+                // Sunny-karp: accessors are synthesized on the fly and
+                // not in the registry — `resolve_caller_from_type_args`'s
+                // cache-miss fallback re-runs `type_resolve_body` on the
+                // (already concrete) substituted body.
+                let accessor_key = format!("{}.{}", struct_name, field_name);
+                let resolved_caller = resolve_caller_from_type_args(
+                    tcx, &effective_registry, &state.typed_bodies, &accessor_key, &resolved_func,
+                    &std::collections::HashMap::new(),
+                );
                 state.toylang_instances.push(ToylangInstance {
                     extern_symbol,
                     internal_symbol,
-                    resolved_func,
+                    resolved_func: resolved_caller.func,
                     stub_def_id: Some(stub_def_id),
                     instance_args: vec![],
+                    typed_body: resolved_caller.typed_body,
                 });
             }
             // §5.5 Step 2 (narrower-§5.5): eagerly emit LOCAL trait-impl
@@ -591,8 +632,11 @@ impl ToylangCallbacks {
                     if !method.func.type_params.is_empty() {
                         continue;
                     }
-                    let resolved_func = resolve_caller_from_type_args(
-                        &method.func,
+                    let impl_method_key = format!(
+                        "{}::{}", toy_impl.self_type_name, method.name,
+                    );
+                    let resolved_caller = resolve_caller_from_type_args(
+                        tcx, &effective_registry, &state.typed_bodies, &impl_method_key, &method.func,
                         &std::collections::HashMap::new(),
                     );
                     let Some(stub_def_id) = crate::oracle::find_trait_impl_method_def_id(
@@ -613,14 +657,15 @@ impl ToylangCallbacks {
                     state.toylang_instances.push(ToylangInstance {
                         extern_symbol,
                         internal_symbol,
-                        resolved_func: resolved_func.clone(),
+                        resolved_func: resolved_caller.func.clone(),
                         stub_def_id: Some(stub_def_id),
                         instance_args: vec![],
+                        typed_body: resolved_caller.typed_body.clone(),
                     });
                     // §5.5 Step 1: use effective_registry for cross-crate callees.
                     walk_and_stash_internal_callees(
                         tcx, &effective_registry, self.registry.as_ref(),
-                        &resolved_func, &method.name, state,
+                        &resolved_caller, &method.name, state,
                     );
                 }
             }
@@ -793,25 +838,28 @@ impl LangCallbacks for ToylangCallbacks {
             // oracle's contains_type_param guard), which `is_deferred()`
             // silently skips below.
             if func.body.is_none() { continue; }
-            let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
+            let caller_tp = func.type_params.clone();
+            let caller_tp_a = caller_tp.clone();
+            let caller_tp_b = caller_tp.clone();
+            let rust_method_ret = move |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
                 if type_name.is_empty() {
-                    crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
+                    crate::oracle::rust_free_fn_return_type(tcx, method, type_args, &caller_tp_a)
                         .map(|opt| opt.unwrap_or(crate::toylang::typed_ast::ResolvedType::Void))
                 } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
                     let receiver_ty = &type_args[0];
                     let explicit_args = &type_args[1..];
-                    crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args)
+                    crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args, &caller_tp_a)
                 } else {
-                    crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
+                    crate::oracle::rust_method_return_type(tcx, type_name, method, type_args, &caller_tp_a)
                 }
             };
-            let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
+            let rust_param_types = move |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
                 if type_name.is_empty() {
-                    crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
+                    crate::oracle::rust_free_fn_param_types(tcx, method, type_args, &caller_tp_b)
                 } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
-                    crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..])
+                    crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..], &caller_tp_b)
                 } else {
-                    crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
+                    crate::oracle::rust_method_param_types(tcx, type_name, method, type_args, &caller_tp_b)
                 }
             };
             // Per @IVTDBTZ, trait-vs-inherent dispatch predicate — asks the
@@ -819,10 +867,13 @@ impl LangCallbacks for ToylangCallbacks {
             let is_rust_trait = |name: &str| {
                 crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
             };
+            let _ = &caller_tp; // referenced via captures only
             match crate::toylang::type_resolve::resolve_fn_body(&effective_registry, func, &rust_method_ret, &rust_param_types, &is_rust_trait) {
                 Err(e) if e.is_deferred() => {
-                    // Workstream B — query needs concrete args; the per-Instance
-                    // substituted pass will redo it. Don't surface as user error.
+                    // Sunny-karp: with the contains_type_param early-returns
+                    // gone from the oracle, `is_deferred()` no longer fires
+                    // from this path; left in for forward-compat with any
+                    // legacy `DeferredTypeParam` producers.
                 }
                 Err(e) => errors.push(format!("function '{}': {:?}", name, e)),
                 Ok(typed) => {
@@ -862,30 +913,34 @@ impl LangCallbacks for ToylangCallbacks {
                 if method.func.body.is_none() {
                     continue;
                 }
-                let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
+                let caller_tp = method.func.type_params.clone();
+                let caller_tp_a = caller_tp.clone();
+                let caller_tp_b = caller_tp.clone();
+                let rust_method_ret = move |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
                     if type_name.is_empty() {
-                        crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
+                        crate::oracle::rust_free_fn_return_type(tcx, method, type_args, &caller_tp_a)
                             .map(|opt| opt.unwrap_or(crate::toylang::typed_ast::ResolvedType::Void))
                     } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
                         let receiver_ty = &type_args[0];
                         let explicit_args = &type_args[1..];
-                        crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args)
+                        crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args, &caller_tp_a)
                     } else {
-                        crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
+                        crate::oracle::rust_method_return_type(tcx, type_name, method, type_args, &caller_tp_a)
                     }
                 };
-                let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
+                let rust_param_types = move |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
                     if type_name.is_empty() {
-                        crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
+                        crate::oracle::rust_free_fn_param_types(tcx, method, type_args, &caller_tp_b)
                     } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
-                        crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..])
+                        crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..], &caller_tp_b)
                     } else {
-                        crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
+                        crate::oracle::rust_method_param_types(tcx, type_name, method, type_args, &caller_tp_b)
                     }
                 };
                 let is_rust_trait = |name: &str| {
                     crate::oracle::find_use_imported_trait_def_id(tcx, name).is_some()
                 };
+                let _ = &caller_tp;
                 match crate::toylang::type_resolve::resolve_fn_body(
                     &effective_registry,
                     &method.func,
@@ -955,6 +1010,33 @@ impl LangCallbacks for ToylangCallbacks {
         // the rlib's exactly except for the `.sky-meta` extension. This is
         // what `docs/architecture/sidecar-format.md` requires.
         let sidecar_path = tcx.output_filenames(()).with_extension("sky-meta");
+        // Sunny-karp (2026-06-25): cache the just-resolved typed bodies on
+        // ToylangState so per-Instance mono can substitute them rather than
+        // re-running `resolve_fn_body` + `insert_scope_end_drops` once per
+        // monomorphization. We resolve again here (a second pass over the
+        // same bodies the validation loop above type-resolved) and stash
+        // the result. The duplication is the smallest correctness-safe
+        // change while we land the cache; a follow-up can hoist the stash
+        // INTO the validation loop and skip the second resolve. Drop-synth
+        // is invoked inside `type_resolve_body`.
+        {
+            let mut new_typed: BTreeMap<String, crate::toylang::typed_ast::TypedBlock>
+                = BTreeMap::new();
+            for (name, func) in &self.registry.functions {
+                if func.body.is_none() { continue; }
+                let typed = type_resolve_body(tcx, &effective_registry, func, name);
+                new_typed.insert(name.clone(), typed);
+            }
+            for toy_impl in &self.registry.trait_impls {
+                for method in &toy_impl.methods {
+                    if method.func.body.is_none() { continue; }
+                    let key = format!("{}::{}", toy_impl.self_type_name, method.name);
+                    let typed = type_resolve_body(tcx, &effective_registry, &method.func, &key);
+                    new_typed.insert(key, typed);
+                }
+            }
+            state(s).typed_bodies = new_typed;
+        }
         // Phase E Path 2 / Phase 1.3 — populate the typeid table just
         // before serialization. Cheap (one BLAKE3 hash per struct) and keeps
         // the table fresh against any registry edits earlier in the typing
@@ -1250,7 +1332,6 @@ impl LangCallbacks for ToylangCallbacks {
                     internal_symbol.push_str("__");
                     internal_symbol.push_str(&crate::oracle::resolved_type_to_mangled_name(arg));
                 }
-                let resolved_func = resolve_caller_from_instance(&method.func, instance, tcx);
                 // Build an effective registry for walk_and_stash to use
                 // (covers cross-Sky-crate impl-body callees).
                 let effective_for_walk = {
@@ -1269,16 +1350,23 @@ impl LangCallbacks for ToylangCallbacks {
                     }
                     effective
                 };
+                let impl_method_key = format!(
+                    "{}::{}", inst.self_type_name, inst.method_name,
+                );
+                let resolved_caller = resolve_caller_from_instance(
+                    tcx, &effective_for_walk, &ts.typed_bodies, &impl_method_key, &method.func, instance,
+                );
                 ts.toylang_instances.push(ToylangInstance {
                     extern_symbol,
                     internal_symbol,
-                    resolved_func: resolved_func.clone(),
+                    resolved_func: resolved_caller.func.clone(),
                     stub_def_id: Some(stub_def_id),
                     instance_args: inst.concrete_args.clone(),
+                    typed_body: resolved_caller.typed_body.clone(),
                 });
                 walk_and_stash_internal_callees(
                     tcx, &effective_for_walk, self.registry.as_ref(),
-                    &resolved_func, &inst.method_name, ts,
+                    &resolved_caller, &inst.method_name, ts,
                 );
             }
             // §5.5 Step 2: sidecar capture done. Fall through to populate +
@@ -1481,17 +1569,39 @@ fn resolved_to_rustc_ty_with_subst<'tcx>(
     }
 }
 
+/// Sunny-karp (2026-06-25) — output of `resolve_caller_from_instance` /
+/// `resolve_caller_from_type_args`. Carries both the substituted Sky fn
+/// (so dep walkers + codegen can look up params/return_ty/etc.) and the
+/// substituted typed body. The typed body is the load-bearing field — it
+/// drives `walk_typed_body_for_deps` and `lower_typed_block` directly.
+pub struct ResolvedCaller {
+    pub func: crate::toylang::registry::ToyFunction,
+    /// Substituted typed body. Always `Some(_)` for body-bearing fns;
+    /// `None` only for extern declarations (which have no body to type).
+    pub typed_body: Option<crate::toylang::typed_ast::TypedBlock>,
+}
+
 /// Resolve a ToyFunction for a concrete rustc Instance by substituting type params.
 ///
 /// Compiler-law: no branch on param count. For N=0 the zip yields
 /// nothing → empty subst → `resolve_caller_from_type_args` runs
 /// `substitute_type_params` with an empty map (identity) and returns a
 /// caller_fn-equivalent. The zero-param case falls out of the general path.
+///
+/// Sunny-karp: the substituted body comes from substituting the cached
+/// `registry.typed_bodies[caller_fn_name]` (a typed AST possibly carrying
+/// `ResolvedType::TypeParam` placeholders) rather than re-running
+/// `resolve_fn_body` on a freshly substituted source AST. The mini
+/// `insert_late_scope_end_drops` pass runs at the bottom to catch bare-T
+/// locals whose drop status only becomes answerable after substitution.
 pub fn resolve_caller_from_instance<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    registry: &ToylangRegistry,
+    typed_bodies: &BTreeMap<String, crate::toylang::typed_ast::TypedBlock>,
+    caller_fn_name: &str,
     caller_fn: &crate::toylang::registry::ToyFunction,
     instance: ty::Instance<'tcx>,
-    tcx: TyCtxt<'tcx>,
-) -> crate::toylang::registry::ToyFunction {
+) -> ResolvedCaller {
     let subst: std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType> =
         caller_fn.type_params.iter()
             .zip(instance.args.types())
@@ -1499,7 +1609,7 @@ pub fn resolve_caller_from_instance<'tcx>(
                 (param_name.clone(), crate::oracle::rustc_ty_to_resolved_type(tcx, ty))
             })
             .collect();
-    resolve_caller_from_type_args(caller_fn, &subst)
+    resolve_caller_from_type_args(tcx, registry, typed_bodies, caller_fn_name, caller_fn, &subst)
 }
 
 // `resolve_caller_from_identity_args` retired in W3 (course-correct.md item #1
@@ -1508,11 +1618,17 @@ pub fn resolve_caller_from_instance<'tcx>(
 // `resolve_caller_from_instance` with concrete args directly.
 
 /// Resolve a ToyFunction by substituting type params with concrete ResolvedTypes.
-fn resolve_caller_from_type_args(
+/// Sunny-karp: substitutes the cached typed body and runs the late drop-synth
+/// pass. Does NOT re-run `resolve_fn_body`.
+pub fn resolve_caller_from_type_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    registry: &ToylangRegistry,
+    typed_bodies: &BTreeMap<String, crate::toylang::typed_ast::TypedBlock>,
+    caller_fn_name: &str,
     caller_fn: &crate::toylang::registry::ToyFunction,
     subst: &std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType>,
-) -> crate::toylang::registry::ToyFunction {
-    crate::toylang::registry::ToyFunction {
+) -> ResolvedCaller {
+    let func = crate::toylang::registry::ToyFunction {
         type_params: vec![],
         params: caller_fn.params.iter().map(|p| crate::toylang::registry::ToyParam {
             name: p.name.clone(),
@@ -1525,7 +1641,29 @@ fn resolve_caller_from_type_args(
         }),
         // Substituted callee inherits the original's export status.
         is_export: caller_fn.is_export,
-    }
+    };
+    // Substitute the cached typed body. If the cache is absent (caller
+    // is a synthesized accessor not eager-typed, or callee came from an
+    // upstream sidecar that didn't ship typed bodies), fall back to
+    // re-running type_resolve_body on the already-substituted source.
+    let typed_body = caller_fn.body.as_ref().map(|_| {
+        if let Some(cached) = typed_bodies.get(caller_fn_name) {
+            let mut substituted = crate::toylang::type_resolve::substitute_in_typed_body(
+                cached, subst, registry,
+            );
+            let returns_void = matches!(
+                &func.return_ty,
+                None | Some(crate::toylang::typed_ast::ResolvedType::Void),
+            );
+            insert_late_scope_end_drops(tcx, &mut substituted, registry, returns_void);
+            substituted
+        } else {
+            // Cache miss fallback. Re-run `type_resolve_body` on the
+            // substituted source; drop-synth runs inside it.
+            type_resolve_body(tcx, registry, &func, caller_fn_name)
+        }
+    });
+    ResolvedCaller { func, typed_body }
 }
 
 /// Compute a Sky-internal symbol from a function name and ResolvedType type args.
@@ -1603,10 +1741,21 @@ pub fn lifecycle_trait_by_name(trait_name: &str) -> Option<&'static LifecycleTra
     LIFECYCLE_TRAITS.iter().find(|lt| lt.trait_name == trait_name)
 }
 
+/// Sunny-karp (2026-06-25) — takes `caller_type_params` so it can answer
+/// drop questions for `RustType` locals whose args still carry `TypeParam`
+/// placeholders (e.g. `Vec<T>` in a generic body). The ADT-destructor query
+/// (`tcx.adt_destructor`) is a property of the ADT def, not of its
+/// instantiation, so the answer is correct even when the args are Params.
+///
+/// Bare `ResolvedType::TypeParam(_)` locals return `false` here — the
+/// drop-or-not decision genuinely needs the concrete substituted type. The
+/// late `insert_late_scope_end_drops` pass at mono time re-checks any let
+/// whose `drop_synthesized` flag is `false` after substitution.
 fn local_needs_scope_drop<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: &crate::toylang::typed_ast::ResolvedType,
     registry: &ToylangRegistry,
+    caller_type_params: &[String],
 ) -> bool {
     use crate::toylang::typed_ast::ResolvedType;
     // Scope-end drop is currently the only lifecycle-trait insertion
@@ -1624,19 +1773,32 @@ fn local_needs_scope_drop<'tcx>(
         }
         ResolvedType::RustType { .. } => {
             // Query rustc: does this concrete type have an explicit
-            // `impl Drop`? `tcx.adt_destructor(adt_did, typing_env)`
-            // returns `Some(Destructor { did, .. })` iff the ADT has
-            // an explicit Drop impl. Vec/String/Box/etc. return Some
+            // `impl Drop`? `tcx.adt_destructor(adt_did)` returns
+            // `Some(Destructor { did, .. })` iff the ADT has an
+            // explicit Drop impl. Vec/String/Box/etc. return Some
             // (they impl Drop); Option/Result/primitives return None
             // (they rely on auto-generated DropGlue, no trait symbol
             // to resolve). Synthesizing `Drop::drop` for the latter
             // ICEs rustc's mono collector.
-            let rustc_ty = crate::oracle::resolved_to_rustc_ty(tcx, ty);
+            //
+            // Sunny-karp: thread `caller_type_params` so the conversion
+            // for `Vec<T>`-style args (with `TypeParam("T")` placeholders)
+            // succeeds. The destructor decision is taken on the ADT def,
+            // which is the same regardless of Param-vs-concrete args.
+            let arg_ctx = crate::oracle::RustTypeLookupContext::Codegen;
+            let rustc_ty = match crate::oracle::try_resolved_to_rustc_ty(
+                tcx, ty, &arg_ctx, caller_type_params,
+            ) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
             let rustc_middle::ty::TyKind::Adt(adt_def, _) = rustc_ty.kind() else {
                 return false;
             };
             tcx.adt_destructor(adt_def.did()).is_some()
         }
+        // Bare TypeParam — defer to the mono late pass.
+        ResolvedType::TypeParam(_) => false,
         _ => false,
     }
 }
@@ -1700,16 +1862,20 @@ pub fn insert_scope_end_drops<'tcx>(
     block: &mut crate::toylang::typed_ast::TypedBlock,
     registry: &ToylangRegistry,
     fn_returns_void: bool,
+    caller_type_params: &[String],
 ) {
     use crate::toylang::typed_ast::*;
     if !fn_returns_void {
         return;
     }
     let mut to_drop: Vec<(String, ResolvedType)> = Vec::new();
-    for stmt in &block.stmts {
-        if let TypedStmt::Let { name, expr } = stmt {
-            if local_needs_scope_drop(tcx, &expr.ty, registry) {
+    // Identify each let whose type needs drop. Mark those lets'
+    // `drop_synthesized = true` so the late mono pass doesn't double-add.
+    for stmt in block.stmts.iter_mut() {
+        if let TypedStmt::Let { name, expr, drop_synthesized } = stmt {
+            if local_needs_scope_drop(tcx, &expr.ty, registry, caller_type_params) {
                 to_drop.push((name.clone(), expr.ty.clone()));
+                *drop_synthesized = true;
             }
         }
     }
@@ -1718,31 +1884,85 @@ pub fn insert_scope_end_drops<'tcx>(
     }
 }
 
+/// Sunny-karp (2026-06-25) — late drop-synth pass that runs after mono
+/// substitution. Walks top-level lets with `drop_synthesized == false`,
+/// re-checks `local_needs_scope_drop` against the now-concrete substituted
+/// type, and appends a `Drop::drop(&local)` call if needed. Closes the
+/// long-standing gap where bare-`TypeParam` locals (`let x: T = ...`) got
+/// no scope-end drop synthesized because their drop status couldn't be
+/// answered at the eager pass.
+///
+/// Idempotent: sets `drop_synthesized = true` on lets it processes so
+/// re-running is a no-op. Skips entirely when `fn_returns_void` is false
+/// (matches `insert_scope_end_drops`'s move-out invariant).
+///
+/// `caller_type_params: &[]` because by this point the body has been
+/// substituted: types are fully concrete; any TypeParam survival is a bug.
+pub fn insert_late_scope_end_drops<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    block: &mut crate::toylang::typed_ast::TypedBlock,
+    registry: &ToylangRegistry,
+    fn_returns_void: bool,
+) {
+    use crate::toylang::typed_ast::*;
+    if !fn_returns_void {
+        return;
+    }
+    let mut to_drop: Vec<(String, ResolvedType)> = Vec::new();
+    for stmt in block.stmts.iter_mut() {
+        if let TypedStmt::Let { name, expr, drop_synthesized } = stmt {
+            if *drop_synthesized {
+                continue;
+            }
+            if local_needs_scope_drop(tcx, &expr.ty, registry, &[]) {
+                to_drop.push((name.clone(), expr.ty.clone()));
+                *drop_synthesized = true;
+            }
+        }
+    }
+    for (name, ty) in to_drop.into_iter().rev() {
+        block.stmts.push(synth_scope_drop_call(&name, &ty));
+    }
+}
+
+/// Eager type-resolve + drop-synth for one fn. Sunny-karp: closures capture
+/// `resolved_fn.type_params` and pass it to the oracle so `TypeParam`-bearing
+/// queries succeed; the body produced may carry Param placeholders, which
+/// per-Instance mono substitutes via `substitute_in_typed_body`.
+///
+/// Sunny-karp also unifies the (formerly three) re-resolve sites: at
+/// `after_rust_analysis` we call this once per fn, cache the result on
+/// `registry.typed_bodies`, and downstream walkers (`collect_rust_deps_recursive`,
+/// `walk_and_stash_internal_callees`, `llvm_gen::codegen_internal_function`)
+/// read the cached body and substitute rather than re-typing.
 fn type_resolve_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
     resolved_fn: &crate::toylang::registry::ToyFunction,
     fn_name: &str,
 ) -> crate::toylang::typed_ast::TypedBlock {
-    let rust_method_ret = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
+    let caller_type_params = resolved_fn.type_params.clone();
+    let caller_type_params_a = caller_type_params.clone();
+    let caller_type_params_b = caller_type_params.clone();
+    let rust_method_ret = move |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<crate::toylang::typed_ast::ResolvedType, crate::oracle::UnresolvedRustType> {
         if type_name.is_empty() {
-            crate::oracle::rust_free_fn_return_type(tcx, method, type_args)
+            crate::oracle::rust_free_fn_return_type(tcx, method, type_args, &caller_type_params_a)
                 .map(|opt| opt.unwrap_or(crate::toylang::typed_ast::ResolvedType::Void))
         } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
             let receiver_ty = &type_args[0];
             let explicit_args = &type_args[1..];
-            crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args)
+            crate::oracle::rust_trait_method_return_type(tcx, trait_name, method, receiver_ty, explicit_args, &caller_type_params_a)
         } else {
-            crate::oracle::rust_method_return_type(tcx, type_name, method, type_args)
+            crate::oracle::rust_method_return_type(tcx, type_name, method, type_args, &caller_type_params_a)
         }
     };
-    let rust_param_types = |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
+    let rust_param_types = move |type_name: &str, method: &str, type_args: &[crate::toylang::typed_ast::ResolvedType]| -> Result<Option<Vec<crate::toylang::typed_ast::ResolvedType>>, crate::oracle::UnresolvedRustType> {
         if type_name.is_empty() {
-            crate::oracle::rust_free_fn_param_types(tcx, method, type_args)
+            crate::oracle::rust_free_fn_param_types(tcx, method, type_args, &caller_type_params_b)
         } else if let Some(trait_name) = type_name.strip_prefix("__trait::") {
-            crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..])
+            crate::oracle::rust_trait_method_param_types(tcx, trait_name, method, &type_args[0], &type_args[1..], &caller_type_params_b)
         } else {
-            crate::oracle::rust_method_param_types(tcx, type_name, method, type_args)
+            crate::oracle::rust_method_param_types(tcx, type_name, method, type_args, &caller_type_params_b)
         }
     };
     // Per @IVTDBTZ, trait-vs-inherent dispatch predicate — asks the oracle
@@ -1761,7 +1981,7 @@ fn type_resolve_body<'tcx>(
         &resolved_fn.return_ty,
         None | Some(crate::toylang::typed_ast::ResolvedType::Void),
     );
-    insert_scope_end_drops(tcx, &mut block, registry, returns_void);
+    insert_scope_end_drops(tcx, &mut block, registry, returns_void, &caller_type_params);
     block
 }
 
@@ -1770,15 +1990,19 @@ fn type_resolve_body<'tcx>(
 /// Compiler-law: no branch on param count. For N=0 the zip yields
 /// nothing → empty subst → `resolve_caller_from_type_args` returns a
 /// callee_fn-equivalent. The zero-param case falls out of the general path.
-fn resolve_toylang_callee(
+fn resolve_toylang_callee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    registry: &ToylangRegistry,
+    typed_bodies: &BTreeMap<String, crate::toylang::typed_ast::TypedBlock>,
+    callee_name: &str,
     callee_fn: &crate::toylang::registry::ToyFunction,
     type_args: &[crate::toylang::typed_ast::ResolvedType],
-) -> crate::toylang::registry::ToyFunction {
+) -> ResolvedCaller {
     let subst: std::collections::HashMap<String, crate::toylang::typed_ast::ResolvedType> =
         callee_fn.type_params.iter().zip(type_args.iter())
             .map(|(param, arg)| (param.clone(), arg.clone()))
             .collect();
-    resolve_caller_from_type_args(callee_fn, &subst)
+    resolve_caller_from_type_args(tcx, registry, typed_bodies, callee_name, callee_fn, &subst)
 }
 
 /// Walker A: collect the transitive Rust deps of a consumer function body.
@@ -1794,14 +2018,18 @@ fn resolve_toylang_callee(
 fn collect_rust_deps_recursive<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
-    resolved_fn: &crate::toylang::registry::ToyFunction,
+    typed_bodies: &BTreeMap<String, crate::toylang::typed_ast::TypedBlock>,
+    resolved_caller: &ResolvedCaller,
     fn_name: &str,
     cycle_guard: &mut HashSet<String>,
 ) -> Vec<(rustc_span::def_id::DefId, ty::GenericArgsRef<'tcx>)> {
-    let _body = resolved_fn.body.as_ref()
+    let _ = fn_name;
+    // Sunny-karp: use the typed body produced at populate-time
+    // (`resolve_caller_from_instance` / `resolve_caller_from_type_args`),
+    // which substituted the cached generic typed body and re-ran the late
+    // drop-synth pass. No more `type_resolve_body` re-run per Instance.
+    let typed_body = resolved_caller.typed_body.as_ref()
         .expect("collect_rust_deps_recursive called on extern fn");
-
-    let typed_body = type_resolve_body(tcx, registry, resolved_fn, fn_name);
 
     let mut deps = Vec::new();
     let mut fn_calls = Vec::new();
@@ -1811,7 +2039,7 @@ fn collect_rust_deps_recursive<'tcx>(
     // resolution time). `walk_typed_body_for_deps` collects them
     // through its normal rust_method_deps arm — no separate drop
     // walker needed.
-    walk_typed_body_for_deps(&typed_body, &mut fn_calls, &mut rust_method_deps);
+    walk_typed_body_for_deps(typed_body, &mut fn_calls, &mut rust_method_deps);
 
     for (callee_name, type_args) in &fn_calls {
         let Some(callee_fn) = registry.functions.get(callee_name.as_str()) else {
@@ -1836,9 +2064,11 @@ fn collect_rust_deps_recursive<'tcx>(
             // items independently.
             let callee_symbol = compute_internal_symbol_from_type_args(callee_name, type_args);
             if cycle_guard.insert(callee_symbol) {
-                let resolved_callee = resolve_toylang_callee(callee_fn, type_args);
+                let resolved_callee = resolve_toylang_callee(
+                    tcx, registry, typed_bodies, callee_name, callee_fn, type_args,
+                );
                 let transitive_deps = collect_rust_deps_recursive(
-                    tcx, registry, &resolved_callee, callee_name, cycle_guard,
+                    tcx, registry, typed_bodies, &resolved_callee, callee_name, cycle_guard,
                 );
                 deps.extend(transitive_deps);
             }
@@ -1923,18 +2153,23 @@ fn walk_and_stash_internal_callees<'tcx>(
     tcx: TyCtxt<'tcx>,
     registry: &ToylangRegistry,
     local_registry: &ToylangRegistry,
-    resolved_fn: &crate::toylang::registry::ToyFunction,
+    resolved_caller: &ResolvedCaller,
     fn_name: &str,
     state: &mut ToylangState,
 ) {
-    let _body = resolved_fn.body.as_ref()
+    let _ = fn_name; // retained as a label for future diagnostics
+    // Sunny-karp: use the populate-time typed body. The substituted body
+    // is already drop-synthesized and Param-substituted; no rerun.
+    let typed_body = resolved_caller.typed_body.as_ref()
         .expect("walk_and_stash_internal_callees called on extern fn");
-
-    let typed_body = type_resolve_body(tcx, registry, resolved_fn, fn_name);
+    // Snapshot the cache before we start mutating state.toylang_instances —
+    // the borrow checker forbids holding `&state.typed_bodies` and
+    // `&mut state.toylang_instances` simultaneously through recursive calls.
+    let typed_bodies_snapshot = state.typed_bodies.clone();
 
     let mut fn_calls = Vec::new();
     let mut rust_method_deps = Vec::new();
-    walk_typed_body_for_deps(&typed_body, &mut fn_calls, &mut rust_method_deps);
+    walk_typed_body_for_deps(typed_body, &mut fn_calls, &mut rust_method_deps);
 
     for (callee_name, type_args) in &fn_calls {
         let Some(callee_fn) = registry.functions.get(callee_name.as_str()) else {
@@ -1959,7 +2194,9 @@ fn walk_and_stash_internal_callees<'tcx>(
         }
         let callee_symbol = compute_internal_symbol_from_type_args(callee_name, type_args);
         if state.walked_entry_points.insert(callee_symbol.clone()) {
-            let resolved_callee = resolve_toylang_callee(callee_fn, type_args);
+            let resolved_callee = resolve_toylang_callee(
+                tcx, registry, &typed_bodies_snapshot, callee_name, callee_fn, type_args,
+            );
             // Compiler-law audit B1: pass `type_args` (captured at the call
             // site) as `instance_args` rather than hardcoding `vec![]`.
             // For non-generic callees `type_args` is empty (degenerate case
@@ -1974,9 +2211,10 @@ fn walk_and_stash_internal_callees<'tcx>(
             state.toylang_instances.push(ToylangInstance {
                 extern_symbol: callee_symbol.clone(),
                 internal_symbol: callee_symbol,
-                resolved_func: resolved_callee.clone(),
+                resolved_func: resolved_callee.func.clone(),
                 stub_def_id: None,
                 instance_args: type_args.clone(),
+                typed_body: resolved_callee.typed_body.clone(),
             });
             walk_and_stash_internal_callees(
                 tcx, registry, local_registry, &resolved_callee, callee_name, state,

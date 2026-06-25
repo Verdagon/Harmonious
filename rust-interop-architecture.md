@@ -2751,7 +2751,7 @@ The structural argument:
 
 The worst-case substitution complexity is the source-program complexity. Sky's substitution engine handles any program Sky's typechecker accepts; if the substitution would explode, the source would already be unbounded.
 
-Operational concern (not a soundness concern): for very large Sky projects with deep generic call graphs, the substitution work per Instance can be expensive. Memoization (Section 19.5) keeps it bounded within a single rustc invocation.
+Operational concern (not a soundness concern): for very large Sky projects with deep generic call graphs, the substitution work per Instance can be expensive. Memoization (Section 19.5) keeps it bounded within a single rustc invocation — the Layer 2 typed-body cache (sunny-karp, 2026-06-25) ships in the toylang reference and turns per-Instance work from a full type-resolve + drop-synth + walk into a pure typed-AST substitution + late drop-synth check.
 
 ### 13.8 Content-addressed typeids for cross-compile stability
 
@@ -3189,7 +3189,7 @@ no benefit). The convergence at a single symbol is the load-bearing
 property — without it, the two paths would need separate implementations
 of every Sky type's drop logic.
 
-**The predicate.** `local_needs_scope_drop(tcx, ty, registry)` returns
+**The predicate.** `local_needs_scope_drop(tcx, ty, registry, caller_type_params)` returns
 true when the type has a callable Drop trait method:
 - **Sky struct types** (`StructRef` / `Struct`): true iff
   `registry.trait_impls` contains a matching `impl Drop for <name>` entry.
@@ -3200,8 +3200,18 @@ true when the type has a callable Drop trait method:
   flow through auto-generated `DropGlue` with no trait-method symbol.
   Without this filter, synthesizing `Drop::drop` on the latter types
   ICEs rustc's mono collector ("failed to resolve instance for
-  `<Option<i32> as Drop>::drop`").
-- Everything else (primitives, refs, unsized types, type params): false.
+  `<Option<i32> as Drop>::drop`"). The `caller_type_params` arg
+  (sunny-karp, §19.5 Layer 2) lets the predicate answer correctly for
+  Param-bearing args like `Vec<T>`: the destructor is an ADT property
+  of `Vec`, valid regardless of whether `T` is concrete; only the
+  `try_resolved_to_rustc_ty` conversion needs Param-aware index lookup.
+- **Bare `TypeParam`**: returns false. The drop-or-not decision genuinely
+  needs the substituted concrete type. The late
+  `insert_late_scope_end_drops` pass at mono (sunny-karp) re-checks any
+  `TypedStmt::Let` whose `drop_synthesized` flag is still `false` after
+  substitution; that's the pass that closes the bare-T drop gap (see
+  §19.5 Layer 2 + §F.20).
+- Everything else (primitives, refs, unsized types): false.
 
 **Linear types** are simply Sky source types whose user-written
 `impl Drop` body invokes `sky_runtime_panic` + `abort()`. There is no
@@ -3782,7 +3792,7 @@ Constructing valid MIR is fiddly (per @SMINCZ and the MIR construction notes fro
 - `Statement` and `BasicBlockData` are `#[non_exhaustive]`; use the constructor functions, not struct literals.
 - `set_required_consts` and `set_mentioned_items` must be called with empty vecs on synthetic bodies (the normal `mir_promoted` pass doesn't run for them; the mono collector panics if these aren't set).
 - Every BasicBlockData needs a terminator. `TerminatorKind::Unreachable` is valid for bodies that are never executed.
-- `TypingEnv::fully_monomorphized()` is a typing-mode flag, not an input assertion; bodies containing `ty::TyKind::Param` placeholders flow through cleanly. Per Section 19.5, Sky's bodies do NOT have Param placeholders (Sky pre-substitutes them); the body is fully concrete.
+- `TypingEnv::fully_monomorphized()` is a typing-mode flag, not an input assertion; bodies containing `ty::TyKind::Param` placeholders flow through cleanly. The synthetic MIR body Sky's `per_instance_mir` returns to rustc's collector is fully concrete — Sky pre-substitutes at body-construction time. (The eager-typed body cached on `ToylangState.typed_bodies` per §19.5 Layer 2 DOES carry `ResolvedType::TypeParam` placeholders, but those are Sky-side; mono substitution converts to concrete `ResolvedType` BEFORE `try_resolved_to_rustc_ty` runs at MIR-construction time. The oracle's Param-aware path — `caller_type_params` + `ty::Ty::new_param` — is exercised by the eager type-resolve pass that produces the cache, NOT by per_instance_mir's synthetic-body construction.)
 
 ### 19.4 ReifyFnPointer casts for Rust deps
 
@@ -3798,9 +3808,11 @@ The cast's source is `Vec::new` (as a generic Rust fn item); the cast's target i
 
 Sky's per_instance_mir provider builds the casts for every dep enumerated during Sky's walk. The walk is recursive through Sky-internal callees: when the export's body calls a non-export Sky function, Sky walks the non-export's body too, enumerating its Rust deps, and includes those casts in the export's synthetic body.
 
-### 19.5 Per-entry-point subtree memoization keyed by `(def_id, concrete_args)`
+### 19.5 Per-entry-point subtree memoization + typed-body cache
 
-The walk should be memoized to avoid redundant work. The intended cache:
+Two layers of memoization apply to the per-Instance hot path.
+
+**Layer 1 — `(def_id, concrete_args) → RustDeps` walk cache.** The intended high-level cache:
 
 ```rust
 type WalkCache = HashMap<(DefId, GenericArgsRef<'tcx>), Vec<RustDep>>;
@@ -3808,9 +3820,35 @@ type WalkCache = HashMap<(DefId, GenericArgsRef<'tcx>), Vec<RustDep>>;
 
 For each Sky item walked, with its concrete args, the resulting list of Rust deps would be cached and reused on subsequent walks of the same Instance. Across rustc invocations (different cargo crate compiles) the cache rebuilds — different compiles may have different reachable sets.
 
-**Implementation status:** the toylang reference does NOT yet implement this memoization (per the module doc-comment in `rustc-lang-facade/src/queries/per_instance.rs`: "not implemented in this file yet"); every Instance currently recomputes its dep list. For toylang's fixture sizes this is negligible. Tracked as future work for Sky's larger projects.
+**Implementation status:** **NOT** yet implemented in the toylang reference. The per-Instance walk recomputes deps each time. For toylang's fixture sizes this is negligible. Tracked as future work for Sky's larger projects.
 
 The cache lookup is content-addressed: `(def_id, concrete_args)` is the key. For Sky internal callees with type params, the concrete args reflect the substitution at the call site; multiple paths to the same `(def_id, args)` see the same cache entry.
+
+**Layer 2 — typed-body cache (sunny-karp, shipped 2026-06-25).** A coarser but more load-bearing memoization that the toylang reference DOES ship: the typed AST of every body-bearing Sky fn is computed **once** at `after_rust_analysis` and cached. Per-Instance mono substitutes the cached typed AST via a pure typed-AST walk (`substitute_in_typed_body`) instead of re-running `resolve_fn_body` + `insert_scope_end_drops` per monomorphization.
+
+Pre-sunny-karp asymptotic per generic Sky function with K monomorphizations:
+
+- ~2K full type-resolves (validation pass + dep-collection at per_instance_mir + codegen at fill_module)
+- ~2K full `insert_scope_end_drops` passes
+- K substituted typed bodies, all discarded
+
+Post-sunny-karp:
+
+- 1 full type-resolve at `after_rust_analysis` (stashed on `ToylangState.typed_bodies`)
+- 1 full `insert_scope_end_drops` at the same site
+- K cheap typed-AST substitutions via `substitute_in_typed_body`
+- K cheap `insert_late_scope_end_drops` passes (only handle let-bindings whose type was a bare `TypeParam` at the eager pass and only became drop-decidable after substitution)
+
+For toylang's fixtures the wall-clock savings are imperceptible (the type-resolve cost per Instance is sub-millisecond). At Sky scale on real-size libraries with hundreds of generic instantiations, this is tens of seconds per compile reclaimed.
+
+**Two mechanisms make Layer 2 work.**
+
+1. **Oracle accepts Param-bearing queries.** Pre-sunny-karp, every Rust-side query (`rust_method_return_type`, `rust_method_param_types`, `rust_free_fn_*`, `rust_trait_method_*`) short-circuited with `RustTypeDeferred` the moment it saw `ResolvedType::TypeParam` in its args. `try_resolved_to_rustc_ty`'s `TypeParam` arm panicked ("Approach A invariant"). The shortcut was implementation laziness from the Approach A migration, not an architectural constraint — `tcx.fn_sig(...).instantiate(...)` accepts Param-bearing args cleanly because Params are normalization terminals; `rustc_ty_to_resolved_type` already round-trips `TyKind::Param → ResolvedType::TypeParam`. Sunny-karp's fix: every oracle query takes a new `caller_type_params: &[String]` argument; `try_resolved_to_rustc_ty`'s `TypeParam(name)` arm rebuilds `ty::Ty::new_param(tcx, idx, name)` from the name's position in the surrounding fn's generic list. The six contains-`TypeParam` early-returns are gone. A seventh guard in `type_resolve.rs`'s `MethodCall` resolver, doing the same defer-on-Param check, also retired.
+2. **`substitute_in_typed_body` is a pure typed-AST walk.** Inputs: cached `TypedBlock` + `HashMap<String, ResolvedType>` subst + `&ToylangRegistry`. Output: substituted `TypedBlock`. At each `TypedExpr.ty` and each `type_args` slot, the walk runs `substitute_type_params(...)` followed by `resolve_struct_fields(...)`. The second step is load-bearing: substitution introduces `StructRef`-shape types (parser-shape) into typed expressions that need to be `Struct{field_types}`-shape (resolver-shape) for codegen to compute layout. Without the chained promotion, codegen treats the field-less form as opaque/zero-sized and returns stack garbage. See §F.20 for the silent-miscompile postmortem.
+
+**Bare-`TypeParam` drop closure.** Pre-sunny-karp the AST-rewrite drop synthesis (§15.7) had a silent gap: `let x: T = ...` where `T` is a function-level type param fell through `local_needs_scope_drop`'s `_ => false` arm because the predicate couldn't answer drop-or-not without the concrete substituted type. The local silently leaked. Sunny-karp closes the gap via a `drop_synthesized: bool` flag on `TypedStmt::Let` and a mini `insert_late_scope_end_drops` pass that runs after substitution at mono. The eager `insert_scope_end_drops` at `after_rust_analysis` sets the flag `true` on lets whose drop status was decidable then (`Vec<T>`-shape RustTypes work fine because `tcx.adt_destructor` is an ADT property valid regardless of args). The late pass re-checks any `drop_synthesized == false` let against its now-concrete substituted type. Idempotent: the late pass marks lets it processed.
+
+**Storage location:** the typed-body cache lives on `ToylangState.typed_bodies: BTreeMap<String, TypedBlock>`, not on `ToyFunction` or on `ToylangRegistry`. The `&self` signature on `Callbacks::after_rust_analysis` forbids `Arc::make_mut(&mut self.registry)`-style writes; state is `&mut` at every consumer call site and is the right scope (per-rustc-invocation). Impl-method typed bodies key on `"<Self>::<method>"`. Trade-offs vs the registry design: less locality (a `&ToyFunction` no longer carries its typed body), no cross-crate sharing (downstream rederives), and `walk_and_stash_internal_callees` clones the map into a snapshot to dodge the borrow checker during recursive instance-stashing. Net acceptable for toylang; revisit for Sky if multi-crate generic load makes downstream-rederive cost matter.
 
 ### 19.6 Default trait method resolution via `Instance::expect_resolve`
 
@@ -7008,6 +7046,157 @@ marker), async Drop variant. The synthesis pass no longer branches on
 which trait it's emitting for. Per §15.7 step "remaining 5% leak"
 paragraph: adding the next lifecycle trait is one registry-entry
 append.
+
+#### F.20 Sunny-karp: eager type-resolve + typed-body cache + bare-T drop closure (2026-06-25)
+
+The implementation arc for the §19.5 Layer 2 (typed-body cache) +
+oracle-accepts-Params + bare-`TypeParam` drop closure. Six work items
+A–F per the approved plan; three implementation surprises worth
+recording. Plan archive at the consumer's session-local plan store; the
+load-bearing lessons are below.
+
+**Motivation surfaced mid-session.** Investigation of the per_instance_mir
+↔ type-checking interaction exposed that toylang's eager validation
+loop silently swallowed `RustTypeDeferred` errors at every generic body's
+Rust call whose args depended on `T`, discarded the partial typed AST,
+and re-ran the whole pass at every concrete monomorphization. Six oracle
+early-returns (`oracle.rs:506,813,834,856,890,964`) were the source of
+the deferral, added during the Approach A migration as a shortcut and
+never removed. `try_resolved_to_rustc_ty`'s `TypeParam` arm panicked
+unconditionally. The shortcut was implementation laziness; rustc handles
+Param-bearing `tcx.fn_sig().instantiate(...)` cleanly because Params are
+normalization terminals, and `rustc_ty_to_resolved_type` already
+round-trips `TyKind::Param → ResolvedType::TypeParam`. Pre-sunny-karp
+per-Instance asymptotic: K monomorphizations of a generic body cost
+~2K full type-resolves + ~2K `insert_scope_end_drops` passes + the typed
+AST was thrown away at K+1 of those steps. Post-sunny-karp: 1 type-resolve
++ 1 drop-synth + K cheap typed-AST substitutions + K cheap late-pass
+drop-synth checks.
+
+**Six work items shipped (487/0/1 verifying):**
+
+- **A — oracle accepts Param-bearing queries.** Six `contains_type_param`
+  early-returns deleted. All six query functions (`rust_method_return_type`,
+  `rust_method_param_types`, `rust_free_fn_return_type`, `rust_free_fn_param_types`,
+  `rust_trait_method_return_type`, `rust_trait_method_param_types`) gain a
+  `caller_type_params: &[String]` arg. `try_resolved_to_rustc_ty` gains the
+  same arg; its `TypeParam(name)` arm rebuilds
+  `ty::Ty::new_param(tcx, idx, name)` from the name's position in the
+  surrounding fn's generic list.
+- **B — typed-body cache on `ToylangState.typed_bodies`.** A `BTreeMap<String,
+  TypedBlock>` populated once at `after_rust_analysis`. NOT on `ToyFunction`
+  as the plan suggested — the `&self` callback signature forbids
+  `Arc::make_mut(&mut self.registry)` and pivoting to state-based was
+  cleaner than introducing interior mutability. Impl methods key on
+  `"<Self>::<method>"`. `#[serde(skip)]`-equivalent: typed bodies are not
+  serialized; downstream rederives at its own `after_rust_analysis`.
+- **C — `substitute_in_typed_body` pure typed-AST walk.** Inputs:
+  `&TypedBlock`, `&HashMap<String, ResolvedType>`, `&ToylangRegistry`. At
+  each `TypedExpr.ty` and each `type_args` slot, runs
+  `substitute_type_params` then `resolve_struct_fields`. The second step
+  is the silent-miscompile fix (see Surprise 3 below).
+- **D — mono substitution path.** `resolve_caller_from_instance` /
+  `resolve_caller_from_type_args` return `ResolvedCaller { func,
+  typed_body }`. Cache hit → substitute typed AST + late drop-synth.
+  Cache miss (synthesized accessors not eager-typed) → fall back to
+  `type_resolve_body`. All call sites threaded: per_instance_mir,
+  populate channels, cascade drain, llvm_gen.
+- **E — drop-synth split.** New `drop_synthesized: bool` field on
+  `TypedStmt::Let`. Eager `insert_scope_end_drops` sets `true` on lets
+  it emits drops for. New `insert_late_scope_end_drops` at mono
+  re-checks any `false`-flagged let against its now-concrete substituted
+  type. Closes a long-standing silent gap: bare-`TypeParam` locals
+  (`let x: T = ...`) previously fell through the eager predicate's
+  `_ => false` arm because the drop status genuinely needed the
+  concrete substituted type. Two fixtures verify:
+  `drop/fixture10_generic_consume_t_with_drop` (positive, `T = Widget`)
+  and `drop/fixture11_generic_consume_t_no_drop` (negative, `T = i32`).
+- **F — unify three re-resolve sites.** `collect_rust_deps_recursive`,
+  `walk_and_stash_internal_callees`, `codegen_internal_function` all read
+  the precomputed substituted typed body. `codegen_internal_function`
+  keeps the re-resolve path as a cache-miss fallback. `ToylangInstance`
+  and `FnItem` gained `typed_body: Option<TypedBlock>` fields.
+
+**Three surprises worth recording.**
+
+1. **`&self` callback shape forbade `Arc::make_mut`.** The plan called for
+   caching `typed_body` on `ToyFunction` via
+   `Arc::make_mut(&mut self.registry)` at `after_rust_analysis`. The
+   callback signature is `fn after_rust_analysis(&self, ...)` — no
+   `&mut self` handle exists to take. Wrote ~60 lines of "Practical
+   fix..." comments trying to talk myself into a workaround (interior
+   mutability via `Arc::get_mut`, shadow handles, manual reseating)
+   before pivoting to `ToylangState.typed_bodies`. The plan had
+   explicitly considered and rejected the state-based design ("`ToyFunction`
+   is the obvious home") but the architectural constraint from the
+   callback signature forced the pivot. **Lesson:** when a plan
+   prescribes a mutation pattern, verify the available `self`-shape
+   at the mutation site BEFORE committing to it. The state-based design
+   loses some locality (a `&ToyFunction` no longer carries its typed
+   body) and cross-crate cache sharing (downstream rederives) — see
+   §19.5 trade-offs — but is structurally compatible with the
+   `Callbacks` trait without a signature change.
+
+2. **Seventh `contains_type_param` guard outside the oracle.** First test
+   run after A–F failed 28 case5 tests with
+   `RustTypeDeferred { context: "method '.push' on receiver containing TypeParam" }`.
+   The plan enumerated six oracle early-returns to delete; it missed a
+   seventh in `type_resolve.rs:730` (the `MethodCall` resolver) doing the
+   same defer-on-Param check. Deleted; case5 recovered. **Lesson:**
+   `git grep contains_type_param` once before declaring "I deleted all
+   the guards." Reasoning from the plan's enumeration alone missed this.
+   The general form: behaviors implemented via consistent
+   call-the-same-helper patterns can be searched by helper name;
+   trusting a plan's site enumeration without grepping defeats that
+   property.
+
+3. **`StructRef → Struct` promotion required inside the new substitution
+   walk — silent miscompile trap.** First test run after the
+   seventh-guard fix still failed `test_generic_callee_with_struct`
+   with stack-garbage output (`1835591808\n1` instead of `10\n20`). The
+   cached typed body has `TypeParam("T")` placeholders.
+   `substitute_in_typed_body` replaces them with the instance arg's
+   `ResolvedType` value. The arg comes from
+   `rustc_ty_to_resolved_type(tcx, instance.args.types()[i])` — which
+   mints `StructRef { name, type_args }` for Sky types (parser-shape,
+   no `field_types`). Codegen consumes
+   `Struct { name, type_args, field_types }` (resolver-shape, mandatory
+   `field_types`). The original re-resolve path passed
+   `StructRef`-bearing source through `resolve_struct_fields` for free.
+   The pure-substitution path didn't, so the substituted typed body
+   had `StructRef{Point}` where codegen needed
+   `Struct{Point, [I32, I32]}` — codegen treated the field-less form
+   as opaque/zero-sized and returned stack garbage. **Reactive fix:**
+   chained `resolve_struct_fields` after `substitute_type_params`
+   inside the walk, which required passing `registry: &ToylangRegistry`
+   through (`substitute_in_typed_body(body, subst, registry)`).
+   **Deeper smell:** `ResolvedType` having both `StructRef` and `Struct`
+   as variants means "this state is reachable but invalid" is
+   representable in the type system. The bug class is broader than
+   this one instance — any pure-AST-walk substitution that produces
+   fresh `ResolvedType` values has to remember the promotion step
+   with no compile-time enforcement. The structural fix (two distinct
+   types: a parser-shape `SourceType` carrying `StructRef`, a
+   resolved-shape `ResolvedType` carrying only `Struct{field_types}`,
+   with a single chokepoint `resolve_source_type` between them) is
+   queued for a v2 refactor (~600-800 lines, 11 files). Until that
+   lands, the `resolve_struct_fields` chain in
+   `substitute_in_typed_body` is the runtime mitigation.
+
+**Calibration discipline reinforced (per §25.3.6).** Surprise 3 is
+exactly the pattern §25.3.6 documents: a code path that prior reasoning
+(plan-level design walkthrough) explicitly confirmed correct turned out
+wrong only when empirical fixture work surfaced runtime garbage. The
+substitution walk "looked obviously correct" — replace TypeParam with
+the substituted value, walk the children, done. The trap was in the
+shape of the substituted value relative to consumer expectations. IR
+inspection and runtime output were the only signals.
+
+**Residual cleanup post-sunny-karp** (low-priority follow-ups):
+`RustTypeLookupContext::DeferredTypeParam` variant + `oracle::contains_type_param`
+function + `UnresolvedRustType::is_deferred()` + `TypeResolveError::RustTypeDeferred`
+all retain a small dead-code footprint; no callers exercise them post-sunny-karp.
+Mechanical to delete in a sweep.
 
 This is the master design document for Sky's compiler & Rust interop architecture. Total length: ~30 chapters, 6 appendices, approximately 100 pages.
 

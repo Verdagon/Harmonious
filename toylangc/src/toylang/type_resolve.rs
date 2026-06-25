@@ -335,6 +335,100 @@ pub fn substitute_type_params_in_body(
     subst_fn_body(body, subst)
 }
 
+/// Sunny-karp (2026-06-25) — pure typed-AST substitution. Walks a TypedBlock
+/// produced by `resolve_fn_body` on a generic body (with `ResolvedType::TypeParam`
+/// placeholders in expression types) and rewrites every type via
+/// `substitute_type_params`, then runs `resolve_struct_fields` so any
+/// freshly-introduced `StructRef` is promoted to `Struct` with field_types
+/// populated (codegen lowering depends on the `Struct` form).
+///
+/// No oracle queries, no rustc calls — pure data transform.
+pub fn substitute_in_typed_body(
+    body: &super::typed_ast::TypedBlock,
+    subst: &HashMap<String, ResolvedType>,
+    registry: &super::registry::ToylangRegistry,
+) -> super::typed_ast::TypedBlock {
+    use super::typed_ast::*;
+    fn rewrite_ty(ty: &ResolvedType, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> ResolvedType {
+        let s = super::type_resolve::substitute_type_params(ty, subst);
+        super::type_resolve::resolve_struct_fields(&s, registry)
+            .unwrap_or(s)
+    }
+    fn subst_expr(expr: &TypedExpr, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> TypedExpr {
+        let ty = rewrite_ty(&expr.ty, subst, registry);
+        let kind = match &expr.kind {
+            TypedExprKind::IntLit(n) => TypedExprKind::IntLit(*n),
+            TypedExprKind::BoolLit(b) => TypedExprKind::BoolLit(*b),
+            TypedExprKind::StringLit(s) => TypedExprKind::StringLit(s.clone()),
+            TypedExprKind::ByteStringLit(b) => TypedExprKind::ByteStringLit(b.clone()),
+            TypedExprKind::Var(name) => TypedExprKind::Var(name.clone()),
+            TypedExprKind::StructLit { name, fields } => TypedExprKind::StructLit {
+                name: name.clone(),
+                fields: fields.iter().map(|(n, e)| (n.clone(), subst_expr(e, subst, registry))).collect(),
+            },
+            TypedExprKind::FnCall { name, type_args, args } => TypedExprKind::FnCall {
+                name: name.clone(),
+                type_args: type_args.iter().map(|ta| rewrite_ty(ta, subst, registry)).collect(),
+                args: args.iter().map(|a| subst_expr(a, subst, registry)).collect(),
+            },
+            TypedExprKind::BinaryOp { op, left, right } => TypedExprKind::BinaryOp {
+                op: *op,
+                left: Box::new(subst_expr(left, subst, registry)),
+                right: Box::new(subst_expr(right, subst, registry)),
+            },
+            TypedExprKind::StaticCall { ty: ty_name, method, type_args, args } => TypedExprKind::StaticCall {
+                ty: ty_name.clone(),
+                method: method.clone(),
+                type_args: type_args.iter().map(|ta| rewrite_ty(ta, subst, registry)).collect(),
+                args: args.iter().map(|a| subst_expr(a, subst, registry)).collect(),
+            },
+            TypedExprKind::MethodCall { receiver, method, args } => TypedExprKind::MethodCall {
+                receiver: Box::new(subst_expr(receiver, subst, registry)),
+                method: method.clone(),
+                args: args.iter().map(|a| subst_expr(a, subst, registry)).collect(),
+            },
+            TypedExprKind::FieldAccess { receiver, field } => TypedExprKind::FieldAccess {
+                receiver: Box::new(subst_expr(receiver, subst, registry)),
+                field: field.clone(),
+            },
+            TypedExprKind::If { cond, then_stmts, then_expr, else_stmts, else_expr } => TypedExprKind::If {
+                cond: Box::new(subst_expr(cond, subst, registry)),
+                then_stmts: then_stmts.iter().map(|s| subst_stmt(s, subst, registry)).collect(),
+                then_expr: then_expr.as_ref().map(|e| Box::new(subst_expr(e, subst, registry))),
+                else_stmts: else_stmts.iter().map(|s| subst_stmt(s, subst, registry)).collect(),
+                else_expr: else_expr.as_ref().map(|e| Box::new(subst_expr(e, subst, registry))),
+            },
+            TypedExprKind::Ref(inner) => TypedExprKind::Ref(Box::new(subst_expr(inner, subst, registry))),
+        };
+        TypedExpr { kind, ty }
+    }
+    fn subst_stmt(stmt: &TypedStmt, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> TypedStmt {
+        match stmt {
+            TypedStmt::Let { name, expr, drop_synthesized } => TypedStmt::Let {
+                name: name.clone(),
+                expr: subst_expr(expr, subst, registry),
+                drop_synthesized: *drop_synthesized,
+            },
+            TypedStmt::ExprStmt(expr) => TypedStmt::ExprStmt(subst_expr(expr, subst, registry)),
+            TypedStmt::While { cond, body } => TypedStmt::While {
+                cond: subst_expr(cond, subst, registry),
+                body: subst_block(body, subst, registry),
+            },
+            TypedStmt::Assign { name, expr } => TypedStmt::Assign {
+                name: name.clone(),
+                expr: subst_expr(expr, subst, registry),
+            },
+        }
+    }
+    fn subst_block(block: &TypedBlock, subst: &HashMap<String, ResolvedType>, registry: &super::registry::ToylangRegistry) -> TypedBlock {
+        TypedBlock {
+            stmts: block.stmts.iter().map(|s| subst_stmt(s, subst, registry)).collect(),
+            ret: block.ret.as_ref().map(|e| subst_expr(e, subst, registry)),
+        }
+    }
+    subst_block(body, subst, registry)
+}
+
 fn find_field_index(toy_struct: &super::registry::ToyStruct, struct_name: &str, field_name: &str) -> Result<usize, TypeResolveError> {
     toy_struct.fields.iter()
         .position(|f| f.name == field_name)
@@ -636,16 +730,13 @@ fn resolve_expr(
         Expr::MethodCall { receiver, method, args } => {
             let typed_recv = resolve_expr(receiver, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
 
-            // Phase B — if the receiver's type contains a TypeParam (e.g.,
-            // `fn foo<T>(x: T) { x.clone() }`), defer to the per-Instance
-            // substituted pass. Without this guard, the existing match arms
-            // below would hit MethodCallOnUnsupportedType for `TypeParam`,
-            // which is a hard error rather than a deferred one.
-            if crate::oracle::contains_type_param(&typed_recv.ty) {
-                return Err(TypeResolveError::RustTypeDeferred {
-                    context: format!("method `.{}` on receiver containing TypeParam", method),
-                });
-            }
+            // Sunny-karp (2026-06-25): the old `contains_type_param(&typed_recv.ty)`
+            // guard that returned `RustTypeDeferred` is gone — the oracle now
+            // accepts Param-bearing receivers via the `caller_type_params`
+            // thread-through. The match arms below extract the `RustType` /
+            // `Ref<RustType>` shape (which includes args carrying Param
+            // placeholders); the oracle's `rust_method_return_type` produces a
+            // sig where Params survive end-to-end.
 
             let (rust_name, rust_type_args) = match &typed_recv.ty {
                 ResolvedType::RustType { name, type_args } => (name.as_str(), type_args.as_slice()),
@@ -789,7 +880,7 @@ fn resolve_stmt(
         Stmt::Let { name, expr } => {
             let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
             scope.insert(name.clone(), typed_expr.ty.clone());
-            Ok(TypedStmt::Let { name: name.clone(), expr: typed_expr })
+            Ok(TypedStmt::Let { name: name.clone(), expr: typed_expr, drop_synthesized: false })
         }
         Stmt::ExprStmt(expr) => {
             let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;

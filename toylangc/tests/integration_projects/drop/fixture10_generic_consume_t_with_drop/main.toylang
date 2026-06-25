@@ -1,0 +1,31 @@
+// Sunny-karp (2026-06-25) Fixture 10 — bare TypeParam local drops at
+// scope end. `consume<T>(x: T)` takes ownership of `x`; at function
+// exit, `x` is a let-binding-equivalent whose type was `TypeParam("T")`
+// at the eager pass. The new late drop-synth pass at mono substitutes
+// T → Widget, re-checks `local_needs_scope_drop`, and synthesizes the
+// `Drop::drop(&x)` call.
+//
+// Expected stdout: `42`. Widget's Drop body prints the id; nothing
+// else does.
+
+use std::ops::Drop
+
+fn println_i32(x: i32)
+
+struct Widget {
+    id: i32,
+}
+
+export impl Drop for Widget {
+    fn drop(&mut self) {
+        println_i32(self.id);
+    }
+}
+
+fn consume<T>(x: T) {
+}
+
+fn main() {
+    let w = Widget { id: 42 };
+    consume<Widget>(w);
+}
