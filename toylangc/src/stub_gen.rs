@@ -509,16 +509,15 @@ pub fn generate(registry: &ToylangRegistry) -> String {
         items.push(syn::Item::Impl(impl_block));
     }
 
-    // Phase E.d — re-export `Drop` from the stub rlib so the
-    // compiler-synthesized scope-end drop calls can resolve the
-    // trait DefId. Skipped when the user's toylang source already has
-    // a `use ...::Drop` import (`registry.imports` contains a path
-    // ending in `::Drop`) — re-exporting twice is a name collision.
+    // Phase E.d — re-export `Drop` from the stub rlib so user-source
+    // `impl Drop for X { fn drop(&mut self) { ... } }` blocks can name
+    // the trait. Skipped when user source already imports it.
     //
-    // The synthesized scope-end calls are `Drop::drop(&local)`; the
-    // dispatch path in `lower_typed_expr` and the dep-walker both
-    // route through `find_use_imported_trait_def_id("Drop")`, which
-    // walks this stub rlib's `pub use` re-exports.
+    // (Post-2026-06-25 "drop-is-just-a-function" migration: the
+    // compiler-synthesized scope-end drops no longer dispatch through
+    // `Drop::drop` — they emit `core::mem::drop(local)` instead — but
+    // user-source `impl Drop for X` blocks still need the trait name to
+    // be in scope. The `Drop` re-export below covers that.)
     let user_already_imports_drop = registry.imports.iter().any(|p| {
         p.split("::").last() == Some("Drop")
     });
@@ -528,6 +527,28 @@ pub fn generate(registry: &ToylangRegistry) -> String {
             pub use core::ops::Drop;
         });
     }
+
+    // Post-2026-06-25 — the compiler-synthesized scope-end drop calls
+    // route through this Sky-owned thin generic wrapper. From the mono
+    // pipeline's POV `__toylang_drop` is just a normal generic Rust fn
+    // (`InstanceKind::Item`, real MIR body); the `drop_in_place` call
+    // inside the body is where rustc's `InstanceKind::DropGlue` lang-item
+    // resolution happens, but that's transparent to Sky — Sky's
+    // per_instance_mir cascade just sees "another use-imported generic
+    // call." This is what makes drop "just a function" at the mono path
+    // without needing to special-case `InstanceKind::DropGlue` anywhere.
+    //
+    // `#[inline(always)]` because the wrapper body is one drop_in_place
+    // call; LLVM inlines it at every Sky call site, so the wrapper has no
+    // runtime cost beyond what `drop_in_place::<T>` itself costs (which
+    // is zero for trivially-droppable T per rustc's drop-glue elision).
+    items.push(parse_quote! {
+        #[inline(always)]
+        #[allow(unused_unsafe)]
+        pub unsafe fn __toylang_drop<T>(x: *mut T) {
+            unsafe { core::ptr::drop_in_place(x) }
+        }
+    });
     items.push(parse_quote! {
         #[inline(never)]
         pub unsafe fn __toylang_option_unwrap<T>(o: *mut core::option::Option<T>) -> T {

@@ -259,17 +259,6 @@ pub enum TypedStmt {
     Let {
         name: String,
         expr: TypedExpr,
-        /// Sunny-karp (2026-06-25) — true once `insert_scope_end_drops`
-        /// has appended a `Drop::drop(&name)` call for this let's type.
-        /// Eager pass at `after_rust_analysis` sets this for any local
-        /// whose type's drop status is known then (concretely-typed +
-        /// `Vec<T>`-style RustType with Param-bearing args also count
-        /// because `tcx.adt_destructor` works on the ADT def). Bare
-        /// `TypeParam` locals stay `false` — the late pass at mono
-        /// re-checks them once the substituted type is concrete and
-        /// synthesizes the drop if needed. Idempotent: the late pass
-        /// skips any let already marked true.
-        drop_synthesized: bool,
     },
     ExprStmt(TypedExpr),
     While { cond: TypedExpr, body: TypedBlock },

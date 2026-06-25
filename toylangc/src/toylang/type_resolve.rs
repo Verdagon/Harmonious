@@ -349,10 +349,9 @@ pub fn substitute_in_typed_body(
     }
     fn subst_stmt(stmt: &TypedStmt, subst: &HashMap<String, ResolvedType>) -> TypedStmt {
         match stmt {
-            TypedStmt::Let { name, expr, drop_synthesized } => TypedStmt::Let {
+            TypedStmt::Let { name, expr } => TypedStmt::Let {
                 name: name.clone(),
                 expr: subst_expr(expr, subst),
-                drop_synthesized: *drop_synthesized,
             },
             TypedStmt::ExprStmt(expr) => TypedStmt::ExprStmt(subst_expr(expr, subst)),
             TypedStmt::While { cond, body } => TypedStmt::While {
@@ -868,7 +867,7 @@ fn resolve_stmt(
         Stmt::Let { name, expr } => {
             let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
             scope.insert(name.clone(), typed_expr.ty.clone());
-            Ok(TypedStmt::Let { name: name.clone(), expr: typed_expr, drop_synthesized: false })
+            Ok(TypedStmt::Let { name: name.clone(), expr: typed_expr })
         }
         Stmt::ExprStmt(expr) => {
             let typed_expr = resolve_expr(expr, &ResolvedType::Void, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;

@@ -866,9 +866,7 @@ fn codegen_internal_function<'ctx, 'tcx>(
             &func.return_ty,
             None | Some(SourceType::Void),
         );
-        crate::toylang::callbacks_impl::insert_scope_end_drops(
-            tcx, &mut body, registry, returns_void, &caller_type_params,
-        );
+        crate::toylang::callbacks_impl::insert_scope_end_drops(&mut body, returns_void);
         Some(body)
     };
     let typed_body: &crate::toylang::typed_ast::TypedBlock = match precomputed_typed_body {
@@ -2175,7 +2173,7 @@ fn lower_typed_expr<'ctx>(
 
 fn lower_typed_stmt<'ctx>(ctx: &mut CodegenCtx<'ctx, '_, '_>, stmt: &TypedStmt) {
     match stmt {
-        TypedStmt::Let { name, expr, drop_synthesized: _ } => {
+        TypedStmt::Let { name, expr } => {
             let result = lower_typed_expr(ctx, expr);
             match result {
                 ExprResult::Ptr(ptr, ty) => {

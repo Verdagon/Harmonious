@@ -3098,59 +3098,100 @@ Cleanup runs only on cancellation. Normal completion is handler-free. If a user 
 
 ### 15.7 The drop emission mechanism — AST-rewrite synthesis
 
-**Updated 2026-06-23 (Phase E + E.b/c/d).** Drop is not architecturally
-special; it is just a function that the language sometimes auto-calls.
-Sky's frontend implements this principle through a single AST-rewrite
-pass that runs immediately after type resolution. After the pass,
-every downstream stage — dep walker, mono cascade, per_instance_mir,
-codegen, symbol resolution, link — treats drop calls as ordinary
-trait static calls with no drop-specific code paths.
+**Updated 2026-06-25 (drop-is-just-a-function migration).** Drop is not
+architecturally special; it is just a function that the language
+sometimes auto-calls. Sky's frontend implements this through a single
+AST-rewrite pass that runs immediately after type resolution. After the
+pass, every downstream stage — dep walker, mono substitution,
+`per_instance_mir`, codegen, symbol resolution, link — treats the
+synthesized scope-end calls as ordinary generic Rust function calls
+with **zero drop-specific code paths**. The word "drop" does not appear
+in any code path triggered by `per_instance_mir`'s invocation.
 
 **The mechanism in five steps.**
 
 1. **Source-level Drop impls are normal trait impls.** A Sky type that
    needs cleanup carries an `export impl Drop for X { fn drop(&mut self) { ... } }`
    in Sky source. From Sky's typechecker's view, Drop is just a Rust
-   trait that Sky source can impl, no different from `Clone`.
+   trait that Sky source can impl, no different from `Clone`. The
+   impl block's emission + cascade discovery + `fill_extra_modules`
+   pipeline is unchanged from §6's normal trait-impl handling.
 
-2. **stub_gen emits the impl declaration.** Stub source contains
-   `impl Drop for X { fn drop(&mut self) { unreachable!() } }` (with
-   `unreachable!()` body — Sky's `fill_extra_modules` supplies the
-   real body, same as case4's Clone pattern). Stub_gen also emits
-   `pub use core::ops::Drop;` unconditionally (gated on absence to
-   avoid colliding with any user `use std::ops::Drop` import) so the
-   trait DefId is always resolvable from the synthesis pass.
+2. **stub_gen emits the impl declaration + a thin generic wrapper.**
+   Stub source contains `impl Drop for X { fn drop(&mut self) { unreachable!() } }`
+   (with `unreachable!()` body — Sky's `fill_extra_modules` supplies
+   the real body, same as case4's Clone pattern). Stub_gen also emits
+   `pub use core::ops::Drop;` so the trait DefId resolves for the
+   user-source impl block. Additionally — and this is what makes drop
+   "just a function" at the mono path — stub_gen emits a Sky-owned
+   thin generic wrapper:
+   ```rust
+   #[inline(always)]
+   pub unsafe fn __toylang_drop<T>(x: *mut T) {
+       core::ptr::drop_in_place(x)
+   }
+   ```
+   This wrapper is a NORMAL generic Rust fn (`InstanceKind::Item`, real
+   MIR body). The `drop_in_place` reference inside its body is where
+   rustc's `InstanceKind::DropGlue` resolution happens, but rustc
+   handles that internally when it walks the wrapper's body during
+   mono collection — it's invisible to Sky.
 
 3. **Type resolution runs.** `resolve_fn_body` produces the typed AST
    as usual — no drop knowledge anywhere.
 
-4. **`insert_scope_end_drops` synthesizes drop calls into the typed AST.**
-   This is the ONE site that knows about Drop. The pass:
+4. **`insert_scope_end_drops` synthesizes scope-end calls into the typed AST.**
+   This is the ONE site that knows scope-end calls exist. The pass:
    - Skips entirely when the function has a non-void return (the
      caller's let-binding takes ownership of the returned value via
      move semantics; dropping our local would double-drop).
-   - For each `let` binding in the function body whose type needs a
-     drop (predicate `local_needs_scope_drop(tcx, ty, registry)` —
-     see below), appends a synthetic `TypedStmt::ExprStmt(TypedExprKind::StaticCall { ty: "Drop", method: "drop", args: [Ref(Var(local_name))] })`
+   - For EVERY `let` binding in the function body, appends a synthetic
+     `TypedStmt::ExprStmt(TypedExprKind::FnCall { name: "__toylang_drop", type_args: [T], args: [Ref(Var(local_name))] })`
      to the block's stmts in REVERSE declaration order (LIFO — Rust's
-     drop order).
+     drop order). No predicate, no `local_needs_scope_drop` decision —
+     the wrapper's body bottoms out at `drop_in_place::<T>` which
+     rustc generates as a no-op for trivially-droppable T (i32,
+     Option, primitives) and as the full drop chain for needs-drop T
+     (Vec, Widget, Box). Same call shape for every let.
 
 5. **The synthesized calls flow through the existing pipeline unchanged.**
-   - `walk_typed_body_for_deps` collects them via its standard
-     `rust_method_deps` arm.
-   - `collect_rust_deps_recursive` queues `<T as Drop>::drop` as a
-     Rust dep through the trait-method dispatch path.
-   - The per_instance_mir cascade surfaces the dep so rustc's mono
-     collector queues the concrete monomorphization.
+   The wrapper-shape is a plain generic `FnCall` — indistinguishable
+   from any user-written `FnCall { name: "...", type_args, args }`:
+   - `walk_typed_body_for_deps` collects each as `(name, type_args)`
+     via its standard FnCall arm.
+   - `collect_rust_deps_recursive` calls `find_use_imported_fn_def_id(tcx, "__toylang_drop")`
+     → returns the wrapper's DefId. Pushes `(wrapper_def_id, [T])` as
+     a Rust dep.
+   - `per_instance_mir`'s `build_dependency_body` emits a
+     `ReifyFnPointer` cast targeting the concrete `__toylang_drop::<T>`
+     instance.
+   - Rustc's mono collector queues the wrapper instance (`InstanceKind::Item`),
+     walks its MIR body, sees the `drop_in_place::<T>` call inside the
+     wrapper, queues `drop_in_place::<T>` via its standard
+     `InstanceKind::DropGlue` machinery (transparent to Sky), recursively
+     queues drop-glue for `T`'s fields and any `<T as Drop>::drop`
+     trait method if T has an explicit impl.
    - For Sky-defined Drop impls (e.g. `<Widget as Drop>::drop`), the
      cascade discovery (`is_consumer_trait_impl_method`) captures the
-     instance and `fill_extra_modules` emits Sky's body — exactly the
-     same path case4's Clone uses.
+     instance reachable through the drop-glue chain and `fill_extra_modules`
+     emits Sky's body — exactly the same path case4's Clone uses.
    - For std-defined Drop impls (e.g. `<Vec<Widget> as Drop>::drop`),
      rustc emits the body from std's source as part of its normal
      cross-crate generic mono.
-   - `lower_typed_expr`'s `StaticCall` arm emits the LLVM call at the
-     resolved symbol.
+   - `lower_typed_expr`'s `FnCall` arm emits the LLVM call to
+     `__toylang_drop::<T>` at the resolved symbol; `#[inline(always)]`
+     means LLVM inlines the wrapper body at every Sky call site, so
+     the wrapper has no runtime cost beyond what `drop_in_place::<T>`
+     itself costs (which is zero for trivially-droppable T).
+
+   **The mono path itself never thinks about drop as special.** No
+   `local_needs_scope_drop` predicate, no `LIFECYCLE_TRAITS` registry,
+   no `insert_late_scope_end_drops` post-substitution pass, no
+   `drop_synthesized` flag on `TypedStmt::Let`. The word "drop" does
+   not appear in `per_instance_mir`'s code or in any function it
+   invokes during dep collection. `__toylang_drop` is a function whose
+   name happens to start with "drop"; structurally it's just another
+   use-imported generic Rust fn.
 
 **The dual-path drop model — both Sky source and Rust source converge at the same body.**
 Drop calls reach Sky's emitted body via two structurally different
@@ -3189,29 +3230,24 @@ no benefit). The convergence at a single symbol is the load-bearing
 property — without it, the two paths would need separate implementations
 of every Sky type's drop logic.
 
-**The predicate.** `local_needs_scope_drop(tcx, ty, registry, caller_type_params)` returns
-true when the type has a callable Drop trait method:
-- **Sky struct types** (`StructRef` / `Struct`): true iff
-  `registry.trait_impls` contains a matching `impl Drop for <name>` entry.
-- **Rust types** (`RustType`): true iff `tcx.adt_destructor(adt_def.did())`
-  returns `Some(_)`. This is rustc's query for "does this ADT have an
-  explicit `impl Drop`?" — returns `Some` for Vec/String/Box/etc.,
-  `None` for Option/Result/Stdout/primitives whose drop semantics
-  flow through auto-generated `DropGlue` with no trait-method symbol.
-  Without this filter, synthesizing `Drop::drop` on the latter types
-  ICEs rustc's mono collector ("failed to resolve instance for
-  `<Option<i32> as Drop>::drop`"). The `caller_type_params` arg
-  (sunny-karp, §19.5 Layer 2) lets the predicate answer correctly for
-  Param-bearing args like `Vec<T>`: the destructor is an ADT property
-  of `Vec`, valid regardless of whether `T` is concrete; only the
-  `try_resolved_to_rustc_ty` conversion needs Param-aware index lookup.
-- **Bare `TypeParam`**: returns false. The drop-or-not decision genuinely
-  needs the substituted concrete type. The late
-  `insert_late_scope_end_drops` pass at mono (sunny-karp) re-checks any
-  `TypedStmt::Let` whose `drop_synthesized` flag is still `false` after
-  substitution; that's the pass that closes the bare-T drop gap (see
-  §19.5 Layer 2 + §F.20).
-- Everything else (primitives, refs, unsized types): false.
+**No predicate, no late pass.** The pre-2026-06-25 `local_needs_scope_drop`
+predicate + the sunny-karp `insert_late_scope_end_drops` mono pass +
+the `drop_synthesized` flag on `TypedStmt::Let` + the `LIFECYCLE_TRAITS`
+registry have all retired. The wrapper-shape emission means every let
+gets the same `__toylang_drop::<T>(&local)` call regardless of T;
+rustc's `drop_in_place::<T>` (called inside the wrapper) handles
+trivially-droppable T as a no-op and needs-drop T as the full drop
+chain. Sky's compiler makes ZERO drop-trait decisions; rustc's
+drop-glue machinery runs entirely inside the wrapper body, transparent
+to Sky's mono path.
+
+This closes the bare-`TypeParam` drop gap structurally rather than via
+the sunny-karp two-pass scheme. `let x: T = ...` in a generic body
+synthesizes `__toylang_drop::<T>(&x)` at the eager pass; mono
+substitutes `T → ConcreteT` like any other generic call's `type_args`;
+the wrapper's `drop_in_place::<ConcreteT>` does the right thing for
+any ConcreteT (no-op for i32, real drop chain for Widget, Vec, etc.).
+No mono-time drop-specific work.
 
 **Linear types** are simply Sky source types whose user-written
 `impl Drop` body invokes `sky_runtime_panic` + `abort()`. There is no
