@@ -66,6 +66,7 @@
 //! body (rustc fork patch 4) is the sole def at link time.
 
 pub mod cross_crate_inlinable;
+pub mod deduce_param_attrs;
 // `drop_glue` module retired 2026-06-23 (Phase E — see module-level doc).
 pub mod layout;
 pub mod partition;
@@ -92,9 +93,19 @@ pub fn lang_override_queries(
         providers.queries.collect_and_partition_mono_items,
         providers.queries.cross_crate_inlinable,
         providers.extern_queries.cross_crate_inlinable,
+        providers.queries.deduced_param_attrs,
     );
 
     providers.queries.layout_of        = layout::lang_layout_of;
+    // Phase P (2026-06-25, handoff §Phase P): override `deduced_param_attrs`
+    // to return `&[]` for `#[toylang::emit_consumer_body]`-tagged items.
+    // Closes a latent silent-UB vector — rustc's MIR analysis on Sky's
+    // `unreachable!()` stub body wrongly infers `readonly` + `captures(none)`
+    // for indirect-passed params, which LLVM trusts at every Rust call site.
+    // Sky's actual body may mutate `&mut LargeStruct` etc., making the attr
+    // a LIE → silent miscompile at -O2+. See the override module for the
+    // full rationale.
+    providers.queries.deduced_param_attrs = deduce_param_attrs::lang_deduced_param_attrs;
     // `mir_shims` override retired 2026-06-23 (Phase E). Rustc's default
     // DropGlue path fires unchanged; per-type drop semantics come from
     // stub_gen-emitted Drop impl bridges + Sky drop fns via per_instance_mir.

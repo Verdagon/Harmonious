@@ -56,6 +56,7 @@ const EXPECTED_AUDIT_MARKERS: &[(&str, &str)] = &[
     ("per_instance.rs", "cache-audit:"),
     ("partition.rs", "cache-audit:"),
     ("cross_crate_inlinable.rs", "cache-audit:"),
+    ("deduce_param_attrs.rs", "cache-audit:"),
 ];
 
 #[test]

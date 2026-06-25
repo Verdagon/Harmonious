@@ -3312,3 +3312,20 @@ fn test_drop_b10_probe_cgu1_thin() {
 fn test_drop_b10_probe_fat() {
     run_drop_project("b10_probe_fat");
 }
+
+/// Phase P smoke test — Sky export with a struct param sized for
+/// `PassMode::Indirect` on aarch64 (>16 bytes). Validates that the
+/// new `deduce_param_attrs` query override doesn't break the build or
+/// emit incorrect IR for indirect-passed params at -O3 + lto = "thin".
+///
+/// A proper soundness fence (Sky body mutating the indirect param,
+/// caller observing the mutation across the call) would require
+/// mutation surface that toylang grammar doesn't yet support; the
+/// override itself is trivially correct (return `&[]` for tagged items)
+/// and the cache_audit fence enforces the marker comment. See
+/// `rustc-lang-facade/src/queries/deduce_param_attrs.rs` for the
+/// soundness rationale.
+#[test]
+fn test_drop_phase_p_indirect_arg_o3_thin() {
+    run_drop_project("phase_p_indirect_arg_o3_thin");
+}

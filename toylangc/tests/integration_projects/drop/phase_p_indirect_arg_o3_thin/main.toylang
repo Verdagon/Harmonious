@@ -1,0 +1,44 @@
+// Phase P fence — smoke test for the deduce_param_attrs override.
+//
+// `Big` is sized so that rustc's ABI passes it via PassMode::Indirect on
+// aarch64 (>16 bytes). Without the deduce_param_attrs override, rustc
+// would analyze first_field's `unreachable!()` stub MIR and conclude
+// PassMode::Indirect param `b` is `readonly` + `captures(none)` (since
+// the stub never reads/writes locals). LLVM applies the attrs at every
+// Rust call site.
+//
+// Sky's actual fill_extra_modules-emitted body reads `b.a` (only reads,
+// no mutation) so the soundness bug doesn't surface at runtime in this
+// specific shape — `readonly` happens to be correct here. The fence
+// runs the path through the new override + checks build + correct output
+// at -O3 + lto = "thin"; a proper soundness assertion would require a
+// Sky source pattern that mutates an indirect-passed param, which
+// toylang grammar can't express today (no `&mut` non-receiver args; no
+// field assignment).
+//
+// Override soundness rationale (the actual win):
+//   When toylang grammar later gains mutation surface (or when Sky proper
+//   lands with its full source language), `pub fn process(d: &mut Big)`
+//   with a mutating body would silently UB at -O2+ if deduce_param_attrs
+//   continued to analyze the unreachable!() stub. The override returns
+//   &[] for tagged items, so the readonly claim is never made. See
+//   `rustc-lang-facade/src/queries/deduce_param_attrs.rs` header.
+
+fn println_i64(x: i64)
+
+struct Big {
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+}
+
+export fn first_field(b: Big) -> i64 {
+    b.a
+}
+
+fn main() {
+    let big = Big { a: 42, b: 0, c: 0, d: 0 };
+    let v = first_field(big);
+    println_i64(v);
+}
