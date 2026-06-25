@@ -525,11 +525,60 @@ fn push_arg_for_rust_call<'ctx>(
             let arg_ptr = arg.into_ptr(&ctx.builder, arg_ty, "method_arg");
             call_args.push(arg_ptr.into());
         }
-        CoercedParam::Pair(_a_str, _b_str) => {
+        CoercedParam::Pair(a_str, b_str) => {
             // Fat pointer / two-scalar aggregate — extract and pass separately.
             // Source of truth is rustc's coerced_param shape.
-            let val = lower_typed_expr(ctx, arg_expr).into_value(&ctx.builder);
-            let struct_val = val.into_struct_value();
+            //
+            // Phase R Site #1: the original implementation assumed the
+            // source value was always a struct-typed loaded value (so
+            // `into_struct_value()` would succeed). That holds for
+            // `&str` / `&[u8]` (Sky resolves both as `{ ptr, i64 }`
+            // struct) — but NOT for sources whose toylang type
+            // resolves to a non-struct LLVM type while rustc's ABI
+            // happens to coerce the arg to `Pair`. The likely path is
+            // narrow under today's toylang grammar (thin refs are
+            // Direct, not Pair), but a thin pointer typed at the
+            // toylang side as `Ref { inner: Struct }` would surface
+            // here as a `PointerType` value → `into_struct_value()`
+            // would panic.
+            //
+            // Defensive fix: if the source value's LLVM type doesn't
+            // match the expected Pair struct shape, reinterpret via
+            // memory (same @ACRTFDZ pattern Direct's aggregate→scalar
+            // case uses). Build the target `{ a, b }` struct type from
+            // the coerced strings, alloca, store source bits, load as
+            // the Pair struct, then extract.
+            let arg_result = lower_typed_expr(ctx, arg_expr);
+            let arg_toylang_ty = ctx.resolved_to_inkwell(&arg_expr.ty);
+            let a_ty = parse_coerced_type(ctx, a_str);
+            let b_ty = parse_coerced_type(ctx, b_str);
+            let pair_struct_ty = ctx.context.struct_type(&[a_ty, b_ty], false);
+            let pair_basic: BasicTypeEnum = pair_struct_ty.into();
+
+            let struct_val = if arg_toylang_ty == pair_basic {
+                arg_result.into_value(&ctx.builder).into_struct_value()
+            } else {
+                // Memory reinterpret. Use the LARGER of the two LLVM
+                // types as the alloca to accommodate both writes.
+                let pointer_bytes = ctx.pointer_align;
+                let src_size = static_size_bytes(arg_toylang_ty, pointer_bytes);
+                let pair_size = static_size_bytes(pair_basic, pointer_bytes);
+                let alloca_ty = if pair_size >= src_size { pair_basic } else { arg_toylang_ty };
+                let buf = ctx.builder.build_alloca(alloca_ty, "pair_coerce_buf").unwrap();
+                // Store source value into the buffer at its native type.
+                let src_ptr = arg_result.into_ptr(&ctx.builder, arg_toylang_ty, "pair_src");
+                let copy_size = src_size.min(pair_size);
+                let copy_size_val = ctx.context.i64_type().const_int(copy_size, false);
+                ctx.builder.build_memcpy(
+                    buf, ctx.pointer_align as u32,
+                    src_ptr, ctx.pointer_align as u32,
+                    copy_size_val,
+                ).unwrap();
+                ctx.builder
+                    .build_load(pair_basic, buf, "pair_coerce_load")
+                    .unwrap()
+                    .into_struct_value()
+            };
             let first = ctx.builder.build_extract_value(struct_val, 0, "pair_first").unwrap();
             let second = ctx.builder.build_extract_value(struct_val, 1, "pair_second").unwrap();
             call_args.push(first.into());
@@ -1630,10 +1679,32 @@ fn lower_typed_expr<'ctx>(
 
                 let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
 
+                // Phase R Sites #5/#6: when the receiver coerces to
+                // `Pair` (e.g. trait impl on `[T]` / `str` where self is
+                // `&[T]` / `&str` — a fat pointer rustc decomposes into
+                // (ptr, len) scalars), pushing the receiver as a single
+                // `ptr` would mismatch the function signature. Dispatch
+                // through `push_arg_for_rust_call` to extract both
+                // scalars and push them in sequence. Direct/Indirect
+                // shapes keep the existing thin-pointer push, which is
+                // what every Sky struct + Rust opaque-type receiver
+                // produces today.
+                let push_receiver = |ctx: &mut CodegenCtx<'ctx, '_, '_>,
+                                     call_args: &mut Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>| {
+                    use rustc_lang_facade::abi_helpers::CoercedParam;
+                    match &coerced_params[0] {
+                        CoercedParam::Pair(_, _) => {
+                            push_arg_for_rust_call(ctx, recv_expr, &coerced_params[0], call_args);
+                        }
+                        _ => {
+                            call_args.push(recv_ptr.into());
+                        }
+                    }
+                };
                 if is_sret {
                     let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, &format!("{}_trait", ty));
                     call_args.push(alloca.into());
-                    call_args.push(recv_ptr.into());
+                    push_receiver(ctx, &mut call_args);
                     for (i, arg_expr) in args[1..].iter().enumerate() {
                         // coerced_params[0] is self; explicit args start at index 1.
                         push_arg_for_rust_call(ctx, arg_expr, &coerced_params[1 + i], &mut call_args);
@@ -1649,7 +1720,7 @@ fn lower_typed_expr<'ctx>(
                     let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
                     ExprResult::Ptr(alloca, opaque_ty)
                 } else {
-                    call_args.push(recv_ptr.into());
+                    push_receiver(ctx, &mut call_args);
                     for (i, arg_expr) in args[1..].iter().enumerate() {
                         push_arg_for_rust_call(ctx, arg_expr, &coerced_params[1 + i], &mut call_args);
                     }
@@ -1891,11 +1962,30 @@ fn lower_typed_expr<'ctx>(
             // Clone so we don't hold a borrow on ctx.rust_method_info while
             // lowering args (which needs &mut ctx).
             let coerced_params = info.coerced_params.clone();
+            // Phase R Site #6: same Pair-receiver dispatch as Site #5
+            // (trait static call). When the method's `self` coerces to
+            // `Pair` (e.g., `impl SomeTrait for [T]`'s `&self` →
+            // `(ptr, len)`), pushing `recv_ptr` as a single thin pointer
+            // mismatches the function signature. Direct/Indirect shapes
+            // keep the existing thin-pointer push.
+            let push_method_receiver = |ctx: &mut CodegenCtx<'ctx, '_, '_>,
+                                        call_args: &mut Vec<inkwell::values::BasicMetadataValueEnum<'ctx>>| {
+                use rustc_lang_facade::abi_helpers::CoercedParam;
+                match &coerced_params[0] {
+                    CoercedParam::Pair(_, _) => {
+                        push_arg_for_rust_call(ctx, receiver, &coerced_params[0], call_args);
+                    }
+                    _ => {
+                        call_args.push(recv_ptr.into());
+                    }
+                }
+            };
             if is_sret {
                 // sret method call (constructor-like returning opaque type)
                 let alloca = ctx.alloca_opaque_rust_ty(&expr.ty, "method_sret");
                 let opaque_ty = ctx.rust_ty_to_llvm_opaque(&expr.ty).0;
-                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![alloca.into(), recv_ptr.into()];
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![alloca.into()];
+                push_method_receiver(ctx, &mut call_args);
                 for (i, a) in args.iter().enumerate() {
                     // coerced_params[0] is self; explicit args start at index 1.
                     push_arg_for_rust_call(ctx, a, &coerced_params[1 + i], &mut call_args);
@@ -1911,7 +2001,8 @@ fn lower_typed_expr<'ctx>(
                 ExprResult::Ptr(alloca, opaque_ty)
             } else {
                 // Non-sret method call
-                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = vec![recv_ptr.into()];
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
+                push_method_receiver(ctx, &mut call_args);
                 for (i, a) in args.iter().enumerate() {
                     push_arg_for_rust_call(ctx, a, &coerced_params[1 + i], &mut call_args);
                 }
@@ -2186,11 +2277,19 @@ fn resolve_rust_symbol<'tcx>(
 
 
 fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTypeEnum<'ctx> {
-    if s == "ptr" {
-        return ctx.context.ptr_type(AddressSpace::default()).into();
-    }
-    if s == "double" {
-        return ctx.context.f64_type().into();
+    // Float arms — covers the full set rustc's abi_helpers emits via
+    // `primitive_to_llvm_str` and `reg_to_llvm_str`. Phase R Site #10:
+    // before this, only "double" was handled; any other float string
+    // (Sky source returning/taking f32 once toylang grammar grows it,
+    // or SIMD-using Sky exports producing vector returns) would panic
+    // with "unsupported coerced type: ...".
+    match s {
+        "ptr" => return ctx.context.ptr_type(AddressSpace::default()).into(),
+        "half" => return ctx.context.f16_type().into(),
+        "float" => return ctx.context.f32_type().into(),
+        "double" => return ctx.context.f64_type().into(),
+        "fp128" => return ctx.context.f128_type().into(),
+        _ => {}
     }
     if s.starts_with("i") {
         let bits: u32 = s[1..].parse().unwrap_or_else(|_| panic!("bad coerced type: {}", s));
@@ -2205,6 +2304,23 @@ fn parse_coerced_type<'ctx>(ctx: &CodegenCtx<'ctx, '_, '_>, s: &str) -> BasicTyp
             BasicTypeEnum::IntType(it) => it.array_type(count).into(),
             BasicTypeEnum::FloatType(ft) => ft.array_type(count).into(),
             _ => panic!("unsupported array element type"),
+        }
+    } else if s.starts_with("<") && s.ends_with(">") {
+        // LLVM vector type like "<8 x i8>" — produced by
+        // `reg_to_llvm_str` for `RegKind::Vector`. Rustc emits this
+        // when the ABI uses a vector register for a coerced return /
+        // param. Not currently triggered by toylang (no SIMD types in
+        // the grammar) but added defensively so the trigger surface
+        // doesn't ICE on first SIMD use.
+        let inner = &s[1..s.len()-1]; // "8 x i8"
+        let parts: Vec<&str> = inner.split(" x ").collect();
+        let count: u32 = parts[0].trim().parse()
+            .unwrap_or_else(|_| panic!("bad vector size in coerced type: {}", s));
+        let elem = parse_coerced_type(ctx, parts[1].trim());
+        match elem {
+            BasicTypeEnum::IntType(it) => it.vec_type(count).into(),
+            BasicTypeEnum::FloatType(ft) => ft.vec_type(count).into(),
+            _ => panic!("unsupported vector element type: {}", parts[1].trim()),
         }
     } else if s.starts_with("{") {
         parse_struct_type_str(ctx, s).into()
