@@ -687,6 +687,75 @@ fn is_internal_sret(ty: &ResolvedType) -> bool {
     matches!(ty, ResolvedType::Struct { .. } | ResolvedType::RustType { .. })
 }
 
+/// Compute the LLVM-level byte size of a BasicTypeEnum at codegen time.
+/// Used by codegen_extern_wrapper's sret-bridge to size the staging alloca
+/// (`max(internal_ty_size, rust_ret_type_size)`) — see Phase R Site #8.
+///
+/// LLVM's `type.size_of()` returns a const-expression IntValue that we
+/// can't directly extract as a u64 (it's `LLVMSizeOf(ty)`, a constant
+/// expression, not a literal constant). This helper computes the same
+/// thing at the Rust level by walking the type structure.
+///
+/// Alignment-padding follows LLVM's natural rules (each field aligns to
+/// its own size; struct rounds up to its max-field alignment). Matches
+/// what `resolved_to_inkwell` produces for Sky structs and what
+/// `parse_coerced_type` produces for Rust ABI returns. Caller must
+/// supply `pointer_bytes` (typically 8 on aarch64; comes from
+/// `tcx.data_layout.pointer_size().bytes()`).
+fn static_size_bytes(ty: BasicTypeEnum<'_>, pointer_bytes: u64) -> u64 {
+    fn align_up(n: u64, align: u64) -> u64 {
+        if align <= 1 { n } else { (n + align - 1) & !(align - 1) }
+    }
+    match ty {
+        BasicTypeEnum::IntType(it) => {
+            let bits = it.get_bit_width() as u64;
+            (bits + 7) / 8
+        }
+        BasicTypeEnum::FloatType(_) => {
+            // inkwell's FloatType doesn't expose bit_width; rely on
+            // printed-name match. f32=4, f64=8, half=2, x86_fp80=10,
+            // fp128/ppc_fp128=16. Sky never emits float types outside
+            // f64 today, but cover the standard set defensively.
+            let name = ty.print_to_string().to_str().unwrap_or("").to_string();
+            match name.as_str() {
+                "half" => 2,
+                "float" => 4,
+                "double" => 8,
+                "x86_fp80" => 10,
+                "fp128" | "ppc_fp128" => 16,
+                _ => panic!("static_size_bytes: unrecognized float type '{}'", name),
+            }
+        }
+        BasicTypeEnum::PointerType(_) => pointer_bytes,
+        BasicTypeEnum::ArrayType(at) => {
+            let elem = at.get_element_type();
+            let count = at.len() as u64;
+            static_size_bytes(elem, pointer_bytes) * count
+        }
+        BasicTypeEnum::StructType(st) => {
+            // Mirror LLVM's natural struct layout: each field at its own
+            // alignment, struct rounds up to max-field alignment.
+            let mut offset = 0u64;
+            let mut max_align = 1u64;
+            for i in 0..st.count_fields() {
+                let field = st.get_field_type_at_index(i)
+                    .unwrap_or_else(|| panic!(
+                        "static_size_bytes: struct field {} missing", i
+                    ));
+                let field_size = static_size_bytes(field, pointer_bytes);
+                let field_align = field_size.max(1).min(pointer_bytes);
+                offset = align_up(offset, field_align);
+                offset += field_size;
+                max_align = max_align.max(field_align);
+            }
+            align_up(offset, max_align)
+        }
+        BasicTypeEnum::VectorType(_) | BasicTypeEnum::ScalableVectorType(_) => {
+            panic!("static_size_bytes: vector types not supported");
+        }
+    }
+}
+
 /// Codegen a toylang function body with the simple internal ABI.
 /// Structs/Vec always use sret (ptr first param, void return).
 /// Primitives return directly. No Rust ABI coercion.
@@ -1151,12 +1220,44 @@ fn codegen_extern_wrapper<'ctx, 'tcx>(
         ctx.builder.build_return(None).unwrap();
     } else if internal_sret {
         // Per @ACRTFDZ, internal used sret but Rust expects a direct return
-        // (e.g., {i32,i32} coerced to i64). Load from the sret alloca as the
-        // ABI-coerced type so the return matches what the caller expects.
-        let tmp = call_args[0].into_pointer_value();
-        let coerced_val = ctx.builder.build_load(
-            rust_ret_type.unwrap(), tmp, "coerced_ret",
+        // (e.g., {i32,i32} coerced to i64). Bridge via two allocas + memcpy:
+        //   1. internal_buf (the existing wrapper_sret alloca, sized as the
+        //      internal toylang LLVM type) is the sret target the internal
+        //      fn wrote into.
+        //   2. coerced_buf (new alloca sized as rust_ret_type) is the staging
+        //      buffer we load the return value from.
+        //   3. memcpy min(internal_size, rust_size) bytes between them.
+        //
+        // The min() guard handles BOTH directions:
+        //   - rust_ret_type SIZE > internal_size (e.g., 5-byte struct of
+        //     bools coerced to i64). Without the second alloca, loading
+        //     rust_ret_type from internal_buf reads past internal_buf →
+        //     stack garbage at -O1+ (Site #8 of the round-4-close emission
+        //     audit; silent miscompile pre-fix).
+        //   - rust_ret_type SIZE < internal_size. The memcpy copies only
+        //     rust_size bytes; coerced_buf is exactly that size; load fits.
+        //
+        // Same B10 shape as the push_arg_for_rust_call::Direct fix: declared
+        // signature and actual emission must match exactly under ABI coercion.
+        let internal_buf = call_args[0].into_pointer_value();
+        let rust_ty = rust_ret_type.unwrap();
+        let pointer_bytes = ctx.pointer_align;
+        let internal_size = static_size_bytes(ret_complex_ty.unwrap(), pointer_bytes);
+        let rust_size = static_size_bytes(rust_ty, pointer_bytes);
+        let copy_size = internal_size.min(rust_size);
+
+        let coerced_buf = ctx.builder
+            .build_alloca(rust_ty, "wrapper_sret_coerced")
+            .unwrap();
+        let copy_size_val = ctx.context.i64_type().const_int(copy_size, false);
+        ctx.builder.build_memcpy(
+            coerced_buf, ctx.pointer_align as u32,
+            internal_buf, ctx.pointer_align as u32,
+            copy_size_val,
         ).unwrap();
+        let coerced_val = ctx.builder
+            .build_load(rust_ty, coerced_buf, "coerced_ret")
+            .unwrap();
         ctx.builder.build_return(Some(&coerced_val)).unwrap();
     } else {
         // Both return directly — forward the internal function's return value
