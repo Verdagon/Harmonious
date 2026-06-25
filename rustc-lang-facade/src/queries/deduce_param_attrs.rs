@@ -88,7 +88,7 @@
 //!
 //! ## Verification (2026-06-25)
 //!
-//! IR inspection of the existing `bench4_largestruct_byval_thin` fixture
+//! IR inspection of the existing `bench4_artifactual_loopfold_only` fixture
 //! confirms the override fires. The fixture has Sky exports
 //! `make_large(i64) -> LargeStruct` and `first_field(LargeStruct) -> i64`
 //! where `LargeStruct` is 32 bytes (`PassMode::Indirect`). Without the

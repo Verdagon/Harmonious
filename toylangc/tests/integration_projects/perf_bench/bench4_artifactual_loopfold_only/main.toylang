@@ -1,0 +1,39 @@
+// Bench 4 (artifactual_loopfold_only): RETAINED for two reasons despite
+// the original perf premise being artifactual:
+//
+//   1. **Phase P IR fence.** Exercises Sky exports with
+//      `PassMode::Indirect` params (32-byte LargeStruct) so we can
+//      IR-inspect the deduce_param_attrs override's effect. See
+//      `rustc-lang-facade/src/queries/deduce_param_attrs.rs` for the
+//      verification notes — post-Phase-P this fixture's IR shows
+//      `captures(address)` not `captures(none)`, no `readonly` attr,
+//      proving the override fires.
+//
+//   2. **Documents the artifactual perf finding.** The original
+//      Bench 4 reported "Sky matches inlineable Rust at 0.1% delta"
+//      which was loop-fold artifact (no black_box; LLVM constant-folded
+//      the inner loop). Bench 4b (`bench4b_blackbox_sky` +
+//      `bench4b_blackbox_rust_inlineable`) is the meaningful perf
+//      measurement using `std::hint::black_box`. Bench 4 is preserved
+//      under its rename `bench4_artifactual_loopfold_only` (2026-06-25,
+//      handoff A2) so a future reader doesn't redo the same misleading
+//      measurement.
+//
+// `LargeStruct` is 32 bytes (4 × i64) — comfortably above aarch64's
+// PassMode::Indirect threshold. Rust callers pass it via pointer; the
+// callee gets logical ownership of a copy.
+
+struct LargeStruct {
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+}
+
+export fn first_field(x: LargeStruct) -> i64 {
+    x.a
+}
+
+export fn make_large(a: i64) -> LargeStruct {
+    LargeStruct { a: a, b: 0, c: 0, d: 0 }
+}

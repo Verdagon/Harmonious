@@ -1,5 +1,5 @@
 [project]
-name = "bench4_largestruct_byval_thin"
+name = "bench4_artifactual_loopfold_only"
 source = "main.toylang"
 rust_caller = "rust_caller.rs"
 features = ["allocator_api"]

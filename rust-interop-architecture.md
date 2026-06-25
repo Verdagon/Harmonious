@@ -6893,7 +6893,7 @@ conservative safe default. Path-b emission (Sky stamping ground-truth
 attrs at the wrapper boundary) is deferred to v2; current bench-shaped
 workloads inline through the wrapper at thin LTO making per-call
 attr decoration moot (see §22.4's v1 wrapper-attr posture paragraph).
-Verification: IR inspection of the existing `bench4_largestruct_byval_thin`
+Verification: IR inspection of the existing `bench4_artifactual_loopfold_only`
 fixture confirms the override fires. Sky's tagged-item declarations
 show `captures(address)` (default for `&T`/sret) not `captures(none)`
 (which `deduce_param_attrs` would have added), and no `readonly` attr.
