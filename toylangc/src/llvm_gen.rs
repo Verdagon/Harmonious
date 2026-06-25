@@ -745,11 +745,25 @@ fn is_internal_sret(ty: &ResolvedType) -> bool {
 /// expression, not a literal constant). This helper computes the same
 /// thing at the Rust level by walking the type structure.
 ///
-/// Alignment-padding follows LLVM's natural rules (each field aligns to
-/// its own size; struct rounds up to its max-field alignment). Matches
-/// what `resolved_to_inkwell` produces for Sky structs and what
-/// `parse_coerced_type` produces for Rust ABI returns. Caller must
-/// supply `pointer_bytes` (typically 8 on aarch64; comes from
+/// Alignment-padding follows the heuristic `field_align = min(field_size,
+/// pointer_bytes)`. This matches LLVM's actual rules EXACTLY for every
+/// type Sky's `resolved_to_inkwell` produces today:
+///   - bool/i1 (size 1, align 1) ✓
+///   - i32 (size 4, align 4) ✓
+///   - i64 / usize / ptr (size 8, align 8) ✓
+///   - f64 (size 8, align 8) ✓
+///   - struct of the above (align = max-field-align) ✓
+///
+/// Known divergence from LLVM for types Sky doesn't emit today:
+///   - i128 fields (LLVM aligns to 16; heuristic clamps to pointer_bytes=8)
+///   - Array fields (LLVM uses element-alignment; heuristic uses
+///     min(total_size, pointer_bytes))
+///   - Vector types (panic — unsupported)
+///
+/// When toylang grammar grows i128, fixed-size byte arrays, or SIMD,
+/// audit this helper against `TargetData::abi_alignment_of_type` (via
+/// inkwell) or migrate to using LLVM's data layout directly. Caller
+/// supplies `pointer_bytes` (typically 8 on aarch64; comes from
 /// `tcx.data_layout.pointer_size().bytes()`).
 fn static_size_bytes(ty: BasicTypeEnum<'_>, pointer_bytes: u64) -> u64 {
     fn align_up(n: u64, align: u64) -> u64 {

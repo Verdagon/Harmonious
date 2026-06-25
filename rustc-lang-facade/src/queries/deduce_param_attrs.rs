@@ -86,6 +86,32 @@
 //! the default provider unconditionally → byte-identical to vanilla
 //! rustc for every Rust caller's call site.
 //!
+//! ## Verification (2026-06-25)
+//!
+//! IR inspection of the existing `bench4_largestruct_byval_thin` fixture
+//! confirms the override fires. The fixture has Sky exports
+//! `make_large(i64) -> LargeStruct` and `first_field(LargeStruct) -> i64`
+//! where `LargeStruct` is 32 bytes (`PassMode::Indirect`). Without the
+//! override, `apply_deduced_attributes` would set `ReadOnly` + `CapturesNone`
+//! on the LLVM IR at every Rust caller's call site (the stub
+//! `unreachable!()` body produces an empty `UsageSummary` → rustc concludes
+//! the function neither reads nor captures its params).
+//!
+//! Post-fix IR (from `tmp/bench4_main.ll`):
+//!   declare void @make_large(ptr dead_on_unwind noalias noundef writable
+//!                            sret([32 x i8]) align 8 captures(address)
+//!                            dereferenceable(32), i64 noundef)
+//!   declare i64 @first_field(ptr dead_on_return noalias noundef align 8
+//!                            captures(address) dereferenceable(32))
+//!
+//! The params have `captures(address)` (the default for `&T`/sret), NOT
+//! `captures(none)` (which `deduce_param_attrs` would have added). Likewise
+//! NO `readonly` attr present. The override is suppressing the deduced
+//! attrs as intended. The remaining attrs (`noalias`, `noundef`, `align`,
+//! `dereferenceable`, `dead_on_*`, `writable`, `sret`) come from rustc's
+//! standard ABI emission for references and indirect returns — not from
+//! `deduced_param_attrs` — so they correctly stay.
+//!
 //! cache-audit: deduced_param_attrs's upstream declaration in
 //! `rustc_middle/src/query/mod.rs:2709-2712` has NO `cache_on_disk_if`
 //! modifier; rustc's macro emits the default policy of `false`, so

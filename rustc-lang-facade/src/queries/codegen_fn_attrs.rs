@@ -66,6 +66,47 @@
 //! unconditionally → byte-identical to vanilla rustc for every Rust
 //! caller's call site.
 //!
+//! ## Interaction audit (2026-06-25, handoff verification gap #9)
+//!
+//! Sky's `codegen_fn_attrs` override flows through one downstream
+//! query consumer:
+//!
+//! - `rustc_middle::ty::layout::fn_can_unwind` (layout.rs:1233-1257) —
+//!   consults `tcx.codegen_fn_attrs(did).flags.contains(NEVER_UNWIND)`
+//!   first; returns false (= can't unwind) if the flag is set. Result
+//!   feeds into codegen's landing-pad emission decisions.
+//!
+//! **Effective-no-op caveat under uniform panic=abort.** The same
+//! `fn_can_unwind` (layout.rs:1244-1246) early-returns false for ALL
+//! non-foreign items when `tcx.sess.panic_strategy().unwinds()` is
+//! false. Sky's enforced panic=abort posture (§16.1) makes this true,
+//! so for uniform panic=abort builds Phase Q gives NO ADDITIONAL
+//! BENEFIT — the `NEVER_UNWIND` flag is redundant with the existing
+//! panic_strategy check.
+//!
+//! **Where the override actually matters:** mixed-panic-strategy
+//! builds where a Sky stub_rlib compiled panic=abort gets consumed by
+//! a Rust crate compiled panic=unwind. In that case:
+//!   - The Sky-side `codegen_fn_attrs` query fires under panic=abort
+//!     session, returns attrs with NEVER_UNWIND set (Phase Q).
+//!   - The attrs flow through rmeta to the user_bin compile.
+//!   - User_bin's `fn_can_unwind` runs under panic=unwind session
+//!     → without Phase Q: false (NEVER_UNWIND unset, panic_strategy
+//!     unwinds, so returns true = can unwind). WITH Phase Q: true
+//!     (NEVER_UNWIND set, early-returns false = can't unwind).
+//!     Landing pads at Sky call sites eliminate.
+//!
+//! Phase Q's perf benefit is therefore measurable ONLY under
+//! mixed-panic-strategy interop. Under Sky's typical uniform
+//! panic=abort posture, it's a defensive correctness no-op.
+//!
+//! Downstream queries that DO NOT consume `codegen_fn_attrs` for
+//! Sky-tagged items (audited 2026-06-25):
+//! - `cross_crate_inlinable` — independent inlinability decision.
+//! - `deduced_param_attrs` — independent ABI attr inference.
+//! - `layout_of` — type layout, doesn't depend on fn-level attrs.
+//! - `mir_inliner_callees` / `mir_callgraph_cyclic` — MIR-level only.
+//!
 //! cache-audit: codegen_fn_attrs's upstream declaration in
 //! `rustc_middle/src/query/mod.rs` has `cache_on_disk_if { def_id.is_local() }`
 //! — disk-cached for local DefIds. Sky's override returns deterministic
