@@ -1,0 +1,28 @@
+// Bench 4b — Sky LargeStruct boundary cost with black_box defeating
+// constant-folding.
+//
+// Bench 4 (the previous attempt) was artifactual: LLVM constant-folded
+// `first_field(make_large(black_box(i)))` to just `i` and the inner
+// loop became `acc += i` (no actual cross-crate calls in the hot path).
+// Bench 4b uses `std::hint::black_box` on the LargeStruct VALUE between
+// make_large and first_field, forcing materialization. LLVM can still
+// inline through the Sky wrappers, but the LargeStruct bytes have to
+// actually live in memory + go across the boundary.
+//
+// This measures Sky's wrapper boundary cost when LLVM doesn't get to
+// skip the work via constant folding.
+
+struct LargeStruct {
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+}
+
+export fn first_field(x: LargeStruct) -> i64 {
+    x.a
+}
+
+export fn make_large(a: i64) -> LargeStruct {
+    LargeStruct { a: a, b: 0, c: 0, d: 0 }
+}

@@ -3344,3 +3344,20 @@ fn test_drop_phase_p_indirect_arg_o3_thin() {
 fn test_drop_bool_accessor_via_rust_caller() {
     run_drop_project("bool_accessor_via_rust_caller");
 }
+
+/// Regression fixture for the integer-literal widening bug found
+/// during Bench 4 IR verification 2026-06-25. Pre-fix, toylang's
+/// parser default-typed unsuffixed `0` as i32; the type resolver
+/// didn't coerce against the expected type. A struct like
+/// `W { a: i64, b: i64 } ... W { a: 0, b: 0 }` produced a typed
+/// AST where the field expressions had type i32, and codegen
+/// emitted `store i32 0` to the i64 field — leaving the upper 4
+/// bytes uninitialized. Silent miscompile any time the field was
+/// read. Fix: `type_resolve::resolve_expr`'s `IntLit` arm now widens
+/// i32 → i64/usize when the expected type calls for it (narrowing
+/// is still rejected). Probe just constructs an i64-field struct
+/// from unsuffixed literals and reads each field.
+#[test]
+fn test_drop_intlit_widening_struct_field() {
+    run_drop_project("intlit_widening_struct_field");
+}

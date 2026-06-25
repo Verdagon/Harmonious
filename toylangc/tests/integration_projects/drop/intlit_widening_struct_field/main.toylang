@@ -1,0 +1,43 @@
+// Regression fixture for the integer-literal widening bug found
+// during Bench 4 verification 2026-06-25.
+//
+// Bug: toylang's parser default-typed unsuffixed integer literals as
+// i32 (fitting values) or i64 (overflowing values). The type resolver
+// didn't coerce against the expected type, so a Sky source like
+// `struct W { a: i64 } ... W { a: 0 }` produced a typed AST where the
+// field expression had type i32 but the field type was i64. Codegen
+// then emitted `store i32 0` to the i64 field, leaving the upper 4
+// bytes uninitialized.
+//
+// Symptom: any code that reads the field as i64 sees stack garbage in
+// the upper 32 bits. Manifested in Bench 4's `make_large` as
+// `store i32 0` for fields `b`, `c`, `d` — visible in the disassembly
+// as `str wzr, [sp, #0xN]` instead of `str xzr, [sp, #0xN]`.
+//
+// Fix: type_resolve's `Expr::IntLit` arm now widens an i32-typed
+// literal to i64/usize when the expected type is one of those.
+// Narrowing is still rejected (explicit `2i64` in an i32 position
+// errors out, preserving test_arg_type_mismatch_i32_vs_i64).
+//
+// Probe: construct a struct with i64 fields initialized to unsuffixed
+// `0` literals, then read each field. Pre-fix, the upper 4 bytes of
+// each i64 field were uninitialized stack garbage; reading them as a
+// large positive value or wrapping the i64 to a negative number would
+// surface the bug.
+
+fn println_i64(x: i64)
+
+struct W {
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+}
+
+fn main() {
+    let w = W { a: 0, b: 0, c: 0, d: 0 };
+    println_i64(w.a);
+    println_i64(w.b);
+    println_i64(w.c);
+    println_i64(w.d);
+}

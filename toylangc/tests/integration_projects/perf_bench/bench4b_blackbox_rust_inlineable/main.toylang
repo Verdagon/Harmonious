@@ -1,0 +1,8 @@
+// Bench 4b pure-Rust apples-to-apples baseline. Same shape as
+// bench4b_blackbox_sky: black_box on LargeStruct between maker and
+// reader prevents constant-folding. Helpers live in test_widgets;
+// #[inline]-attributed so LLVM is free to inline through.
+
+export fn unused_anchor() -> i32 {
+    0
+}

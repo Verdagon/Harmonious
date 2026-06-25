@@ -350,7 +350,7 @@ fn find_field_index(toy_struct: &super::registry::ToyStruct, struct_name: &str, 
 
 fn resolve_expr(
     expr: &Expr,
-    _expected_ty: &ResolvedType,
+    expected_ty: &ResolvedType,
     scope: &HashMap<String, ResolvedType>,
     registry: &ToylangRegistry,
     rust_method_ret: &dyn Fn(&str, &str, &[ResolvedType]) -> Result<ResolvedType, crate::oracle::UnresolvedRustType>,
@@ -359,7 +359,34 @@ fn resolve_expr(
 ) -> Result<TypedExpr, TypeResolveError> {
     match expr {
         Expr::IntLit(n, ty) => {
-            Ok(TypedExpr { kind: TypedExprKind::IntLit(*n), ty: ty.clone() })
+            // The parser commits a default type for unsuffixed integer
+            // literals (`i32` for values fitting in i32, else `i64`).
+            // Without coercion against `expected_ty`, a Sky source like
+            // `struct W { a: i64, b: i64 } ... W { a: x, b: 0 }` would
+            // produce a typed AST where field `b`'s expression has type
+            // i32 but the field type is i64. Codegen then emits
+            // `store i32 0` to the i64 field, leaving the upper 4 bytes
+            // uninitialized → silent miscompile for any caller that
+            // reads `b` (or in struct memcpy-as-larger-type paths).
+            //
+            // Fix: when `expected_ty` is an integer type that fits the
+            // literal value, coerce the literal to it. Falls back to
+            // the parsed type when expected isn't an integer (e.g.,
+            // when the literal is used as an unconstrained expression
+            // statement or in a type-ambiguous position).
+            let coerced_ty = match (expected_ty, ty) {
+                // WIDEN only — never narrow. A parser default-typed
+                // `0` (i32) sitting in an i64 field's expected
+                // position widens cleanly. An explicitly-suffixed
+                // `2i64` sitting in an i32-expected position stays
+                // i64 — narrowing would silently lose precision and
+                // mask user errors (see test_arg_type_mismatch_i32_vs_i64).
+                (ResolvedType::I64, ResolvedType::I32) => ResolvedType::I64,
+                (ResolvedType::Usize, ResolvedType::I32) if *n >= 0 => ResolvedType::Usize,
+                (ResolvedType::Usize, ResolvedType::I64) if *n >= 0 => ResolvedType::Usize,
+                _ => ty.clone(),
+            };
+            Ok(TypedExpr { kind: TypedExprKind::IntLit(*n), ty: coerced_ty })
         }
 
         Expr::BoolLit(b) => {
@@ -666,7 +693,7 @@ fn resolve_expr(
         }
 
         Expr::UnaryNeg(inner) => {
-            let typed_inner = resolve_expr(inner, _expected_ty, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
+            let typed_inner = resolve_expr(inner, expected_ty, scope, registry, rust_method_ret, rust_param_types, is_rust_trait)?;
             let ty = typed_inner.ty.clone();
             let zero = match &ty {
                 ResolvedType::I32 => TypedExpr { kind: TypedExprKind::IntLit(0), ty: ResolvedType::I32 },
