@@ -76,7 +76,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       138  /// The two walks are intentionally symmetric — same matcher, same DefKind
       139  /// filter — so that the cross-crate path produces semantically identical
 
-⏺ Update(/Users/verdagon/erw/toylangc/src/oracle.rs)
+⏺ Update(/Volumes/V/Harmonious/toylangc/src/oracle.rs)
   ⎿  Added 3 lines, removed 1 line
       155      ) {
       156          return Some(def_id);
@@ -89,7 +89,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       162          tcx.crate_name(c).as_str() == "__lang_stubs"
       163      })?;
 
-⏺ Update(/Users/verdagon/erw/toylangc/src/oracle.rs)
+⏺ Update(/Volumes/V/Harmonious/toylangc/src/oracle.rs)
   ⎿  Added 16 lines, removed 11 lines
       516
       517  /// Find an extern (non-toylang) function by name among local definitions.
@@ -132,7 +132,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now fix callbacks_impl.rs:
 
-⏺ Update(/Users/verdagon/erw/toylangc/src/toylang/callbacks_impl.rs)
+⏺ Update(/Volumes/V/Harmonious/toylangc/src/toylang/callbacks_impl.rs)
   ⎿  Added 3 lines, removed 2 lines
       69      /// are already in the rlib's `.o`) and skip `after_rust_analysis`
       70      /// validation (already validated upstream). `llvm_paths` is also forced
@@ -146,7 +146,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       76  }
       77
 
-⏺ Update(/Users/verdagon/erw/toylangc/src/toylang/callbacks_impl.rs)
+⏺ Update(/Volumes/V/Harmonious/toylangc/src/toylang/callbacks_impl.rs)
   ⎿  Added 6 lines, removed 2 lines
       567          // phase callbacks + the B6 population step, not any internal
       568          // codegen logs. `NotifyConcreteEntryPoint` entries come from
@@ -163,7 +163,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       577              let lines: Vec<String> = ts.log.iter().map(|entry| format!("{:?}", entry)).collect();
       578              std::fs::write(&path, lines.join("\n")).expect("failed to write callback log");
 
-⏺ Update(/Users/verdagon/erw/toylangc/src/toylang/callbacks_impl.rs)
+⏺ Update(/Volumes/V/Harmonious/toylangc/src/toylang/callbacks_impl.rs)
   ⎿  Added 10 lines, removed 10 lines
       1054  /// Find a function's DefId in __lang_stubs by name.
       1055  ///
@@ -194,10 +194,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now fix standalone_tests.rs:
 
-⏺ Read(/Users/verdagon/erw/toylangc/tests/standalone_tests.rs · lines 1-50)
+⏺ Read(/Volumes/V/Harmonious/toylangc/tests/standalone_tests.rs · lines 1-50)
   ⎿  Read 50 lines
 
-⏺ Update(/Users/verdagon/erw/toylangc/tests/standalone_tests.rs)
+⏺ Update(/Volumes/V/Harmonious/toylangc/tests/standalone_tests.rs)
   ⎿  Added 5 lines, removed 1 line
        6  }
        7
@@ -215,7 +215,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Add @MRRIWMZ reference to manifest.rs:
 
-⏺ Update(/Users/verdagon/erw/toylangc/src/manifest.rs)
+⏺ Update(/Volumes/V/Harmonious/toylangc/src/manifest.rs)
   ⎿  Added 11 lines
        1 +//! `toylang.toml` parser.
        2 +//!
@@ -234,7 +234,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now fix the lib.rs "stub injection" claim in the facade module docs:
 
-⏺ Update(/Users/verdagon/erw/rustc-lang-facade/src/lib.rs)
+⏺ Update(/Volumes/V/Harmonious/rustc-lang-facade/src/lib.rs)
   ⎿  Added 6 lines, removed 2 lines
        1  //! rustc-lang-facade: a library for integrating custom languages with rustc.
        2  //!
@@ -253,23 +253,23 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now let me audit the test files. Start with integration_projects.rs and test_helpers:
 
-⏺ Read(/Users/verdagon/erw/toylangc/tests/integration_projects.rs · lines 1-100)
+⏺ Read(/Volumes/V/Harmonious/toylangc/tests/integration_projects.rs · lines 1-100)
   ⎿  Read 100 lines
 
-⏺ Read(/Users/verdagon/erw/toylangc/tests/integration_projects.rs · lines 100-499)
+⏺ Read(/Volumes/V/Harmonious/toylangc/tests/integration_projects.rs · lines 100-499)
   ⎿  Read 400 lines
 
-⏺ Read(/Users/verdagon/erw/toylangc/tests/integration_projects.rs · lines 670-719)
+⏺ Read(/Volumes/V/Harmonious/toylangc/tests/integration_projects.rs · lines 670-719)
   ⎿  Read 50 lines
 
-⏺ Read(/Users/verdagon/erw/toylangc/tests/integration_projects/test_helpers/src/lib.rs)
+⏺ Read(/Volumes/V/Harmonious/toylangc/tests/integration_projects/test_helpers/src/lib.rs)
   ⎿  Read 158 lines
 
-⏺ Search(pattern: "per-instance|Instance-keyed|per_instance|pre-stage|pre-5c", path: "/Users/verdagon/erw/toylangc/src")
+⏺ Search(pattern: "per-instance|Instance-keyed|per_instance|pre-stage|pre-5c", path: "/Volumes/V/Harmonious/toylangc/src")
   ⎿  Found 1 line
      toylangc/src/oracle.rs:298:            // — which preserves the pre-stage-3 invariant that Params are
 
-⏺ Search(pattern: "fork patch|rustc fork|forked|monomorphize_fn|monomorphize_type.*state|ErasedInstance", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "fork patch|rustc fork|forked|monomorphize_fn|monomorphize_type.*state|ErasedInstance", path: "/Volumes/V/Harmonious")
   ⎿  Found 11 lines
      rustc-lang-facade/src/queries/upstream_monomorphization.rs:23://! confirms it's ~5 LoC of wiring. No rustc fork patch required — this is
      rustc-lang-facade/src/queries/partition.rs:20://! Stage 4a's CGU filter replaced the `CODEGEN_SKIP_HOOK` fork patch (stage
@@ -284,13 +284,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
      toylangc/src/toylang/callbacks_impl.rs:267:                // `monomorphize_type` is stateless.
 
 ⏺ Bash(cargo +nightly-2025-01-15 check 2>&1 > /tmp/erw-comments-check.txt)
-  ⎿      Checking rustc-lang-facade v0.1.0 (/Users/verdagon/erw/rustc-lang-facade)
-         Checking toylangc v0.1.0 (/Users/verdagon/erw/toylangc)
+  ⎿      Checking rustc-lang-facade v0.1.0 (/Volumes/V/Harmonious/rustc-lang-facade)
+         Checking toylangc v0.1.0 (/Volumes/V/Harmonious/toylangc)
          Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.90s
 
 ⏺ Bash(cargo +nightly-2025-01-15 check --tests 2>&1 > /tmp/erw-tests-check.txt)
-  ⎿      Checking rustc-lang-facade v0.1.0 (/Users/verdagon/erw/rustc-lang-facade)
-         Checking toylangc v0.1.0 (/Users/verdagon/erw/toylangc)
+  ⎿      Checking rustc-lang-facade v0.1.0 (/Volumes/V/Harmonious/rustc-lang-facade)
+         Checking toylangc v0.1.0 (/Volumes/V/Harmonious/toylangc)
          Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.17s
 
 ⏺ Now let me run the tests to verify:
@@ -300,8 +300,8 @@ verdagon@Evans-MacBook-Pro-2 erw %
      error: no library targets found in package `toylangc`
 
 ⏺ Bash(cargo +nightly-2025-01-15 test -p toylangc --bins 2>&1 > /tmp/erw-comments-test.txt)
-  ⎿     Compiling rustc-lang-facade v0.1.0 (/Users/verdagon/erw/rustc-lang-facade)
-        Compiling toylangc v0.1.0 (/Users/verdagon/erw/toylangc)
+  ⎿     Compiling rustc-lang-facade v0.1.0 (/Volumes/V/Harmonious/rustc-lang-facade)
+        Compiling toylangc v0.1.0 (/Volumes/V/Harmonious/toylangc)
          Finished `test` profile [unoptimized + debuginfo] target(s) in 9.60s
           Running unittests src/main.rs (target/debug/deps/toylangc-b00010be7a886faa)
 
@@ -317,7 +317,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 ⏺ Bash(cargo +nightly-2025-01-15 test -p toylangc --test standalone_tests test_uuid_new_v4 2>&1 > /tmp/erw-standalone-test.txt)
-  ⎿     Compiling toylangc v0.1.0 (/Users/verdagon/erw/toylangc)
+  ⎿     Compiling toylangc v0.1.0 (/Volumes/V/Harmonious/toylangc)
          Finished `test` profile [unoptimized + debuginfo] target(s) in 2.96s
           Running tests/standalone_tests.rs (target/debug/deps/standalone_tests-b3be26ea5d0f56d4)
 
@@ -791,7 +791,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me check how the pin is anchored in the codebase before answering:
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 23 files
      toylangc/tests/standalone_tests.rs
      rustc-lang-facade/src/queries/layout.rs
@@ -817,11 +817,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/problem-abi-coercion.md
      rust-toolchain.toml
 
-⏺ Bash(ls /Users/verdagon/erw/rust-toolchain.toml /Users/verdagon/erw/rust-toolchain 2>&1 | head -5)
-  ⎿  ls: /Users/verdagon/erw/rust-toolchain: No such file or directory
-     /Users/verdagon/erw/rust-toolchain.toml
+⏺ Bash(ls /Volumes/V/Harmonious/rust-toolchain.toml /Volumes/V/Harmonious/rust-toolchain 2>&1 | head -5)
+  ⎿  ls: /Volumes/V/Harmonious/rust-toolchain: No such file or directory
+     /Volumes/V/Harmonious/rust-toolchain.toml
 
-⏺ Read(/Users/verdagon/erw/rust-toolchain.toml)
+⏺ Read(/Volumes/V/Harmonious/rust-toolchain.toml)
   ⎿  Read 4 lines
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -873,7 +873,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ we already responded to vale, can you make sure docs are consistent with that
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious")
   ⎿  Found 8 files
      HANDOFF-TL.md
      docs/historical/phase-history.md
@@ -884,10 +884,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/handoff-codegen-backend-plugin.md
      response-reducing-rustc-fork.md
 
-⏺ Bash(ls /Users/verdagon/erw/response-reducing-rustc-fork.md 2>&1)
-  ⎿  /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls /Volumes/V/Harmonious/response-reducing-rustc-fork.md 2>&1)
+  ⎿  /Volumes/V/Harmonious/response-reducing-rustc-fork.md
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/HANDOFF-TL.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/HANDOFF-TL.md")
   ⎿  Found 19 lines
      34:- **Open threads** (all non-urgent, see §3): a Vale response draft
      81:### 3a. The Vale response
@@ -909,7 +909,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      411:fork-reduction roadmap originally prompted by Vale's
      418:reference for any future consumer — Vale-fork-ready by design, not
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/future-architecture-investigations.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/future-architecture-investigations.md")
   ⎿  Found 22 lines
      29:A reviewer on the Vale project
      30:(`/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`)
@@ -951,12 +951,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ i rewrote it first taking into account all of our stuff. sent it this morning
 
-⏺ Bash(ls -la /Users/verdagon/erw/response-reducing-rustc-fork.md && wc -l /Users/verdagon/erw/response-reducing-rustc-fork.md)
-  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Users/verdagon/erw/response-reducing-rustc-fork.md
-          163 /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls -la /Volumes/V/Harmonious/response-reducing-rustc-fork.md && wc -l /Volumes/V/Harmonious/response-reducing-rustc-fork.md)
+  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
+          163 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Read(/Users/verdagon/erw/response-reducing-rustc-fork.md · lines 1-30)
+⏺ Read(/Volumes/V/Harmonious/response-reducing-rustc-fork.md · lines 1-30)
   ⎿  Read 30 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
@@ -965,13 +965,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
   Reading full §10 and the surrounding context first:
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 60-169)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 60-169)
   ⎿  Read 110 lines
 
-⏺ Read(/Users/verdagon/erw/future-architecture-investigations.md · lines 300-424)
+⏺ Read(/Volumes/V/Harmonious/future-architecture-investigations.md · lines 300-424)
   ⎿  Read 125 lines
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 380-424)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 380-424)
   ⎿  Read 44 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -979,7 +979,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now the edits:
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 3 lines, removed 3 lines
       31  - **Active work:** none. No junior handoffs in flight. No unresolved
       32    architectural risks. No mid-stage refactors.
@@ -994,7 +994,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       38  - **The rustc fork working tree at `~/rust` is empty** (no diff
       39    against upstream). Its branch name `per-instance-mir` is vestigial.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 13 lines, removed 24 lines
        78
        79  All non-urgent; none block normal maintenance.
@@ -1045,7 +1045,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       100
       101  The ModuleLlvm-wall spike identified a ~30-line PR to rustc —
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       191  12. **`docs/historical/phase-history.md`** — per-phase writeups
       192      (phases 1–8 + fork-reduction stages 1–5 + post-stage-5
@@ -1058,7 +1058,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       197      from each stage. Reference if you need to see how past work
       198      was scoped + executed.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 1 line, removed 1 line
       283  ├── README.md                                   # public-facing (minimal)
       284  ├── HANDOFF-TL.md                               # this doc
@@ -1069,7 +1069,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       288  ├── docs/
       289  │   ├── meta.md                                 # doc strategy
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       378        knows what the canaries are for the Category A/B risks.
       379  - [ ] Outgoing TL has walked through §3 (open threads) + §6
@@ -1084,7 +1084,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now update future-architecture-investigations.md:
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 11 lines, removed 13 lines
       301
       302  ## Part 5: Current status — what's outstanding
@@ -1120,7 +1120,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       319
       320  The reasoning doc and architecture guide have been updated to reflect
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       403     branches** if you need specific evidence cited in the reasoning
       404     doc. You don't need to read them for top-level understanding.
@@ -1137,7 +1137,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       411  5. **Don't re-run any of the three investigations.** They're
       412     prototype-verified or prototype-characterized as noted; unless
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       414     the rustc-fork toolchain version), re-running would just reproduce
       415     known results.
@@ -1156,7 +1156,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -1176,7 +1176,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
           is: **most of your alternatives are more viable than the architecture guide's framing suggests, because several weren't explicitly considered when the current des
           ign was picked.** Long version below, with the six questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -1185,10 +1185,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -1220,7 +1220,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -1295,12 +1295,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -1327,13 +1327,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -1343,7 +1343,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
 ⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path:
-  "/Users/verdagon/erw")
+  "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -1355,12 +1355,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -1370,7 +1370,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -1652,18 +1652,18 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -1961,7 +1961,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 ⏺ Bash(cargo +nightly-2025-01-15 test -p toylangc --test standalone_tests test_uuid_new_v4 2>&1 > /tmp/erw-standalone-test.txt)
-  ⎿     Compiling toylangc v0.1.0 (/Users/verdagon/erw/toylangc)
+  ⎿     Compiling toylangc v0.1.0 (/Volumes/V/Harmonious/toylangc)
          Finished `test` profile [unoptimized + debuginfo] target(s) in 2.96s
           Running tests/standalone_tests.rs (target/debug/deps/standalone_tests-b3be26ea5d0f56d4)
 
@@ -2435,7 +2435,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me check how the pin is anchored in the codebase before answering:
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 23 files
      toylangc/tests/standalone_tests.rs
      rustc-lang-facade/src/queries/layout.rs
@@ -2461,11 +2461,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/problem-abi-coercion.md
      rust-toolchain.toml
 
-⏺ Bash(ls /Users/verdagon/erw/rust-toolchain.toml /Users/verdagon/erw/rust-toolchain 2>&1 | head -5)
-  ⎿  ls: /Users/verdagon/erw/rust-toolchain: No such file or directory
-     /Users/verdagon/erw/rust-toolchain.toml
+⏺ Bash(ls /Volumes/V/Harmonious/rust-toolchain.toml /Volumes/V/Harmonious/rust-toolchain 2>&1 | head -5)
+  ⎿  ls: /Volumes/V/Harmonious/rust-toolchain: No such file or directory
+     /Volumes/V/Harmonious/rust-toolchain.toml
 
-⏺ Read(/Users/verdagon/erw/rust-toolchain.toml)
+⏺ Read(/Volumes/V/Harmonious/rust-toolchain.toml)
   ⎿  Read 4 lines
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -2517,7 +2517,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ we already responded to vale, can you make sure docs are consistent with that
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious")
   ⎿  Found 8 files
      HANDOFF-TL.md
      docs/historical/phase-history.md
@@ -2528,10 +2528,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/handoff-codegen-backend-plugin.md
      response-reducing-rustc-fork.md
 
-⏺ Bash(ls /Users/verdagon/erw/response-reducing-rustc-fork.md 2>&1)
-  ⎿  /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls /Volumes/V/Harmonious/response-reducing-rustc-fork.md 2>&1)
+  ⎿  /Volumes/V/Harmonious/response-reducing-rustc-fork.md
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/HANDOFF-TL.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/HANDOFF-TL.md")
   ⎿  Found 19 lines
      34:- **Open threads** (all non-urgent, see §3): a Vale response draft
      81:### 3a. The Vale response
@@ -2553,7 +2553,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      411:fork-reduction roadmap originally prompted by Vale's
      418:reference for any future consumer — Vale-fork-ready by design, not
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/future-architecture-investigations.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/future-architecture-investigations.md")
   ⎿  Found 22 lines
      29:A reviewer on the Vale project
      30:(`/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`)
@@ -2595,12 +2595,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ i rewrote it first taking into account all of our stuff. sent it this morning
 
-⏺ Bash(ls -la /Users/verdagon/erw/response-reducing-rustc-fork.md && wc -l /Users/verdagon/erw/response-reducing-rustc-fork.md)
-  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Users/verdagon/erw/response-reducing-rustc-fork.md
-          163 /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls -la /Volumes/V/Harmonious/response-reducing-rustc-fork.md && wc -l /Volumes/V/Harmonious/response-reducing-rustc-fork.md)
+  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
+          163 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Read(/Users/verdagon/erw/response-reducing-rustc-fork.md · lines 1-30)
+⏺ Read(/Volumes/V/Harmonious/response-reducing-rustc-fork.md · lines 1-30)
   ⎿  Read 30 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
@@ -2609,13 +2609,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
   Reading full §10 and the surrounding context first:
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 60-169)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 60-169)
   ⎿  Read 110 lines
 
-⏺ Read(/Users/verdagon/erw/future-architecture-investigations.md · lines 300-424)
+⏺ Read(/Volumes/V/Harmonious/future-architecture-investigations.md · lines 300-424)
   ⎿  Read 125 lines
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 380-424)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 380-424)
   ⎿  Read 44 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -2623,7 +2623,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now the edits:
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 3 lines, removed 3 lines
       31  - **Active work:** none. No junior handoffs in flight. No unresolved
       32    architectural risks. No mid-stage refactors.
@@ -2638,7 +2638,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       38  - **The rustc fork working tree at `~/rust` is empty** (no diff
       39    against upstream). Its branch name `per-instance-mir` is vestigial.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 13 lines, removed 24 lines
        78
        79  All non-urgent; none block normal maintenance.
@@ -2689,7 +2689,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       100
       101  The ModuleLlvm-wall spike identified a ~30-line PR to rustc —
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       191  12. **`docs/historical/phase-history.md`** — per-phase writeups
       192      (phases 1–8 + fork-reduction stages 1–5 + post-stage-5
@@ -2702,7 +2702,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       197      from each stage. Reference if you need to see how past work
       198      was scoped + executed.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 1 line, removed 1 line
       283  ├── README.md                                   # public-facing (minimal)
       284  ├── HANDOFF-TL.md                               # this doc
@@ -2713,7 +2713,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       288  ├── docs/
       289  │   ├── meta.md                                 # doc strategy
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       378        knows what the canaries are for the Category A/B risks.
       379  - [ ] Outgoing TL has walked through §3 (open threads) + §6
@@ -2728,7 +2728,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now update future-architecture-investigations.md:
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 11 lines, removed 13 lines
       301
       302  ## Part 5: Current status — what's outstanding
@@ -2764,7 +2764,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       319
       320  The reasoning doc and architecture guide have been updated to reflect
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       403     branches** if you need specific evidence cited in the reasoning
       404     doc. You don't need to read them for top-level understanding.
@@ -2781,7 +2781,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       411  5. **Don't re-run any of the three investigations.** They're
       412     prototype-verified or prototype-characterized as noted; unless
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       414     the rustc-fork toolchain version), re-running would just reproduce
       415     known results.
@@ -2800,7 +2800,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -2820,7 +2820,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
           is: **most of your alternatives are more viable than the architecture guide's framing suggests, because several weren't explicitly considered when the current des
           ign was picked.** Long version below, with the six questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -2829,10 +2829,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -2864,7 +2864,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -2939,12 +2939,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -2971,13 +2971,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -2987,7 +2987,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
 ⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path:
-  "/Users/verdagon/erw")
+  "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -2999,12 +2999,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -3014,7 +3014,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -3296,18 +3296,18 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -3623,11 +3623,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Step 2: Draft tech debt #30                                ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
                                                                                                                                                                     390472 tokens
-⏺ Read(/Users/verdagon/erw/docs/architecture/known-tech-debt.md · lines 78-117)                        current:  · latest:  Checking for updates
+⏺ Read(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md · lines 78-117)                        current:  · latest:  Checking for updates
   ⎿  Read 40 lines           a       cle) · esc to interrupt · ctrl+t to hide tasks                                                                             ◉ xhigh · /effort
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Update(/Users/verdagon/erw/docs/architecture/known-tech-debt.md)
+⏺ Update(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md)
   ⎿  Added 62 lines
       112
       113  ---
@@ -3773,7 +3773,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      thread 'test_point_layout' (67235499) panicked at toylangc/tests/integration_projects.rs:326:9:
      point_layout: expected 'layout_of intercepted for: Point size=8 align=4' in build stderr, got:
           Locking 1 package to latest compatible version
-        Compiling lang_stubs_point_layout v0.0.0 (/Users/verdagon/erw/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
+        Compiling lang_stubs_point_layout v0.0.0 (/Volumes/V/Harmonious/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
      warning: target feature `neon` must be enabled to ensure that the ABI of the current target can be implemented correctly
        |
        = note: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
@@ -3817,7 +3817,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me check how the pin is anchored in the codebase before answering:
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 23 files
      toylangc/tests/standalone_tests.rs
      rustc-lang-facade/src/queries/layout.rs
@@ -3843,11 +3843,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/problem-abi-coercion.md
      rust-toolchain.toml
 
-⏺ Bash(ls /Users/verdagon/erw/rust-toolchain.toml /Users/verdagon/erw/rust-toolchain 2>&1 | head -5)
-  ⎿  ls: /Users/verdagon/erw/rust-toolchain: No such file or directory
-     /Users/verdagon/erw/rust-toolchain.toml
+⏺ Bash(ls /Volumes/V/Harmonious/rust-toolchain.toml /Volumes/V/Harmonious/rust-toolchain 2>&1 | head -5)
+  ⎿  ls: /Volumes/V/Harmonious/rust-toolchain: No such file or directory
+     /Volumes/V/Harmonious/rust-toolchain.toml
 
-⏺ Read(/Users/verdagon/erw/rust-toolchain.toml)
+⏺ Read(/Volumes/V/Harmonious/rust-toolchain.toml)
   ⎿  Read 4 lines
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -3899,7 +3899,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ we already responded to vale, can you make sure docs are consistent with that
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious")
   ⎿  Found 8 files
      HANDOFF-TL.md
      docs/historical/phase-history.md
@@ -3910,10 +3910,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/handoff-codegen-backend-plugin.md
      response-reducing-rustc-fork.md
 
-⏺ Bash(ls /Users/verdagon/erw/response-reducing-rustc-fork.md 2>&1)
-  ⎿  /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls /Volumes/V/Harmonious/response-reducing-rustc-fork.md 2>&1)
+  ⎿  /Volumes/V/Harmonious/response-reducing-rustc-fork.md
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/HANDOFF-TL.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/HANDOFF-TL.md")
   ⎿  Found 19 lines
      34:- **Open threads** (all non-urgent, see §3): a Vale response draft
      81:### 3a. The Vale response
@@ -3935,7 +3935,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      411:fork-reduction roadmap originally prompted by Vale's
      418:reference for any future consumer — Vale-fork-ready by design, not
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/future-architecture-investigations.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/future-architecture-investigations.md")
   ⎿  Found 22 lines
      29:A reviewer on the Vale project
      30:(`/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`)
@@ -3977,12 +3977,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ i rewrote it first taking into account all of our stuff. sent it this morning
 
-⏺ Bash(ls -la /Users/verdagon/erw/response-reducing-rustc-fork.md && wc -l /Users/verdagon/erw/response-reducing-rustc-fork.md)
-  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Users/verdagon/erw/response-reducing-rustc-fork.md
-          163 /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls -la /Volumes/V/Harmonious/response-reducing-rustc-fork.md && wc -l /Volumes/V/Harmonious/response-reducing-rustc-fork.md)
+  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
+          163 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Read(/Users/verdagon/erw/response-reducing-rustc-fork.md · lines 1-30)
+⏺ Read(/Volumes/V/Harmonious/response-reducing-rustc-fork.md · lines 1-30)
   ⎿  Read 30 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
@@ -3991,13 +3991,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
   Reading full §10 and the surrounding context first:
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 60-169)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 60-169)
   ⎿  Read 110 lines
 
-⏺ Read(/Users/verdagon/erw/future-architecture-investigations.md · lines 300-424)
+⏺ Read(/Volumes/V/Harmonious/future-architecture-investigations.md · lines 300-424)
   ⎿  Read 125 lines
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 380-424)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 380-424)
   ⎿  Read 44 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -4005,7 +4005,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now the edits:
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 3 lines, removed 3 lines
       31  - **Active work:** none. No junior handoffs in flight. No unresolved
       32    architectural risks. No mid-stage refactors.
@@ -4020,7 +4020,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       38  - **The rustc fork working tree at `~/rust` is empty** (no diff
       39    against upstream). Its branch name `per-instance-mir` is vestigial.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 13 lines, removed 24 lines
        78
        79  All non-urgent; none block normal maintenance.
@@ -4071,7 +4071,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       100
       101  The ModuleLlvm-wall spike identified a ~30-line PR to rustc —
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       191  12. **`docs/historical/phase-history.md`** — per-phase writeups
       192      (phases 1–8 + fork-reduction stages 1–5 + post-stage-5
@@ -4084,7 +4084,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       197      from each stage. Reference if you need to see how past work
       198      was scoped + executed.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 1 line, removed 1 line
       283  ├── README.md                                   # public-facing (minimal)
       284  ├── HANDOFF-TL.md                               # this doc
@@ -4095,7 +4095,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       288  ├── docs/
       289  │   ├── meta.md                                 # doc strategy
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       378        knows what the canaries are for the Category A/B risks.
       379  - [ ] Outgoing TL has walked through §3 (open threads) + §6
@@ -4110,7 +4110,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now update future-architecture-investigations.md:
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 11 lines, removed 13 lines
       301
       302  ## Part 5: Current status — what's outstanding
@@ -4146,7 +4146,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       319
       320  The reasoning doc and architecture guide have been updated to reflect
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       403     branches** if you need specific evidence cited in the reasoning
       404     doc. You don't need to read them for top-level understanding.
@@ -4163,7 +4163,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       411  5. **Don't re-run any of the three investigations.** They're
       412     prototype-verified or prototype-characterized as noted; unless
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       414     the rustc-fork toolchain version), re-running would just reproduce
       415     known results.
@@ -4182,7 +4182,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -4202,7 +4202,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
           is: **most of your alternatives are more viable than the architecture guide's framing suggests, because several weren't explicitly considered when the current des
           ign was picked.** Long version below, with the six questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -4211,10 +4211,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -4246,7 +4246,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -4321,12 +4321,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -4353,13 +4353,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Grep hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -4369,7 +4369,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
 ⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path:
-  "/Users/verdagon/erw")
+  "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -4381,12 +4381,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -4396,7 +4396,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -4678,18 +4678,18 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
   ⎿  PreToolUse:Bash hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -4998,11 +4998,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Step 2: Draft tech debt #30
 
-⏺ Read(/Users/verdagon/erw/docs/architecture/known-tech-debt.md · lines 78-117)
+⏺ Read(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md · lines 78-117)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Update(/Users/verdagon/erw/docs/architecture/known-tech-debt.md)
+⏺ Update(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md)
   ⎿  Added 62 lines
       112
       113  ---
@@ -5137,7 +5137,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      thread 'test_point_layout' (67235499) panicked at toylangc/tests/integration_projects.rs:326:9:
      point_layout: expected 'layout_of intercepted for: Point size=8 align=4' in build stderr, got:
           Locking 1 package to latest compatible version
-        Compiling lang_stubs_point_layout v0.0.0 (/Users/verdagon/erw/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
+        Compiling lang_stubs_point_layout v0.0.0 (/Volumes/V/Harmonious/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
      warning: target feature `neon` must be enabled to ensure that the ABI of the current target can be implementedcorrectly
        |
        = note: this was previously accepted by the compiler but is being phased out; it will become a hard error ina future release!
@@ -5231,13 +5231,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me verify the current post-bump state of the key extension points so the guide reflects reality:
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/driver.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/driver.rs)
   ⎿  Read 96 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs)
   ⎿  Read 154 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -5546,10 +5546,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please write all that into a file. please dont wrap at 80 characters, each line should be uninterrupted by newlines
 
-⏺ Bash(ls /Users/verdagon/erw/docs/background/ 2>&1)
+⏺ Bash(ls /Volumes/V/Harmonious/docs/background/ 2>&1)
   ⎿  (No output)
 
-⏺ Bash(ls -la /Users/verdagon/erw/docs/background/)
+⏺ Bash(ls -la /Volumes/V/Harmonious/docs/background/)
   ⎿  total 0
      drwxr-xr-x@  2 verdagon  staff   64 Apr  9 20:25 .
      drwxr-xr-x@ 10 verdagon  staff  320 Apr 17 17:32 ..
@@ -5559,14 +5559,14 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ❯ /rename toylang-tl
   ⎿  Session renamed to: toylang-tl
 
-⏺ Write(/Users/verdagon/erw/docs/background/rustc-extension-points.md)
-  ⎿  Wrote 232 lines to /Users/verdagon/erw/docs/background/rustc-extension-points.md
+⏺ Write(/Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
+  ⎿  Wrote 232 lines to /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}'
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md /Users/verdagon/erw/docs/background/rustc-extension-points.md 2>&1; wc -l
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md)
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md /Volumes/V/Harmonious/docs/background/rustc-extension-points.md 2>&1; wc -l
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
   ⎿  Prose lines over 160 chars: 35
-          232 /Users/verdagon/erw/docs/background/rustc-extension-points.md
+          232 /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Saved to docs/background/rustc-extension-points.md. 232 lines, 35 of them long prose paragraphs (none wrapped). Headings, tables, code blocks, and bullet lists are structured as
    markdown normally requires; every prose paragraph is a single uninterrupted line.
@@ -5584,7 +5584,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me check how the pin is anchored in the codebase before answering:
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 23 files
      toylangc/tests/standalone_tests.rs
      rustc-lang-facade/src/queries/layout.rs
@@ -5610,11 +5610,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/problem-abi-coercion.md
      rust-toolchain.toml
 
-⏺ Bash(ls /Users/verdagon/erw/rust-toolchain.toml /Users/verdagon/erw/rust-toolchain 2>&1 | head -5)
-  ⎿  ls: /Users/verdagon/erw/rust-toolchain: No such file or directory
-     /Users/verdagon/erw/rust-toolchain.toml
+⏺ Bash(ls /Volumes/V/Harmonious/rust-toolchain.toml /Volumes/V/Harmonious/rust-toolchain 2>&1 | head -5)
+  ⎿  ls: /Volumes/V/Harmonious/rust-toolchain: No such file or directory
+     /Volumes/V/Harmonious/rust-toolchain.toml
 
-⏺ Read(/Users/verdagon/erw/rust-toolchain.toml)
+⏺ Read(/Volumes/V/Harmonious/rust-toolchain.toml)
   ⎿  Read 4 lines
   ⎿  PreToolUse:Grep hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Bash hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -5666,7 +5666,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ we already responded to vale, can you make sure docs are consistent with that
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious")
   ⎿  Found 8 files
      HANDOFF-TL.md
      docs/historical/phase-history.md
@@ -5677,10 +5677,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/handoff-codegen-backend-plugin.md
      response-reducing-rustc-fork.md
 
-⏺ Bash(ls /Users/verdagon/erw/response-reducing-rustc-fork.md 2>&1)
-  ⎿  /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls /Volumes/V/Harmonious/response-reducing-rustc-fork.md 2>&1)
+  ⎿  /Volumes/V/Harmonious/response-reducing-rustc-fork.md
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/HANDOFF-TL.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/HANDOFF-TL.md")
   ⎿  Found 19 lines
      34:- **Open threads** (all non-urgent, see §3): a Vale response draft
      81:### 3a. The Vale response
@@ -5702,7 +5702,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      411:fork-reduction roadmap originally prompted by Vale's
      418:reference for any future consumer — Vale-fork-ready by design, not
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/future-architecture-investigations.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/future-architecture-investigations.md")
   ⎿  Found 22 lines
      29:A reviewer on the Vale project
      30:(`/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`)
@@ -5744,12 +5744,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ i rewrote it first taking into account all of our stuff. sent it this morning
 
-⏺ Bash(ls -la /Users/verdagon/erw/response-reducing-rustc-fork.md && wc -l /Users/verdagon/erw/response-reducing-rustc-fork.md)
-  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Users/verdagon/erw/response-reducing-rustc-fork.md
-          163 /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls -la /Volumes/V/Harmonious/response-reducing-rustc-fork.md && wc -l /Volumes/V/Harmonious/response-reducing-rustc-fork.md)
+  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
+          163 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
   ⎿  PreToolUse:Bash hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Read(/Users/verdagon/erw/response-reducing-rustc-fork.md · lines 1-30)
+⏺ Read(/Volumes/V/Harmonious/response-reducing-rustc-fork.md · lines 1-30)
   ⎿  Read 30 lines
   ⎿  PreToolUse:Read hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
 
@@ -5758,13 +5758,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
   Reading full §10 and the surrounding context first:
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 60-169)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 60-169)
   ⎿  Read 110 lines
 
-⏺ Read(/Users/verdagon/erw/future-architecture-investigations.md · lines 300-424)
+⏺ Read(/Volumes/V/Harmonious/future-architecture-investigations.md · lines 300-424)
   ⎿  Read 125 lines
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 380-424)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 380-424)
   ⎿  Read 44 lines
   ⎿  PreToolUse:Read hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -5772,7 +5772,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now the edits:
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 3 lines, removed 3 lines
       31  - **Active work:** none. No junior handoffs in flight. No unresolved
       32    architectural risks. No mid-stage refactors.
@@ -5787,7 +5787,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       38  - **The rustc fork working tree at `~/rust` is empty** (no diff
       39    against upstream). Its branch name `per-instance-mir` is vestigial.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 13 lines, removed 24 lines
        78
        79  All non-urgent; none block normal maintenance.
@@ -5838,7 +5838,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       100
       101  The ModuleLlvm-wall spike identified a ~30-line PR to rustc —
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       191  12. **`docs/historical/phase-history.md`** — per-phase writeups
       192      (phases 1–8 + fork-reduction stages 1–5 + post-stage-5
@@ -5851,7 +5851,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       197      from each stage. Reference if you need to see how past work
       198      was scoped + executed.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 1 line, removed 1 line
       283  ├── README.md                                   # public-facing (minimal)
       284  ├── HANDOFF-TL.md                               # this doc
@@ -5862,7 +5862,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       288  ├── docs/
       289  │   ├── meta.md                                 # doc strategy
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       378        knows what the canaries are for the Category A/B risks.
       379  - [ ] Outgoing TL has walked through §3 (open threads) + §6
@@ -5877,7 +5877,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now update future-architecture-investigations.md:
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 11 lines, removed 13 lines
       301
       302  ## Part 5: Current status — what's outstanding
@@ -5913,7 +5913,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       319
       320  The reasoning doc and architecture guide have been updated to reflect
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       403     branches** if you need specific evidence cited in the reasoning
       404     doc. You don't need to read them for top-level understanding.
@@ -5930,7 +5930,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       411  5. **Don't re-run any of the three investigations.** They're
       412     prototype-verified or prototype-characterized as noted; unless
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       414     the rustc-fork toolchain version), re-running would just reproduce
       415     known results.
@@ -5949,7 +5949,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -5969,7 +5969,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
           : **most of your alternatives are more viable than the architecture guide's framing suggests, because several weren't explicitly considered when the current design
           was picked.** Long version below, with the six questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -5978,10 +5978,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -6013,7 +6013,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -6087,12 +6087,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -6119,13 +6119,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
   ⎿  PreToolUse:Grep hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Grep hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -6135,7 +6135,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
 ⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path:
-  "/Users/verdagon/erw")
+  "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -6147,12 +6147,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -6162,7 +6162,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -6444,18 +6444,18 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
   ⎿  PreToolUse:Read hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
   ⎿  PreToolUse:Bash hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -6763,11 +6763,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Step 2: Draft tech debt #30
 
-⏺ Read(/Users/verdagon/erw/docs/architecture/known-tech-debt.md · lines 78-117)
+⏺ Read(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md · lines 78-117)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Update(/Users/verdagon/erw/docs/architecture/known-tech-debt.md)
+⏺ Update(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md)
   ⎿  Added 62 lines
       112
       113  ---
@@ -6902,7 +6902,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      thread 'test_point_layout' (67235499) panicked at toylangc/tests/integration_projects.rs:326:9:
      point_layout: expected 'layout_of intercepted for: Point size=8 align=4' in build stderr, got:
           Locking 1 package to latest compatible version
-        Compiling lang_stubs_point_layout v0.0.0 (/Users/verdagon/erw/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
+        Compiling lang_stubs_point_layout v0.0.0 (/Volumes/V/Harmonious/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
      warning: target feature `neon` must be enabled to ensure that the ABI of the current target can be implementedcorrectly
        |
        = note: this was previously accepted by the compiler but is being phased out; it will become a hard error ina future release!
@@ -6995,13 +6995,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me verify the current post-bump state of the key extension points so the guide reflects reality:
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/driver.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/driver.rs)
   ⎿  Read 96 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs)
   ⎿  Read 154 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                              ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -7308,10 +7308,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please write all that into a file. please dont wrap at 80 characters, each line should be uninterrupted by newlines
 
-⏺ Bash(ls /Users/verdagon/erw/docs/background/ 2>&1)
+⏺ Bash(ls /Volumes/V/Harmonious/docs/background/ 2>&1)
   ⎿  (No output)
 
-⏺ Bash(ls -la /Users/verdagon/erw/docs/background/)
+⏺ Bash(ls -la /Volumes/V/Harmonious/docs/background/)
   ⎿  total 0
      drwxr-xr-x@  2 verdagon  staff   64 Apr  9 20:25 .
      drwxr-xr-x@ 10 verdagon  staff  320 Apr 17 17:32 ..
@@ -7321,14 +7321,14 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ❯ /rename toylang-tl
   ⎿  Session renamed to: toylang-tl
 
-⏺ Write(/Users/verdagon/erw/docs/background/rustc-extension-points.md)
-  ⎿  Wrote 232 lines to /Users/verdagon/erw/docs/background/rustc-extension-points.md
+⏺ Write(/Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
+  ⎿  Wrote 232 lines to /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}'
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md /Users/verdagon/erw/docs/background/rustc-extension-points.md 2>&1; wc -l
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md)
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md /Volumes/V/Harmonious/docs/background/rustc-extension-points.md 2>&1; wc -l
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
   ⎿  Prose lines over 160 chars: 35
-          232 /Users/verdagon/erw/docs/background/rustc-extension-points.md
+          232 /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Saved to docs/background/rustc-extension-points.md. 232 lines, 35 of them long prose paragraphs (none wrapped). Headings, tables, code blocks, and bullet lists are structured as
   markdown normally requires; every prose paragraph is a single uninterrupted line.
@@ -7346,7 +7346,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me check how the pin is anchored in the codebase before answering:
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 23 files
      toylangc/tests/standalone_tests.rs
      rustc-lang-facade/src/queries/layout.rs
@@ -7372,11 +7372,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/problem-abi-coercion.md
      rust-toolchain.toml
 
-⏺ Bash(ls /Users/verdagon/erw/rust-toolchain.toml /Users/verdagon/erw/rust-toolchain 2>&1 | head -5)
-  ⎿  ls: /Users/verdagon/erw/rust-toolchain: No such file or directory
-     /Users/verdagon/erw/rust-toolchain.toml
+⏺ Bash(ls /Volumes/V/Harmonious/rust-toolchain.toml /Volumes/V/Harmonious/rust-toolchain 2>&1 | head -5)
+  ⎿  ls: /Volumes/V/Harmonious/rust-toolchain: No such file or directory
+     /Volumes/V/Harmonious/rust-toolchain.toml
 
-⏺ Read(/Users/verdagon/erw/rust-toolchain.toml)
+⏺ Read(/Volumes/V/Harmonious/rust-toolchain.toml)
   ⎿  Read 4 lines
   ⎿  PreToolUse:Grep hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Bash hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -7428,7 +7428,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ we already responded to vale, can you make sure docs are consistent with that
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious")
   ⎿  Found 8 files
      HANDOFF-TL.md
      docs/historical/phase-history.md
@@ -7439,10 +7439,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      docs/historical/handoff-codegen-backend-plugin.md
      response-reducing-rustc-fork.md
 
-⏺ Bash(ls /Users/verdagon/erw/response-reducing-rustc-fork.md 2>&1)
-  ⎿  /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls /Volumes/V/Harmonious/response-reducing-rustc-fork.md 2>&1)
+  ⎿  /Volumes/V/Harmonious/response-reducing-rustc-fork.md
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/HANDOFF-TL.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/HANDOFF-TL.md")
   ⎿  Found 19 lines
      34:- **Open threads** (all non-urgent, see §3): a Vale response draft
      81:### 3a. The Vale response
@@ -7464,7 +7464,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      411:fork-reduction roadmap originally prompted by Vale's
      418:reference for any future consumer — Vale-fork-ready by design, not
 
-⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Users/verdagon/erw/future-architecture-investigations.md")
+⏺ Search(pattern: "Vale|response-reducing-rustc-fork", path: "/Volumes/V/Harmonious/future-architecture-investigations.md")
   ⎿  Found 22 lines
      29:A reviewer on the Vale project
      30:(`/Volumes/V/ValeRustInterop/investigations/reducing-rustc-fork.md`)
@@ -7506,12 +7506,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ i rewrote it first taking into account all of our stuff. sent it this morning
 
-⏺ Bash(ls -la /Users/verdagon/erw/response-reducing-rustc-fork.md && wc -l /Users/verdagon/erw/response-reducing-rustc-fork.md)
-  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Users/verdagon/erw/response-reducing-rustc-fork.md
-          163 /Users/verdagon/erw/response-reducing-rustc-fork.md
+⏺ Bash(ls -la /Volumes/V/Harmonious/response-reducing-rustc-fork.md && wc -l /Volumes/V/Harmonious/response-reducing-rustc-fork.md)
+  ⎿  -rw-r--r--@ 1 verdagon  staff  29171 Apr 17 14:06 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
+          163 /Volumes/V/Harmonious/response-reducing-rustc-fork.md
   ⎿  PreToolUse:Bash hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Read(/Users/verdagon/erw/response-reducing-rustc-fork.md · lines 1-30)
+⏺ Read(/Volumes/V/Harmonious/response-reducing-rustc-fork.md · lines 1-30)
   ⎿  Read 30 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
@@ -7520,13 +7520,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
   Reading full §10 and the surrounding context first:
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 60-169)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 60-169)
   ⎿  Read 110 lines
 
-⏺ Read(/Users/verdagon/erw/future-architecture-investigations.md · lines 300-424)
+⏺ Read(/Volumes/V/Harmonious/future-architecture-investigations.md · lines 300-424)
   ⎿  Read 125 lines
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md · lines 380-424)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md · lines 380-424)
   ⎿  Read 44 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -7534,7 +7534,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now the edits:
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 3 lines, removed 3 lines
       31  - **Active work:** none. No junior handoffs in flight. No unresolved
       32    architectural risks. No mid-stage refactors.
@@ -7549,7 +7549,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       38  - **The rustc fork working tree at `~/rust` is empty** (no diff
       39    against upstream). Its branch name `per-instance-mir` is vestigial.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 13 lines, removed 24 lines
        78
        79  All non-urgent; none block normal maintenance.
@@ -7600,7 +7600,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       100
       101  The ModuleLlvm-wall spike identified a ~30-line PR to rustc —
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       191  12. **`docs/historical/phase-history.md`** — per-phase writeups
       192      (phases 1–8 + fork-reduction stages 1–5 + post-stage-5
@@ -7613,7 +7613,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       197      from each stage. Reference if you need to see how past work
       198      was scoped + executed.
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 1 line, removed 1 line
       283  ├── README.md                                   # public-facing (minimal)
       284  ├── HANDOFF-TL.md                               # this doc
@@ -7624,7 +7624,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       288  ├── docs/
       289  │   ├── meta.md                                 # doc strategy
 
-⏺ Update(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Update(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Added 2 lines, removed 2 lines
       378        knows what the canaries are for the Category A/B risks.
       379  - [ ] Outgoing TL has walked through §3 (open threads) + §6
@@ -7639,7 +7639,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now update future-architecture-investigations.md:
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 11 lines, removed 13 lines
       301
       302  ## Part 5: Current status — what's outstanding
@@ -7675,7 +7675,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       319
       320  The reasoning doc and architecture guide have been updated to reflect
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       403     branches** if you need specific evidence cited in the reasoning
       404     doc. You don't need to read them for top-level understanding.
@@ -7692,7 +7692,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
       411  5. **Don't re-run any of the three investigations.** They're
       412     prototype-verified or prototype-characterized as noted; unless
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       414     the rustc-fork toolchain version), re-running would just reproduce
       415     known results.
@@ -7711,7 +7711,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -7731,7 +7731,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
           atives are more viable than the architecture guide's framing suggests, because several weren't explicitlyconsidered when the current design was picked.** Long version below, with the six
            questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -7740,10 +7740,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -7775,7 +7775,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -7845,12 +7845,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -7877,13 +7877,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
   ⎿  PreToolUse:Grep hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Grep hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -7892,7 +7892,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
-⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -7904,12 +7904,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -7919,7 +7919,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -8251,18 +8251,18 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
   ⎿  PreToolUse:Bash hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -8570,11 +8570,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Step 2: Draft tech debt #30
 
-⏺ Read(/Users/verdagon/erw/docs/architecture/known-tech-debt.md · lines 78-117)
+⏺ Read(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md · lines 78-117)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Update(/Users/verdagon/erw/docs/architecture/known-tech-debt.md)
+⏺ Update(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md)
   ⎿  Added 62 lines
       112
       113  ---
@@ -8709,7 +8709,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      thread 'test_point_layout' (67235499) panicked at toylangc/tests/integration_projects.rs:326:9:
      point_layout: expected 'layout_of intercepted for: Point size=8 align=4' in build stderr, got:
           Locking 1 package to latest compatible version
-        Compiling lang_stubs_point_layout v0.0.0 (/Users/verdagon/erw/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
+        Compiling lang_stubs_point_layout v0.0.0 (/Volumes/V/Harmonious/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
      warning: target feature `neon` must be enabled to ensure that the ABI of the current target can be implementedcorrectly
        |
        = note: this was previously accepted by the compiler but is being phased out; it will become a hard error ina future release!
@@ -8802,13 +8802,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me verify the current post-bump state of the key extension points so the guide reflects reality:
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/driver.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/driver.rs)
   ⎿  Read 96 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs)
   ⎿  Read 154 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -9106,10 +9106,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please write all that into a file. please dont wrap at 80 characters, each line should be uninterrupted by newlines
 
-⏺ Bash(ls /Users/verdagon/erw/docs/background/ 2>&1)
+⏺ Bash(ls /Volumes/V/Harmonious/docs/background/ 2>&1)
   ⎿  (No output)
 
-⏺ Bash(ls -la /Users/verdagon/erw/docs/background/)
+⏺ Bash(ls -la /Volumes/V/Harmonious/docs/background/)
   ⎿  total 0
      drwxr-xr-x@  2 verdagon  staff   64 Apr  9 20:25 .
      drwxr-xr-x@ 10 verdagon  staff  320 Apr 17 17:32 ..
@@ -9119,13 +9119,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ❯ /rename toylang-tl
   ⎿  Session renamed to: toylang-tl
 
-⏺ Write(/Users/verdagon/erw/docs/background/rustc-extension-points.md)
-  ⎿  Wrote 232 lines to /Users/verdagon/erw/docs/background/rustc-extension-points.md
+⏺ Write(/Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
+  ⎿  Wrote 232 lines to /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
-⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Users/verdagon/erw/docs/background/rustc-extension-points.md
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md 2>&1; wc -l /Users/verdagon/erw/docs/background/rustc-extension-points.md)
+⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md 2>&1; wc -l /Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
   ⎿  Prose lines over 160 chars: 35
-          232 /Users/verdagon/erw/docs/background/rustc-extension-points.md
+          232 /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Saved to docs/background/rustc-extension-points.md. 232 lines, 35 of them long prose paragraphs (none wrapped). Headings, tables, code blocks, and bullet lists are structured as markdown normally
   requires; every prose paragraph is a single uninterrupted line.
@@ -9169,7 +9169,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -9189,7 +9189,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
           atives are more viable than the architecture guide's framing suggests, because several weren't explicitlyconsidered when the current design was picked.** Long version below, with the six
            questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -9198,10 +9198,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -9233,7 +9233,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -9303,12 +9303,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -9335,13 +9335,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
   ⎿  PreToolUse:Grep hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Grep hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -9350,7 +9350,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
-⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -9362,12 +9362,12 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -9377,7 +9377,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -9709,18 +9709,18 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
   ⎿  PreToolUse:Bash hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -10028,11 +10028,11 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Step 2: Draft tech debt #30
 
-⏺ Read(/Users/verdagon/erw/docs/architecture/known-tech-debt.md · lines 78-117)
+⏺ Read(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md · lines 78-117)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
 
-⏺ Update(/Users/verdagon/erw/docs/architecture/known-tech-debt.md)
+⏺ Update(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md)
   ⎿  Added 62 lines
       112
       113  ---
@@ -10167,7 +10167,7 @@ verdagon@Evans-MacBook-Pro-2 erw %
      thread 'test_point_layout' (67235499) panicked at toylangc/tests/integration_projects.rs:326:9:
      point_layout: expected 'layout_of intercepted for: Point size=8 align=4' in build stderr, got:
           Locking 1 package to latest compatible version
-        Compiling lang_stubs_point_layout v0.0.0 (/Users/verdagon/erw/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
+        Compiling lang_stubs_point_layout v0.0.0 (/Volumes/V/Harmonious/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
      warning: target feature `neon` must be enabled to ensure that the ABI of the current target can be implementedcorrectly
        |
        = note: this was previously accepted by the compiler but is being phased out; it will become a hard error ina future release!
@@ -10260,13 +10260,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ⏺ Let me verify the current post-bump state of the key extension points so the guide reflects reality:
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/driver.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/driver.rs)
   ⎿  Read 96 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs)
   ⎿  Read 154 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
   ⎿  Read 40 lines
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
   ⎿  PreToolUse:Read hook error                                                                         ⎿  Hook JSON output validation failed — (root): Invalid input
@@ -10564,10 +10564,10 @@ verdagon@Evans-MacBook-Pro-2 erw %
 
 ❯ please write all that into a file. please dont wrap at 80 characters, each line should be uninterrupted by newlines
 
-⏺ Bash(ls /Users/verdagon/erw/docs/background/ 2>&1)
+⏺ Bash(ls /Volumes/V/Harmonious/docs/background/ 2>&1)
   ⎿  (No output)
 
-⏺ Bash(ls -la /Users/verdagon/erw/docs/background/)
+⏺ Bash(ls -la /Volumes/V/Harmonious/docs/background/)
   ⎿  total 0
      drwxr-xr-x@  2 verdagon  staff   64 Apr  9 20:25 .
      drwxr-xr-x@ 10 verdagon  staff  320 Apr 17 17:32 ..
@@ -10577,13 +10577,13 @@ verdagon@Evans-MacBook-Pro-2 erw %
 ❯ /rename toylang-tl
   ⎿  Session renamed to: toylang-tl
 
-⏺ Write(/Users/verdagon/erw/docs/background/rustc-extension-points.md)
-  ⎿  Wrote 232 lines to /Users/verdagon/erw/docs/background/rustc-extension-points.md
+⏺ Write(/Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
+  ⎿  Wrote 232 lines to /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
-⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Users/verdagon/erw/docs/background/rustc-extension-points.md
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md 2>&1; wc -l /Users/verdagon/erw/docs/background/rustc-extension-points.md)
+⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md 2>&1; wc -l /Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
   ⎿  Prose lines over 160 chars: 35
-          232 /Users/verdagon/erw/docs/background/rustc-extension-points.md
+          232 /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Saved to docs/background/rustc-extension-points.md. 232 lines, 35 of them long prose paragraphs (none wrapped). Headings, tables, code blocks, and bullet lists are structured as markdown normally
   requires; every prose paragraph is a single uninterrupted line.
@@ -11007,7 +11007,7 @@ verdagon@Evans-MBP-2 erw % claude -c
       411  5. **Don't re-run any of the three investigations.** They're
       412     prototype-verified or prototype-characterized as noted; unless
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       414     the rustc-fork toolchain version), re-running would just reproduce
       415     known results.
@@ -11026,7 +11026,7 @@ verdagon@Evans-MBP-2 erw % claude -c
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -11046,7 +11046,7 @@ verdagon@Evans-MBP-2 erw % claude -c
           atives are more viable than the architecture guide's framing suggests, because several weren't explicitlyconsidered when the current design was picked.** Long version below, with the six
            questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -11055,10 +11055,10 @@ verdagon@Evans-MBP-2 erw % claude -c
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -11086,7 +11086,7 @@ verdagon@Evans-MBP-2 erw % claude -c
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -11155,12 +11155,12 @@ verdagon@Evans-MBP-2 erw % claude -c
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -11187,18 +11187,18 @@ verdagon@Evans-MBP-2 erw % claude -c
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
 
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
-⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -11210,12 +11210,12 @@ verdagon@Evans-MBP-2 erw % claude -c
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -11225,7 +11225,7 @@ verdagon@Evans-MBP-2 erw % claude -c
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -11497,16 +11497,16 @@ verdagon@Evans-MBP-2 erw % claude -c
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -11808,10 +11808,10 @@ verdagon@Evans-MBP-2 erw % claude -c
 
 ⏺ Step 2: Draft tech debt #30
 
-⏺ Read(/Users/verdagon/erw/docs/architecture/known-tech-debt.md · lines 78-117)
+⏺ Read(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md · lines 78-117)
   ⎿  Read 40 lines
 
-⏺ Update(/Users/verdagon/erw/docs/architecture/known-tech-debt.md)
+⏺ Update(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md)
   ⎿  Added 62 lines
       112
       113  ---
@@ -11944,7 +11944,7 @@ verdagon@Evans-MBP-2 erw % claude -c
      thread 'test_point_layout' (67235499) panicked at toylangc/tests/integration_projects.rs:326:9:
      point_layout: expected 'layout_of intercepted for: Point size=8 align=4' in build stderr, got:
           Locking 1 package to latest compatible version
-        Compiling lang_stubs_point_layout v0.0.0 (/Users/verdagon/erw/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
+        Compiling lang_stubs_point_layout v0.0.0 (/Volumes/V/Harmonious/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
      warning: target feature `neon` must be enabled to ensure that the ABI of the current target can be implementedcorrectly
        |
        = note: this was previously accepted by the compiler but is being phased out; it will become a hard error ina future release!
@@ -12029,13 +12029,13 @@ verdagon@Evans-MBP-2 erw % claude -c
 
 ⏺ Let me verify the current post-bump state of the key extension points so the guide reflects reality:
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/driver.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/driver.rs)
   ⎿  Read 96 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs)
   ⎿  Read 154 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
   ⎿  Read 40 lines
 
 ⏺ rustc Extension Points — A Step-by-Step Guide
@@ -12330,10 +12330,10 @@ verdagon@Evans-MBP-2 erw % claude -c
 
 ❯ please write all that into a file. please dont wrap at 80 characters, each line should be uninterrupted by newlines
 
-⏺ Bash(ls /Users/verdagon/erw/docs/background/ 2>&1)
+⏺ Bash(ls /Volumes/V/Harmonious/docs/background/ 2>&1)
   ⎿  (No output)
 
-⏺ Bash(ls -la /Users/verdagon/erw/docs/background/)
+⏺ Bash(ls -la /Volumes/V/Harmonious/docs/background/)
   ⎿  total 0
      drwxr-xr-x@  2 verdagon  staff   64 Apr  9 20:25 .
      drwxr-xr-x@ 10 verdagon  staff  320 Apr 17 17:32 ..
@@ -12341,13 +12341,13 @@ verdagon@Evans-MBP-2 erw % claude -c
 ❯ /rename toylang-tl
   ⎿  Session renamed to: toylang-tl
 
-⏺ Write(/Users/verdagon/erw/docs/background/rustc-extension-points.md)
-  ⎿  Wrote 232 lines to /Users/verdagon/erw/docs/background/rustc-extension-points.md
+⏺ Write(/Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
+  ⎿  Wrote 232 lines to /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
-⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Users/verdagon/erw/docs/background/rustc-extension-points.md
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md 2>&1; wc -l /Users/verdagon/erw/docs/background/rustc-extension-points.md)
+⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md 2>&1; wc -l /Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
   ⎿  Prose lines over 160 chars: 35
-          232 /Users/verdagon/erw/docs/background/rustc-extension-points.md
+          232 /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Saved to docs/background/rustc-extension-points.md. 232 lines, 35 of them long prose paragraphs (none wrapped). Headings, tables, code blocks, and bullet lists are structured as markdown normally
   requires; every prose paragraph is a single uninterrupted line.
@@ -12855,7 +12855,7 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
       411  5. **Don't re-run any of the three investigations.** They're
       412     prototype-verified or prototype-characterized as noted; unless
 
-⏺ Update(/Users/verdagon/erw/future-architecture-investigations.md)
+⏺ Update(/Volumes/V/Harmonious/future-architecture-investigations.md)
   ⎿  Added 4 lines, removed 4 lines
       414     the rustc-fork toolchain version), re-running would just reproduce
       415     known results.
@@ -12874,7 +12874,7 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 
 ⏺ Now add a sent-status header to the response file itself:
 
-⏺ Update(/Users/verdagon/erw/response-reducing-rustc-fork.md)
+⏺ Update(/Volumes/V/Harmonious/response-reducing-rustc-fork.md)
   ⎿  Added 12 lines
        1 +<!--
        2 +Record of the Vale response sent 2026-04-20.
@@ -12894,7 +12894,7 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
           atives are more viable than the architecture guide's framing suggests, because several weren't explicitlyconsidered when the current design was picked.** Long version below, with the six
            questions answered in order.
 
-⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "(not sent|unsent|draft.*Vale|Vale.*draft|response.*unsent|response-reducing-rustc-fork)", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 lines
      HANDOFF-TL.md:90:Record-of-sent kept at `response-reducing-rustc-fork.md` (repo root).
      HANDOFF-TL.md:194:13. **`response-reducing-rustc-fork.md`** — record of the Vale
@@ -12903,10 +12903,10 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
      future-architecture-investigations.md:406:4. **Look at `response-reducing-rustc-fork.md`** to see what was
      docs/historical/handoff-codegen-backend-plugin.md:500:- Update the Vale response draft (`response-reducing-rustc-fork.md`) to reflect the zero-fork landing.
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-codegen-backend-plugin.md · lines 490-509)
   ⎿  Read 20 lines
 
-⏺ Search(pattern: "Vale", path: "/Users/verdagon/erw/docs/historical/handoff-two-crate-migration.md")
+⏺ Search(pattern: "Vale", path: "/Volumes/V/Harmonious/docs/historical/handoff-two-crate-migration.md")
   ⎿  Found 4 lines
      81:[Omitted long matching line]
      476:- Additional Cases 1a/1b/3 infrastructure. Stage 5 preserves the capability; actual exercise is future work (possibly Vale).
@@ -12934,7 +12934,7 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 
 ❯ please do a scoping pass for bumping to nightly
 
-⏺ Search(pattern: "nightly-2025-01-15", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "nightly-2025-01-15", path: "/Volumes/V/Harmonious")
   ⎿  Found 60 lines
      rust-toolchain.toml:2:channel = "nightly-2025-01-15"
      CLAUDE.md:11:[Omitted long matching line]
@@ -13003,12 +13003,12 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 
 ⏺ Now map the three confirmed-drift PRs onto our code:
 
-⏺ Search(pattern: "RunCompiler", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "RunCompiler", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 lines
      rustc-lang-facade/src/driver.rs:52:    rustc_driver::RunCompiler::new(rustc_args, &mut driver).run();
      toylangc/src/main.rs:194:    rustc_driver::RunCompiler::new(args, &mut cb).run();
 
-⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "codegen_crate|EncodedMetadata|join_codegen", path: "/Volumes/V/Harmonious")
   ⎿  Found 24 lines
      rustc-lang-facade/src/driver.rs:64:        // cleared inside `LangCodegenBackend::codegen_crate`, but under
      rustc-lang-facade/src/driver.rs:88:        // LangCodegenBackend::codegen_crate, AFTER monomorphization completes.
@@ -13035,18 +13035,18 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
      rustc-lang-facade/src/cgu_stash.rs:83:    // contract (both stash and read inside the same `codegen_crate` call on
      toylangc/src/llvm_gen.rs:1920:    // `codegen_crate` call.
 
-⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "impl.*Callbacks for|rustc_driver::Callbacks", path: "/Volumes/V/Harmonious")
   ⎿  Found 3 lines
      rustc-lang-facade/src/driver.rs:57:impl rustc_driver::Callbacks for LangDriver {
      toylangc/src/main.rs:188:impl rustc_driver::Callbacks for NoopCallbacks {}
      toylangc/src/toylang/callbacks_impl.rs:371:impl LangCallbacks for ToylangCallbacks {
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs · lines 135-154)
   ⎿  Read 16 lines
 
 ⏺ Now identify unknown-drift surfaces (MIR construction / ABI / partitioner):
 
-⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "rustc_middle::mir|BasicBlockData|Rvalue::Cast|CastKind::PointerCoercion|NullOp::SizeOf|set_required_consts|set_mentioned_items|ReifyFnPointer", path: "/Volumes/V/Harmonious")
   ⎿  Found 9 files
      toylangc/src/toylang/callbacks_impl.rs
      rustc-lang-facade/src/cgu_stash.rs
@@ -13058,12 +13058,12 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
      rustc-lang-facade/src/queries/drop_glue.rs
      rustc-lang-facade/src/mir_helpers.rs
 
-⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PassMode|CoercedReturn|CoercedParam|FnAbi|Conv::", path: "/Volumes/V/Harmonious")
   ⎿  Found 2 files
      toylangc/src/llvm_gen.rs
      rustc-lang-facade/src/abi_helpers.rs
 
-⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "MonoItemData|Linkage::|Visibility::|CodegenUnit|internalize_symbols|collect_and_partition", path: "/Volumes/V/Harmonious")
   ⎿  Found 7 files
      rustc-lang-facade/src/lib.rs
      toylangc/src/stub_gen.rs
@@ -13073,7 +13073,7 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
      rustc-lang-facade/src/queries/mod.rs
      toylangc/src/llvm_gen.rs
 
-⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Users/verdagon/erw")
+⏺ Search(pattern: "PseudoCanonicalInput|ParamEnv|TypingEnv|BackendRepr", path: "/Volumes/V/Harmonious")
   ⎿  Found 6 files
      toylangc/src/toylang/callbacks_impl.rs
      toylangc/src/oracle.rs
@@ -13345,16 +13345,16 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 
 ⏺ Let me peek at one existing junior handoff to match the house style:
 
-⏺ Read(/Users/verdagon/erw/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
+⏺ Read(/Volumes/V/Harmonious/docs/historical/handoff-optimized-mir-migration.md · lines 1-80)
   ⎿  Read 80 lines
 
-⏺ Write(/Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿  Wrote 658 lines to /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Write(/Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿  Wrote 658 lines to /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Bash(wc -l /Users/verdagon/erw/HANDOFF-nightly-bump.md)
-  ⎿       658 /Users/verdagon/erw/HANDOFF-nightly-bump.md
+⏺ Bash(wc -l /Volumes/V/Harmonious/HANDOFF-nightly-bump.md)
+  ⎿       658 /Volumes/V/Harmonious/HANDOFF-nightly-bump.md
 
-⏺ Created at /Users/verdagon/erw/HANDOFF-nightly-bump.md (658 lines).
+⏺ Created at /Volumes/V/Harmonious/HANDOFF-nightly-bump.md (658 lines).
 
   Structure
 
@@ -13656,10 +13656,10 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 
 ⏺ Step 2: Draft tech debt #30
 
-⏺ Read(/Users/verdagon/erw/docs/architecture/known-tech-debt.md · lines 78-117)
+⏺ Read(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md · lines 78-117)
   ⎿  Read 40 lines
 
-⏺ Update(/Users/verdagon/erw/docs/architecture/known-tech-debt.md)
+⏺ Update(/Volumes/V/Harmonious/docs/architecture/known-tech-debt.md)
   ⎿  Added 62 lines
       112
       113  ---
@@ -13792,7 +13792,7 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
      thread 'test_point_layout' (67235499) panicked at toylangc/tests/integration_projects.rs:326:9:
      point_layout: expected 'layout_of intercepted for: Point size=8 align=4' in build stderr, got:
           Locking 1 package to latest compatible version
-        Compiling lang_stubs_point_layout v0.0.0 (/Users/verdagon/erw/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
+        Compiling lang_stubs_point_layout v0.0.0 (/Volumes/V/Harmonious/toylangc/tests/integration_projects/point_layout/.toylang-build/lang_stubs_crate)
      warning: target feature `neon` must be enabled to ensure that the ABI of the current target can be implementedcorrectly
        |
        = note: this was previously accepted by the compiler but is being phased out; it will become a hard error ina future release!
@@ -13877,13 +13877,13 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 
 ⏺ Let me verify the current post-bump state of the key extension points so the guide reflects reality:
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/driver.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/driver.rs)
   ⎿  Read 96 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/codegen_wrapper.rs)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/codegen_wrapper.rs)
   ⎿  Read 154 lines
 
-⏺ Read(/Users/verdagon/erw/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
+⏺ Read(/Volumes/V/Harmonious/rustc-lang-facade/src/queries/optimized_mir.rs · lines 145-184)
   ⎿  Read 40 lines
 
 ⏺ rustc Extension Points — A Step-by-Step Guide
@@ -14178,10 +14178,10 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 
 ❯ please write all that into a file. please dont wrap at 80 characters, each line should be uninterrupted by newlines
 
-⏺ Bash(ls /Users/verdagon/erw/docs/background/ 2>&1)
+⏺ Bash(ls /Volumes/V/Harmonious/docs/background/ 2>&1)
   ⎿  (No output)
 
-⏺ Bash(ls -la /Users/verdagon/erw/docs/background/)
+⏺ Bash(ls -la /Volumes/V/Harmonious/docs/background/)
   ⎿  total 0
      drwxr-xr-x@  2 verdagon  staff   64 Apr  9 20:25 .
      drwxr-xr-x@ 10 verdagon  staff  320 Apr 17 17:32 ..
@@ -14189,13 +14189,13 @@ verdagon@Evans-MBP-2 erw % claude --resume toylang-tl
 ❯ /rename toylang-tl
   ⎿  Session renamed to: toylang-tl
 
-⏺ Write(/Users/verdagon/erw/docs/background/rustc-extension-points.md)
-  ⎿  Wrote 232 lines to /Users/verdagon/erw/docs/background/rustc-extension-points.md
+⏺ Write(/Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
+  ⎿  Wrote 232 lines to /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
-⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Users/verdagon/erw/docs/background/rustc-extension-points.md
-  /Users/verdagon/erw/docs/background/rustc-extension-points.md 2>&1; wc -l /Users/verdagon/erw/docs/background/rustc-extension-points.md)
+⏺ Bash(awk 'NR==FNR{total++;next} /^(#|-|```|\|)/{next} length > 160 {long++} END{print "Prose lines over 160 chars:", long+0}' /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
+  /Volumes/V/Harmonious/docs/background/rustc-extension-points.md 2>&1; wc -l /Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
   ⎿  Prose lines over 160 chars: 35
-          232 /Users/verdagon/erw/docs/background/rustc-extension-points.md
+          232 /Volumes/V/Harmonious/docs/background/rustc-extension-points.md
 
 ⏺ Saved to docs/background/rustc-extension-points.md. 232 lines, 35 of them long prose paragraphs (none wrapped). Headings, tables, code blocks, and bullet lists are structured as markdown normally
   requires; every prose paragraph is a single uninterrupted line.
@@ -14625,9 +14625,9 @@ verdagon@Evans-MBP-2 erw % claude
 ❯ /rename toylang-explainer
   ⎿  Session renamed to: toylang-explainer
 
-❯ please print out /Users/verdagon/erw/docs/background/rustc-extension-points.md to me
+❯ please print out /Volumes/V/Harmonious/docs/background/rustc-extension-points.md to me
 
-⏺ Read(/Users/verdagon/erw/docs/background/rustc-extension-points.md)
+⏺ Read(/Volumes/V/Harmonious/docs/background/rustc-extension-points.md)
   ⎿  Read 233 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
@@ -15388,7 +15388,7 @@ verdagon@Evans-MBP-2 erw % claude
 ❯ please read HANDOFF-TL.md. in a bit im going to give you some saved discussions for a language i want to make, and im hoping you can then ask me a bunch of followup questions
   that will help us figure out how we're going to architect its rust interop.
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Read 423 lines
   ⎿  PreToolUse:Read hook error                                                             ⎿  Hook JSON output validation failed — (root): Invalid input
 
@@ -15593,7 +15593,7 @@ verdagon@Evans-MBP-2 erw % claude --resume 7b2e4ee6-c15f-47ed-892b-edac453b48a5
 ❯ please read HANDOFF-TL.md. in a bit im going to give you some saved discussions for a language i want to make, and im hoping you can then ask me a bunch of followup questions
   that will help us figure out how we're going to architect its rust interop.
 
-⏺ Read(/Users/verdagon/erw/HANDOFF-TL.md)
+⏺ Read(/Volumes/V/Harmonious/HANDOFF-TL.md)
   ⎿  Read 423 lines
 
 ⏺ Read. Project is in maintenance mode — vanilla nightly rustc, zero fork patches, two-crate architecture (stub rlib + user bin), 4 query provider overrides, LLVM backend for

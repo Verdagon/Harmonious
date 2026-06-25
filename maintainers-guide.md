@@ -139,7 +139,7 @@ with features).
 
 3. **Snapshot the current state.**
    ```
-   cargo +rustc-fork test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml \
+   cargo +rustc-fork test --manifest-path /Volumes/V/Harmonious/toylangc/Cargo.toml \
        --test integration_projects -- --test-threads=1 > tmp/pre-bump-test-snapshot.log 2>&1
    ```
    Record the test count. This is your baseline.
@@ -198,7 +198,7 @@ with features).
 8. **Rebuild the facade + toylangc.**
    ```
    LLVM_SYS_211_PREFIX=/Users/verdagon/rust/build/aarch64-apple-darwin/ci-llvm \
-       cargo +rustc-fork build --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml --tests
+       cargo +rustc-fork build --manifest-path /Volumes/V/Harmonious/toylangc/Cargo.toml --tests
    ```
    Fix any compile errors. The facade is exposed to:
    - `MonoItemPartitions` / `CodegenUnit` struct shape changes
@@ -213,8 +213,8 @@ with features).
 
 9. **Run cold tests.**
    ```
-   rm -rf /Users/verdagon/erw/toylangc/target/integration-projects-cache
-   find /Users/verdagon/erw/toylangc/tests/integration_projects \
+   rm -rf /Volumes/V/Harmonious/toylangc/target/integration-projects-cache
+   find /Volumes/V/Harmonious/toylangc/tests/integration_projects \
        -name ".toylang-build" -type d -exec rm -rf {} + 2>/dev/null
    LLVM_SYS_211_PREFIX=... cargo +rustc-fork test --manifest-path .../Cargo.toml \
        --test integration_projects -- --test-threads=1 \
@@ -692,7 +692,7 @@ re-litigate if you don't know they've been settled:
 Build + test toylangc:
 ```
 LLVM_SYS_211_PREFIX=/Users/verdagon/rust/build/aarch64-apple-darwin/ci-llvm \
-    cargo +rustc-fork test --manifest-path /Users/verdagon/erw/toylangc/Cargo.toml \
+    cargo +rustc-fork test --manifest-path /Volumes/V/Harmonious/toylangc/Cargo.toml \
     --test integration_projects -- --test-threads=1
 ```
 
@@ -704,10 +704,10 @@ LLVM_SYS_211_PREFIX=... cargo +rustc-fork test --manifest-path .../Cargo.toml \
 
 Run toylangc directly on a fixture (for save-temps debugging):
 ```
-cd /Users/verdagon/erw/toylangc/tests/integration_projects/inlining/case5_no_lto
+cd /Volumes/V/Harmonious/toylangc/tests/integration_projects/inlining/case5_no_lto
 rm -rf .toylang-build
 LLVM_SYS_211_PREFIX=... DYLD_FALLBACK_LIBRARY_PATH=/Users/verdagon/.rustup/toolchains/rustc-fork/lib \
-    RUSTFLAGS="-C save-temps" /Users/verdagon/erw/target/debug/toylangc build
+    RUSTFLAGS="-C save-temps" /Volumes/V/Harmonious/target/debug/toylangc build
 ```
 
 Inspect a Sky binary's symbol table:
@@ -724,8 +724,8 @@ Disassemble main:
 
 Wipe caches for a cold run:
 ```
-rm -rf /Users/verdagon/erw/toylangc/target/integration-projects-cache
-find /Users/verdagon/erw/toylangc/tests/integration_projects \
+rm -rf /Volumes/V/Harmonious/toylangc/target/integration-projects-cache
+find /Volumes/V/Harmonious/toylangc/tests/integration_projects \
     -name ".toylang-build" -type d -exec rm -rf {} +
 ```
 
