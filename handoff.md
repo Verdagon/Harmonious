@@ -102,7 +102,7 @@ User's stated priority is **rustc-integration quality, especially perf/inlining 
 
 10. **Phase R Site #8 probe — sret-bridge alloca/load size mismatch (~half day).** Highest-leverage of the 7 emission-audit findings; same shape as B10 we just fixed but asymmetric direction we didn't cover. Build a probe; if it triggers, fix the same way (memory reinterpretation aligned to declared signature).
 
-11. **Phase Q — `codegen_fn_attrs` override for `NEVER_UNWIND` (~1 day with bench).** Free perf win under Sky's panic=abort posture. Eliminates LLVM landing-pad emission at every Rust caller. Needs a panic=unwind perf bench to measure delta.
+11. ~~Phase Q — `codegen_fn_attrs` override~~ — **SHIPPED THEN RETIRED 2026-06-25** (commits `736eeb5` ship + `f88aa84` retire). Reviewer's round-4-followup audit confirmed cargo enforces panic-strategy consistency at build-graph resolution; mixed-strategy case is structurally impossible within Sky's tooling, making Phase Q's `NEVER_UNWIND` flag a defensive no-op with no real failure mode. Provenance comment chain pinned in `queries/mod.rs` with explicit DO NOT FLATTEN annotation.
 
 12. **Phase R remaining sites — Sites #1, #5/#6, #10 (~1 day total).** Probe + fix each candidate from the emission audit. Site #10 (parse_coerced_type missing float arms) becomes important the moment anyone wants `f32`/`f64` Sky exports.
 
@@ -210,22 +210,29 @@ NONE of these decisions have shipped yet. No empirical work has touched them sin
 
 ### What's left — at-a-glance decision tree (refreshed 2026-06-25)
 
-User's stated priority: **rustc-integration quality, especially perf/inlining**. All 5 round-4-close-driven rustc-integration tasks SHIPPED 2026-06-25 (Phase P, Phase Q, Phase R Sites #1/#5/#6/#8/#10, Bench 4, plus the surprise bool-accessor finding/fix).
+User's stated priority: **rustc-integration quality, especially perf/inlining**. All 5 round-4-close-driven rustc-integration tasks closed 2026-06-25 — Phase P shipped + verified, Phase Q shipped-then-retired per reviewer's interaction audit, Phase R Sites #1/#5/#6/#8/#10 shipped defensively, Bench 4 shipped (artifactual; Bench 4b is the meaningful measurement), plus two SURPRISE silent-miscompile bug fixes (bool accessor, IntLit widening) found via the empirical-fixture-first discipline.
 
 ```
 Status →
 ├── rustc-integration (USER PRIORITY) — DONE this session
 │   ├── ✅ Phase P: deduce_param_attrs soundness override (commit 760b674)
 │   ├── ✅ Phase R Site #8: sret-bridge defensive fix (commit 04e98c7)
-│   ├── ✅ Phase Q: codegen_fn_attrs NEVER_UNWIND override (commit 736eeb5)
+│   ├── ⚰️ Phase Q: codegen_fn_attrs NEVER_UNWIND override (shipped 736eeb5 then RETIRED f88aa84)
 │   ├── ✅ Phase R Sites #1/#5/#6/#10: defensive ABI-coercion fixes (commit 52ee0a3)
 │   ├── ✅ Bool accessor silent miscompile FIX (commit 736eeb5)
-│   └── ✅ Bench 4 LargeStruct (commit d9248c7) — Sky matches inlineable Rust at 0.1%
+│   └── ✅ Bench 4 LargeStruct (commit d9248c7) — artifactual; Bench 4b (ae014d0) is the meaningful measurement: 20-run trimmed-mean Sky-Rust parity at 2% delta within noise
+│
+├── ✅ Doc sweep — COMPLETED 2026-06-25
+│   ├── §22.4 reframed to lead with Sky-Rust parity (commit 8f85622 + 33aeae4)
+│   ├── §25.2 B10 rewrite (commit 33aeae4) — "was Sky's bug, not LLVM's" framing
+│   ├── §15.7 dual-path drop narrative paragraph (commit 8f85622)
+│   ├── Lifecycle-traits registry (commit 8f85622) — generalizes "Drop" hardcoding
+│   ├── §25.3.6 calibration discipline (commit f88aa84) — 4-bugs-with-rationalization-priors pattern
+│   └── §22.4 v2 path-b note (commit f88aa84) — preserves v2 perf-recovery option
 │
 ├── Operational / drift hygiene (medium priority — NEXT SESSION)
 │   ├── Phase N (recursion safety, ~2-3 days)
-│   ├── Phase O (drift CI fences for B24/B25/B26, ~3-5 days)
-│   └── Doc sweep (§22.4 reframe, §25.2 B10 rewrite, §15 dual-path para, lifecycle-traits registry)
+│   └── Phase O (drift CI fences for B24/B25/B26, ~3-5 days)
 │
 ├── Engineering velocity (lower priority unless blocking)
 │   └── Phase G (cdylib + wrapper-mode retirement, ~5-7 days)
@@ -235,16 +242,16 @@ Status →
     └── Phases J/K/L/M — u128 typeids → content-hash → SkyRef → async typestate
 ```
 
-**Bench 4 finding (key):** Sky's wrapper-boundary cost matches inlineable Rust at 0.1% delta for indirect-passed by-value structs. Path-b emission (Sky's ground-truth attrs at `codegen_extern_wrapper`) was the deferred perf recovery for Phase P's conservative `&[]` override; Bench 4 shows the gap is ~0 because LLVM inlines through Sky's wrapper at thin LTO. **Path-b is NOT measurably worth pursuing** for current Sky shapes. Phase P's safety override is sufficient. ⚠️ Caveat — Bench 4 may be artifactual; see "Session 2026-06-25 verification gaps" §7 below.
+**Bench 4 finding (resolved 2026-06-25):** Original Bench 4's "Sky matches inlineable Rust at 0.1% delta" finding was artifactual — disassembly inspection confirmed LLVM completely inlined and constant-folded the inner loop. Bench 4b (with `std::hint::black_box` defeating the fold + post-IntLit-widening-fix) gives the meaningful number: **Sky inner loop is byte-identical to inlineable Rust's; 20-run trimmed-mean comparison shows Sky 6505μs vs Rust 6658μs (Sky ~2% faster, within run-to-run variance).** Path-b conclusion is now robust: Sky's cross-crate boundary cost equals inlineable Rust at thin LTO for shapes LLVM can inline through. The pre-fix 38% gap was entirely the IntLit widening silent miscompile, not the wrapper boundary itself. Phase P's conservative `&[]` override is sufficient for v1.
 
-**⚠️ IMPORTANT — read before next session:** Of 9 verification gaps from this session's defensive correctness work, 5 are now closed via audit/IR-inspection + 4 remain genuinely blocked behind toylang grammar growth. Three silent-miscompile bug fixes were verified end-to-end (bool accessor, IntLit widening, B10 round-4). Path-b emission was de-prioritized after Bench 4b 20-run verification showed Sky-vs-Rust wrapper-boundary parity. See "Session 2026-06-25 verification gaps + suspected issues" below + "Follow-ups discovered during the continuation session" for unblocked open items (A1-A4).
+**⚠️ IMPORTANT — read before next session:** Of 9 verification gaps from this session's defensive correctness work, 5 closed via audit/IR-inspection + 4 remain genuinely blocked behind toylang grammar growth. **Three silent-miscompile bug fixes were verified end-to-end** (bool accessor, IntLit widening, B10 round-4). Bench 4b 20-run verification established Sky-vs-Rust wrapper-boundary parity (path-b emission unnecessary for v1). Phase Q shipped-then-retired same day per reviewer's audit (cargo enforces panic-strategy consistency; mixed case structurally impossible). Of the four continuation follow-ups (A1-A4), A3 + A4 closed; A1 + A2 remain open and grammar-unblocked. See "Session 2026-06-25 verification gaps + suspected issues" below for the full state.
 
 **Recommended ordering for next fresh-context session:** 
-1. **A1 audit** (resolve_expr other arms for missing expected_ty coercion) — quick win; could surface more silent-miscompile bugs of the IntLit class. ~1 hour.
-2. **A2 rename** of misleading Bench 4 → bench4_artifactual_loopfold_only. ~half hour.
-3. **A3 Phase Q retire decision** — punt to user; cheap to ask, may simplify the override surface.
-4. **Doc sweep** (round-4 residuals: §22.4 reframe, §25.2 B10 rewrite, §15 dual-path para, lifecycle-traits registry).
-5. **Phase O drift CI fences** (operational hygiene; protects the now-multiplied query overrides from rustc drift).
+1. **A1 audit** (resolve_expr other arms for missing expected_ty coercion) — quick win; could surface more silent-miscompile bugs of the IntLit class. ~1 hour. **OPEN.**
+2. **A2 rename** of misleading Bench 4 → bench4_artifactual_loopfold_only. ~half hour. **OPEN.**
+3. ~~A3 Phase Q retire decision~~ — **RESOLVED (commit `f88aa84`)**: reviewer's round-4-followup confirmed retirement; deleted.
+4. ~~Doc sweep~~ — **COMPLETED 2026-06-25** (commits `8f85622` + `33aeae4` + `f88aa84` + `5c0a6b2`). §22.4 reframed to lead with Sky-Rust parity; §25.2 B10 rewrite ("was our bug"); §15.7 dual-path drop narrative; lifecycle-traits registry; §25.3.6 calibration discipline; §22.4 v2 path-b note; arch doc post-Phase-Q-retirement sweep.
+5. **Phase O drift CI fences** (operational hygiene; protects the active query overrides from rustc drift). 5 active overrides post-Phase-Q-retirement (4 distinct queries).
 6. **Phase G** if iteration speed becomes the bottleneck.
 7. Re-probe Phase R deferred items when toylang grammar growth makes their triggers reachable.
 
@@ -1982,7 +1989,7 @@ Tasks:
 
 **Status: OPEN, high priority.** Latent silent-UB vector currently in production-bound emission.
 
-**WHAT.** Override rustc's `deduce_param_attrs` query for `#[toylang::emit_consumer_body]`-tagged items to return `&[]` (no attrs claimed). This is the safe-default fix that closes the soundness gap; perf recovery is a separate Phase Q-adjacent follow-up.
+**WHAT.** Override rustc's `deduce_param_attrs` query for `#[toylang::emit_consumer_body]`-tagged items to return `&[]` (no attrs claimed). This is the safe-default fix that closes the soundness gap; perf recovery (path-b emission of Sky's ground-truth attrs at the wrapper boundary) is a deferred v2 option, tracked in §22.4 of the arch doc — don't commit to it without a bench showing the v1 conservative shape leaves measurable perf on the table.
 
 **WHY.** rustc's `deduce_param_attrs` analyzes Sky's stub `unreachable!()` MIR body. The body lowers to a `Call` terminator to `core::panicking::panic` that doesn't touch param locals at all. `UsageSummary` stays `empty()` → rustc concludes "the function neither mutates, captures, drops, nor shared-borrows its param." `apply_deduced_attributes` (rustc-fork `compiler/rustc_ty_utils/src/abi.rs:646-672`) then sets `ReadOnly` + `CapturesNone` for `PassMode::Indirect` params.
 
@@ -2013,9 +2020,25 @@ Same B10 shape (rustc trusts stub MIR; stub "lies" about behavior); worse failur
 - New §25.2 entry: latent silent-UB vector closed (or refresh existing entry; choose framing).
 - §22.4.1 cache-policy table: new query row.
 
-### Phase Q: `codegen_fn_attrs` override for `NEVER_UNWIND` + perf bench (~1 day) — surfaced during round-4 close
+### Phase Q: `codegen_fn_attrs` override for `NEVER_UNWIND` — SHIPPED THEN RETIRED same day 2026-06-25
 
-**Status: OPEN, medium priority.** Free perf win under Sky's panic=abort posture.
+**Status: SHIPPED THEN RETIRED 2026-06-25.** Commits `736eeb5` (ship) + `f88aa84` (retire). Provenance comment chain pinned in `rustc-lang-facade/src/queries/mod.rs` with explicit DO NOT FLATTEN annotation (commit `a6f7940`); per reviewer's round-4-followup, "Doc-trail of decisions that oscillated is more useful than the doc-trail of decisions that landed cleanly — it shows future engineers the failure mode that drove the re-introduction."
+
+**Why retired (reviewer's reasoning, 2026-06-25):** cargo enforces panic-strategy consistency across the dep graph at build-graph resolution. A `panic = "unwind"` user_bin pulling in a `panic = "abort"` Sky stub_rlib would fail before any compile fires. Sky's `.skybuild/Cargo.toml` pins panic=abort at the workspace root (§16.1); cargo propagates to all members. The mixed-panic-strategy case Phase Q's `NEVER_UNWIND` flag defended against is structurally impossible within Sky's tooling — Phase Q was a defensive correctness no-op with no real failure mode.
+
+If Sky ever ships precompiled-bodies for pure-cargo consumption (arch §21.7 v2), the panic-strategy question reappears at the cargo-package metadata layer (e.g. `package.required-features = ["panic_abort"]`), NOT at the codegen-attr layer. Per "every Sky mechanism must be load-bearing" discipline, dead overrides incur maintenance cost.
+
+**Files removed in `f88aa84`:**
+- `rustc-lang-facade/src/queries/codegen_fn_attrs.rs` (deleted)
+- mod.rs registration + lang_override_queries call removed
+- lib.rs OnceLock + accessor + install_query_defaults sig
+- cache_audit.rs entry
+
+**Historical Tasks/WHAT/etc. preserved below as design history; do NOT re-implement.**
+
+----- HISTORICAL DESIGN-HISTORY ENTRY (do not re-implement) -----
+
+**WHAT.** Override `codegen_fn_attrs` for `#[toylang::emit_consumer_body]`-tagged items to stamp the `NEVER_UNWIND` flag. Eliminates LLVM landing-pad emission at every Rust caller — significant for tight callee-rich loops under panic=unwind.
 
 **WHAT.** Override `codegen_fn_attrs` for `#[toylang::emit_consumer_body]`-tagged items to stamp the `NEVER_UNWIND` flag. Eliminates LLVM landing-pad emission at every Rust caller — significant for tight callee-rich loops under panic=unwind.
 
@@ -2103,8 +2126,8 @@ Same B10 shape (rustc trusts stub MIR; stub "lies" about behavior); worse failur
 - Phase M: 3-5 days (async typestate).
 - Phase N: 2-3 days (Sky-side recursion).
 - Phase O: 3-5 days (drift CI fences).
-- Phase P: half-day (deduce_param_attrs soundness override).
-- Phase Q: 1 day (codegen_fn_attrs override + panic=unwind bench).
+- Phase P: half-day (deduce_param_attrs soundness override) — SHIPPED 2026-06-25.
+- ~~Phase Q: 1 day~~ — SHIPPED THEN RETIRED 2026-06-25 (no work needed; deleted same day).
 - Phase R: 1-2 days (B10-style emission audit follow-ups).
 
 Some can parallelize (cdylib build + FFI shape + cache audit could overlap with content-hash work); some can't (predicate migration must precede mir_shims elimination; both must precede per-view ref types in stub_gen).
@@ -2172,7 +2195,7 @@ Two minor doc/code residuals from round-4 close (folded into the post-round-4 do
 
 Round-4 close also surfaced 3 new Phase entries via parallel-agent investigation:
 - **Phase P** (deduce_param_attrs soundness override) — latent silent-UB vector closed.
-- **Phase Q** (codegen_fn_attrs NEVER_UNWIND override) — free perf win under panic=abort.
+- ~~**Phase Q** (codegen_fn_attrs NEVER_UNWIND override)~~ — shipped-then-retired same day per reviewer's interaction audit.
 - **Phase R** (B10-style emission audit follow-ups, 7 sites) — systematic ABI-coercion-mismatch hunt.
 
 See "NEXT — start here next session" at the top of the TL;DR for the priority-ordered plan.
@@ -2221,13 +2244,13 @@ DO:
 
 ## Session 2026-06-25 — verification gaps + suspected issues
 
-This session shipped Phase P, Phase Q, Phase R (Sites #1/#5/#6/#8/#10), Bench 4, and the bool accessor fix. Five of those six items are **defensive correctness fixes whose trigger conditions are currently unreachable in toylang grammar** — they haven't been verified against the actual bug surfaces they claim to close. Tracking each as an open follow-up so future sessions know exactly what's tested and what isn't.
+This session shipped Phase P, Phase Q (then retired same day per reviewer's audit), Phase R (Sites #1/#5/#6/#8/#10), Bench 4, the bool accessor fix, and the IntLit widening fix. Of the original 9 verification gaps tracked: 5 closed via audit/inspection, 4 remain genuinely blocked behind toylang grammar growth (those 4 are the Phase R defensive fixes whose triggers require i8/i16, trait impls on slices, or f32/SIMD). The follow-ups discovered during the continuation (A1-A4): A3 + A4 closed; A1 + A2 remain unblocked-open.
 
 ### Verification gaps (defensive fixes lacking trigger-condition tests)
 
 1. ~~Phase P override verification~~ — **resolved via IR inspection 2026-06-25.** The existing `bench4_largestruct_byval_thin` fixture exercises the override end-to-end (Rust caller invokes Sky exports `make_large(i64) -> LargeStruct` and `first_field(LargeStruct) -> i64`, both with indirect-passed params). IR inspection confirms the override fires: Sky's tagged-item declarations show `captures(address)` (default for `&T`/sret) NOT `captures(none)` (which `deduce_param_attrs` would have added), and NO `readonly` attr. Verification details captured in `rustc-lang-facade/src/queries/deduce_param_attrs.rs` header. A true soundness fence (Sky body mutating the indirect param) still requires toylang grammar to grow `&mut T` non-receiver args + field mutation — that follow-up remains open but the override IS verified to suppress the deduced attrs at the LLVM IR layer. **Closes verification gap #1.**
 
-2. ~~Phase Q perf bench~~ — **resolved via interaction audit 2026-06-25.** The `codegen_fn_attrs` override is consumed by `rustc_middle::ty::layout::fn_can_unwind` (layout.rs:1233-1257). Same function early-returns false for ALL non-foreign items when `tcx.sess.panic_strategy().unwinds()` is false. Sky's enforced panic=abort posture (§16.1) makes that the case → Phase Q's `NEVER_UNWIND` flag is REDUNDANT under uniform panic=abort. The override only matters in mixed-panic-strategy interop (Sky stub_rlib compiled panic=abort consumed by a Rust user_bin compiled panic=unwind), where the override's attrs flow through rmeta and the user_bin's `fn_can_unwind` early-returns false based on the flag. Phase Q shipped as a defensive correctness no-op for uniform builds + a real perf win for mixed-strategy interop builds. No bench shipped because Sky's typical use case is uniform panic=abort. Full audit in `rustc-lang-facade/src/queries/codegen_fn_attrs.rs` header. **Closes verification gap #2.**
+2. ~~Phase Q perf bench~~ — **resolved via interaction audit 2026-06-25 + reviewer's retirement endorsement.** The `codegen_fn_attrs` override was consumed by `rustc_middle::ty::layout::fn_can_unwind` (layout.rs:1233-1257). Same function early-returns false for ALL non-foreign items when `tcx.sess.panic_strategy().unwinds()` is false. Sky's enforced panic=abort posture (§16.1) makes that the case → Phase Q's `NEVER_UNWIND` flag was REDUNDANT under uniform panic=abort. Reviewer's round-4-followup additionally observed that cargo enforces panic-strategy consistency at build-graph resolution, so even the mixed-strategy edge case Phase Q would have helped was structurally impossible within Sky's tooling. **Phase Q retired** 2026-06-25 (commit `f88aa84`); no bench needed because there's no override to bench against. Provenance comment chain pinned in `rustc-lang-facade/src/queries/mod.rs` with DO NOT FLATTEN annotation. **Closes verification gap #2.**
 
 3. **Phase R Site #8 (sret-bridge alloca/load size mismatch, commit `04e98c7`) — no regression probe for the actual trigger.** When my initial bool-struct fixture surfaced the bool accessor bug instead (which I fixed separately), I removed the misleading fixture and committed the defensive fix unverified. Site #8's actual trigger requires struct shapes toylang can't currently express (LLVM-size differs from rustc's ABI-coerced direct return size — typically 3/5/6/7-byte structs requiring `i8`/`i16` field types). **Follow-up:** when toylang grammar grows `i8`/`i16`, write a probe fixture with a 3-byte struct returned by-value, verify build + correct runtime at -O3 + thin LTO.
 
@@ -2243,7 +2266,7 @@ This session shipped Phase P, Phase Q, Phase R (Sites #1/#5/#6/#8/#10), Bench 4,
 
 8. ~~`static_size_bytes` alignment heuristic~~ — **audited 2026-06-25.** Heuristic `field_align = min(field_size, pointer_bytes)` matches LLVM's actual rules EXACTLY for every type Sky's `resolved_to_inkwell` produces today (`bool`/`i1`, `i32`, `i64`/`usize`/`ptr`, `f64`, structs of those). Known divergences from LLVM for types Sky doesn't emit yet: `i128` fields (LLVM aligns to 16; heuristic clamps to pointer_bytes), array fields in structs (LLVM uses element-alignment), and vector types (heuristic panics). Audit + caveats documented in `static_size_bytes`' doc-comment in `llvm_gen.rs`. **Follow-up:** when toylang grammar grows `i128`, fixed-size byte arrays, or SIMD, re-audit against `TargetData::abi_alignment_of_type`. **Closes verification gap #8 within current Sky scope.**
 
-9. ~~Query override interaction audit~~ — **audited 2026-06-25.** Traced consumers for each Sky override. Findings: (a) Phase Q's `codegen_fn_attrs` is consumed by `fn_can_unwind` (layout.rs:1233); this is the ONLY downstream consumer for Sky-tagged items. (b) `cross_crate_inlinable`, `deduced_param_attrs`, `layout_of`, `mir_inliner_callees`, `mir_callgraph_cyclic` are independent — no cross-feed for Sky-tagged items. (c) Phase Q audit revealed `fn_can_unwind`'s panic_strategy early-return makes Phase Q effectively no-op under uniform panic=abort (see #2 above). Full audit captured in `rustc-lang-facade/src/queries/codegen_fn_attrs.rs` header. **Closes verification gap #9.**
+9. ~~Query override interaction audit~~ — **audited 2026-06-25.** Traced consumers for each Sky override. Findings: (a) Phase Q's `codegen_fn_attrs` (then-active) was consumed by `fn_can_unwind` (layout.rs:1233) — the ONLY downstream consumer for Sky-tagged items. The audit was load-bearing: it surfaced that `fn_can_unwind`'s panic_strategy early-return made Phase Q effectively no-op under uniform panic=abort, leading directly to Phase Q's retirement (see #2 above). (b) `cross_crate_inlinable`, `deduced_param_attrs`, `layout_of`, `mir_inliner_callees`, `mir_callgraph_cyclic` are independent — no cross-feed for Sky-tagged items. Post-Phase-Q-retirement: only 4 distinct active overrides remain, and the interaction surface is now zero (no downstream consumer of any Sky override flows into another query). **Closes verification gap #9.**
 
 ### What was actually fully verified this session
 
