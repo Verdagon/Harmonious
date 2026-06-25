@@ -58,9 +58,14 @@ If you're picking up cold from someone else, also skim `tmp/claude-conversation-
 - **Phase F (symbol_name override retirement)** — DONE 2026-06-24. `rustc-lang-facade/src/queries/symbol_name.rs` deleted; module declaration + provider assignment removed from `queries/mod.rs`; `DEFAULT_SYMBOL_NAME` OnceLock + `default_symbol_name()` accessor + `consumer_symbol_for_callback_name` trait method + StatefulVtable slot + trampoline + call helper all removed from `rustc-lang-facade/src/lib.rs`. `is_consumer_accessor_safe` deleted (orphaned). Toylangc-side: `compute_consumer_symbol` + the `consumer_symbol_for_callback_name` trait impl removed; `compute_fn_symbol` switched from `default_symbol_name()(tcx, instance)` → `tcx.symbol_name(instance).name.to_string()`. 477 tests pass cold; bench3_drop_thin smoke-test 352μs. See Decision 2 below.
 - **Phase H (patch 4 rev 3 — `#[repr(C)]` FFI shape)** — DONE 2026-06-24. Rev-2 `trait ExtraModuleAllocator<M> { fn allocate(&mut self, name: &str) -> &mut M; }` + `VecAllocator<'a, M, F: FnMut(&str) -> M>` retired in favor of `#[repr(C)] struct ExtraModuleAllocator<M> { state: *mut c_void, allocate: unsafe extern "C" fn(state, name_ptr, name_len) -> *mut M }`. Fork-side changes (~/rust, 4 files): `compiler/rustc_codegen_ssa/src/traits/backend.rs` (struct + trait method signature), `traits/mod.rs` (re-export update), `base.rs::codegen_crate` (per-`B` `unsafe extern "C" fn` thunk + state struct + struct-literal builder), `rustc_codegen_llvm/src/lib.rs` (`FillExtraModulesHook` + `LlvmCodegenBackend::fill_extra_modules` signature). Facade-side (erw, 2 files): `extra_modules_hook.rs` (consumer_fill_modules_hook signature), `lib.rs::LlvmModuleFactory` (inner field + reborrow discipline in `fill_module`). Rebuilt rustc-fork via the full `x.py dist rustc-dev` + library + reinstall procedure (~3.5 min). 477 tests pass; bench3_drop_thin smoke-test 615μs. FFI shape is now correct under BOTH static-link (current) and cdylib (future Phase G) integration; Sky proper's eventual cdylib refactor becomes a wiring change rather than an ABI rewrite. See Decision 5 below.
 - **Phase I (cache_on_disk_if audit)** — DONE 2026-06-24. **Decision 14's prescribed Provider-slot syntax (`providers.queries.layout_of_cache_on_disk_if = ...`) doesn't exist on current nightly.** `cache_on_disk_if` is a query-DECLARATION-time modifier in rustc's macro DSL, not a Provider slot. The audit re-derived cache-safety: every Sky-overridden query is safe by construction (`per_instance_mir` declared `false` in fork patch; `layout_of` + `cross_crate_inlinable` default to `false`; `collect_and_partition_mono_items` is `eval_always`; `symbol_name` was disk-cached but its override later retired in Phase F). Annotated all 4 surviving override files with `cache-audit:` marker comments. New CI fence `toylangc/tests/cache_audit.rs` asserts every override carries a marker. New §22.4.1 documents the policy table; new B21 risk entry tracks "per-query disk-cache staleness if rustc evolves the cache API." Decision 14 itself is revised below.
+- **Round 4 with the reviewer** — CLOSED 2026-06-24. Five deliverables landed (bench numbers, cache audit, drop fixtures, mir_shims empirical validation, surprises). Reviewer signed off; round 5 awaits Phase L or Phase G to surface real implementation reality. Two minor doc/code residuals queued for post-round-4 sweep: lifecycle-traits registry (generalize `local_needs_scope_drop`'s hardcoded "Drop" string, ~5 LOC), and §15 dual-path drop narrative paragraph.
+- **B10 root cause identified + fixed** — DONE 2026-06-24, commit `3041ec8`. The arch doc had framed B10 as an LLVM bug ("LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures"). It was a Sky emission bug we caused. `push_arg_for_rust_call`'s `Direct` arm in `llvm_gen.rs` was emitting struct aggregate values where rustc's ABI declared a scalar param (e.g. for `v.push(Widget { id: 1 })` where Widget = `{ i32 }` coerces to `i32`, the call instruction passed `{ i32 }` aggregate to a function declared `void(ptr, i32)`). Verifier accepted it; bitcode round-trip failed at -O1+ with "failed to parse bitcode for LTO module: Invalid record" (thin LTO) or "Callee is not a pointer type" (fat LTO). Fix: when source toylang type is `StructType` and target ABI type differs, reinterpret via memory (alloca + store + load-as-target-type). Same pattern `codegen_extern_wrapper` already uses for incoming params (@ACRTFDZ). 5 regression probes (`test_drop_b10_probe_{o0,nolto,sky_main_vec_thin,cgu1_thin,fat}`) enrolled covering the failing matrix; all 5 pass; 482 tests total cold. Bench rerun confirms perf holds within run-to-run variance. **§25.2 B10 doc reframing follows in the post-round-4 sweep.**
 
 **Not yet started (your work):**
 - Phases **G** (cdylib build system — when Sky proper's architecture migration begins; ~5-7 days because retiring toylangc's wrapper mode is a prerequisite), **J** (u128 typeids), **K** (content-hash const args), **L** (per-view refs), **M** (async typestate), **N** (recursion safety), **O** (drift fences).
+- **Phase P (deduce_param_attrs soundness override, ~half day)** — surfaced during round-4 close via parallel-agent investigation. rustc's `deduce_param_attrs` analyzes Sky's `unreachable!()` stub MIR and concludes that `PassMode::Indirect` params are `readonly` + `captures(none)` (because the stub never reads/writes them). LLVM trusts those attrs at every Rust call site. If Sky's actual `fill_extra_modules`-emitted body mutates a `&mut LargeStruct` param, the `readonly` attr is a LIE → silent miscompile at -O2+. **Currently latent** — Sky has no fixture with indirect-passed mutable params (Bench 1's `add(i32, i32)` is all Direct and dodges the indirect-only application path). A real Sky 0.1.0 release with any `fn f(x: &mut LargeStruct)` Sky export would hit silent UB. Fix: override `deduce_param_attrs` for `#[toylang::emit_consumer_body]`-tagged items to return `&[]` (safe default). New integration fence: Sky export takes `&mut LargeStruct`; Rust caller mutates across the call; verify correct result at -O3 + thin LTO. See Phase P entry below.
+- **Phase Q (codegen_fn_attrs override for NEVER_UNWIND / Cold / FFI_PURE, ~1 day with bench)** — surfaced during round-4 close. Sky enforces `panic = "abort"` globally per §16.1, so every Sky export is genuinely never-unwind. Override `codegen_fn_attrs` for tagged items to stamp `NEVER_UNWIND` → eliminates LLVM landing-pad emission at every Rust caller (significant for tight callee-rich loops under panic=unwind). Extensions: `Cold`, `FFI_PURE`/`FFI_CONST` where Sky's typechecker knows purity. Needs a panic=unwind perf bench to measure before/after. See Phase Q entry below.
+- **Phase R (B10-style emission audit follow-ups, ~1-2 days)** — surfaced during round-4 close. Agent audit found 7 candidate sites with B10-class signature-mismatch risk. Priority order: Site #8 (codegen_extern_wrapper sret-bridge alloca/load size mismatch — same B10 shape, asymmetric direction), Site #1 (push_arg_for_rust_call `Pair` arm assumes struct source), Sites #5/#6 (receiver-as-Indirect assumption breaks for slice self-types), Site #10 (parse_coerced_type missing float/vector arms — will panic on first `f32`/`f64` Sky export). Each needs a probe fixture + fix if triggered. See Phase R entry below.
 - Phase H shipped standalone (not bundled with G) because the new `#[repr(C)]` FFI shape works under both static-link and cdylib integration — so Phase G's eventual work doesn't have to revisit patch 4 ABI.
 
 **In flight from prior sessions (independent of this exchange):**
@@ -89,24 +94,35 @@ Critical caveat (historical): **toylang had zero drop tests**, so the mir_shims 
 7. ~~Symbol_name override elimination (Phase F)~~ — DONE (2026-06-24). Per Decision 2: deleted `queries/symbol_name.rs`, removed the provider assignment, dropped `DEFAULT_SYMBOL_NAME` + `default_symbol_name()` + the `consumer_symbol_for_callback_name` callback + vtable slot + trampoline + accessor. `compute_fn_symbol` now reads `tcx.symbol_name(instance)` directly. `is_consumer_accessor_safe` deleted (orphaned). `is_consumer_fn` + `is_consumer_trait_impl_method` stay alive (per_instance.rs + cascade-drain callers). 477 tests pass; bench3_drop_thin smoke-test 352μs. Three of the four roundtrip-relevant cleanup arcs (Decisions 1/2/3) now ship.
 8. ~~Patch 4 rev 3: `#[repr(C)]` FFI shape (Phase H)~~ — DONE (2026-06-24). Per Decision 5: replaced `&mut dyn ExtraModuleAllocator<M>` trait-object + `VecAllocator` driver with `#[repr(C)] struct ExtraModuleAllocator<M> { state, allocate }`. Updated rustc-fork (4 files: `traits/backend.rs`, `traits/mod.rs`, `base.rs::codegen_crate`, `rustc_codegen_llvm/lib.rs`) and the facade (2 files: `extra_modules_hook.rs`, `lib.rs::LlvmModuleFactory`). Rebuilt rustc-fork via the full `x.py dist rustc-dev` + library + reinstall procedure (~3.5 min). 477 tests pass; bench3_drop_thin smoke-test 615μs (within run-to-run variance). FFI shape is now correct under both static-link (current) and cdylib (future Phase G) integration. Shipped standalone — Phase G's wrapper-mode-retirement + cdylib-build-system work waits for Sky proper's architecture migration.
 
-**NEXT — start here next session:**
+**NEXT — start here next session (refreshed 2026-06-24 after round 4 close):**
 
-9. **Either schedule round 4 with the reviewer**, or continue with one of these smaller execution chunks:
-   - **Phase J (u128 typeids, ~2-3 days)** — direct continuation of the cleanup arc; no fork changes.
-   - **Phase N (recursion safety, ~2-3 days)** — bounded fix to a known runaway-walker risk; no fork changes.
-   - **Phase O (drift CI fences, ~3-5 days)** — building B24/B25/B26 detection tests.
-   - **Phase G (cdylib build system, ~5-7 days)** — the larger Sky-architecture migration (retire toylangc wrapper mode + cdylib loader + bundle structure); pairs with the now-shipped Phase H ABI rewrite.
+User's stated priority is **rustc-integration quality, especially perf/inlining and "the best way to integrate into rustc"** — NOT Sky language design. Order accordingly:
 
-After that: ~~symbol_name elimination (Phase F, ½ day)~~ DONE 2026-06-24; cdylib build system + patch 4 rev 3 (Phases G+H, ~1 week), u128 typeids + content-hash const args (Phases J+K, ~1.5 weeks), per-view ref types + async typestate (Phases L+M, ~3 weeks).
+9. **Phase P — `deduce_param_attrs` soundness override (~half day).** **Highest priority** — closes a latent silent-UB vector currently in production-bound emission. Same B10 shape (rustc trusts stub MIR, Sky's stub "lies" about behavior), worse failure mode (silent miscompile vs loud compile error). Override returns `&[]` for tagged items + fence fixture with `&mut LargeStruct` Sky export.
 
-**Round 4 deliverables** (when you come back to the reviewer):
-1. **Perf bench numbers — IN HAND.** Bench 1 ratio 1.50×; Sky vs Rust baseline at 0.3% delta; Bench 3 drop chain 25.5× **with apples-to-apples pure-Rust comparison showing 27.5×** (inherited from Rust, not Sky-specific; Sky vs Rust cross-crate at thin LTO = 3% delta). Decision-gate verdict: lock §5.5. The round-4 framing for Bench 3 is now: "Sky's drop emission gives LLVM the same elimination opportunity Rust's does; the 26× speedup is a property of cross-crate Drop chains under LLVM's inliner that Sky inherits, not anything Sky adds."
-2. **Cache_on_disk_if audit results — IN HAND.** Prescribed API doesn't exist; every override cache-safe by construction; CI fence in place.
-3. **Drop fixture outcomes — IN HAND.** 9 fixtures pass; the prior `mir_shims` override was empirically broken (never fired; Finding A.6).
-4. **mir_shims elimination empirical validation — IN HAND.** AST-rewrite shape ships at 342/0/1 tests; no regressions in the 333 prior integration tests (post-Phases-C+D+F+H total: 477 cold).
-5. **Implementation surprises grouped by where they surfaced — IN HAND.** F3 (Sky main + while loop stack overflow due to toylangc O0 alloca recycling), B10 residual (Phase E drop synthesis + Vec<SkyStruct> still trips bug under ThinLTO cross-CGU import); both documented in arch doc §F.18.
+10. **Phase R Site #8 probe — sret-bridge alloca/load size mismatch (~half day).** Highest-leverage of the 7 emission-audit findings; same shape as B10 we just fixed but asymmetric direction we didn't cover. Build a probe; if it triggers, fix the same way (memory reinterpretation aligned to declared signature).
 
-The round 4 conversation has all four data anchors the reviewer asked for. Phase C+D+F+H all shipped 2026-06-24. Next session can either schedule round 4 OR continue with one of: Phase J (u128 typeids, ~2-3 days), Phase N (recursion safety, ~2-3 days), Phase O (drift CI fences, ~3-5 days), or Phase G (cdylib build system + wrapper-mode retirement, ~5-7 days). See "State of the World" below for the consolidated reviewer-prep summary.
+11. **Phase Q — `codegen_fn_attrs` override for `NEVER_UNWIND` (~1 day with bench).** Free perf win under Sky's panic=abort posture. Eliminates LLVM landing-pad emission at every Rust caller. Needs a panic=unwind perf bench to measure delta.
+
+12. **Phase R remaining sites — Sites #1, #5/#6, #10 (~1 day total).** Probe + fix each candidate from the emission audit. Site #10 (parse_coerced_type missing float arms) becomes important the moment anyone wants `f32`/`f64` Sky exports.
+
+13. **Build a `&LargeStruct` Sky-call perf bench.** Currently no bench exposes the indirect-arg alias-analysis question. Without it we can't measure whether path-b emission (Sky-ground-truth attrs in `codegen_extern_wrapper`) is worth pursuing. Measure first, then decide.
+
+**Lower priority (defer unless one becomes blocking):**
+- **Phase G (cdylib build system, ~5-7 days)** — engineering-velocity win, not perf. Pairs with the now-shipped Phase H ABI rewrite. Defer until backend iteration speed becomes the bottleneck.
+- **Phase N (recursion safety, ~2-3 days)** — bounded fix to runaway-walker risk; no perf impact; low priority.
+- **Phase O (drift CI fences, ~3-5 days)** — operational; B24/B25/B26 detection tests; no perf impact.
+
+**Skip per user's stated priorities** (Sky language design, not rustc integration):
+- Phase J (u128 typeids), Phase K (content-hash const args), Phase L (per-view ref types), Phase M (async typestate).
+
+**Doc landings owed from round-4 close** (fold into a single sweep before or during the work above):
+- §22.4 reframing: lead with "Sky's cross-crate boundary cost equals Rust's at every opt level" rather than "1.5× LTO ratio" (per reviewer's round-4-close note).
+- §25.2 B10 rewrite: drop the "LLVM bug" framing; describe Sky's emission bug + fix.
+- §15 dual-path drop narrative paragraph (Sky source → AST synthesis; Rust source → rustc's standard `drop_in_place`; both converge at Sky's single-symbol body).
+- Generalize `local_needs_scope_drop`'s hardcoded "Drop" trait name to a lifecycle-traits registry (~5 LOC + registry entry).
+
+**Round 4 — CLOSED 2026-06-24.** All 5 deliverables landed. Reviewer signed off. Round 5 awaits Phase L or Phase G to surface real implementation reality. See "State of the World" below for the canonical summary.
 
 ---
 
@@ -148,6 +164,14 @@ Listed in rough order of how-load-bearing for the reviewer:
 
 8. **Rustdoc-not-installed trap + build-rustdoc-also-wipes-stdlib (2026-06-24).** Long-standing infrastructure issue where `cargo test --workspace` exited non-zero on the doctest step because rustdoc wasn't built for the rustc-fork toolchain. Building rustdoc via `x.py build src/tools/rustdoc` requires re-running the FULL `rustc-dev` reinstall procedure because the library build clears the sysroot's `librustc_*.rmeta` files. Procedure now documented in `docs/historical/rebuilding-rustc-fork.md`.
 
+9. **B10 was a Sky emission bug, not an LLVM bug (round-4 close, 2026-06-24).** The arch doc's §25.2 B10 framing had pinned blame on "LLVM 21's bitcode writer drops FUNCTION records under ABI-coerced extern call signatures." Investigation during round-4 prep showed it was `push_arg_for_rust_call`'s `Direct` arm emitting struct aggregate values where rustc's ABI declared a scalar. LLVM accepted the malformed IR at -O0 but bitcode round-trip failed at -O1+. **Fix is on Sky's side**, not waiting for LLVM. Shipped commit `3041ec8` + 5 regression probes (`test_drop_b10_probe_*`). Doc reframing follows in post-round-4 sweep.
+
+10. **`deduce_param_attrs` is a latent silent-UB vector (round-4-close agent investigation, 2026-06-24).** rustc's query analyzes Sky's `unreachable!()` stub MIR and concludes that since the stub never reads/writes any param, every `PassMode::Indirect` param is `readonly` + `captures(none)`. LLVM applies those attrs at every Rust call site → if Sky's actual body mutates `&mut LargeStruct`, the `readonly` attr is a LIE. Same B10 shape (rustc trusts stub MIR, stub "lies"), worse failure mode (silent miscompile vs loud compile error). **Currently latent** — Bench 1 is all Direct so doesn't expose it; Sky has no fixture with indirect-passed mutable params. A real Sky 0.1.0 release with `fn f(x: &mut LargeStruct)` Sky export would hit silent UB. Phase P fixes it.
+
+11. **`codegen_fn_attrs` is underutilized (round-4-close agent audit, 2026-06-24).** Sky historically overrode `codegen_fn_attrs` for linkage stamping (Option 4 era) and retired the override. The OPTIMIZATION-stamping opportunity is new. `NEVER_UNWIND` alone eliminates LLVM landing-pad emission at every Rust caller — significant for tight callee-rich loops under panic=unwind. Sky's panic=abort posture (§16.1) makes this trivially correct. Phase Q.
+
+12. **Seven B10-class candidate sites in toylangc's emission (round-4-close agent audit, 2026-06-24).** Beyond the `Direct` arm we fixed, the agent emission audit identified 7 more sites where signature mismatch could lurk. Top priority: Site #8 (codegen_extern_wrapper sret-bridge alloca/load size mismatch — same B10 shape, asymmetric direction we didn't cover). Phase R.
+
 ### What contradicts the round 1-3 analysis (READ THIS BEFORE ROUND 4)
 
 The reviewer pushed certain models in rounds 1-3. Three places where empirical work overturned them:
@@ -182,22 +206,38 @@ NONE of these decisions have shipped yet. No empirical work has touched them sin
 - **Phase H patch 4 rev 3:** arch §3.2 (patch 4) + §B.4 (patch source) + §C.4 (shipping shape) + §F.15 (design history with rev 2 → rev 3 transition) + Decision 5 SHIPPED entry.
 - **Risks status:** arch §25.2 entries A1-A3, B1-B27 (every risk has CLOSED / partial / probability annotation). B21, B24, B25, B26, B27 are NEW from 2026-06-24; B5, B8, B9, B10 (partial), B11, B12 (gated), B13, B14, B15, B16, B17 all CLOSED architecturally.
 
-### What's left — at-a-glance decision tree
+### What's left — at-a-glance decision tree (refreshed 2026-06-24 post-round-4-close)
+
+User's stated priority: **rustc-integration quality, especially perf/inlining**. NOT Sky language design. Order accordingly.
 
 ```
 Next session →
-├── Round 4 with reviewer (recommended; all data anchors IN HAND)
-│   └── Walk this State-of-the-World section + Bench 3 framing.
+├── rustc-integration (USER PRIORITY)
+│   ├── Phase P: deduce_param_attrs soundness override (~half day) ← TOP PRIORITY
+│   │   └── Closes latent silent-UB vector (would have shipped in Sky 0.1.0)
+│   ├── Phase R Site #8 probe (~half day)
+│   │   └── Same B10 shape, asymmetric direction we haven't covered
+│   ├── Phase Q: codegen_fn_attrs NEVER_UNWIND override (~1 day + bench)
+│   │   └── Free perf win under panic=abort
+│   ├── Phase R Sites #1, #5/#6, #10 (~1 day)
+│   │   └── Probe + fix remaining ABI-coercion mismatch candidates
+│   └── &LargeStruct perf bench (~half day)
+│       └── Exposes the gap Phase P closes; informs path-b perf recovery
 │
-└── Continue execution work
-    ├── Phase J (u128 typeids, ~2-3 days, no fork changes)
-    ├── Phase N (recursion safety, ~2-3 days, no fork changes)
-    ├── Phase O (drift CI fences for B24/B25/B26, ~3-5 days)
-    ├── Phase G (cdylib + wrapper-mode retirement, ~5-7 days)
-    └── Phase K → L → M chain (content-hash → SkyRef → async typestate, ~3-5 weeks)
+├── Operational / drift hygiene (medium priority)
+│   ├── Phase N (recursion safety, ~2-3 days)
+│   ├── Phase O (drift CI fences for B24/B25/B26, ~3-5 days)
+│   └── Doc sweep (§22.4 reframe, §25.2 B10 rewrite, §15 dual-path para, lifecycle-traits registry)
+│
+├── Engineering velocity (lower priority unless blocking)
+│   └── Phase G (cdylib + wrapper-mode retirement, ~5-7 days)
+│       └── ~10× iteration speed for backend changes; not perf
+│
+└── Sky language design (USER WANTS TO SKIP)
+    └── Phases J/K/L/M — u128 typeids → content-hash → SkyRef → async typestate
 ```
 
-The first three options are bounded chunks that don't cross the fork boundary. Phase G is the larger architecture migration that PAIRS with the already-shipped Phase H FFI rewrite. Phases K/L/M are the big design-evolution chunks.
+**Recommended ordering for next fresh-context session:** Phase P (silent-UB fix) → Phase R Site #8 (highest-leverage B10 follow-up) → Phase Q (panic=unwind perf win) → Phase R remaining sites → &LargeStruct bench. This is ~3-4 focused days of rustc-integration work, all in the user's stated priority zone.
 
 ---
 
@@ -1929,6 +1969,113 @@ Tasks:
 
 **Output**: drift-observation safety net in place.
 
+### Phase P: `deduce_param_attrs` soundness override (~half day) — surfaced during round-4 close
+
+**Status: OPEN, high priority.** Latent silent-UB vector currently in production-bound emission.
+
+**WHAT.** Override rustc's `deduce_param_attrs` query for `#[toylang::emit_consumer_body]`-tagged items to return `&[]` (no attrs claimed). This is the safe-default fix that closes the soundness gap; perf recovery is a separate Phase Q-adjacent follow-up.
+
+**WHY.** rustc's `deduce_param_attrs` analyzes Sky's stub `unreachable!()` MIR body. The body lowers to a `Call` terminator to `core::panicking::panic` that doesn't touch param locals at all. `UsageSummary` stays `empty()` → rustc concludes "the function neither mutates, captures, drops, nor shared-borrows its param." `apply_deduced_attributes` (rustc-fork `compiler/rustc_ty_utils/src/abi.rs:646-672`) then sets `ReadOnly` + `CapturesNone` for `PassMode::Indirect` params.
+
+These attrs propagate to every Rust caller's call site. If Sky's actual `fill_extra_modules`-emitted body mutates an indirect-passed param (e.g., `&mut LargeStruct`), the `readonly` attr LLVM applies is a LIE. LLVM trusts the attr; verifier checks shape, not semantics. **Silent UB at -O2+.**
+
+Same B10 shape (rustc trusts stub MIR; stub "lies" about behavior); worse failure mode (silent miscompile vs B10's loud compile error). Currently latent — Sky has no fixture with indirect-passed mutable params. Bench 1's `add(i32, i32) -> i32` is all `PassMode::Direct` and dodges the `apply_deduced_attributes` indirect-only path. A real Sky 0.1.0 release with any `fn f(x: &mut LargeStruct)` Sky export would hit silent UB.
+
+**Tasks.**
+- Add `deduce_param_attrs` override in `rustc-lang-facade/src/queries/` returning `&[]` for items where `is_consumer_codegen_target(tcx, def_id)` returns true.
+- Add `cache-audit:` marker comment per the new override (per the cache_audit fence from Phase I).
+- New integration fence: `tests/integration_projects/<somewhere>/deduce_param_attrs_indirect_mut/`. Sky export takes `&mut LargeStruct`; Rust caller pre-fills the struct, calls Sky which mutates it; verify post-call observation at `-O3 + lto = "thin"` is correct (the mutation visible).
+- Optional: build a sibling fixture WITHOUT the override to confirm the bug fires before the fix (negative-test framing in the doc).
+
+**Output.** Silent UB vector closed. Sky exports with indirect-passed mutable params are now safe at all opt levels.
+
+**FILES TOUCHED (planned).**
+- `rustc-lang-facade/src/queries/deduce_param_attrs.rs` (new file)
+- `rustc-lang-facade/src/queries/mod.rs` (add module + provider registration)
+- `rustc-lang-facade/src/lib.rs::install_query_defaults` (sig if needed)
+- `toylangc/tests/integration_projects/<new fixture dir>`
+- `toylangc/tests/cache_audit.rs` (new override gets a marker requirement)
+
+**GOTCHAS.**
+- The override returns `&[]` — empty slice — so applies "no attrs" rather than "wrong attrs." Conservative; never UB; just may lose downstream optimization opportunities. That's the right trade-off for v1.
+- Perf recovery (path b — emit Sky's ground-truth attrs in `codegen_extern_wrapper`) is deferred until a `&LargeStruct` perf bench shows the gap is material.
+
+**DOC IMPACT.**
+- New §25.2 entry: latent silent-UB vector closed (or refresh existing entry; choose framing).
+- §22.4.1 cache-policy table: new query row.
+
+### Phase Q: `codegen_fn_attrs` override for `NEVER_UNWIND` + perf bench (~1 day) — surfaced during round-4 close
+
+**Status: OPEN, medium priority.** Free perf win under Sky's panic=abort posture.
+
+**WHAT.** Override `codegen_fn_attrs` for `#[toylang::emit_consumer_body]`-tagged items to stamp the `NEVER_UNWIND` flag. Eliminates LLVM landing-pad emission at every Rust caller — significant for tight callee-rich loops under panic=unwind.
+
+**WHY.** Sky enforces `panic = "abort"` globally per arch §16.1. Every Sky export is genuinely never-unwind. rustc's default `codegen_fn_attrs` for Sky stubs leaves `NEVER_UNWIND` off (because the stub source doesn't carry a `#[no_panic]` attr) → every Rust caller emits landing pads / cleanup blocks unconditionally, even though Sky's real body cannot panic.
+
+**Tasks.**
+- Build a panic=unwind perf bench: Sky export called from a Rust loop, surrounded by unwinding Rust code (e.g., destructors that can panic). Measure runtime at -O3 + thin LTO with and without the override.
+- Add `codegen_fn_attrs` override in `rustc-lang-facade/src/queries/` returning the default attrs with `NEVER_UNWIND` flag set, for tagged items.
+- `cache-audit:` marker.
+- Document delta in §22.4.
+
+**Extensions (incremental from same override).**
+- `Cold` for unlikely-path Sky exports — requires Sky source annotation `#[cold]` propagated through `toylang::emit_consumer_body`-tagged emission.
+- `FFI_PURE` / `FFI_CONST` where Sky's typechecker knows purity — unlocks LLVM's pure-function optimizations.
+- Explicit `target_features` for SIMD-related callsite-feature-compat decisions (per rustc_codegen_ssa builder.rs:1431).
+
+**Output.** Measurable perf win on panic=unwind builds. Other Sky-call optimization opportunities unlocked incrementally.
+
+**GOTCHAS.**
+- `NEVER_UNWIND` is only valid if Sky's real body actually doesn't unwind. Under Sky's panic=abort posture this is guaranteed. If Sky ever ships a panic=unwind mode (it shouldn't per §16.1, but hypothetically), this override needs gating.
+- Make sure the override is gated on Sky-active marker presence (per §4.4 byte-identical pass-through invariant).
+- Historical: Sky overrode `codegen_fn_attrs` during the Option 4 era for linkage stamping. That override retired. The new override is a fresh use of the same query, for a different purpose.
+
+**DOC IMPACT.**
+- §22.4 perf-model: new finding for panic=unwind workloads.
+- §22.4.1 cache-policy table: new query row.
+- New B-class risk entry if applicable.
+
+### Phase R: B10-style emission audit follow-ups (~1-2 days) — surfaced during round-4 close agent investigation
+
+**Status: OPEN, medium priority.** 7 candidate sites identified by emission audit; build probes + fix if triggered.
+
+**WHAT.** Build probe fixtures for each candidate ABI-coercion-mismatch site in toylangc's emission. For each that triggers an LLVM bitcode-parse error (or other malformed-IR symptom) at -O1+, apply the same memory-reinterpretation pattern the round-4 B10 fix uses.
+
+**Sites in priority order:**
+
+**Site #8 — `codegen_extern_wrapper` sret-bridge alloca/load size mismatch** (`llvm_gen.rs:1156-1160`). Top priority — same B10 shape, asymmetric direction. Alloca sized as internal toylang struct type; load reads as `rust_ret_type` (ABI-coerced). When `rust_ret_type` is larger than the alloca, reads past stack. Probe: toylang fn `fn f() -> struct W { a: i8 }` where rustc ABI-coerces W to a larger direct return; verify build + correct runtime at -O3 + thin LTO.
+
+**Site #1 — `push_arg_for_rust_call::Pair` arm assumes struct source** (`llvm_gen.rs:528-537`). Calls `val.into_struct_value()`. If source is a bare `ptr` from `Ref { inner }`, extract panics or extracts wrong bits. No `arg_toylang_ty != target` symmetry-check like the Direct arm has post-fix. Probe: pass `&Widget` (Widget coerces to ScalarPair) to a Rust generic whose param resolves to `Pair`.
+
+**Sites #5 + #6 — receiver-as-Indirect assumption** (`llvm_gen.rs:1532-1547`, `1578-1594`, `1797`, `1813`). Receiver `recv_ptr` always pushed as `ptr`. Breaks when `self` coerces to `Pair` (e.g., slice self-types like `<[T]>::len(self: &[T])`). Probe: explicit static-call form on a slice method.
+
+**Site #10 — `parse_coerced_type` missing float/vector arms** (`llvm_gen.rs:2020-2046`). Missing `float`/`half`/`fp128` + vector cases. Will panic on first `f32`/`f64` Sky export. Loud failure, not silent corruption; but important to fix the moment anyone wants float Sky exports. Probe: `export fn add_f64(a: f64, b: f64) -> f64 { ... }`.
+
+**Lower-priority sites (build only if higher-priority probes complete cleanly):**
+
+**Site #7 — Direct param load with larger internal_ty** (`llvm_gen.rs:1085-1101`). Asymmetric inverse of round-4 fix. Trigger requires exotic `Cast { prefix, rest }` shape.
+
+**Site #9 — Direct return mismatch when internal returns non-int** (`llvm_gen.rs:1161-1171`). `coerce_int_to_type` only handles int truncation. Triggers if `is_internal_sret` evaluates false for a struct that should be sret.
+
+**Site #2 — `Indirect` arm alloca alignment for `repr(transparent)`** (`llvm_gen.rs:519-526`). Lower-likelihood; alloca alignment may differ from callee expectation for `repr(transparent)` newtype.
+
+**Tasks per site:**
+- Build a `b10_probe_<descriptive_name>` fixture under `toylangc/tests/integration_projects/drop/` or a new `tests/integration_projects/abi_mismatch/` subdirectory.
+- Enroll in integration runner.
+- Run probe; if build/runtime fails, characterize the failure mode (compile error vs miscompile vs UB).
+- Fix the emission site using the same pattern as the round-4 B10 fix: detect type mismatch, reinterpret via memory.
+- Add the fixture as a regression test post-fix.
+
+**Output.** All known ABI-coercion mismatch sites either probed clean or fixed. Sky's emission is robust to LLVM bitcode round-trips across opt levels and LTO modes for all current ABI shapes.
+
+**GOTCHAS.**
+- Some probe sites may not trigger today simply because Sky source can't produce the trigger shape (e.g., float Sky exports — Site #10 won't fire until someone writes one). Document as "latent; will fire when X" rather than treating as a clean pass.
+- Site #8 and Site #7 are inverses of the round-4 fix and may share a single helper if both need fixing. Refactor opportunity.
+
+**DOC IMPACT.**
+- §25.2 B10 already covers this class of bug; new B-class entries for any newly-found sites.
+- arch §26.5 (`@ACRTFDZ`) note the memory-reinterpretation pattern is now used at multiple sites, not just `codegen_extern_wrapper`'s incoming params.
+
 ### Total estimate
 
 ~6-10 weeks for a focused engineer:
@@ -1947,6 +2094,9 @@ Tasks:
 - Phase M: 3-5 days (async typestate).
 - Phase N: 2-3 days (Sky-side recursion).
 - Phase O: 3-5 days (drift CI fences).
+- Phase P: half-day (deduce_param_attrs soundness override).
+- Phase Q: 1 day (codegen_fn_attrs override + panic=unwind bench).
+- Phase R: 1-2 days (B10-style emission audit follow-ups).
 
 Some can parallelize (cdylib build + FFI shape + cache audit could overlap with content-hash work); some can't (predicate migration must precede mir_shims elimination; both must precede per-view ref types in stub_gen).
 
@@ -1999,9 +2149,26 @@ Audit other chapters for empirical-backing gaps (similar to §15's now-acknowled
 
 ---
 
-## Round 4 prep (when you come back to the reviewer)
+## Round 4 with the reviewer — CLOSED 2026-06-24
 
-**Status as of 2026-06-24: all five round-4 deliverables shipped + their associated data are IN HAND.** This section is now a presentation order rather than a work plan. The "State of the World" section above carries the canonical empirical numbers + surprises + decision status; this section covers what to LEAD with and what to AVOID rehashing.
+**All five deliverables landed; reviewer signed off; round 5 awaits Phase L or Phase G to surface real implementation reality.**
+
+The reviewer's round-4-close response endorsed: (a) §5.5 locked, (b) the Bench 3 apples-to-apples baseline framing, (c) the B10 root-cause reframing (Sky emission bug, not LLVM bug). They made one notable framing observation worth carrying forward: **for §22.4's user-facing perf model, lead with Sky vs Rust parity (0.5–2% delta) rather than the 1.5× LTO ratio.** The structural ratio is a universal-Rust-property; the parity is the Sky-specific claim worth defending. Doc rewrite owed in the post-round-4 sweep.
+
+They also flagged a calibration point for Phase L / Phase G: A.6 (prior mir_shims was empirically broken) and B10 (was a Sky emission bug) were both findings where **integration fixtures caught premise errors, not just confirmed conclusions**. Bring this posture into Phase L: build the Send/Sync/'static integration fixtures FIRST (including per-view conversion failure modes), THEN write the typechecker changes that the fixtures will drive.
+
+Two minor doc/code residuals from round-4 close (folded into the post-round-4 doc sweep):
+1. Lifecycle-traits registry: generalize `local_needs_scope_drop`'s hardcoded "Drop" string to a registry lookup (`tcx.is_lifecycle_trait(trait_def_id)`). ~5 LOC + one registry entry for Drop. Pays back when comptime Init / SkyDrop marker / async drop lands.
+2. §15 dual-path drop narrative: explicit paragraph naming both paths (Sky source → AST synthesis → trait static call; Rust source → rustc's `drop_in_place` → `<T as Drop>::drop` → resolved via single-symbol naming) and noting they converge at the same Sky-emitted body.
+
+Round-4 close also surfaced 3 new Phase entries via parallel-agent investigation:
+- **Phase P** (deduce_param_attrs soundness override) — latent silent-UB vector closed.
+- **Phase Q** (codegen_fn_attrs NEVER_UNWIND override) — free perf win under panic=abort.
+- **Phase R** (B10-style emission audit follow-ups, 7 sites) — systematic ABI-coercion-mismatch hunt.
+
+See "NEXT — start here next session" at the top of the TL;DR for the priority-ordered plan.
+
+### Round 4 presentation order (historical — what was delivered)
 
 Order matters per reviewer's discipline:
 
