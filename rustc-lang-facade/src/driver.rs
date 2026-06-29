@@ -203,16 +203,14 @@ impl rustc_driver::Callbacks for LangDriver {
 }
 
 /// Walk every upstream crate; for each one that's a Sky-marked rlib,
-/// locate the adjacent `.sky-meta` sidecar, read its bytes, and hand them
-/// to the consumer via `on_sky_lib_loaded`. See `after_analysis` for the
-/// design rationale; this function is the mechanical implementation.
+/// locate the adjacent `.sky-cache` (sibling-cache file), read its
+/// bytes, and hand them to the consumer via `on_sky_lib_cache_loaded`.
 ///
-/// Missing-sidecar policy: per architecture doc §7.6 ("Missing sidecar is
-/// a hard error"), if a marker-bearing rlib has no adjacent sidecar we
-/// panic with a clear message. The marker means Sky machinery was
-/// supposed to be active during the rlib's compile; an absent sidecar
-/// indicates corrupted or out-of-sync target state and proceeding would
-/// produce runtime panics from `unreachable!()` stub bodies.
+/// Sidecar→cache migration **complete** post-Step-4 (2026-06-29). The
+/// `.sky-meta` sidecar has been retired; the cache is the sole upstream
+/// metadata artifact. Cache-missing is a hard error per architecture
+/// §7.6, surfaced with a crate-name-tagged diagnostic so the user knows
+/// which upstream to rebuild.
 fn load_upstream_sidecars(tcx: TyCtxt<'_>) {
     use rustc_hir::def_id::CRATE_DEF_INDEX;
     use rustc_span::def_id::DefId;
@@ -231,36 +229,71 @@ fn load_upstream_sidecars(tcx: TyCtxt<'_>) {
         let Some(rlib_path) = source.rlib.as_ref().or(source.rmeta.as_ref()) else {
             panic!(
                 "[facade] Sky-marked crate `{}` has no rlib/rmeta path; \
-                 cannot locate adjacent .sky-meta sidecar",
+                 cannot locate adjacent .sky-cache",
                 crate_name,
             );
         };
-        // Map the rlib path to its adjacent `.sky-meta` sidecar. Cargo's
-        // rlib filename carries a `lib` prefix (`liblang_stubs-HASH.rlib`),
-        // but S.3 writes the sidecar via `tcx.output_filenames(())
-        // .with_extension("sky-meta")` whose filestem is the bare crate
-        // name (no `lib` prefix). So we strip the `lib` prefix from the
-        // rlib's filename before swapping extension. (`.rmeta` paths
-        // from a metadata-only build follow the same convention.)
-        let sidecar_path = {
-            let dir = rlib_path.parent().unwrap_or(std::path::Path::new("."));
-            let stem = rlib_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let stripped = stem.strip_prefix("lib").unwrap_or(stem);
-            dir.join(format!("{}.sky-meta", stripped))
-        };
-        let sidecar_bytes = std::fs::read(&sidecar_path).unwrap_or_else(|e| {
+        // Map the rlib path to its adjacent cache file. Cargo's rlib
+        // filename carries a `lib` prefix (`liblang_stubs-HASH.rlib`),
+        // but the producer writes via `tcx.output_filenames(())
+        // .with_extension(...)` whose filestem is the bare crate name
+        // (no `lib` prefix). Strip the `lib` prefix from the rlib's
+        // filename before swapping extension. (`.rmeta` paths from a
+        // metadata-only build follow the same convention.)
+        let dir = rlib_path.parent().unwrap_or(std::path::Path::new("."));
+        let stem = rlib_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let stripped = stem.strip_prefix("lib").unwrap_or(stem);
+
+        let cache_path = dir.join(format!("{}.sky-cache", stripped));
+
+        let cache_bytes = std::fs::read(&cache_path).unwrap_or_else(|e| {
             panic!(
-                "[facade] Sky sidecar missing for crate `{}`\n  \
+                "[facade] Sky upstream cache missing for crate `{}`\n  \
                  expected at: {}\n  \
                  crate marker present: yes\n  \
-                 hint: rebuild `{}` with the Sky toolchain (architecture doc §7.6)\n  \
+                 hint: rebuild `{}` with the current Sky toolchain (architecture doc §7.6).\n  \
                  underlying error: {}",
                 crate_name,
-                sidecar_path.display(),
+                cache_path.display(),
                 crate_name,
                 e,
             )
         });
-        crate::call_on_sky_lib_loaded(tcx, &crate_name, &sidecar_bytes);
+        let digest = read_cache_key_digest_minimal(&cache_bytes).unwrap_or_else(|_| {
+            panic!(
+                "[facade] Sky upstream cache at {} has malformed header (bad magic, \
+                 wrong format_version, or truncated). Rebuild `{}` with the current \
+                 Sky toolchain.",
+                cache_path.display(),
+                crate_name,
+            )
+        });
+        crate::call_on_sky_lib_cache_loaded(tcx, &crate_name, &cache_bytes, &digest);
     }
 }
+
+/// Minimal header read sufficient to extract the cache key digest
+/// without pulling toylangc's `cache` module into the facade. Mirrors
+/// `toylangc::cache::CacheHeader::read` but returns just the digest.
+fn read_cache_key_digest_minimal(buf: &[u8]) -> Result<[u8; 16], ()> {
+    const HEADER_SIZE: usize = 64;
+    const CACHE_MAGIC: [u8; 4] = *b"SKYC";
+    const CACHE_FORMAT_VERSION: u32 = 1;
+    if buf.len() < HEADER_SIZE {
+        return Err(());
+    }
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(&buf[0..4]);
+    if magic != CACHE_MAGIC {
+        return Err(());
+    }
+    let mut ver_bytes = [0u8; 4];
+    ver_bytes.copy_from_slice(&buf[4..8]);
+    if u32::from_le_bytes(ver_bytes) != CACHE_FORMAT_VERSION {
+        return Err(());
+    }
+    let mut digest = [0u8; 16];
+    digest.copy_from_slice(&buf[8..24]);
+    Ok(digest)
+}
+

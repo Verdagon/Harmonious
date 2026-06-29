@@ -81,7 +81,10 @@ pub enum CallbackLog {
     /// non-empty. Sidecars are loaded from the user-bin compile (the rlib
     /// compile has no upstream Sky-marked deps under wrapper mode), so
     /// this entry appears only in user-bin runs.
-    OnSkyLibLoaded { crate_name: String, n_structs: usize, n_functions: usize },
+    /// Sidecar→cache migration Step 4 (2026-06-29): the
+    /// `OnSkyLibLoaded` (sidecar-load) variant retired. The variant
+    /// below is the sole upstream-metadata-load log entry.
+    OnSkyLibCacheLoaded { crate_name: String, n_structs: usize, n_functions: usize },
     /// Fired once per user-bin compile (post-Workstream-A oracle sweep
     /// completion: course-correct.md items #11 + #15 prep). Counts how
     /// many of the registry's body-less (extern) functions
@@ -195,6 +198,18 @@ pub struct ToylangState {
     /// not serialized cross-crate (downstream rederives from the source
     /// `body` at its own `after_rust_analysis`).
     pub typed_bodies: BTreeMap<String, crate::toylang::typed_ast::TypedBlock>,
+    /// Sidecar→cache migration (2026-06-28). Cache-key digests of every
+    /// transitive upstream Sky-marked rlib, populated by
+    /// `on_sky_lib_cache_loaded` at facade-load time. Consumed by the
+    /// producer-side cache write at `after_rust_analysis` /
+    /// `consumer_fill_modules` to compute THIS crate's own cache digest
+    /// — Plan Decision 1 (Option 1, transitive Merkle fingerprinting).
+    ///
+    /// `BTreeMap` rather than `HashMap` so iteration order is
+    /// deterministic; the digest computation also sorts but the
+    /// in-memory shape matches the deterministic-iteration convention
+    /// followed elsewhere in the registry.
+    pub upstream_cache_digests: BTreeMap<String, [u8; 16]>,
 }
 
 pub struct ToylangCallbacks {
@@ -228,6 +243,19 @@ pub struct ToylangCallbacks {
     ///   finds nothing here — rustc doesn't queue extern non-generic
     ///   items for local mono). Validation is skipped (already ran upstream).
     pub is_user_bin_compile: bool,
+    /// Sidecar→cache migration (2026-06-28). Path to the `toylang.toml`
+    /// the wrapper used to drive this compile. Hashed into the cache
+    /// key's `SkyTomlHash` axis. Wrapper mode (`main::run_wrapper_mode`)
+    /// fills this in from the same lookup that already resolves the
+    /// manifest; the field exists so the producer-side cache write
+    /// doesn't have to re-walk the directory tree.
+    pub manifest_path: std::path::PathBuf,
+    /// Sidecar→cache migration (2026-06-28). Path to the `.toylang`
+    /// source file. Hashed into the cache key's `LocalSourceHashes`
+    /// axis. Today's toylang has a single source file per crate; if a
+    /// future variant supports multi-file projects, this becomes a
+    /// `Vec<PathBuf>`.
+    pub source_path: std::path::PathBuf,
 }
 
 /// Downcast `&mut dyn Any` to `&mut ToylangState`.
@@ -235,7 +263,166 @@ fn state(s: &mut dyn Any) -> &mut ToylangState {
     s.downcast_mut::<ToylangState>().expect("consumer state is not ToylangState")
 }
 
+/// Sidecar→cache migration helper: BLAKE3 over the toylangc binary
+/// itself (read via `std::env::current_exe`). Cached for the lifetime
+/// of the process so repeated cache writes don't re-hash the binary.
+fn compute_skyc_binary_hash() -> [u8; 32] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<[u8; 32]> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let exe_path = std::env::current_exe()
+            .unwrap_or_else(|e| panic!("[toylang] cannot resolve current_exe for cache key: {}", e));
+        let bytes = std::fs::read(&exe_path)
+            .unwrap_or_else(|e| panic!(
+                "[toylang] cannot read current_exe at {} for cache key: {}",
+                exe_path.display(),
+                e,
+            ));
+        crate::cache_key::hash_bytes(&bytes)
+    })
+}
+
+/// Hash a file's contents via BLAKE3, panicking with a `label`-tagged
+/// diagnostic on failure. Used by the producer-side cache write to
+/// derive `LocalSourceHashes` + `SkyTomlHash`. Panic-on-failure matches
+/// the existing sidecar write's posture (any I/O failure during
+/// producer write aborts the rlib compile).
+fn compute_file_hash_or_panic(path: &std::path::Path, label: &str) -> [u8; 32] {
+    crate::cache_key::hash_file(path).unwrap_or_else(|e| {
+        panic!(
+            "[toylang] cannot hash {} at {} for cache key: {}",
+            label,
+            path.display(),
+            e,
+        )
+    })
+}
+
+/// Render a 16-byte BLAKE3-truncated digest as a 32-char hex string for
+/// diagnostics. Inline so the cache write site can log without pulling
+/// in `hex` as a separate dependency.
+fn short_hex(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes.iter() {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
 impl ToylangCallbacks {
+    /// Sidecar→cache migration (2026-06-28, Step 1.3): write the local
+    /// sibling-cache file (`.sky-cache`) adjacent to the rlib that
+    /// rustc is about to emit, alongside the existing sidecar.
+    ///
+    /// Under Step 1 (dual-path) BOTH sidecar and cache get written.
+    /// Step 3 removes the sidecar write; Step 4 deletes the sidecar
+    /// module entirely.
+    ///
+    /// Cache key inputs gathered:
+    /// - SkycBinaryHash: BLAKE3 of the toylangc binary
+    /// - FormatVersion: `cache::CACHE_FORMAT_VERSION`
+    /// - LocalSourceHashes: the single `.toylang` source file at
+    ///   `self.source_path`
+    /// - UpstreamCacheDigests: from `state.upstream_cache_digests`
+    ///   (populated by `on_sky_lib_cache_loaded` for each transitive
+    ///   upstream Sky-marked dep with a cache file)
+    /// - TargetTriple: `tcx.sess.target.tuple()` (target-conditional
+    ///   typing-pass output)
+    /// - SkyTomlHash: BLAKE3 of `self.manifest_path`
+    /// - AnnotationFileHashes: empty (annotation files unused in
+    ///   current toylang; the axis slot stays so Sky proper can fill
+    ///   it later without redesigning the key)
+    ///
+    /// Atomic write: `.tmp` + `rename(2)`. Posix rename is atomic on
+    /// the same filesystem (cargo's target/ dir is always one fs); on
+    /// failure no partial cache file is left behind.
+    ///
+    /// Returns the cache key digest written, so a caller that wants
+    /// to log or compare can.
+    fn write_cache<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        registry_with_typeid_table: &ToylangRegistry,
+        state: &ToylangState,
+        diagnostic_label: &str,
+    ) -> [u8; 16] {
+        // Build the cache key inputs.
+        let skyc_binary_hash = compute_skyc_binary_hash();
+        let local_source_hash = compute_file_hash_or_panic(
+            &self.source_path,
+            "toylang source",
+        );
+        let sky_toml_hash = compute_file_hash_or_panic(
+            &self.manifest_path,
+            "toylang manifest",
+        );
+        let target_triple = tcx.sess.target.llvm_target.to_string();
+        let upstream_cache_digests: Vec<(String, [u8; 16])> = state
+            .upstream_cache_digests
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let local_source_hashes = vec![(
+            self.source_path.display().to_string(),
+            local_source_hash,
+        )];
+        let annotation_file_hashes: Vec<(String, [u8; 32])> = Vec::new();
+
+        let inputs = crate::cache_key::CacheKeyInputs {
+            skyc_binary_hash,
+            format_version: crate::cache::CACHE_FORMAT_VERSION,
+            local_source_hashes,
+            upstream_cache_digests,
+            target_triple,
+            sky_toml_hash,
+            annotation_file_hashes,
+        };
+        let digest = crate::cache_key::compute_cache_key_digest(&inputs);
+
+        // Serialize the cache payload — same registry shape as the
+        // sidecar's payload (post-typeid-table population), but with
+        // the cache header instead of the sidecar header.
+        let bytes = crate::cache::serialize_cache(registry_with_typeid_table, digest)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[toylang] cache ({}) serialize failed: {}",
+                    diagnostic_label, e,
+                )
+            });
+
+        // Write atomically: .tmp + rename. Same path stem as the
+        // sidecar uses (tcx.output_filenames(()).with_extension(...)).
+        let cache_path = tcx.output_filenames(()).with_extension("sky-cache");
+        let tmp_path = cache_path.with_extension("sky-cache.tmp");
+        std::fs::write(&tmp_path, &bytes).unwrap_or_else(|e| {
+            panic!(
+                "[toylang] cache ({}) tmp write failed at {}: {}",
+                diagnostic_label,
+                tmp_path.display(),
+                e,
+            )
+        });
+        std::fs::rename(&tmp_path, &cache_path).unwrap_or_else(|e| {
+            panic!(
+                "[toylang] cache ({}) atomic rename {} → {} failed: {}",
+                diagnostic_label,
+                tmp_path.display(),
+                cache_path.display(),
+                e,
+            )
+        });
+        if std::env::var("TOYLANG_LOG_PATH").is_ok() {
+            eprintln!(
+                "[toylang] wrote cache ({}): {} ({} bytes, digest={})",
+                diagnostic_label,
+                cache_path.display(),
+                bytes.len(),
+                short_hex(&digest),
+            );
+        }
+        digest
+    }
+
     /// Rust-dep discovery for a consumer function DefId. Pure read with
     /// respect to `ToylangState` (only `log` is appended); internal-callee
     /// stashing happens in `notify_concrete_entry_point_inner`.
@@ -1005,11 +1192,10 @@ impl LangCallbacks for ToylangCallbacks {
         // ONCE per rlib compile (gated above on `!is_user_bin_compile`),
         // which is exactly when the sidecar should be produced.
         //
-        // `OutputFilenames::with_extension` joins out_directory + filestem
-        // and sets the extension — yielding a path whose basename matches
-        // the rlib's exactly except for the `.sky-meta` extension. This is
-        // what `docs/architecture/sidecar-format.md` requires.
-        let sidecar_path = tcx.output_filenames(()).with_extension("sky-meta");
+        // Sidecar→cache migration Step 4 (2026-06-29): sidecar path
+        // computation retired. The cache path is computed inside
+        // `write_cache` using the same
+        // `tcx.output_filenames(())` API with `.sky-cache` extension.
         // Sunny-karp (2026-06-25): cache the just-resolved typed bodies on
         // ToylangState so per-Instance mono can substitute them rather than
         // re-running `resolve_fn_body` + `insert_scope_end_drops` once per
@@ -1044,72 +1230,86 @@ impl LangCallbacks for ToylangCallbacks {
         // `&self`; serialization is otherwise pure with respect to the
         // registry. Architecture §10.8: the table ships in the sidecar so
         // downstream compiles can decode upstream typeids.
-        let mut registry_for_sidecar: ToylangRegistry = (*self.registry).clone();
-        registry_for_sidecar.populate_typeid_table();
-        let bytes = crate::sidecar::serialize_sidecar(&registry_for_sidecar)
-            .unwrap_or_else(|e| panic!("[toylang] sidecar serialize failed: {}", e));
-        std::fs::write(&sidecar_path, &bytes).unwrap_or_else(|e| {
-            panic!(
-                "[toylang] sidecar write failed at {}: {}",
-                sidecar_path.display(),
-                e,
-            )
-        });
-        // Diagnostic eprintln gated on TOYLANG_LOG_PATH so it doesn't
-        // pollute the build stderr that layout-probe tests grep.
-        if std::env::var("TOYLANG_LOG_PATH").is_ok() {
-            eprintln!(
-                "[toylang] wrote sidecar: {} ({} bytes)",
-                sidecar_path.display(),
-                bytes.len(),
-            );
-        }
+        let mut registry_for_cache: ToylangRegistry = (*self.registry).clone();
+        registry_for_cache.populate_typeid_table();
+        // Sidecar→cache migration Step 4 (2026-06-29): sidecar
+        // emission retired entirely. Cache is the sole upstream
+        // metadata artifact.
+        let ts_for_cache = state(s);
+        self.write_cache(
+            tcx,
+            &registry_for_cache,
+            ts_for_cache,
+            "after_rust_analysis",
+        );
     }
 
-    fn on_sky_lib_loaded<'tcx>(
+    // Sidecar→cache migration Step 4 (2026-06-29): the
+    // `on_sky_lib_loaded` impl retired alongside the sidecar emission.
+    // The `on_sky_lib_cache_loaded` impl below is the sole upstream-
+    // metadata-load path.
+
+    /// Sidecar→cache migration (2026-06-28, Step 1.4 / Step 4): deserialize
+    /// a sibling-cache file, populate the universe, and store the upstream's
+    /// cache digest so this crate's own cache digest can incorporate it
+    /// transitively (Plan Decision 1, Option 1 transitive Merkle).
+    fn on_sky_lib_cache_loaded<'tcx>(
         &self,
         s: &mut dyn Any,
         _tcx: TyCtxt<'tcx>,
         crate_name: &str,
-        sidecar_bytes: &[u8],
+        cache_bytes: &[u8],
+        cache_key_digest: &[u8; 16],
     ) {
         let ts = state(s);
-        // Deserialize unconditionally. The facade's missing-file path
-        // already panicked if the sidecar wasn't readable; a deserialize
-        // failure here means the bytes are present but malformed, which
-        // is a hard-error condition per architecture doc §7.6.
-        let registry = crate::sidecar::deserialize_sidecar(sidecar_bytes)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "[toylang] failed to deserialize sidecar for crate `{}`: {}",
-                    crate_name, e,
-                )
-            });
+        // Trust-but-verify: the cache file was produced by an upstream
+        // skyc compile with its own view of the cache-key axes. The
+        // digest header is what THAT compile thought the digest should
+        // be; we accept it verbatim (the digest is informational at
+        // Step 1, load-bearing at Step 3 when sidecar fallback is gone).
+        //
+        // Deserialize using the header's own digest so the
+        // self-verification gate inside `deserialize_cache` is
+        // satisfied. This catches header/payload corruption (bad
+        // magic, bad checksum) but not "wrong upstream inputs" — that
+        // case surfaces later when THIS crate's compile sees a stale
+        // upstream digest baked into its own cache key (which then
+        // doesn't match what cargo's fingerprint expects).
+        let registry = match crate::cache::deserialize_cache(cache_bytes, *cache_key_digest) {
+            Ok(r) => r,
+            Err(e) => {
+                // Step 1 dual-path: cache deserialize failure is
+                // recoverable because `on_sky_lib_loaded` will fire
+                // with the sidecar bytes next. Log to diagnostics so a
+                // genuine corruption produces a debug trail.
+                if std::env::var("TOYLANG_LOG_PATH").is_ok() {
+                    eprintln!(
+                        "[toylang] cache deserialize failed for `{}`: {} — falling back to sidecar",
+                        crate_name, e,
+                    );
+                }
+                return;
+            }
+        };
+        // Stash the upstream's cache-key digest for THIS crate's own
+        // producer-side digest computation. Plan Decision 1: transitive
+        // Merkle — every upstream's digest contributes to the
+        // downstream's digest, so any upstream change cascades
+        // invalidation.
+        ts.upstream_cache_digests.insert(crate_name.to_string(), *cache_key_digest);
+
         let n_structs = registry.structs.len();
         let n_functions = registry.functions.len();
-        ts.log.push(CallbackLog::OnSkyLibLoaded {
+        ts.log.push(CallbackLog::OnSkyLibCacheLoaded {
             crate_name: crate_name.to_string(),
             n_structs,
             n_functions,
         });
-        // Insertion order matters only for diagnostics; cross-crate name
-        // collisions between Sky libs are out of scope until Phase 3 E
-        // (multi-crate). For now we trust the facade to call us at most
-        // once per crate.
-        // Phase 3 E.6: mirror the body-bearing fn names + struct names into
-        // the callbacks-level sets so `is_consumer_fn` / `is_consumer_type`
-        // (called via the predicate vtable, which doesn't see state) recognize
-        // them. The `symbol_name` query override then redirects cross-crate
-        // consumer-fn calls (e.g. the user-bin's main calling case6_lib::double_it)
-        // to the consumer emitter's `__toylang_impl_*` symbol that codegen
-        // produces from the populate-upstream iteration.
-        //
-        // Tier 3 #7.4 + #8: all mirrors retired. The facade's `SkyUniverse`
-        // carries (a) body-bearing fn names + type names for predicates,
-        // (b) full ToyStruct field info via the type-erased `struct_infos`
-        // map for `monomorphize_type`'s Case-6 cross-Sky-crate layout
-        // queries. `populate_sky_universe_from_registry` writes both in
-        // one pass.
+
+        // Populate the universe + upstream_registries — same as the
+        // sidecar path. Idempotent so the dual-path double-call is
+        // safe; iteration count grows by ~2x during Step 1 but it's
+        // cheap and goes away when sidecar emission retires (Step 3).
         populate_sky_universe_from_registry(&registry);
         ts.upstream_registries.insert(crate_name.to_string(), registry);
     }
@@ -1261,24 +1461,27 @@ impl LangCallbacks for ToylangCallbacks {
             // `on_sky_lib_loaded` (populate_sky_universe_from_registry).
             // Trait-impl discoveries are NOT shipped (A.1.X retired);
             // they're emitted inline at this compile session below.
+            // Post-Step-4 consolidation (2026-06-29): the
+            // consumer_fill_modules cache write has been retired as
+            // structurally redundant. Pre-2026-06-29 there were two
+            // write sites (one at `after_rust_analysis`, one here);
+            // they both wrote identical content because (a) the
+            // registry is `Arc<ToylangRegistry>` and immutable through
+            // the compile, (b) trait-impl discoveries from the
+            // cascade-drain go into a local Vec rather than the
+            // registry, and (c) the typeid table only re-derives from
+            // the (unchanged) struct list. The historical reason for
+            // dual-write was that discoveries used to live in the
+            // registry pre-A.1.X-retirement (2026-06-21). The single
+            // `after_rust_analysis` write now produces the
+            // authoritative cache; this site only logs the discovery
+            // count and proceeds to inline emission.
             let mut effective_registry: ToylangRegistry = (*self.registry).clone();
             effective_registry.populate_typeid_table();
-            let sidecar_path = tcx.output_filenames(()).with_extension("sky-meta");
-            let bytes = crate::sidecar::serialize_sidecar(&effective_registry)
-                .unwrap_or_else(|e| panic!("[toylang] sidecar (post-discovery) serialize failed: {}", e));
-            std::fs::write(&sidecar_path, &bytes).unwrap_or_else(|e| {
-                panic!(
-                    "[toylang] sidecar (post-discovery) write failed at {}: {}",
-                    sidecar_path.display(),
-                    e,
-                )
-            });
             if std::env::var("TOYLANG_LOG_PATH").is_ok() {
                 eprintln!(
-                    "[toylang] sidecar written with {} discovered trait-impl instance(s) emitted inline: {} ({} bytes)",
+                    "[toylang] post-discovery: {} trait-impl instance(s) emitted inline (cache already written at after_rust_analysis)",
                     discoveries.len(),
-                    sidecar_path.display(),
-                    bytes.len(),
                 );
             }
 

@@ -60,16 +60,18 @@ The "in one sentence" version of Sky's goals is intentionally compressed. The re
 
 This subsection sketches Sky's source-level memory model only as much as the interop architecture needs. The full design lives elsewhere; what follows is the minimum required for a reader of this document to understand why the interop story has the shape it does.
 
-**Groups.** A group is a named memory region — a contiguous address space within which a set of related objects live. Groups are explicit in Sky source: a function declaration like `fn process<G>(x: &G T)` says "process takes a reference to a `T` that lives in group `G`." The group annotation is Sky's analog to Rust's lifetime annotation, but it carries more information: a group is a runtime construct (Sky's allocator manages group regions and frees them as a unit when the group ends), and Sky's typechecker tracks which references belong to which groups.
+**Groups.** A group is a named scope of related references. Groups are explicit in Sky source: a function declaration like `fn process<G>(x: &G T)` says "process takes a reference to a `T` whose region is named `G`." The group annotation is Sky's analog to Rust's lifetime annotation, but it carries more information: groups can be nested (the containment structure is part of the type system, not just the outlives relation), and Sky's typechecker tracks which references belong to which groups across the program.
+
+Groups are **primarily a compile-time construct**, like Rust lifetimes. The typechecker proves region validity Sky-side and the resulting reference is erased to `re_erased` at the rustc boundary, just like Rust's borrows post-borrowck. Allocation strategy is a separate concern: Sky's allocator may use bump-allocated arenas where region freeing maps to a single operation (a runtime *consequence* of having proven region containment), but the **group is the static type-system concept**, not the arena. The arch-level claim "groups have runtime existence" was wrong in earlier drafts of this section; the runtime side is allocator implementation, not part of the group abstraction.
 
 Two key differences from Rust's lifetime model:
 
-1. **Groups are runtime-realized.** Sky's allocator implements groups as bump-allocated arenas (or similar region-based allocation strategies). Freeing a group frees every object inside it in a single operation. Rust's lifetimes are purely a compile-time construct with no runtime existence; Sky's groups have both compile-time and runtime existence.
-2. **Groups can be nested explicitly.** Sky source can declare that group `G1` lives inside group `G2`, expressing region containment. References can be promoted from `&G1 T` to `&G2 T` when `G1 ⊂ G2`. This is more expressive than Rust's `'long: 'short` outlives bounds because Sky tracks the containment structure, not just the outlives relation.
+1. **Groups nest explicitly.** Sky source can declare that group `G1` lives inside group `G2`, expressing region containment. References promote from `&G1 T` to `&G2 T` when `G1 ⊂ G2`. More expressive than Rust's `'long: 'short` outlives bounds because Sky tracks the containment structure, not just the outlives relation.
+2. **Groups carry more information than rustc lifetimes can express.** Sky's containment relation has no Rust lifetime analog. The mapping is asymmetric: Sky understands more than rustc sees.
 
 For interop purposes, groups erase to Rust's `'re_erased` lifetime at the rustc boundary. The mechanism is identical to erw's `@ELASZ` pattern: Sky's frontend generates `GenericArgs` for Rust items by populating each lifetime slot with `tcx.lifetimes.re_erased`. From rustc's view, every borrow Sky produces appears with an erased lifetime, post-borrowck-style. Sky's typechecker has already proven the borrow valid Sky-side; rustc trusts the erasure.
 
-The group-to-lifetime mapping is asymmetric: Sky's groups carry information rustc lifetimes don't (containment, runtime regional existence), but the erasure pattern projects Sky groups onto a single Rust lifetime kind (`re_erased`) at the boundary. Sky's frontend reconciles any Rust lifetime constraints on a Rust API with Sky's group-level constraints; this reconciliation happens during stub generation and during typechecking. Section 11 covers the boundary in full.
+Sky's frontend reconciles any Rust lifetime constraints on a Rust API with Sky's group-level constraints; this reconciliation happens during stub generation and during typechecking. Section 11 covers the boundary in full.
 
 **Linear types.** A linear type is a type whose values cannot be silently dropped — they must be explicitly consumed by either being returned, passed to a consumer function, or destructured. Sky's typechecker enforces this at compile time. A linear file handle, for example, cannot be left at end-of-scope without an explicit `close()` call; the typechecker will reject any program that allows the linear value to escape consumption.
 
@@ -77,7 +79,7 @@ Linearity is a property of the type, not of the value or the binding. Some Sky t
 
 For interop purposes, linear Sky types pose a problem: rustc has no concept of linearity. When a Sky linear type appears in Rust source — perhaps because the Sky type is passed to a Rust generic and the Rust code stores it in a `Vec<T>` — rustc may decide to drop it. Sky's typechecker can't prevent this; the type has crossed into rustc's domain.
 
-Sky's solution: every linear Sky type's source-level `impl Drop` body calls `sky_runtime_panic("Sky linear type X was dropped from Rust")` followed by `abort()`. The compiler's AST-rewrite pass synthesizes `Drop::drop(&local)` calls at scope-end positions for any let-binding whose type has a Drop impl; rustc's auto-generated `drop_in_place` chain reaches the user's panic-and-abort body via the same path it reaches any other Sky-emitted trait impl method. The program terminates with a clear diagnostic. Sky's user has not violated linearity from inside Sky source; Rust has violated it, and Sky responds by killing the program before further damage. Section 15 covers the drop story; the AST-rewrite mechanism is §15.7 in detail.
+Sky's solution: every linear Sky type's source-level `impl Drop` body calls `sky_runtime_panic("Sky linear type X was dropped from Rust")` followed by `abort()`. The compiler's AST-rewrite pass synthesizes a `__toylang_drop::<T>(&local)` wrapper-call at every let-binding's scope end (no predicate — the wrapper bottoms out at `drop_in_place::<T>` which is a no-op for trivially-droppable T and a full drop chain for needs-drop T). For Sky linear types, that chain reaches the user's panic-and-abort body via the same path it reaches any other Sky-emitted trait impl method. The program terminates with a clear diagnostic. Sky's user has not violated linearity from inside Sky source; Rust has violated it, and Sky responds by killing the program before further damage. Section 15 covers the drop story; the AST-rewrite mechanism is §15.7 in detail.
 
 **Slab-based comptime.** Sky's comptime is Zig-style: the same expression language runs at compile time as runs at runtime. A `comptime` block evaluates immediately at the surrounding compile point; a `comptime` parameter is bound to a specific compile-time value that becomes a property of the type. Sky's comptime evaluator implements this by simulating a "RAM-like slab" — an in-memory byte buffer with allocator services — that holds comptime-constructed values. Comptime values are referenced by their slab address (a `usize`-typed offset).
 
@@ -94,7 +96,7 @@ When Sky compiles `zork::<s>`, the comptime argument `s` is bound to slab offset
 
 So Sky's comptime values, when they need to cross into rustc-visible territory, do so as integer slab addresses. The actual Spaceship at offset `0x1220` lives in Sky's slab, which is per-rustc-invocation state in Sky's frontend (which lives inside our forked rustc, per Section 4). Sky's `layout_of` override, when asked about `zork::<0x1220>`, dereferences the slab pointer in Sky's universe to recover the actual Spaceship value, and then evaluates Sky's comptime-machinery to produce the layout.
 
-The slab is per-rustc-invocation. It is created when Sky's machinery activates (after sidecar load); populated during typechecking and during per_instance_mir queries; discarded when the invocation ends. The slab is never serialized to disk. Comptime results that need to persist across invocations are baked into the Temputs (sidecar) in their resolved form, not as slab references. Section 13 covers comptime in full.
+The slab is per-rustc-invocation. It is created when Sky's machinery activates (after upstream cache load); populated during typechecking and during per_instance_mir queries; discarded when the invocation ends. The slab is never serialized to disk. Under the post-migration single-class comptime model (§13.4), comptime evaluates at per_instance_mir time per-Instance — values are NOT baked into Temputs. Section 13 covers comptime in full.
 
 **Why this matters for the interop architecture.** Sky's comptime allows arbitrary-typed const generic parameters. Rust's const-generic machinery does not. So Sky's per_instance_mir provider must do its own substitution — it cannot rely on rustc's collector substituting Sky's comptime args for it, because rustc's substitution engine has no `ConstKind::Param` semantics for arbitrary Sky types. This forces Sky into Approach A (Instance-keyed dep discovery, Sky substitutes), where erw was able to use Approach B (DefId-keyed, rustc substitutes). The slab-pointer-as-usize trick relaxes this constraint *somewhat* (because the integer surface is rustc-compatible), but only partially — Sky's per_instance_mir still needs to evaluate Sky-side comptime when generating the substituted body, and that evaluation needs the Instance's args concretely. Section 19 covers this in full.
 
@@ -208,9 +210,14 @@ This subsection records what Sky is *not* — design choices that have been cons
 
 **Sky does not support unsized generic arguments outside specific reference patterns.** Sky inherits erw's `@UTAIRZ` pattern: unsized types (`str`, `[u8]`, `[T]` for non-`Sized` `T`) appear only as the inner type of a reference. Sky source cannot have a `T: ?Sized` generic in arbitrary position; it can have `&G T: ?Sized` references with specific size-known concrete instantiations.
 
-**Sky does not surrender LLVM output control to rustc's codegen pipeline.** Sky's LLVM backend (Inkwell-based, contributed via patch 4's `fill_extra_modules` hook — see §5, §F.15) owns every byte of Sky-emitted LLVM IR. This is non-negotiable. It enables Sky to guarantee codegen quality, ABI discipline (`@ACRTFDZ`/`@TCHAPZ`), pin discipline (`@SMPLZ`), and emission-shape stability across rustc bumps. Designs that lower Sky source to rustc MIR and let rustc's codegen produce the bodies — periodically proposed as a "long-term simplification" because they would retire the discovery/synthesis machinery — are **rejected permanently** for this reason. Sky's frontend never emits rustc MIR for Sky-defined bodies; per_instance_mir returns synthetic dep-registering bodies (see §19), but the real bodies come from Sky's own LLVM backend, full stop.
+**Sky does not surrender LLVM output control to rustc's codegen pipeline.** Sky's LLVM backend (Inkwell-based, contributed via patch 4's `fill_extra_modules` hook — see §5, §F.15) owns every byte of Sky-emitted LLVM IR. This is non-negotiable for **two load-bearing reasons, in priority order**:
 
-**Sky does not treat drop as architecturally special.** Drop is just a function the language sometimes auto-calls. The compiler synthesizes `Drop::drop(&local)` AST nodes at scope-end positions during type resolution (see §15.7); after that pass, every downstream stage — dep walker, mono cascade, per_instance_mir, codegen, symbol resolution, link — treats the synthesized calls as ordinary trait static calls with no drop-specific code paths. The retired `mir_shims` query override (Phase E, 2026-06-23) had categorized drop as a thing that needed its own emission path; empirical validation showed the override had never actually worked for any shipping fixture, and its removal lost zero functionality. See §F.18 for the implementation lessons.
+1. **Backend pluralism.** Sky may eventually target backends that don't go through LLVM — GPU/NPU/custom hardware via MLIR, or any future high-level IR that holds direct references to optimization passes defined by others. Committing Sky-defined bodies to rustc MIR-as-target permanently bolts Sky to rustc's LLVM pipeline; MIR cannot represent the high-level node references MLIR-style backends need. Owning the backend boundary keeps the option open.
+2. **Engineering reuse (secondary).** Vale's existing Inkwell-based emitter is paid-for engineering; rewriting it as a MIR builder is months of work for a property already in hand.
+
+Designs that lower Sky source to rustc MIR and let rustc's codegen produce the bodies — periodically proposed as a "long-term simplification" because they would retire the discovery/synthesis machinery — are **rejected permanently** for reason (1). Sky's frontend never emits rustc MIR for Sky-defined bodies; per_instance_mir returns synthetic dep-registering bodies (see §19), but the real bodies come from Sky's own LLVM backend, full stop. The Inkwell-based emitter also delivers codegen quality, ABI discipline (`@ACRTFDZ`/`@TCHAPZ`), pin discipline (`@SMPLZ`), and emission-shape stability across rustc bumps — these are real benefits but not the principled reason; the principled reason is keeping non-LLVM backends viable.
+
+**Sky does not treat drop as architecturally special.** Drop is just a function the language sometimes auto-calls. The compiler synthesizes `__toylang_drop::<T>(&local)` wrapper-call AST nodes at scope-end positions during type resolution (see §15.7) — `__toylang_drop` is a Sky-owned thin generic Rust fn that calls `drop_in_place::<T>` internally. After the synthesis pass, every downstream stage — dep walker, mono cascade, per_instance_mir, codegen, symbol resolution, link — treats the synthesized calls as ordinary generic Rust function calls with no drop-specific code paths. The word "drop" never appears in any code triggered by `per_instance_mir`'s invocation. The retired `mir_shims` query override (Phase E, 2026-06-23) had categorized drop as a thing that needed its own emission path; empirical validation showed the override had never actually worked for any shipping fixture, and its removal lost zero functionality. See §F.18 for the implementation lessons and §F.22 for the wrapper-emission migration that made the mono path fully drop-agnostic.
 
 Many of these "does not do" entries are recovered through specific designed mechanisms — Sky doesn't unwind but Result is rich enough for error handling, Sky doesn't cancel by drop but channel-based cancellation is composable. The point of this subsection is not to enumerate Sky's limitations as a sales criticism but to make explicit the boundaries of the design space so future contributors know which questions are settled.
 
@@ -491,7 +498,7 @@ The key insight again: Sky tells rustc that the impl exists (via the stub rlib's
 
 **Empirical correction (sessions 18-19).** The "rustc's collector queues `duplicate<Widget>` when walking Sky's main" sentence above is correct in terms of *cascade flow*, but it elides *when* the cascade fires. Empirically — verified by per_instance_mir-probing toylang's `case_generic_impl_block` fixture — the consumer-side `per_instance_mir` cascade for an item like Sky's `__sky_main` fires **at the stub rlib compile, not at the user-bin compile**. At user-bin compile, rustc's mono collector at `collector.rs::should_codegen_locally` gates on `is_reachable_non_generic(def_id) || instance.upstream_monomorphization(tcx).is_some()` for non-local items: when `__sky_main` is a non-generic upstream symbol (which it is — Sky's main lives in the bin's own stub rlib), this gate short-circuits and the collector never queries `per_instance_mir` for it at user-bin time. The cascade — and therefore the discovery of `duplicate<Widget>` and `<Widget as Clone>::clone` — is **exclusively a stub-rlib-compile-time mechanism.**
 
-The current architecture handles this by emitting the cascade-surfaced trait-impl bodies **at the same compile session where the cascade fires** (i.e. at the stub rlib compile). At that session's `consumer_fill_modules`, after the mono walk completes (the post-mono timing avoids @GCMLZ re-entry that would deadlock at `after_rust_analysis`), the pure function `collect_consumer_trait_impl_instances(tcx) -> Vec<DiscoveredTraitImplInstance>` walks the unfiltered partition for `MonoItem::Fn(instance)` entries matching `is_consumer_trait_impl_method`, returns a local Vec, and the same callback drains it inline into Sky's codegen pipeline. No sidecar serialization, no `on_sky_lib_loaded` deserialization, no augmented-map query override — symbol canonicalization across crates is handled by Sky's `collect_and_partition_mono_items` filter (removes consumer items from rustc's CGU list so the only `.o` symbol comes from `fill_extra_modules`) plus `share_generics = true` at every Sky stub rlib compile (so rustc's natural cstore-walk records each cascade-surfaced monomorphization in the rlib's rmeta for downstream lookup). See §8.9.5 for the current pipeline and §F.13 / §F.14 for the deep-investigation findings.
+The current architecture handles this by emitting the cascade-surfaced trait-impl bodies **at the same compile session where the cascade fires** (i.e. at the stub rlib compile). At that session's `consumer_fill_modules`, after the mono walk completes (the post-mono timing avoids @GCMLZ re-entry that would deadlock at `after_rust_analysis`), the pure function `collect_consumer_trait_impl_instances(tcx) -> Vec<DiscoveredTraitImplInstance>` walks the unfiltered partition for `MonoItem::Fn(instance)` entries matching `is_consumer_trait_impl_method`, returns a local Vec, and the same callback drains it inline into Sky's codegen pipeline. No cross-process state, no augmented-map query override — symbol canonicalization across crates is handled by Sky's `collect_and_partition_mono_items` filter (removes consumer items from rustc's CGU list so the only `.o` symbol comes from `fill_extra_modules`) plus `share_generics = true` at every Sky stub rlib compile (so rustc's natural cstore-walk records each cascade-surfaced monomorphization in the rlib's rmeta for downstream lookup). See §8.9.5 for the current pipeline and §F.13 / §F.14 for the deep-investigation findings.
 
 ### 2.7 Cases 5 and 6: transitive library structure
 
@@ -608,19 +615,17 @@ Sky maintains a fork of rustc. The fork is deliberate, not a fallback. This chap
 
 ### 3.1 Why Sky forks
 
-Sky needs a custom rustc query: `per_instance_mir`. The query is Instance-keyed (takes a concrete `Instance<'tcx>`, not a `LocalDefId`), and Sky's provider returns a MIR body with Sky's comptime evaluation already applied to the Instance's concrete args. There is no sanctioned rustc extension point that delivers this. Sky adds the query as a fork patch.
+Sky needs a custom rustc query: `per_instance_mir`. The query is Instance-keyed (takes a concrete `Instance<'tcx>`, not a `LocalDefId`), and Sky's provider returns a MIR body whose `ReifyFnPointer` casts enumerate the Rust deps reachable from that specific Instance's substituted body. There is no sanctioned rustc extension point that delivers this. Sky adds the query as a fork patch.
 
-The reason Sky needs Instance-keyed substitution rather than DefId-keyed (as `optimized_mir` provides via the sanctioned `Config::override_queries`) is **arbitrary-typed const generic parameters**.
+The **load-bearing reason Sky needs Instance-keyed dep enumeration** rather than DefId-keyed (as `optimized_mir` provides via the sanctioned `Config::override_queries`) is **per-Instance dep discovery for the interleaved-monomorphization cases (1b, 3, 4, 5, 6 from §2)**.
 
-Rust's const generics are restricted to a small set of types: integers, `bool`, `char`, and (under `adt_const_params`) certain ADTs that satisfy strict valtree-encoding constraints. Rust's substitution engine has machinery to encode, compare, intern, and substitute `ConstKind::Param` values for these types. The machinery does not generalize to arbitrary user-defined types — there is no plugin extension point for "extend the const-generic universe with this Sky type, here's its equality semantics, here's its hashing."
+For cases like Sky → Rust generic → back into Sky (Case 4), the Rust deps Sky transitively reaches depend on the concrete generic args at each call site. A DefId-keyed query gets the same answer for every Instance of a Sky function; an Instance-keyed query gets the answer for *this specific* `(def_id, concrete_args)` pair. The collector walks the per-Instance body, sees the ReifyFnPointer casts (with concrete args substituted in), and queues the right Rust monomorphizations.
 
-Sky's comptime model produces values of *any* Sky type. Some of those values appear as comptime arguments to generic functions — Sky's analog to Rust's const generics, but without the type restriction. When Sky's compiler instantiates such a function for a specific compile-time-known argument value (say, a `Spaceship` produced by a `comptime` block), the generic argument is a concrete `Spaceship` value, not a type parameter.
+DefId-keyed dep enumeration would force Sky to either (a) over-approximate (enumerate every possible Rust dep at every possible Instance, exploding combinatorially) or (b) push substitution into rustc's collector by returning a body with `Param` placeholders for Sky-typed args. (a) is impractical; (b) fails for arbitrary-typed comptime args (Rust's const generics restrict the type universe; rustc has no representation for `Spaceship`-as-Param). Instance-keyed Sky-side substitution avoids both failure modes.
 
-If Sky used Approach B (DefId-keyed `optimized_mir` override, rustc-side substitution), Sky's provider would have to return a body with `Spaceship` as a `Param` placeholder. Rustc's collector would then try to substitute the placeholder per Instance. But rustc has no representation for `Spaceship`-as-Param — `Spaceship` is not in rustc's universe at all. The collector would either crash or silently produce wrong output.
+The arbitrary-typed comptime constraint is a **secondary reinforcement** of the same conclusion, not the primary reason. Even if Sky's comptime were restricted to Rust's const-generic universe, Instance-keyed dep enumeration would still be required for the per-Instance Rust-dep walk that the interop cases need. The comptime side of the story explains why DefId-keyed-plus-rustc-substitution can't work as a fallback; dep enumeration explains why Instance-keyed is the right level in the first place.
 
-The slab-pointer trick (representing comptime Sky values as integer slab addresses) helps, but does not fully resolve the issue. Sky *could* surface `Spaceship`-as-comptime-arg to rustc as `usize`-typed const args holding the slab address, and rustc could substitute those `usize` values across the body. But then Sky's body construction at substitution time would still need access to the *actual* Spaceship value (to evaluate comptime expressions involving the Spaceship), and that evaluation can't be deferred to rustc — only Sky's comptime evaluator understands Spaceship semantics. So Sky's substitution needs to happen at body-construction time with the Instance's concrete args in hand, which means the query must be Instance-keyed.
-
-This is the Approach A constraint inherited from `dep-discovery-approaches.md`'s analysis: when the downstream substitutor (rustc's collector) cannot handle the value type, the upstream substitution (Sky's provider) must do it. Sky's compile-time metaprogramming makes Sky the only entity that can substitute Sky-typed comptime args correctly. Hence per_instance_mir, Instance-keyed.
+This is the Approach A constraint inherited from `dep-discovery-approaches.md`'s analysis: per-Instance Rust-dep walks require per-Instance substituted bodies, and Sky's comptime makes Sky the only entity that can substitute correctly. Hence per_instance_mir, Instance-keyed.
 
 ### 3.2 The four patches
 
@@ -1248,12 +1253,17 @@ impl CodegenBackend for SkyCodegenBackend {
         //         mangler would give the stub fn; no override needed. See
         //         §6.2 + §26.1, handoff Decision 2.);
         //   - mir_shims (retired 2026-06-23, Phase E — drop semantics now
-        //         flow through rustc's standard DropGlue path; per-Sky-type
-        //         bodies come from a compiler-synthesized `Drop::drop(&local)`
-        //         AST node inserted by `insert_scope_end_drops`; cascade
-        //         discovery + fill_extra_modules emits the bodies. See
+        //         flow through rustc's standard DropGlue path; the eager
+        //         pass at after_rust_analysis synthesizes a
+        //         `__toylang_drop::<T>(&local)` wrapper-call AST node for
+        //         every let-binding (unconditional, no predicate). The
+        //         wrapper is a Sky-owned thin generic Rust fn whose body
+        //         calls `drop_in_place::<T>`; rustc's standard DropGlue
+        //         resolution + cascade discovery + fill_extra_modules
+        //         emits the user's Sky `<T as Drop>::drop` body. See
         //         §15.7 for the AST-rewrite mechanism, §F.18 for the
-        //         implementation lessons.);
+        //         original Phase E lessons, §F.22 for the wrapper-emission
+        //         migration that made the mono path fully drop-agnostic.);
         //   - codegen_fn_attrs (retired TWICE: Option 4 era 2026-06-22
         //         alongside patch 5, then re-introduced as Phase Q
         //         2026-06-25 + retired again same day per reviewer's
@@ -1288,7 +1298,7 @@ The forked rustc binary, at startup, constructs `SkyCodegenBackend::new()` via `
 
 Sky's `.o` content is produced at every crate compile where Sky's machinery activates. The post-Step-2 (2026-06-21) split:
 
-- **Each library's compile** produces (a) the stub rlib's `.o` carrying rustc-compiled Rust-side machinery — including Rust generic intermediaries the cascade surfaces (e.g. `some_rust_lib::duplicate<Widget>`); the `pub fn ... { unreachable!() }` stub bodies for Sky exports are **filtered out of the CGU list** by Sky's `collect_and_partition_mono_items` override, so rustc emits no `.o` symbol for them — plus (b) Sky's `fill_extra_modules` contribution: real `External`-linkage bodies for the **non-generic** Sky items defined in this library, and for the cascade-discovered trait-impl monomorphizations whose impl lives in this library, and (c) a sidecar (Temputs for the library's full surface, used by downstream typechecking).
+- **Each library's compile** produces (a) the stub rlib's `.o` carrying rustc-compiled Rust-side machinery — including Rust generic intermediaries the cascade surfaces (e.g. `some_rust_lib::duplicate<Widget>`); the `pub fn ... { unreachable!() }` stub bodies for Sky exports are **filtered out of the CGU list** by Sky's `collect_and_partition_mono_items` override, so rustc emits no `.o` symbol for them — plus (b) Sky's `fill_extra_modules` contribution: real `External`-linkage bodies for the **non-generic** Sky items defined in this library, and for the cascade-discovered trait-impl monomorphizations whose impl lives in this library, and (c) a `.sky-cache` file (Temputs for the library's full surface, used by downstream typechecking — local-only, see §7).
 - **The final binary's compile** produces the binary's `.o`, carrying (a) the bin's Rust-emitted code, (b) Sky bodies for the binary's own non-generic items, and (c) Sky bodies for **generic** monomorphizations the binary reaches transitively (since the substituted instances don't exist at any library's compile — they materialize only when concrete args are supplied downstream).
 
 This is the post-§5.5-Step-2 split. The locked architectural commitment is that Sky libraries do not ship precompiled bodies *for items whose final emission depends on the downstream's concrete args* — i.e. generic items, comptime-dependent items. Non-generic items, whose emission is the same regardless of downstream usage, emit at the owning crate's compile. Every Sky body in the final binary is still codegenned by *some* invocation of Sky's compiler from the library's Sky AST; the question Step 2 answered is "which invocation" — owning-crate for non-generics, binary for generics.
@@ -1356,7 +1366,7 @@ import crate.types.SharedType              // Sky item from crate root
 The path syntax distinguishes namespace via the first segment:
 
 - **`rust.`** — Rust crates. Resolves via cargo's dep graph + rustc's `module_children` walks. The path after `rust.` is the Rust path (`rust.std.vec.Vec` → `::std::vec::Vec` in rustc terms; `rust.tokio.spawn` → the `tokio` crate's `spawn` function).
-- **`sky.`** — Sky libraries from cargo deps. Resolves via Sky's universe loaded from sidecars. The path after `sky.` is the Sky lib's name + qualified item path within the lib.
+- **`sky.`** — Sky libraries from cargo deps. Resolves via Sky's universe loaded from each upstream's `.sky-cache` file (§7). The path after `sky.` is the Sky lib's name + qualified item path within the lib.
 - **`self.`** — items in the current Sky file's module.
 - **`super.`** — items in the parent module.
 - **`crate.`** — items in the current crate's root.
@@ -1407,7 +1417,7 @@ Per-library is locked. The cost (more disk usage in `target/` from multiple rlib
 
 ### 6.2 Export-only items in the stub rlib
 
-The stub rlib contains declarations only for items marked `export` in Sky source. Non-export items are *not* in the stub rlib. Rustc literally cannot name them. They live entirely in Sky's universe (the sidecar) and in Sky's codegen output (the binary's final `.o`).
+The stub rlib contains declarations only for items marked `export` in Sky source. Non-export items are *not* in the stub rlib. Rustc literally cannot name them. They live entirely in Sky's universe (loaded from the `.sky-cache`) and in Sky's codegen output (the binary's final `.o`).
 
 The mechanism: skyc's frontend, when generating the stub rlib's Rust source, walks the Sky library's items and emits a Rust declaration for each `export` item. Non-export items are skipped at stub-gen time. The stub rlib's source is small relative to the Sky library's total surface.
 
@@ -1619,6 +1629,15 @@ Sky source that calls `option.unwrap()` is desugared by Sky's frontend to a call
 
 **Distinction from the F1 finding (2026-06-20).** The `#[inline(never)]` on Phase-6 wrappers above is a SEPARATE discipline from the historical `#[inline(never)]` on Sky-item stubs (accessor methods, wrapper functions, trait-impl methods in `stub_gen`). The historical attribute on Sky-item stubs was removed during F1 because: (a) its stated rationales (share-generics gate bypass, MIR inliner leak protection) were obsolete (patch 5 era / §F.1 respectively; patch 5 itself retired 2026-06-22), (b) its v2-precompiled-bodies concern (B12) is gated by build.rs in v1, and (c) it blocked LLVM's cross-language inliner. The Phase-6 wrappers' `#[inline(never)]` is retained because it serves an unrelated purpose: making the wrapper's symbol stably nameable from Sky's bitcode regardless of whether other Rust code happens to have called the wrapped stdlib operation. When v2 precompiled-bodies work begins, both `#[inline(never)]` policies should be re-evaluated together.
 
+**`#[inline(never)]` vs `@llvm.used` — different layers, different jobs.** Both come up in Sky's symbol-survival story but they protect against different LLVM passes and aren't substitutes:
+
+| Mechanism | Layer | What it blocks | Where used in Sky |
+|---|---|---|---|
+| `#[inline(never)]` (source-level attr → rustc → LLVM `noinline` attribute on the IR function) | LLVM **inliner** pass | The inliner from substituting the body at every call site (which would eliminate the standalone symbol) | Phase-6 wrappers in stub rlib's Rust source — keeps the standalone symbol nameable from Sky's bitcode |
+| `@llvm.used` global (vs the weaker `@llvm.compiler.used`) | LLVM **GlobalDCE + LTO internalize + linker dead-strip** passes | GlobalDCE from removing the symbol entirely + LTO `internalize` from demoting linkage External→Internal + the linker's dead-strip pass | Sky's emission of rustc-visible extern wrappers in `llvm_gen::pin_in_llvm_used` — keeps Sky's emitted bodies surviving LTO `internalize` (§26.16 SMPLZ) |
+
+`#[inline(never)]` is purely about the inliner; `@llvm.used` is about three subsequent passes that operate on the *post-inlining* IR. A symbol can need both protections independently: `#[inline(never)]` keeps the body from being inlined away, then `@llvm.used` keeps the body from being DCE'd or internalize-demoted after surviving the inliner. The Phase-6 wrappers only need `#[inline(never)]` because they're emitted by rustc into Rust-source code that's never a Sky-emission target. Sky's rustc-visible extern wrappers only need `@llvm.used` because they're emitted via `fill_extra_modules` (so rustc doesn't see a Rust source for them) and the inliner-substitution risk doesn't apply to their shape.
+
 ### 6.7 Sky source file ships alongside
 
 Every published Sky library ships its `.sky` source files alongside the generated artifacts. The cargo package layout for a published Sky library:
@@ -1631,22 +1650,24 @@ my_utils/
     lib.sky                 # user-authored Sky source (shipped verbatim)
     [other .sky files]      # user-authored
   Cargo.lock                # not in published package, generated downstream
-  build.rs                  # skyc-generated, enforces Sky toolchain presence
-  my_utils.sky-meta         # sidecar (Temputs blob) — adjacent to the generated rlib
+  build.rs                  # skyc-generated; emits `cargo:rerun-if-*` per cache-key axis
+                            # and enforces Sky toolchain presence
 ```
+
+**STATUS UPDATE (2026-06-28, sidecar→cache migration):** the `.sky-meta` sidecar that used to ship adjacent to the rlib in the published `.crate` is **retired from distribution**. Source-only distribution is the locked design (Plan Decision 9): cache content (`.sky-cache`) lives only locally under `target/`, rebuilt by skyc on demand. The previous "v1 future feature might allow source-less Sky libs" bullet is **out of scope** per the migration's locked decision; cache file format remains shape-compatible with a hypothetical future shipped blob as cheap insurance, but no v2 closed-source path is committed.
 
 The `.sky` source is shipped because:
 
 - **User inspection.** Users browsing a Sky library on crates.io can read the source. Critical for understanding what a library does without running it. Critical for security review.
 - **Source-level debugging.** Debug symbols in the final binary reference `.sky` source lines. The source files must be findable.
 - **IDE / tooling.** Rust-analyzer (or a future Sky-analyzer) can show Sky source on hover. Without the source, users have to chase down the source separately.
-- **No closed-source Sky libraries in v1.** A future feature might allow source-less Sky libs (ship only the sidecar + Rust stubs), but v1 always ships source.
+- **Closed-source Sky libraries are out of scope.** ~~A future feature might allow source-less Sky libs~~ — retired 2026-06-28 per the sidecar→cache migration's Plan Decision 9. The architectural commitment is source-shipped forever.
 
 The disk-space cost is modest. Sky source is text; cargo packages compress; published Sky libraries are typically a few KB to tens of KB.
 
 ### 6.8 Cross-references
 
-- Section 8 — what's in the sidecar (Temputs) and what's not.
+- Section 8 — what's in the cache (Temputs) and what's not.
 - Section 9 — the export keyword and its semantics.
 - Section 10 — what types look like in the stub rlib (opaque, with layout supplied via override).
 - Section 18 — cargo orchestration that produces the stub rlib via skyc.
@@ -1654,144 +1675,211 @@ The disk-space cost is modest. Sky source is text; cargo packages compress; publ
 
 ---
 
-## 7. The Sidecar
+## 7. The Cache
 
-The sidecar is Sky's per-library binary blob containing the Temputs (Sky's typing-pass output) for every item in the library — exports and non-exports both. The sidecar lets downstream consumers (the binary's compile, or another Sky library that depends on this one) reconstitute Sky's universe without re-parsing source.
+The cache is Sky's per-library binary file containing the Temputs (Sky's typing-pass output) for every item in the library — exports and non-exports both. The cache lets downstream consumers (the binary's compile, or another Sky library that depends on this one) reconstitute Sky's universe without re-parsing source.
 
-### 7.1 Sidecar location and naming convention
+The cache is **local, never shipped**. It lives next to cargo's per-build artifacts (`.rlib`/`.rmeta`) under `target/<triple>/<profile>/deps/`, gets produced by the producer's own compile, and gets read by downstream compiles. Source-only distribution (the `.crate` package on crates.io carries `.sky` source + the skyc-generated stub `lib.rs` + a `build.rs` that emits per-axis `cargo:rerun-if-*` directives — no Temputs blob). Downstream consumers rebuild the cache locally on miss.
 
-The sidecar file is adjacent to the rlib, with a `.sky-meta` extension. For `my_utils.rlib`, the sidecar is `my_utils.sky-meta`. Both files live in cargo's target directory or in the published cargo package.
+> **Historical note (2026-06-28 sidecar→cache migration).** Before this migration, Sky's per-library typed-universe blob was the `.sky-meta` *sidecar*, shipped inside the published `.crate` adjacent to the rlib. The Vale team's architecture exchange (`tmp/claude-conversation-2026-06-28-bd1a7f89.md`) drove the design conversation that pivoted to source-only distribution + a local sibling cache. The substantive content didn't change (same typed AST, same typeid table, same `BTreeMap`-for-determinism + bincode-fixed-int serialization), but the shipping shape and the cross-version compatibility story collapsed dramatically. See §7.8 for the design history.
 
-```
-target/deps/
-  my_utils-abc123.rlib
-  my_utils-abc123.sky-meta
-```
+### 7.1 Cache location and naming convention
 
-When Sky's `rustc` loads an rlib at crate-load time, it checks for an adjacent `.sky-meta` file with the same basename. Present → load the sidecar into Sky's universe. Absent → either it's not a Sky lib (no marker check is needed; the rlib doesn't have the marker), or it's a Sky lib with a missing sidecar (error: "Sky sidecar missing for `my_utils`; required for compilation").
-
-**Why sidecar-adjacent rather than embedded in the rlib:**
-
-Earlier in the design conversation, two options were considered:
-
-- **Approach B: embed the sidecar in the rlib as a custom section.** Rlibs are `ar` archives; adding a `sky-meta.bin` entry alongside Rust's `rmeta` is mechanically straightforward.
-- **Approach C: ship the sidecar as a separate file alongside the rlib.**
-
-The user picked C. Reasoning: easier to inspect (a `.sky-meta` file at a known path can be examined with `skyc inspect`; an embedded section requires extraction first); cleaner missing-file failure mode (if the sidecar is missing, the error is "file not found at this path" — obvious; if the embedded section is missing, the error is "no sky-meta section in rlib" — less obvious); cargo's package mechanism ships both files naturally via the `include` field.
-
-The cost of C: one more file per Sky library on disk and in cargo packages. Modest.
-
-### 7.2 Versioned header
-
-The sidecar starts with a versioned header:
+The cache file is adjacent to the rlib (or rmeta, under `cargo check` / pipelined builds), with a `.sky-cache` extension. For an rlib at `target/<triple>/<profile>/deps/lib<crate>-<hash>.rlib`, the cache is `target/<triple>/<profile>/deps/<crate>-<hash>.sky-cache` (the producer writes via `tcx.output_filenames(()).with_extension("sky-cache")` whose filestem is the bare crate name without the `lib` prefix; the consumer reads via the same path, stripping the `lib` prefix from cargo's rlib filename).
 
 ```
-Bytes 0-3: Magic number "SKYM" (0x534B594D)
-Bytes 4-7: skyc_version_major (u32, LE)
-Bytes 8-11: skyc_version_minor (u32, LE)
-Bytes 12-15: format_version (u32, LE)
-Bytes 16-23: capabilities_bitset (u64, LE)
-Bytes 24-31: payload_offset (u64, LE)
+target/aarch64-apple-darwin/debug/deps/
+  liblang_stubs_my_utils-abc123.rlib            ← cargo's rlib (lib prefix)
+  __lang_stubs-abc123.sky-cache                  ← skyc's cache file (bare crate name)
+```
+
+When Sky's `rustc` loads an rlib at crate-load time, it derives the cache path from the rlib path and reads it. Present → load the cache into Sky's universe. Absent → hard error per §7.6 (Sky machinery was supposed to be active during the rlib's compile; an absent cache means corrupted target state).
+
+**Why sibling file at cargo's `deps/`, not embedded in the rlib:**
+
+The 2026-06-28 design conversation considered three placements:
+
+- **Embedded in the rlib as a custom section.** Rlibs are `ar` archives; adding a custom section is mechanically simple. **Rejected** because cargo's default pipelined builds emit standalone `.rmeta` files (not `ar` archives) and `cargo check` never emits an rlib at all. An embedded cache section would be unreachable at typecheck time.
+- **Local skyc cache directory at `target/skyc-cache/`** keyed by `(source hash, skyc version)`. **Rejected mid-design** when validation surfaced cache-key incompleteness (7 inputs needed, not 2) + the GCMLZ deadlock risk from lazy consumer-side cache population + source-discovery problem for registry/git deps.
+- **Sibling file at cargo's `deps/` dir.** **Adopted.** Lives next to both `.rmeta` and `.rlib`. Cargo's hash-in-filename invalidation handles cleanup. Producer writes at upstream's own compile; consumer reads with the rlib.
+
+The cost: one file per Sky library on disk locally. Not shipped, not in `.crate` packages. Modest.
+
+### 7.2 Cache file header
+
+The cache file starts with a fixed-size 64-byte header:
+
+```
+Bytes 0-3:   Magic number "SKYC" (0x53 0x4B 0x59 0x43)
+Bytes 4-7:   cache_format_version (u32, LE)
+Bytes 8-23:  cache_key_digest (16 bytes, BLAKE3-truncated Merkle)
+Bytes 24-31: payload_offset (u64, LE) = 64
 Bytes 32-39: payload_length (u64, LE)
 Bytes 40-47: payload_checksum (u64, LE, BLAKE3-truncated)
-Bytes 48+: padding to 64-byte alignment
-Bytes 64+: payload (encoded Temputs)
+Bytes 48-63: reserved (zeroed; tolerated nonzero on read)
+Bytes 64+:   payload (encoded Temputs / `ToylangRegistry`)
 ```
 
-The header is fixed-size and trivially decodable. The payload starts at a 64-byte-aligned offset, allowing potential memory-mapping of the payload directly.
+The header is fixed-size and trivially decodable. The payload starts at a 64-byte-aligned offset.
 
-**`skyc_version`** is the version of skyc that produced the sidecar. Used for diagnostics ("This sidecar was produced by skyc 0.5.3").
+**`cache_format_version`** is the version of the cache binary format. Bumping it invalidates every cache entry on next build — no migration is ever attempted. This is the load-bearing simplification the migration enabled: §27.2's planned cross-version migration machinery (with translation functions, in-memory format upgrades, etc.) dies entirely. Cache miss → frontend re-runs from source → fresh cache emitted. The "format version" axis becomes a fast invalidation hook if the cache layout itself evolves, with no migration code attached.
 
-**`format_version`** is the version of the Temputs binary format. Different from skyc_version because the format can stay stable across skyc releases that only fix bugs or extend features in backwards-compatible ways.
+**`cache_key_digest`** is a 16-byte BLAKE3-truncated Merkle digest over the producer's 7 cache-key axes (§7.4). Stored in the header so the consumer can self-verify the cache against its own expected digest before deserializing. Mismatch → cache file was produced under different inputs than the consumer's current view (typically a missed cargo-fingerprint input); treat as cache miss.
 
-**`capabilities_bitset`** is a u64 of feature flags. Bits indicate which optional capabilities the payload uses (e.g., bit 0: contains comptime synthesis recipes; bit 1: contains async state machine descriptions; bit 2: contains user-extended-stdlib annotations). Consumers can quickly check whether they support the sidecar's capabilities without parsing the whole payload.
+**`payload_checksum`** is the first 8 bytes of `BLAKE3(payload)`, little-endian u64. Corruption check (truncation, byte-flip), not cryptographic integrity. Verified on read before bincode-decoding.
 
-**`payload_checksum`** is a BLAKE3 hash of the payload bytes, truncated to 8 bytes. Used to detect corruption (the sidecar was truncated, or its bytes were modified). On read, skyc recomputes the hash and compares; mismatch → "sidecar corrupted" error.
+### 7.3 Serialization format
 
-### 7.3 Serialization format recommendation
+Cache payload: **bincode + fixed-int-encoding + little-endian** (`bincode::config::standard().with_fixed_int_encoding().with_little_endian()`). The same convention applies to typed-AST shapes, registries, typeid tables, and any other content. Fixed-int (not varint) is load-bearing for byte-determinism — varint encoding makes byte length depend on numeric content, which would break the equivalence-of-rebuilds CI invariant (§7.5).
 
-The sidecar's payload format is a recommendation (not yet locked): **bincode + custom-serializable types**.
+Toylangc's `ToylangRegistry` carries `#[derive(Serialize, Deserialize)]` (via `serde`); fields use `BTreeMap` rather than `HashMap` so iteration order is deterministic. See `toylangc/src/cache.rs` for the shipping implementation and `toylangc/src/toylang/registry.rs` for the schema.
 
-Bincode is a binary serialization format from the Rust ecosystem with the properties Sky needs:
+### 7.4 Cache-key axes (the 7-input Merkle digest)
 
-- Deterministic: same input produces same bytes.
-- Self-describing-enough: with `#[derive(Serialize, Deserialize)]` on Sky's Temputs types, the format is derived directly from the type structure.
-- Efficient: binary, compact, fast to read/write.
-- Mature: years of production use in Rust projects.
-- Schema evolution via versioning: changes to the type require a format_version bump; readers that don't understand the new format error out cleanly.
+The cache key is a BLAKE3-truncated 16-byte digest computed over 7 inputs that together determine typing-pass output. Missing any one would be a silent-miscompile vector (cache hits when it shouldn't because the consumer's inputs differ from the producer's). The 7 axes:
 
-Alternatives considered:
+1. **SkycBinaryHash.** BLAKE3 of the toylangc binary itself. Catches "skyc rebuild produces different output for the same input" scenarios that a version string would miss.
+2. **FormatVersion.** Internal cache schema version. Bumping invalidates every entry; no migration is attempted.
+3. **LocalSourceHashes.** Sorted `(filename, BLAKE3)` for each `.sky` source file in the crate. Filename included so renaming a file invalidates the cache.
+4. **UpstreamCacheDigests.** Sorted `(upstream crate name, upstream cache-key digest)` for every transitive upstream Sky-marked dep. Implements **transitive Merkle fingerprinting**: any change in any upstream's cache key cascades into this crate's key, so an upstream rebuild invalidates downstream caches automatically.
+5. **TargetTriple.** `tcx.sess.target.llvm_target` (e.g., "aarch64-apple-darwin"). Affects typing-pass output via target-conditional code paths.
+6. **SkyTomlHash.** BLAKE3 of the crate's `toylang.toml`. Edition + features + project fields all affect parser/typechecker behavior.
+7. **AnnotationFileHashes.** Sorted `(filename, BLAKE3)` for `<crate>.sky-annotations.toml` + project-local override at `<project>/sky-annotations/<crate>.toml`. Currently unused in toylang; the slot exists so adding annotations later doesn't require redesigning the key (arch §24).
 
-- **Cap'n Proto.** Zero-copy reads, schema-evolution-friendly. Heavier toolchain (schema compiler). More complex to integrate. The zero-copy benefit isn't important — sidecar reads happen once per crate load, not per-query.
-- **FlatBuffers.** Similar to Cap'n Proto, slightly more mainstream in non-Rust contexts. Same trade-off.
-- **Protocol Buffers.** Most mature for cross-version evolution. Runtime cost is real but bounded. Wide tooling. Recommended if developer familiarity matters more than tightness.
-- **Postcard.** Sky-ecosystem-style serializer. Similar to bincode but no_std-friendly.
+The single source of truth lives in `toylangc/src/cache_key.rs::CacheKeyAxis::all()`. Two consumers iterate this enum: `compute_cache_key_digest` (the producer-side digest derivation) and `build_rs_rerun_lines` (the skyc-generated stub-crate `build.rs` emission that drives cargo's invalidation). The meta-test `cache_key_axes_and_build_rs_lines_are_in_sync` asserts both visit every variant — adding a new axis without updating both fails CI loudly.
 
-Bincode is the recommendation because it minimizes integration complexity and Sky's typing pass already operates over Rust-shaped data structures. The actual choice (bincode vs alternatives) is deferable to implementation time without changing the architecture.
+#### 7.4.1 Cross-crate invalidation via transitive Merkle
 
-### 7.4 Determinism requirement
+The transitive Merkle pattern (cargo/rustc-aligned, the rmeta-style approach):
 
-The sidecar is byte-deterministic given Sky source input. Same `.sky` files → byte-identical sidecar.
+```
+library_c key = H(library_c source + skyc_version + target + sky.toml + annotations)
+library_b key = H(library_b source + library_c key + skyc_version + target + sky.toml + annotations)
+library_a key = H(library_a source + library_b key + library_c key + ...)
+my_app    key = H(my_app source + library_a key + library_b key + library_c key + ...)
+```
 
-The determinism is enforced by:
+Any change anywhere in the transitive dep graph cascades. Cargo's own fingerprint mechanism handles the upstream→downstream rebuild trigger; the Merkle digest is the within-Sky-machinery confirmation that the universe a downstream loads matches what its inputs imply.
 
-- Sky's typing pass producing deterministic output (no HashMap iteration order in serialized content; sorted iteration where collections are involved).
-- The serialization format being deterministic (bincode is).
+Alternative considered: **content-addressed cross-crate refs + verify-on-load** (cache stores each cross-crate ref as a content-addressed identity, verifies at load that each ref's target's content-hash still matches). Strictly more precise (an inert upstream edit like a comment change wouldn't invalidate downstream), but introduces a new verification mechanism whose correctness is on us to prove. Deferred as a v2 escape if bench data shows the transitive-Merkle conservatism produces too many cache misses in deep dep graphs.
+
+### 7.5 Determinism requirement
+
+The cache is byte-deterministic given Sky source + skyc version. Same `.sky` files + same skyc → byte-identical `.sky-cache`.
+
+Enforced by:
+
+- Sky's typing pass producing deterministic output (BTreeMap iteration order in serialized content; sorted iteration where collections appear).
+- Bincode with fixed-int + little-endian (deterministic).
 - No timestamps, no host-system-dependent content, no random IDs in the payload.
 
-This is a CI-testable invariant. Sky's CI builds a corpus of Sky projects twice (with cache wipes between) and byte-compares the produced sidecars.
+CI-testable invariant: `toylangc/tests/cache_determinism.rs::step_2_fence_2_cache_byte_determinism` builds the `arithmetic` fixture twice into per-run isolated target dirs (`target/cache-det-a/`, `.../-b/`), wipes both target dirs + the project's `.toylang-build/` between runs, locates `__lang_stubs-*.sky-cache` under each `debug/deps/`, reads both, byte-compares. On mismatch the test panics with the first-differing byte index.
 
 Determinism enables:
 
-- Reproducible builds: a Sky binary built today can be byte-reproduced at any later time given the same source and toolchain.
-- Cargo's incremental compile correctness: cargo's fingerprinting can hash the sidecar; if the hash matches a prior build's hash, cargo can skip recompiling downstream consumers.
-- Content-addressed typeids (Section 10.8): the typeid for a Sky-defined type is a hash of its source path + structure; consistent typeids across Sky compiler invocations require deterministic source-to-output mapping.
+- **Reproducible builds.** A Sky binary built today can be byte-reproduced later given the same source + toolchain.
+- **Content-addressed typeids** (§10.8). Same source + skyc → same typeids across compiler invocations.
+- **Cargo incremental correctness.** Cargo's fingerprint on the cache file is meaningful only if the file is deterministic.
 
-### 7.5 Backward compatibility: design now, implement at 1.0
+### 7.6 Cache-missing is a hard error
 
-The sidecar format carries a `format_version`. Pre-1.0 skyc:
-
-- Refuses to load any sidecar whose `format_version` is different from the current skyc's expected version. Error: "Sidecar `my_utils.sky-meta` is format version 5; this skyc supports format version 7. Please rebuild `my_utils` with a matching skyc version."
-- This is strict but predictable. Sky users in v0/v1 know to keep their toolchain consistent across the project. They cannot mix-and-match Sky library versions built with different skyc versions.
-
-At Sky 1.0, the policy changes. Skyc 1.x:
-
-- Reads sidecars with format_versions in the range `[N, M]` for some N ≤ current version ≤ M.
-- For sidecars with `format_version < current`, applies a migration path: a sequence of format-version-translation functions that bring an older format up to current. The migration is read-only (the sidecar on disk is unchanged); the in-memory representation matches current.
-- For sidecars with `format_version > current` (the consumer is newer than the producer is — common: consumer downloaded a newer Sky lib that doesn't yet know about), Sky errors cleanly: "This sidecar was produced by a future skyc version; please upgrade."
-
-The migration machinery is non-trivial and not free. Pre-1.0, Sky defers the work; v0/v1 skycs simply require format-version match. v1.x adds migrations as needed.
-
-### 7.6 Missing sidecar is a hard error
-
-If Sky's `rustc` loads an rlib with the marker but cannot find an adjacent sidecar, the compile fails immediately:
+If Sky's `rustc` loads an rlib with the `__lang_stubs` marker but cannot find an adjacent `.sky-cache` file, the compile fails immediately:
 
 ```
-error: Sky sidecar missing for crate `my_utils`
-  expected at: target/deps/my_utils-abc123.sky-meta
+error: [facade] Sky upstream cache missing for crate `my_utils`
+  expected at: target/aarch64-apple-darwin/debug/deps/__lang_stubs-abc123.sky-cache
   crate marker present: yes
-  hint: this rlib was built without the corresponding sidecar
-  hint: rebuild `my_utils` with the Sky toolchain
+  hint: rebuild `my_utils` with the current Sky toolchain (architecture doc §7.6).
 ```
 
-The error is informative and actionable. Users know exactly what to do.
+The error is loud, named, and actionable. The hard-error policy is correct because: a marker-bearing rlib without an adjacent cache means Sky machinery was supposed to be active during the producer's compile but wasn't (or the cache was manually deleted). Sky cannot proceed without the cache — it has no way to type-check Sky source against the upstream's exported items or to know the upstream's types' layouts. Silently falling back to "treat the rlib as a plain Rust lib" is wrong because the rlib's `unreachable!()` bodies would propagate to runtime panics.
 
-The hard-error policy is correct because: an rlib with the marker but no sidecar means Sky machinery was supposed to be active during the rlib's compile but wasn't (or the sidecar was deleted). Sky cannot proceed without the sidecar — it has no way to type-check Sky source against the lib's exported items, no way to know the lib's types' layouts. Falling back to "treat the rlib as a normal Rust lib" is wrong because the rlib's `unreachable!()` bodies would propagate to runtime panics.
+The error path is rare in practice. Cargo's build graph ensures that when a Sky library is recompiled, its cache is rewritten alongside the rlib (the skyc-generated `build.rs` emits the right `cargo:rerun-if-*` directives — §7.7). The only way to hit the error is to have an out-of-sync target directory (manually deleted cache, corrupted cargo state).
 
-The error path is rare in practice. Cargo's build graph ensures that when a Sky library is recompiled, its sidecar is rewritten alongside the rlib. The only way to hit the error is to have an out-of-sync target directory (manually deleted sidecar, corrupted cargo state). The error tells the user how to recover.
+### 7.7 The skyc-generated `build.rs`
 
-### 7.7 Cross-references
+Each Sky stub crate's `Cargo.toml` carries `build = "build.rs"`, and skyc emits a `build.rs` that prints `cargo:rerun-if-*` directives for every cache-key axis. The script body is regenerated by `toylangc/src/build.rs::write_stub_crate` per build, so the paths and env-var names reflect the producer's current view.
 
-- Section 8 — what's in the sidecar's payload.
-- Section 13 — comptime evaluation that produces sidecar content.
-- Section 22 — cargo's incremental machinery that interacts with sidecars.
-- Section 18 — cargo orchestration that places sidecars next to rlibs.
+Typical generated content:
+
+```rust
+// Auto-generated by skyc.
+fn main() {
+    println!("cargo:rerun-if-changed=/abs/path/to/main.toylang");
+    println!("cargo:rerun-if-changed=/abs/path/to/toylang.toml");
+    println!("cargo:rerun-if-env-changed=SKYC_BINARY_HASH");
+    println!("cargo:rerun-if-env-changed=SKYC_CACHE_FORMAT_VERSION");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_VENDOR");
+    // AnnotationFileHashes: no entries in current toylang.
+    // UpstreamCacheDigests: covered by cargo's rlib fingerprint.
+}
+```
+
+The `UpstreamCacheDigests` axis is handled by cargo's natural rlib-fingerprint mechanism: when an upstream rlib changes, cargo rebuilds this stub crate, and the rebuild reads each upstream's `.sky-cache` digest fresh from disk. No `rerun-if-changed=` line is needed.
+
+The `SkycBinaryHash` axis rides cargo's `RUSTC_WORKSPACE_WRAPPER` fingerprint path (the wrapper's mtime invalidates when toylangc is rebuilt). The `cargo:rerun-if-env-changed=SKYC_BINARY_HASH` belt-and-suspenders covers a hypothetical future non-wrapper invocation path (e.g. Sky-proper post-Phase-G cdylib).
+
+### 7.8 Design history (sidecar→cache migration, 2026-06-28)
+
+This subsection preserves the design arc that led to the current shape. The architectural plan lives in full at `tmp/claude-plan-2026-06-28-bd1a7f89.md`; the full conversation at `tmp/claude-conversation-2026-06-28-bd1a7f89.md`. Outcome inventory: `scratchpad/cache-migration-status.md`. Vale team reply: `scratchpad/reply-to-vale-FINAL.md`.
+
+**The pre-migration design (`.sky-meta` sidecar):**
+- Sidecar shipped inside the published `.crate` on crates.io adjacent to the rlib.
+- Header magic `"SKYM"`, payload was the same bincode-encoded `ToylangRegistry`.
+- Header carried `skyc_version_major/minor` + `format_version` + `capabilities_bitset` + `payload_offset/length/checksum`. No cache-key digest (none was needed — sidecar wasn't self-verifying against producer inputs).
+- §27.2 framed a "design now, implement at 1.0" cross-version migration story: format_version > N would refuse to load with a clean error; at 1.0 a migration framework would translate older formats. **All of this retired in the migration.**
+
+**The architectural arc:**
+
+1. **Vale's literal proposal** (no cache, re-frontend at every consumer invocation). Rejected: O(N²) re-typecheck multiplier when a fanned-in `sky_tokio_equivalent` gets re-typechecked once per downstream sibling, with no cross-process sharing.
+2. **Synthesis: separate cache directory at `target/skyc-cache/`** keyed by `(source hash, skyc version)`. Rejected mid-design when round-1 validation (50 findings, 44 confirmed) surfaced cache-key incompleteness, GCMLZ deadlock risk from lazy consumer-side cache population, and source-discovery problems for registry/git deps.
+3. **Embed-in-rlib pivot** (rustc-rmeta-aligned). Rejected after round-2 validation (50 findings, 49 confirmed) surfaced the pipelining/`cargo check` blocker: cargo's default pipelined builds emit standalone `.rmeta` (not `ar` archives), so an embedded cache section would be unreachable at typecheck time.
+4. **Sibling file at cargo's `deps/`** (the adopted design). Solves pipelining; co-located with rlib; producer writes at upstream's own compile; consumer reads with the rlib.
+
+**The 10 decisions:**
+
+| # | Decision | Outcome |
+|---|----------|---------|
+| 1 | Cross-crate invalidation | Option 1 transitive Merkle (rmeta-aligned) |
+| 2 | Cache writer location | Eager producer-side at upstream's own compile; downstream miss = hard error |
+| 3 | Cache key inputs | 7-axis Merkle digest |
+| 4 | Cache location | `target/<triple>/<profile>/deps/lib<crate>-<hash>.sky-cache` |
+| 5 | CI persistence | None; hermetic CI (user explicit) |
+| 6a | Sibling-file content | Cache content (not a pointer) |
+| 6b | `format_version` location | Cache file's header (not Cargo.toml metadata) |
+| 7 | Migration gating | Conservative 4-step with `// delete after step 4` markers + cleanup audit |
+| 8 | CI fences | All 5: axis mutation, byte determinism, shadow-mode (retired with Step 4), trait-impl-via-cache, cold-CI bench |
+| 9 | Closed-source distribution | Out of scope; cache format kept shape-compatible with hypothetical future shipped blob |
+| 10 | §13.4 doc model | Single-class comptime (all at per_instance_mir); typing-time eager eval deferred to v2 |
+
+**What the migration retired:**
+- `toylangc/src/sidecar.rs` (entire module, ~600 LOC + 22 unit tests).
+- `LangCallbacks::on_sky_lib_loaded` trait method + vtable slot + trampoline + dispatch fn.
+- `CallbackLog::OnSkyLibLoaded` variant.
+- `tests/cache_sidecar_equivalence.rs`, `tests/cache_shadow_mode.rs`, `test_s5_sidecar_determinism` (vacuous post-deletion).
+- Closed-source-libs future direction (formally out of scope per Plan Decision 9).
+- §27.2's planned cross-version migration framework.
+- Migration intermediates: `SKYC_USE_SIDECAR_FALLBACK`, `SKYC_DUAL_WRITE`, `SKYC_CACHE_VERIFY` env vars; dual-write code paths; sidecar fallback gating in `driver.rs::load_upstream_sidecars`.
+
+### 7.9 Cross-references
+
+- §6.7 — source-only distribution (the cache's distribution model).
+- §8 — what's in the cache payload (the Temputs schema).
+- §13 — comptime; under the single-class model, comptime values are NOT baked into the cache (§13.4).
+- §22 — cargo's incremental machinery + the cache invalidation pathway.
+- §18 — cargo orchestration that places the cache next to the rlib.
+- §F.7 — `SkyUniverse.struct_infos` simplification under cache-only.
 
 ---
 
 ## 8. Temputs Format
 
-This chapter covers what's in the sidecar's payload. The format is named "Temputs" after Vale's pre-existing typing-pass output, which Sky inherits and extends.
+This chapter covers what's in the **cache file's payload** (post-sidecar→cache migration, 2026-06-29). Pre-migration the same payload was the body of the `.sky-meta` sidecar; the `ToylangRegistry` shape (`toylangc/src/toylang/registry.rs`), the BTreeMap-for-determinism convention (§7.5), and every field documented below carry across unchanged — what changed is the wrapper file (now `.sky-cache` with magic `SKYC`, see §7.2) and the distribution shape (local-only, never shipped, see §7.1).
+
+The format is named "Temputs" after Vale's pre-existing typing-pass output, which Sky inherits and extends.
 
 ### 8.1 Vale's Temputs as the basis
 
@@ -1815,7 +1903,7 @@ SkyRef("my_utils::Widget")      — A reference to Widget in another Sky library
 SkyRef("self::internal_helper") — A reference to a non-export Sky function in the current library.
 ```
 
-The path is the canonical form Sky's typechecker uses for cross-crate name resolution. Cross-crate resolution happens at sidecar load time: when the consumer (the binary's compile) loads `my_utils.sky-meta`, the references inside become first-class objects in Sky's universe with concrete DefIds populated.
+The path is the canonical form Sky's typechecker uses for cross-crate name resolution. Cross-crate resolution happens at cache load time: when the consumer (the binary's compile) loads `<crate>-HASH.sky-cache`, the references inside become first-class objects in Sky's universe with concrete DefIds populated.
 
 Vale already had some support for foreign-item references (for C interop); Sky extends this to Rust-language references. The mechanism is:
 
@@ -1869,7 +1957,7 @@ For HRTBs (higher-ranked-trait-bounds, see Section 11) on Sky's trait impls of R
 
 Sky's interop architecture uses a universal `SkyOpaqueType<const T: u64>` wrapper to express Sky-side types that rustc shouldn't know about by name (Section 10.6). Each typeid is a stable, content-addressed identity for a Sky type.
 
-The sidecar contains a typeid table:
+The cache contains a typeid table:
 
 ```
 SkyTypeId {
@@ -1882,11 +1970,11 @@ SkyTypeId {
 
 The table is populated at typing-pass time for source-defined types. For comptime-produced types, entries are added during comptime evaluation; the typeid is the hash of the canonical construction recipe.
 
-Each Sky library's sidecar contains typeid entries for types defined in that library. Cross-crate references work because typeids are content-addressed: lib_a and lib_b compute the same typeid for the same logical type independently, because the typeid is a hash of the type's source identity (not its CrateNum or any per-compile state).
+Each Sky library's cache contains typeid entries for types defined in that library. Cross-crate references work because typeids are content-addressed: lib_a and lib_b compute the same typeid for the same logical type independently, because the typeid is a hash of the type's source identity (not its CrateNum or any per-compile state).
 
 ### 8.6 Item bodies: typed AST shipped for all items
 
-The sidecar contains typed AST for every item — exports and non-exports. This is the locked decision from the design conversation: Sky libs ship only AST, downstream codegens everything.
+The cache contains typed AST for every item — exports and non-exports. This is the locked decision from the design conversation: Sky libs ship only source (`.sky` files), downstream codegens everything; the cache materializes the typed view locally per-compile.
 
 Reasons:
 
@@ -1898,7 +1986,7 @@ The cost is compile time at the binary's compile: every Sky body the binary reac
 
 ### 8.7 Source position info
 
-Every Temputs item carries source position (file, line, column). The file is referenced by index into a per-sidecar file table. The file table maps indices to filenames relative to the cargo package root.
+Every Temputs item carries source position (file, line, column). The file is referenced by index into a per-cache file table. The file table maps indices to filenames relative to the cargo package root.
 
 Source positions enable:
 
@@ -1910,11 +1998,11 @@ The size cost is modest: a u32 line, u32 column, u16 file index per AST node. ~1
 
 ### 8.8 No pre-computed layouts (layouts derived at consumer compile time)
 
-The sidecar does *not* contain pre-computed layouts. Layouts are derived at the consumer's compile time from the structural information in the typed AST.
+The cache does *not* contain pre-computed layouts. Layouts are derived at the consumer's compile time from the structural information in the typed AST.
 
 This decision is locked. Reasoning:
 
-- **Sky version independence for layouts.** Different skyc versions might compute layouts differently. If a layout is baked into a sidecar by skyc 0.5, then consumed by skyc 0.6 which has improved layout decisions (better packing, niche optimization), the baked layout would be stale. Re-deriving at consumer time means all layouts in the binary are consistent with the consumer's skyc version.
+- **Sky version independence for layouts.** Different skyc versions might compute layouts differently. If a layout were baked into the cache by skyc 0.5, then consumed by skyc 0.6 which has improved layout decisions (better packing, niche optimization), the baked layout would be stale. (Post-migration the cache is keyed by skyc version anyway — a skyc bump invalidates the cache — but this rule predates the cache and remains a useful design constraint for any future "ship pre-computed layouts" temptation.) Re-deriving at consumer time means all layouts in the binary are consistent with the consumer's skyc version.
 - **Comptime-driven layouts work naturally.** A Sky type whose layout depends on a comptime evaluation needs the consumer's comptime state to derive. Pre-baking would require enumeration of all instantiations; re-derivation handles instantiation-at-use naturally.
 - **Layout flexibility for future Sky compiler improvements.** Sky's codegen can change layout decisions over time (better cache behavior, target-specific tuning); each Sky version's layout decisions apply uniformly to all libs in the binary.
 
@@ -1924,17 +2012,19 @@ Section 10 covers the layout mechanism in detail.
 
 ### 8.9 Inspection tool: `skyc inspect`
 
-A `skyc inspect <sidecar-path>` command dumps the sidecar in a human-readable form. Shipped from v0. Used for:
+A `skyc inspect <cache-path>` command dumps the cache file in a human-readable form. Shipped from v0. Used for:
 
-- Debugging "what's in this sidecar?" questions.
-- Inspecting published Sky libraries before depending on them.
+- Debugging "what's in this cache?" questions.
+- Inspecting cache contents during regression triage (e.g., does the cache contain the expected typeid?).
 - Verifying determinism in CI.
 
-The output format is text (probably JSON or YAML). Each section of the sidecar (header, typeid table, item table) is dumped in turn.
+The output format is text (probably JSON or YAML). Each section of the cache (header including cache_key_digest, typeid table, item table) is dumped in turn.
+
+(Cache files are local-only; this tool can't be used against a "published Sky library" in the crates.io sense, since published libs ship source-only. The published equivalent is `skyc inspect-source <crate>` which runs the frontend over upstream source and emits the universe it produced.)
 
 ### 8.9.5 Discovered trait-impl instances
 
-For Sky-defined types implementing Rust traits (case 4 / case 6 of §2's taxonomy), the cascade that discovers each concrete `<SkyType as RustTrait>::method` monomorphization fires **at the stub rlib compile**, not at user-bin (§2.6's empirical correction; Appendix F's `is_reachable_non_generic` collector gate at `should_codegen_locally`). The user-bin compile can't re-run the cascade for non-generic upstream symbols. The current architecture handles this with an **in-process capture-drain at the same compile session where the cascade fires** — no sidecar shipment, no cross-process state, no augmented-map query override.
+For Sky-defined types implementing Rust traits (case 4 / case 6 of §2's taxonomy), the cascade that discovers each concrete `<SkyType as RustTrait>::method` monomorphization fires **at the stub rlib compile**, not at user-bin (§2.6's empirical correction; Appendix F's `is_reachable_non_generic` collector gate at `should_codegen_locally`). The user-bin compile can't re-run the cascade for non-generic upstream symbols. The current architecture handles this with an **in-process capture-drain at the same compile session where the cascade fires** — no cross-process state, no augmented-map query override, no inclusion in the cache file.
 
 **Mechanism.** At the stub rlib's `consumer_fill_modules` callback (NOT `after_rust_analysis` — capturing there would trigger mono walk and re-enter MUTABLE_STATE per @GCMLZ; the `consumer_fill_modules` timing is post-mono-walk and avoids the re-entry), the pure function `collect_consumer_trait_impl_instances(tcx)` walks rustc's partition for `MonoItem::Fn(instance)` entries matching `is_consumer_trait_impl_method` and returns a `Vec<DiscoveredTraitImplInstance>`. The same callback drains the returned Vec inline: for each tuple it looks up the impl across the loaded registries, substitutes the impl-method body with the captured args, and pushes the resulting Instance into the Sky codegen queue for `fill_module` to emit at this same compile session. The Vec lives microseconds — produced and consumed within one function call.
 
@@ -1960,7 +2050,7 @@ pub struct DiscoveredTraitImplInstance {
 
 // In the toylang reference implementation this is the return type of
 // `collect_consumer_trait_impl_instances(tcx) -> Vec<DiscoveredTraitImplInstance>`.
-// It is NOT a field of any registry/sidecar struct — the data is purely
+// It is NOT a field of any registry/cache struct — the data is purely
 // in-process, single-compile-session.
 ```
 
@@ -1976,14 +2066,14 @@ Determinism (§7.4) still requires sorting before drain — a stable key like `(
 2. Sky's `LangDriver::config` heuristic forces `share_generics=true` at stub rlib compiles, which makes rustc record the trait-impl Instance in the rlib's natural `upstream_monomorphizations_for` map via the standard rmeta encoding.
 3. At downstream (user-bin) compiles, the standard share-generics gate in `Instance::upstream_monomorphization` consults the cstore-walk-populated map and resolves to the owning crate's disambig. (Pre-2026-06-22 architecture used rustc-fork patch 5 to force this resolution at -O>=2 with share_generics=false; with the partition filter restored, the AvailableExternally body no longer exists to misplace, and the standard gate's outputs suffice for both opt levels.)
 
-The previous (now-retired) mechanism shipped the discoveries via the sidecar, pushed them into a `SkyUniverse.discoveries` field at `on_sky_lib_loaded`, and used a `synthesize_upstream_monomorphizations` callback + `upstream_monomorphizations_for` query override to inject synthesized entries into rustc's map. All of that retired 2026-06-21 (commits b09a90b for the §5.5 Step 3 retirement, ff0cfe8 for the dead-code cleanup) once Option 4 (`AvailableExternally` linkage) + §5.5 Step 2 (owning-crate emission) made the rustc-natural map sufficient. See §F.13 / §F.14 / §F.14.1 for the deep-investigation findings that drove the retirement.
+The previous (now-retired) mechanism shipped the discoveries via the (then-extant) sidecar, pushed them into a `SkyUniverse.discoveries` field at `on_sky_lib_loaded`, and used a `synthesize_upstream_monomorphizations` callback + `upstream_monomorphizations_for` query override to inject synthesized entries into rustc's map. All of that retired 2026-06-21 (commits b09a90b for the §5.5 Step 3 retirement, ff0cfe8 for the dead-code cleanup) once Option 4 (`AvailableExternally` linkage) + §5.5 Step 2 (owning-crate emission) made the rustc-natural map sufficient. See §F.13 / §F.14 / §F.14.1 for the deep-investigation findings that drove the retirement. (The 2026-06-28 sidecar→cache migration further retired the sidecar carrier itself; the in-process drain pattern documented above was already in place and survived unchanged.)
 
 ### 8.10 Cross-references
 
 - Section 6 — what gets generated into the stub rlib (exports only).
-- Section 9 — the export keyword's effect on sidecar content (full universe, regardless of export status).
+- Section 9 — the export keyword's effect on cache content (full universe, regardless of export status).
 - Section 10 — typeid mechanism's role in cross-crate type identity.
-- Section 13 — comptime that may add typeids and other entries to the sidecar.
+- Section 13 — comptime that may add typeids and other entries to the cache.
 - Section 2.6 + Appendix F (§F.13, §F.14, §F.14.1) — the cascade-fires-at-stub-rlib-compile empirical correction that motivates §8.9.5's in-process capture-drain.
 
 ---
@@ -2010,7 +2100,7 @@ The export keyword applies to: structs, enums, traits, type aliases, functions, 
 - **Export fn** generates a function declaration in the stub rlib. Rust callers can call it. Sky's per_instance_mir override fires for it. Sky's codegen emits its body.
 - **Export trait** generates a trait declaration in the stub rlib. Rust types can impl the trait (Sky inherits Rust's orphan rule; impls must be in the trait's owning crate or a type-owning crate, Section 6.6).
 - **Export impl** (an impl block marked `export` or with both trait and type being export) generates an impl declaration in the stub rlib.
-- **Non-export items** are absent from the stub rlib. Rustc has no DefId for them. They live entirely in Sky's universe (the sidecar) and in Sky's codegen output (the binary's final `.o`).
+- **Non-export items** are absent from the stub rlib. Rustc has no DefId for them. They live entirely in Sky's universe (loaded from the `.sky-cache`) and in Sky's codegen output (the binary's final `.o`).
 
 ### 9.2 Per-item granularity
 
@@ -2034,7 +2124,7 @@ For an exported Sky item:
 
 For a non-exported Sky item:
 - Rustc has no DefId. The item doesn't exist from rustc's view.
-- Sky's typing pass produces an entry in the sidecar for the item.
+- Sky's typing pass produces an entry in the cache for the item.
 - Sky's codegen emits the item's body into the binary's `.o`.
 - Sky-internal callers of the item (other Sky items in the same library) reference it via Sky-internal symbols.
 - Rust code cannot reference the item by name.
@@ -2052,7 +2142,7 @@ Mechanism:
 1. Sky's stub_gen, when emitting the stub rlib's Rust source, walks the Sky library's items and emits Rust declarations only for exports. Non-exports are skipped.
 2. Sky's typing pass produces Temputs for the full library — exports and non-exports both.
 3. Sky's `per_instance_mir` provider fires only for export items (because only exports have DefIds rustc knows about).
-4. Sky's codegen, at the binary's compile time, walks Sky's universe (loaded from sidecars + the binary's own Temputs) and codegens *every* Sky item reachable from the binary's entry points — exports and non-exports both. The walk happens in Sky's codegen, not via rustc's mono collector.
+4. Sky's codegen, at the binary's compile time, walks Sky's universe (loaded from upstream `.sky-cache` files + the binary's own Temputs) and codegens *every* Sky item reachable from the binary's entry points — exports and non-exports both. The walk happens in Sky's codegen, not via rustc's mono collector.
 5. The emitted `.o` contains Sky-internal symbols for both export and non-export items. Export items also get the Rust-mangled extern symbol; non-export items get only the Sky-internal symbol.
 
 The Rust-mangled extern symbol and the Sky-internal symbol may be the same (Sky may choose to name exports with their Sky-internal name) or different (Sky may use rustc's v0 mangling for exports to enable Rust callers to find them, while using a Sky-specific scheme internally). Section 6 covers the stub generation; Section 5 covers the codegen choices.
@@ -2103,7 +2193,7 @@ The mangling scheme is rustc's v0 mangler applied to the stub fn's DefId — wel
 ### 9.7 Cross-references
 
 - Section 6 — what gets generated into the stub rlib (exports only).
-- Section 8 — what gets serialized into the sidecar (full universe).
+- Section 8 — what gets serialized into the cache (full universe).
 - Section 5 — codegen emits everything.
 - Section 19 — per_instance_mir's dep-enumeration walk.
 
@@ -2312,7 +2402,7 @@ let v = Vec::<comptime_type<N>>::new()
 
 Sky's frontend evaluates `comptime_type<42>` at comptime, gets a Sky-internal type representation, assigns it a typeid based on the construction recipe, rewrites to `SkyOpaqueType<typeid>`. Rustc sees `Vec<SkyOpaqueType<typeid>>`.
 
-In all three cases, rustc treats `SkyOpaqueType<N>` as a normal generic struct instantiation. `layout_of(SkyOpaqueType<N>)` fires; Sky's override looks up N in the universe, returns the layout. Drop semantics flow through the AST-rewrite mechanism (§15.7): if the universe's entry for typeid N marks the type as needing drop, the compiler synthesizes `Drop::drop(&local)` at scope-end positions; cascade discovery + `fill_extra_modules` emits the body via the same path as Sky-defined `<Widget as Drop>::drop`.
+In all three cases, rustc treats `SkyOpaqueType<N>` as a normal generic struct instantiation. `layout_of(SkyOpaqueType<N>)` fires; Sky's override looks up N in the universe, returns the layout. Drop semantics flow through the AST-rewrite mechanism (§15.7): the compiler synthesizes a `__toylang_drop::<T>(&local)` wrapper-call at every let-binding's scope end; the wrapper's internal `drop_in_place::<T>` resolves to rustc's standard DropGlue which (for needs-drop T) queues `<T as Drop>::drop` via cascade discovery, and `fill_extra_modules` emits the body via the same path as Sky-defined `<Widget as Drop>::drop`.
 
 ### 10.8 Content-addressed typeids for cross-crate stability
 
@@ -2325,7 +2415,7 @@ For comptime-produced types: typeid = hash(canonical_construction_recipe). The "
 Stability properties:
 
 - **Same Sky lib + same Sky version → same typeids.** Reproducible builds.
-- **Same Sky lib + different Sky versions → same typeids, if the hashing algorithm hasn't changed.** Cross-version sidecar compatibility (up to format_version compatibility).
+- **Same Sky lib + different Sky versions → same typeids, if the hashing algorithm hasn't changed.** Pre-2026-06-28 this enabled cross-version sidecar compatibility; under the cache model (§7), each skyc-version-keyed cache is regenerated locally, so the same property simply makes the regenerated typeids stable across versions when the algorithm doesn't change.
 - **Different Sky libs that define structurally similar but separately-source-located types → different typeids.** No collisions across libs.
 - **Comptime-produced types with same recipe → same typeid.** Two different call sites with the same comptime arg produce the same typeid.
 
@@ -2338,14 +2428,14 @@ Sky-side identity and rustc-side identity for the same logical type are differen
 - **Sky-side identity:** a SkyTypeId (or qualified path) in Sky's universe. Sky's typechecker, layout machinery, and codegen all use Sky-side identity.
 - **Rustc-side identity:** a DefId. For exports, the DefId is in the stub rlib (and is created by rustc when it parses the stub rlib's Rust source). For non-exports and comptime types, the DefId is the `SkyOpaqueType<const T: u64>` ADT's DefId (one DefId, parameterized by the typeid).
 
-The mapping from rustc-side to Sky-side happens at sidecar load time: Sky's machinery, on seeing a crate with the marker, walks `module_children(crate_root)`, computes each item's qualified path, looks up the Sky item by path, builds a `HashMap<DefId, SkyItemId>` and an inverse `HashMap<SkyItemId, DefId>`. Subsequent queries are O(1).
+The mapping from rustc-side to Sky-side happens at cache load time: Sky's machinery, on seeing a crate with the marker, walks `module_children(crate_root)`, computes each item's qualified path, looks up the Sky item by path, builds a `HashMap<DefId, SkyItemId>` and an inverse `HashMap<SkyItemId, DefId>`. Subsequent queries are O(1).
 
-For the `SkyOpaqueType<const T: u64>` wrapper, the mapping is: given an instantiation `SkyOpaqueType<42>`, the typeid 42 is looked up in the sidecar's typeid table to recover the Sky type. The typeid table is built during sidecar load; entries are added as needed during comptime evaluation.
+For the `SkyOpaqueType<const T: u64>` wrapper, the mapping is: given an instantiation `SkyOpaqueType<42>`, the typeid 42 is looked up in the cache's typeid table to recover the Sky type. The typeid table is built during cache load; entries are added as needed during comptime evaluation.
 
 ### 10.10 Cross-references
 
 - Section 6 — stub rlib's role in carrying export type declarations.
-- Section 8.5 — typeid table format in the sidecar.
+- Section 8.5 — typeid table format in the cache.
 - Section 11 — group params on Sky types appear as PhantomData-tied lifetime slots.
 - Section 13 — comptime-produced types' typeid assignment.
 
@@ -2357,7 +2447,7 @@ This chapter covers how Sky's group system — Sky's analog to Rust's lifetime s
 
 ### 11.1 Groups as Sky's lifetime-equivalent
 
-A Sky group is a named, possibly hierarchical, possibly runtime-realized memory region. Sky source explicitly names groups in references and function signatures:
+A Sky group is a named, possibly hierarchical scope of related references — primarily a compile-time concept (like Rust lifetimes), with an allocator-implementation consequence (Sky's allocator may free a group's region as a unit). Sky source explicitly names groups in references and function signatures:
 
 ```sky
 fn process<G>(items: &G [Widget]) -> &G Widget {
@@ -2365,11 +2455,11 @@ fn process<G>(items: &G [Widget]) -> &G Widget {
 }
 ```
 
-The `&G` annotation says "this reference lives in group G." Sky's typechecker tracks which groups a function operates on, which references belong to which groups, and ensures that no reference outlives its group.
+The `&G` annotation says "this reference belongs to scope G." Sky's typechecker tracks which groups a function operates on, which references belong to which groups, and ensures that no reference outlives its group.
 
 Groups can be hierarchical: `G1 ⊂ G2` declares G1 as a sub-region of G2. References valid for G1 are valid for G2 (a value living in a sub-region also lives in the containing region). This is more expressive than Rust's `'long: 'short` because Sky tracks containment, not just outlives.
 
-Groups are runtime-realized: Sky's runtime allocates group-region memory and frees it as a unit when the group ends. This is the bump-allocator-arena pattern from region-based memory management literature. The exact runtime mechanism varies (bump allocator for short-lived groups, more sophisticated allocators for long-lived groups) but is always region-based.
+**Allocator implementation (separate concern from the type system).** Sky's allocator may use bump-allocated arenas where freeing a region maps to a single operation — a useful runtime consequence of having proven region containment at compile time. The exact mechanism varies (bump allocator for short-lived groups, more sophisticated allocators for long-lived groups) but is implementation, not part of the group abstraction. The group itself is the static scope tracked by the typechecker; the arena is one possible allocation policy that exploits the static guarantee.
 
 ### 11.2 `&G T` erasure to `&'re_erased T` (per @ELASZ pattern)
 
@@ -2676,13 +2766,18 @@ The collector walks the substituted body and queues whatever Rust deps it finds.
 
 ### 13.4 Slab lifecycle: per-invocation, never serialized
 
-The slab is per-rustc-invocation state. Created when Sky's machinery activates (after sidecar load, during after_expansion); discarded when the invocation ends. Never serialized to disk.
+**STATUS UPDATE (2026-06-28, sidecar→cache migration Plan Decision 10).** The earlier framing in this section — "comptime results that need to persist across invocations are baked into the Temputs in their resolved form" — was an over-read of how comptime interacts with the typing pass. The actual model is **single-class comptime**: all comptime evaluates at `per_instance_mir` time (per-Instance), nothing is baked into Temputs / the cache content. Eager typing-time evaluation is a v2 optimization NOT IMPLEMENTED in v1. Under current toylang (no comptime fixtures) this is vacuously satisfied. Producer-side lints from the migration's validation rounds slot in as forward-defense:
+
+1. Reject `comptime`-valued expressions in any exported type position (the Rust `generic_const_exprs` hazard inherited).
+2. Reject `comptime`-sourced values flowing to Rust-visible const generic argument positions (the §29.A.content-hash-const-args correctness gate; until §29.A lands, slab pointers as u64 const args are unsound across compile sessions).
+
+Both lints sit dormant under toylang's current grammar (no comptime). When Sky proper picks up comptime, these become real producer-side checks rather than migration prerequisites.
+
+The slab is per-rustc-invocation state. Created when Sky's machinery activates (after upstream metadata load, during after_expansion); discarded when the invocation ends. Never serialized to disk.
 
 **Why not serialize:** the slab is dynamic compile-time state representing in-flight comptime values. It depends on the invocation's call graph (which comptime expressions evaluate, in what order, with what intermediate values). Serializing the slab would couple a Sky library's published artifact to the specific compile-session that produced it — a different compile session would produce different slab contents (different offsets, different allocation order).
 
-Instead, comptime results that need to persist across invocations are baked into the Temputs in their resolved form. For example, `comptime fn compute_size() -> usize` evaluated at lib_a's compile time produces a `usize` result. That `usize` is what gets stored in lib_a's Temputs (as a literal, not as a slab reference). Downstream compiles read the `usize` from the Temputs and use it directly; no slab reference, no comptime re-evaluation.
-
-For comptime values that genuinely cannot be resolved at the producing lib's compile (e.g., comptime that depends on a type parameter only known at the downstream's compile), the Temputs records the construction recipe, and the downstream's compile re-evaluates with the downstream's slab.
+Under the single-class model: comptime values produced at lib_a's compile are NOT baked into lib_a's cache/Temputs. The cache content is the typed AST (with comptime expressions as unevaluated AST nodes); downstream's `per_instance_mir` evaluates them per-Instance with the downstream's slab. A v2 optimization may eagerly evaluate non-generic-dependent comptime expressions at typing time to amortize across downstream invocations, but that's deferred.
 
 ### 13.5 Comptime determinism requirement
 
@@ -2732,7 +2827,7 @@ pub fn process(w: SkyOpaqueType<typeid_widget>) -> i32 { ::std::unreachable!() }
 
 Where `typeid_widget` is a content-addressed hash of the recipe `(make_widget_type, [I32])`.
 
-Sky's `layout_of` override fires for `SkyOpaqueType<typeid_widget>`; the override looks up the typeid in the sidecar's typeid table, recovers the recipe, evaluates comptime with `I32` as arg, computes the layout, returns to rustc.
+Sky's `layout_of` override fires for `SkyOpaqueType<typeid_widget>`; the override looks up the typeid in the cache's typeid table, recovers the recipe, evaluates comptime with `I32` as arg, computes the layout, returns to rustc.
 
 This is "Option C" from the design conversation's synthetic-items walk — the alternative that avoids new fork patches by representing synthetic types as parameterized wrappers around a stable identity. Section 10.6 covers the wrapper machinery in full.
 
@@ -2768,7 +2863,7 @@ The recipe is deterministic: same Sky source, same comptime args → same recipe
 
 Sky's synthetic-items mechanism avoids the temptation of synthesizing new DefIds in rustc's namespace. The reason: synthesizing new DefIds would require additional fork patches to extend rustc's DefId allocator and item-loading machinery. The `SkyOpaqueType` wrapper approach is more elegant: all synthetic types share the wrapper's single DefId, parameterized by a const u64 typeid.
 
-The result: Sky's fork stays at the four patches in §3.2 (per_instance_mir trio + `fill_extra_modules` hook). No additional fork machinery for synthetic items. The wrapper pattern handles everything via Sky's typeid table + sidecar.
+The result: Sky's fork stays at the four patches in §3.2 (per_instance_mir trio + `fill_extra_modules` hook). No additional fork machinery for synthetic items. The wrapper pattern handles everything via Sky's typeid table + cache.
 
 ### 13.10 Cross-references
 
@@ -2890,7 +2985,7 @@ So a migratory future satisfies `F: Future + Send + 'static + Unpin`. tokio::spa
 
 Wait, that creates an inconsistency. If migratory futures' drop glue is normal but default futures' drop glue panics, how does Sky distinguish?
 
-The mechanism: linear types' source-level `impl Drop` body is the panic-and-abort code; non-linear types' source-level `impl Drop` body (if any) is normal cleanup. The compiler's AST-rewrite pass (§15.7) inserts `Drop::drop(&local)` calls uniformly; the body that runs at scope end is whatever the user wrote, supplied via the standard cascade-discovery + `fill_extra_modules` pipeline. Linear vs non-linear is purely a Sky-source-level discipline tracked by the typechecker; the codegen path is the same for both.
+The mechanism: linear types' source-level `impl Drop` body is the panic-and-abort code; non-linear types' source-level `impl Drop` body (if any) is normal cleanup. The compiler's AST-rewrite pass (§15.7) inserts `__toylang_drop::<T>(&local)` wrapper-call AST nodes uniformly at every let-binding's scope end; the wrapper's internal `drop_in_place::<T>` reaches the user's `<T as Drop>::drop` body via rustc's standard DropGlue resolution + cascade discovery + `fill_extra_modules` pipeline. Linear vs non-linear is purely a Sky-source-level discipline tracked by the typechecker; the codegen path is the same for both.
 
 ### 14.6 Migratory propagation through call graph
 
@@ -3197,22 +3292,24 @@ in any code path triggered by `per_instance_mir`'s invocation.
 Drop calls reach Sky's emitted body via two structurally different
 paths depending on where the dropped value's owning let-binding lives:
 
-- **Sky source path.** When Sky source declares `let v: Vec<SkyType> = ...`
-  in a `void`-returning function, Sky's compiler runs the AST-rewrite
-  pass above (`insert_scope_end_drops`) and appends a synthetic
-  `Drop::drop(&v)` StaticCall to the function's body. The trait static
-  call resolves through the same cascade discovery + `fill_extra_modules`
-  pipeline any other Sky-side trait method call uses. The Sky-emitted
-  `<Vec<SkyType> as Drop>::drop` body is what runs.
+- **Sky source path.** When Sky source declares `let v: Vec<SkyType> = ...`,
+  Sky's compiler runs the AST-rewrite pass above (`insert_scope_end_drops`)
+  and appends a synthetic `__toylang_drop::<Vec<SkyType>>(&v)` `FnCall`
+  to the function's body. The wrapper's internal `drop_in_place::<Vec<SkyType>>`
+  reaches `<Vec<SkyType> as Drop>::drop` via rustc's standard DropGlue;
+  Sky's `<SkyType as Drop>::drop` (for SkyType's per-element drop) is
+  captured by the same cascade discovery + `fill_extra_modules` pipeline
+  any other Sky-side trait method call uses. The Sky-emitted bodies are
+  what run.
 
 - **Rust source path.** When Rust source declares `let v: Vec<SkyType> = ...`
   in a Rust function, Sky's compiler doesn't touch the Rust body. Rustc's
   standard mechanism takes over: at scope end, rustc emits a call to
   `drop_in_place::<Vec<SkyType>>`, which then calls
   `<Vec<SkyType> as Drop>::drop` via the same trait-method dispatch
-  rustc uses for any cross-crate Drop impl. The same Sky-emitted body
-  (resolved by name via the single-symbol architecture per §6.2) is what
-  runs.
+  rustc uses for any cross-crate Drop impl. The same Sky-emitted
+  `<SkyType as Drop>::drop` body (resolved by name via the single-symbol
+  architecture per §6.2) is what runs.
 
 Both paths reach the SAME Sky-emitted `<T as Drop>::drop` symbol. The
 stub rlib publishes the trait impl with an `unreachable!()` body (which
@@ -3251,10 +3348,13 @@ No mono-time drop-specific work.
 
 **Linear types** are simply Sky source types whose user-written
 `impl Drop` body invokes `sky_runtime_panic` + `abort()`. There is no
-separate mechanism — the same compiler pass synthesizes the same kind
-of `Drop::drop(&local)` call; the body that runs at scope end is the
-user's panic-and-abort code, supplied via the standard cascade
-discovery + `fill_extra_modules` pipeline.
+separate mechanism — the same compiler pass synthesizes the same
+`__toylang_drop::<T>(&local)` wrapper-call for linear types as for any
+other type; the body that ultimately runs at scope end is the user's
+panic-and-abort code, reached via the wrapper's `drop_in_place::<T>`
+→ rustc DropGlue → `<LinearWidget as Drop>::drop` chain, with the
+final body supplied via the standard cascade discovery + `fill_extra_modules`
+pipeline.
 
 ```sky
 // Sky source — linear type:
@@ -3283,28 +3383,29 @@ Sky cannot enforce the consumption requirement from Sky source (the
 consumer is Rust code); the panic+abort body is the safety net.
 
 **Why this is principled.** "Drop is just a function the language
-sometimes auto-calls" is honored at ~95%:
-- ONE site knows about Drop: `insert_scope_end_drops` (~30 lines) +
-  `local_needs_scope_drop` predicate (~25 lines) +
-  `synth_scope_drop_call` AST builder (~20 lines) + one `pub use Drop`
-  line in stub_gen.
-- After the synth pass runs, every downstream stage treats drop calls
-  as ordinary `StaticCall` AST nodes. No drop-specific code paths in:
-  type resolution, dep walker, mono cascade, per_instance_mir, codegen,
-  symbol resolution, link.
-- Remaining 5% leak (mostly closed 2026-06-25, commit `8f85622`): the
-  predicate now consults a `LIFECYCLE_TRAITS` const-slice registry
-  (`toylangc/src/toylang/callbacks_impl.rs`) rather than hardcoding
-  the trait name. Currently one entry: `Drop → drop`. Future planned
-  entries: `Init → init` (comptime placement construction), `SkyDrop`
-  (linear-type marker that lets the compiler enforce panic-on-drop
-  without requiring user-written panic bodies), and an async-Drop
-  variant. Per the round-4-close reviewer endorsement: adding a new
-  lifecycle trait is one registry-entry append; the synthesis pass
-  itself never branches on which trait it's handling. Promoting the
-  flat slice to a struct with per-entry insertion-site policy (e.g.
-  `Init` would synth after struct construction, not at scope end)
-  is the work item when the second entry lands.
+sometimes auto-calls" is honored at ~100% post-migration:
+- ONE site knows scope-end calls exist: `insert_scope_end_drops`
+  (~30 lines), which emits a plain `FnCall { name: "__toylang_drop",
+  type_args: [T], args: [Ref(Var(local_name))] }` for every let-binding
+  in LIFO order. No predicate, no `tcx.adt_destructor` check, no
+  trait-name lookup, no `LIFECYCLE_TRAITS` registry. The wrapper itself
+  is two lines in stub_gen.
+- After the synth pass runs, every downstream stage treats the calls as
+  ordinary generic Rust function calls indistinguishable from any
+  user-written `wrap<T>(...)` call. The string `"__toylang_drop"` is a
+  function identifier, not a special-case marker — nothing branches on
+  it. The word "drop" does not appear in any code path triggered by
+  `per_instance_mir`'s invocation.
+- The pre-migration "5% leak" — `local_needs_scope_drop` predicate (~25
+  lines), `synth_scope_drop_call` AST builder (~20 lines), and the
+  brief `LIFECYCLE_TRAITS` const-slice registry (commit `8f85622`,
+  retired in commit `7f8814d` later the same day) — all retired
+  together when the wrapper-emission migration moved the
+  drop-no-op-vs-drop-glue decision into `drop_in_place::<T>` (which
+  rustc already handles correctly for every T). Future Init / SkyDrop
+  / async-Drop variants would either reuse the wrapper pattern with
+  their own thin wrappers or, if a registry genuinely needs to come
+  back, it would be insertion-site-policy-aware from the start.
 
 **Historical (pre-2026-06-23): the retired mir_shims model.** Before
 Phase E, Sky's `mir_shims` query override generated synthetic
@@ -3513,7 +3614,9 @@ When skyc build runs, it generates a workspace at `.skybuild/` (gitignored by de
       lib.sky                                 # symlink or copy of user's main.sky
       main.rs                                 # shim: `fn main() { __sky_main(); }`
     target/                                   # cargo's output directory
-  my_app.sky-meta                             # sidecar for my_app's bin items
+  # (Sky cache files live under target/<triple>/<profile>/deps/, NOT in
+  # the .skybuild workspace itself — they're produced by cargo's per-crate
+  # rustc invocations and live alongside cargo's other build artifacts.)
 ```
 
 The exact layout is implementation detail; the principles:
@@ -3593,9 +3696,9 @@ Skyc spawns cargo once (via `cargo build --manifest-path=.skybuild/Cargo.toml`).
 
 The model is enforced by rustc's design. rustc was not designed to compile multiple crates in one process; the `run_compiler` API expects a one-shot invocation. While calling it twice in the same process *technically works* on most nightlies, it is an under-tested code path with periodic regressions (interner sanity check failures, TLS pollution, etc.).
 
-Sky's per-crate process model means each Sky-machinery activation is independent. Sky's universe is re-loaded from sidecars at each invocation. Sky's slab is created fresh and discarded at end-of-invocation. There is no cross-invocation state (no in-memory cache that persists across crate compiles within one cargo build).
+Sky's per-crate process model means each Sky-machinery activation is independent. Sky's universe is re-loaded from upstream `.sky-cache` files at each invocation. Sky's slab is created fresh and discarded at end-of-invocation. There is no cross-invocation in-memory state (the disk cache replaces the would-be in-memory state for upstreams).
 
-The cost: cargo build of a large project may invoke rustc dozens of times, each with full Sky-machinery startup overhead (load sidecars, build typeid table, etc.). The overhead per invocation is small (~tens of milliseconds for sidecar loading), so the total overhead is bounded. Section 22 covers incremental compilation that skips entire crate compiles.
+The cost: cargo build of a large project may invoke rustc dozens of times, each with full Sky-machinery startup overhead (load upstream `.sky-cache` files, build typeid table, etc.). The overhead per invocation is small (~tens of milliseconds for cache loading), so the total overhead is bounded. Section 22 covers incremental compilation that skips entire crate compiles.
 
 **Skyc does not spawn rustc subprocesses directly.** Earlier in the design conversation, an alternative was discussed where skyc spawns subprocesses of itself per rustc invocation (`skyc internal-rustc <args>`), bypassing cargo as a build-graph orchestrator. That model was rejected: cargo's build-graph machinery (dependency resolution, fingerprinting, parallelism) is months of work to replicate, and replicating it produces a worse build system. Skyc invokes cargo; cargo invokes Sky's `rustc` binary per crate.
 
@@ -3653,7 +3756,7 @@ The skyc binary exposes the following user-facing subcommands. Each is a thin wr
 - **`skyc new <name>`** — Create a new Sky project skeleton. Generates `sky.toml`, `src/main.sky` or `src/lib.sky`, `.gitignore`. Standard convention scaffolding.
 - **`skyc add <crate>`** — Add a dependency. Updates `sky.toml` with the new dep. Optionally specifies version, features, path/git.
 - **`skyc publish`** — Publish a Sky library to crates.io. See Section 21.1.
-- **`skyc inspect <sidecar-path>`** — Dump a `.sky-meta` file in human-readable form. See Section 8.9.
+- **`skyc inspect <cache-path>`** — Dump a `.sky-cache` file in human-readable form. See Section 8.9.
 - **`skyc clean`** — Wipe `.skybuild/` and `target/`. Sometimes needed to recover from corrupted cache state.
 - **`skyc doc`** — Generate documentation from doc comments. Wraps `cargo doc` after generating workspace with doc-comment-preserving stub generation.
 
@@ -3873,7 +3976,12 @@ Post-sunny-karp:
 - 1 full type-resolve at `after_rust_analysis` (stashed on `ToylangState.typed_bodies`)
 - 1 full `insert_scope_end_drops` at the same site
 - K cheap typed-AST substitutions via `substitute_in_typed_body`
-- K cheap `insert_late_scope_end_drops` passes (only handle let-bindings whose type was a bare `TypeParam` at the eager pass and only became drop-decidable after substitution)
+
+(Sunny-karp originally added K cheap `insert_late_scope_end_drops` passes
+at mono to close a bare-`TypeParam` drop-synth gap; the drop-is-just-a-function
+migration later the same day — §F.22 — retired that late pass by switching
+to unconditional `__toylang_drop::<T>` wrapper emission. See the
+"Bare-`TypeParam` drop closure" paragraph below for the arc.)
 
 For toylang's fixtures the wall-clock savings are imperceptible (the type-resolve cost per Instance is sub-millisecond). At Sky scale on real-size libraries with hundreds of generic instantiations, this is tens of seconds per compile reclaimed.
 
@@ -3882,7 +3990,7 @@ For toylang's fixtures the wall-clock savings are imperceptible (the type-resolv
 1. **Oracle accepts Param-bearing queries.** Pre-sunny-karp, every Rust-side query (`rust_method_return_type`, `rust_method_param_types`, `rust_free_fn_*`, `rust_trait_method_*`) short-circuited with `RustTypeDeferred` the moment it saw `ResolvedType::TypeParam` in its args. `try_resolved_to_rustc_ty`'s `TypeParam` arm panicked ("Approach A invariant"). The shortcut was implementation laziness from the Approach A migration, not an architectural constraint — `tcx.fn_sig(...).instantiate(...)` accepts Param-bearing args cleanly because Params are normalization terminals; `rustc_ty_to_resolved_type` already round-trips `TyKind::Param → ResolvedType::TypeParam`. Sunny-karp's fix: every oracle query takes a new `caller_type_params: &[String]` argument; `try_resolved_to_rustc_ty`'s `TypeParam(name)` arm rebuilds `ty::Ty::new_param(tcx, idx, name)` from the name's position in the surrounding fn's generic list. The six contains-`TypeParam` early-returns are gone. A seventh guard in `type_resolve.rs`'s `MethodCall` resolver, doing the same defer-on-Param check, also retired.
 2. **`substitute_in_typed_body` is a pure typed-AST walk.** Inputs: cached `TypedBlock` + `HashMap<String, ResolvedType>` subst + `&ToylangRegistry`. Output: substituted `TypedBlock`. At each `TypedExpr.ty` and each `type_args` slot, the walk runs `substitute_type_params(...)` followed by `resolve_struct_fields(...)`. The second step is load-bearing: substitution introduces `StructRef`-shape types (parser-shape) into typed expressions that need to be `Struct{field_types}`-shape (resolver-shape) for codegen to compute layout. Without the chained promotion, codegen treats the field-less form as opaque/zero-sized and returns stack garbage. See §F.20 for the silent-miscompile postmortem.
 
-**Bare-`TypeParam` drop closure.** Pre-sunny-karp the AST-rewrite drop synthesis (§15.7) had a silent gap: `let x: T = ...` where `T` is a function-level type param fell through `local_needs_scope_drop`'s `_ => false` arm because the predicate couldn't answer drop-or-not without the concrete substituted type. The local silently leaked. Sunny-karp closes the gap via a `drop_synthesized: bool` flag on `TypedStmt::Let` and a mini `insert_late_scope_end_drops` pass that runs after substitution at mono. The eager `insert_scope_end_drops` at `after_rust_analysis` sets the flag `true` on lets whose drop status was decidable then (`Vec<T>`-shape RustTypes work fine because `tcx.adt_destructor` is an ADT property valid regardless of args). The late pass re-checks any `drop_synthesized == false` let against its now-concrete substituted type. Idempotent: the late pass marks lets it processed.
+**Bare-`TypeParam` drop closure.** Pre-sunny-karp the AST-rewrite drop synthesis (§15.7) had a silent gap: `let x: T = ...` where `T` is a function-level type param fell through `local_needs_scope_drop`'s `_ => false` arm because the predicate couldn't answer drop-or-not without the concrete substituted type. The local silently leaked. Sunny-karp's initial closure (same-day shipping) added a `drop_synthesized: bool` flag on `TypedStmt::Let` and a mini `insert_late_scope_end_drops` pass that ran after substitution at mono — the eager pass set the flag `true` on lets whose drop status was decidable then; the late pass re-checked any `false`-flagged let against its now-concrete substituted type. **The drop-is-just-a-function migration later the same day (§F.22) retired the late pass entirely** by switching the eager synthesis to emit `__toylang_drop::<T>(&local)` for every let unconditionally — the wrapper's internal `drop_in_place::<T>` is a no-op for trivially-droppable T and the full drop chain for needs-drop T, so the bare-T case is closed structurally rather than via a two-pass scheme. The `drop_synthesized` flag, `local_needs_scope_drop` predicate, and `insert_late_scope_end_drops` mono pass all retired in commit `7f8814d`.
 
 **Storage location:** the typed-body cache lives on `ToylangState.typed_bodies: BTreeMap<String, TypedBlock>`, not on `ToyFunction` or on `ToylangRegistry`. The `&self` signature on `Callbacks::after_rust_analysis` forbids `Arc::make_mut(&mut self.registry)`-style writes; state is `&mut` at every consumer call site and is the right scope (per-rustc-invocation). Impl-method typed bodies key on `"<Self>::<method>"`. Trade-offs vs the registry design: less locality (a `&ToyFunction` no longer carries its typed body), no cross-crate sharing (downstream rederives), and `walk_and_stash_internal_callees` clones the map into a snapshot to dodge the borrow checker during recursive instance-stashing. Net acceptable for toylang; revisit for Sky if multi-crate generic load makes downstream-rederive cost matter.
 
@@ -3942,7 +4050,7 @@ When Sky's rustc compiles a Sky-marked crate:
 2. **Default Callbacks::config().** Sky's codegen backend is constructed; query overrides are installed (`per_instance_mir`, `layout_of`, `collect_and_partition_mono_items` (the partition filter — see §5.3 / §C.2), `cross_crate_inlinable` + `extern_queries.cross_crate_inlinable` (B16), `deduced_param_attrs` (Phase P 2026-06-25 — returns `&[]` for `#[skyc::emit_consumer_body]`-tagged items, closing a silent-UB vector where rustc's MIR analysis on `unreachable!()` stub bodies would have wrongly inferred `readonly` + `captures(none)` for indirect-passed params). The driver also installs the `fill_extra_modules` hook via `extra_modules_hook::install_consumer_modules_hook()`. Retired overrides: `symbol_name` (retired 2026-06-24 Phase F — single-symbol architecture means rustc's default v0 mangler suffices; see §6.2 / §26.1), `mir_shims` (retired 2026-06-23 Phase E — see §15.7 / §F.18 for the AST-rewrite replacement), `codegen_fn_attrs` (retired TWICE — Option 4 era 2026-06-22 alongside patch 5, then re-introduced as Phase Q 2026-06-25 + retired again same day per reviewer's round-4-followup interaction audit; cargo enforces panic-strategy consistency at build-graph resolution, so Phase Q's NEVER_UNWIND flag had no real failure mode to defend against — see §F.14.1 / §F.17 + `rustc-lang-facade/src/queries/mod.rs` header for the don't-flatten-the-comment-chain provenance), `consumer_lang_active` (patch-5 shim, retired 2026-06-22 with patch 5 removal from the fork), `upstream_monomorphizations[_for]` (A.2, retired in §5.5 Step 3).
 3. **Rustc parses the local crate's Rust source.** The stub rlib's `src/lib.rs` (skyc-generated). Trivially fast.
 4. **Rustc loads upstream rlibs.** Each loaded rlib goes through rustc's metadata-loader. Sky's machinery checks each for `__SKY_STUBS_MARKER`.
-5. **For each Sky-marked rlib loaded:** Sky's machinery locates the adjacent sidecar (`my_utils.sky-meta`), deserializes the Temputs into Sky's in-memory universe.
+5. **For each Sky-marked rlib loaded:** Sky's machinery locates the adjacent `.sky-cache` file (e.g. `__lang_stubs-HASH.sky-cache`), deserializes the Temputs into Sky's in-memory universe.
 6. **Callbacks::after_expansion().** All crates are loaded. Sky's machinery has full access to upstream universes plus the local crate's parsed Rust source.
 
 ### 20.3 Hook point: `Callbacks::after_expansion`
@@ -3970,7 +4078,7 @@ The frontend's output:
 - **Sky's codegen queue** populated with `(SkyItemId, concrete_args)` pairs for every item to emit. For libs (rlib compiles), the queue contains items that survive the export filter. For bins, the queue contains everything reachable from main, plus everything reachable from exports of the bin (since the bin can have exports too).
 - **Sky's typeid table** populated for any synthetic types produced during comptime.
 
-The codegen queue is consumed in step 6.7 (Sky's codegen pass). The Temputs is written to the sidecar at end-of-invocation.
+The codegen queue is consumed in step 6.7 (Sky's codegen pass). The Temputs is written to the `.sky-cache` file at end-of-invocation.
 
 ### 20.5 Rustc typecheck/borrowck on stub bodies (trivial)
 
@@ -3982,7 +4090,7 @@ The mono collector starts. For each Instance the collector encounters whose def_
 
 For Sky-defined types whose layout is needed: the collector calls Sky's `layout_of` override. Sky's provider returns the opaque-with-size LayoutData.
 
-For Sky-defined types whose drop glue is needed: rustc's standard DropGlue path produces the body. If the Sky type has an `export impl Drop for X`, the collector queues `<X as Drop>::drop`; the cascade discovery captures it; `fill_extra_modules` emits Sky's body — same path as case4's Clone. The compiler-synthesized `Drop::drop(&local)` calls (§15.7) are what drive the collector to queue the Instance in the first place.
+For Sky-defined types whose drop glue is needed: rustc's standard DropGlue path produces the body. If the Sky type has an `export impl Drop for X`, the collector queues `<X as Drop>::drop`; the cascade discovery captures it; `fill_extra_modules` emits Sky's body — same path as case4's Clone. The compiler-synthesized `__toylang_drop::<T>(&local)` wrapper-call AST nodes (§15.7) are what drive the collector to walk into the wrapper's body; the `drop_in_place::<T>` call inside the wrapper is what makes rustc queue `<X as Drop>::drop` through its standard DropGlue machinery (transparent to Sky's mono path).
 
 For Sky-defined functions' symbol names: rustc's default v0 mangler produces the name (Phase F retired Sky's `symbol_name` override; single-symbol architecture per §6.2 means Sky's `fill_extra_modules` body uses the same name).
 
@@ -3997,13 +4105,13 @@ Codegen happens concurrently with rustc's pipeline rather than as a discrete pos
 3. **`LlvmCodegenBackend::codegen_crate` processes the filtered partition** as usual: Rust items get their real bodies (including Phase-6 wrappers, Rust generic intermediaries, etc.); consumer items are absent from the partition entirely. Sky's contributed CGUs (from step 1) ride the standard optimize → ThinLTO-summary → emit pipeline as just-another-CGU. Cross-language inlining works because Sky's modules are in the same LTO pool as user-bin's bitcode and the Rust deps' rlib bitcode.
 4. **`join_codegen` and `link` pass through** to the inner `LlvmCodegenBackend` unchanged. Sky's modules were registered with rustc by the allocator in step 1, so rustc finalizes them with everything else.
 
-### 20.8 Output: rlib + sidecar (per-lib); per-lib `.o` for owned non-generics; binary `.o` for generics
+### 20.8 Output: rlib + cache (per-lib); per-lib `.o` for owned non-generics; binary `.o` for generics
 
 For library compiles (stub rlib compiles):
 
-- Output: `my_utils.rlib` + `my_utils.sky-meta`.
+- Output: `lib<crate>-HASH.rlib` (cargo's) + `<crate>-HASH.sky-cache` (skyc's, see §7).
 - The rlib's `.o` carries (a) Rust-side machinery rustc emits during its own flow — Rust generic intermediaries the cascade surfaces (case 4/6) and Phase-6 wrappers with their default `Hidden` linkage. Consumer-item stub bodies are filtered out of the CGU list by Sky's `collect_and_partition_mono_items` override, so they produce no `.o` symbol. Plus (b) Sky's `fill_extra_modules` contribution: real `External`-linkage bodies for the **non-generic** Sky items defined in this library and for cascade-discovered trait-impl methods whose impl lives in this library.
-- The sidecar contains Sky's full Temputs for the library — exports and non-exports both.
+- The cache contains Sky's full Temputs for the library — exports and non-exports both.
 - Sky does NOT produce per-library `.o` content for **generic** Sky items — those materialize only when concrete args are supplied downstream.
 
 For binary compiles:
@@ -4043,10 +4151,10 @@ Timeline:
 
 1. **Cargo compiles `my_utils` first.** Sky's `rustc` invocation produces:
    - `my_utils.rlib` containing the Rust stub source (with `pub fn wrap<T>(x: T) -> Wrapper<T> { unreachable!() }`) compiled by rustc.
-   - `my_utils.sky-meta` (the sidecar) containing the typed AST for `wrap` (with `T` as a Sky generic parameter — unsubstituted).
+   - `<crate>-HASH.sky-cache` (the cache, see §7) containing the typed AST for `wrap` (with `T` as a Sky generic parameter — unsubstituted).
    - **No `.o` containing `wrap<I32>` or any other monomorphization** — those don't exist yet because no caller has named a concrete T.
 
-2. **Cargo compiles `my_app` next.** Sky's `rustc` invocation loads `my_utils.rlib` + `my_utils.sky-meta` into Sky's universe. Now Sky has access to `wrap`'s typed AST with `T` as a placeholder.
+2. **Cargo compiles `my_app` next.** Sky's `rustc` invocation loads `lib<crate>-HASH.rlib` + the adjacent `<crate>-HASH.sky-cache` into Sky's universe. Now Sky has access to `wrap`'s typed AST with `T` as a placeholder.
 
 3. **`my_app`'s Sky's frontend walks main.** It sees `wrap<I32>(42i32)`. Sky records "I need to codegen `wrap<I32>`."
 
@@ -4068,7 +4176,7 @@ The mechanism is structurally identical to Rust's cross-crate generic monomorphi
 
 - Section 19 — per_instance_mir's role during mono collection.
 - Section 5 — codegen backend's role during the codegen phase.
-- Section 7 — sidecar's role at rlib-load time and write time.
+- Section 7 — cache's role at rlib-load time and write time.
 - Section 6 — stub rlib's role in surfacing exports to rustc.
 
 ---
@@ -4090,24 +4198,24 @@ The cargo package contains:
 - The user's Sky source files.
 - The skyc-generated `Cargo.toml`.
 - The skyc-generated stub rlib Rust source.
-- The skyc-generated `build.rs` (Section 21.3).
-- The skyc-generated sidecar (yes, the sidecar is shipped in the cargo package).
+- The skyc-generated `build.rs` (Section 21.3) — emits `cargo:rerun-if-*` directives for every cache-key axis (§7.7).
+
+Post-sidecar→cache migration (2026-06-28): the `.sky-cache` file is NOT shipped in the cargo package. It's a local artifact under `target/<triple>/<profile>/deps/`; downstream consumers rebuild it on cache miss by re-running skyc's frontend over the upstream's shipped source. See §7 and §7.8.
 
 Crates.io stores it as a normal Rust crate. Downstream cargo dependencies resolve it normally.
 
-### 21.2 Generated artifacts (Cargo.toml, stub source, Sky source, sidecar)
+### 21.2 Generated artifacts (Cargo.toml, stub source, Sky source)
 
 A published Sky lib's cargo package layout:
 
 ```
 my_utils-1.2.0/
   Cargo.toml                                  # skyc-generated
-  build.rs                                    # skyc-generated, enforces Sky toolchain
+  build.rs                                    # skyc-generated; cache-key rerun-if-* lines + toolchain check
   src/
     lib.rs                                    # skyc-generated Rust stubs
     lib.sky                                   # author's Sky source (verbatim)
     [other .sky files]                        # author's
-  my_utils.sky-meta                           # skyc-generated sidecar
   README.md                                   # author-provided
   LICENSE                                     # author-provided
 ```
@@ -4118,13 +4226,12 @@ include = [
     "Cargo.toml",
     "build.rs",
     "src/**",
-    "*.sky-meta",
     "README.md",
     "LICENSE",
 ]
 ```
 
-All Sky-specific files are included. Cargo packaging respects the `include`.
+All Sky-specific files are included. Cargo packaging respects the `include`. **`.sky-cache` files are explicitly NOT in the include list** — they're produced locally by downstream consumers and never shipped.
 
 ### 21.3 `build.rs` enforces skyc toolchain presence
 
@@ -4215,7 +4322,7 @@ For Sky users, this is fine — they have skyc. For Rust users who happen to dep
 A v2 feature: opt-in precompiled bodies. A Sky lib could declare itself as "Sky-pure" (no comptime, no advanced features that require skyc to compile), and skyc publish would precompile bodies for common targets. The published cargo package would contain:
 - The Rust stub source.
 - The Sky source.
-- The sidecar.
+- A shipped Temputs blob (under v2, the cache format may be reused as a shippable artifact — §7's "cache format kept shape-compatible with hypothetical future shipped blob" is cheap insurance for exactly this).
 - Pre-compiled `.o` files for common targets (linux-x86_64, macos-x86_64, etc.).
 - A modified build.rs that detects vanilla-rustc compile and links the appropriate pre-compiled `.o`.
 
@@ -4223,11 +4330,13 @@ Pure-Rust users could use the lib natively (the build.rs falls back to the pre-c
 
 The cost: complexity in skyc publish (pre-compile for each target), distribution size, cross-platform fan-out. The benefit: expands Sky's ecosystem fit. Deferred to v2 when concrete need emerges.
 
+Note: §6.7 / Plan Decision 9 explicitly retired the closed-source distribution direction as a v2 commitment. v2 precompiled-bodies here is for *publicly-source-shipping* libs that ALSO want vanilla-rustc consumability — orthogonal to closed-source.
+
 ### 21.8 Cross-references
 
 - Section 4 — toolchain installation that users need.
 - Section 6 — what's in the stub rlib that users see.
-- Section 8 — sidecar format that travels with the lib.
+- Section 7 — cache file format (the local artifact, not shipped).
 - Section 18 — skyc build orchestration that produces the published artifacts.
 
 ---
@@ -4242,7 +4351,7 @@ Cargo's standard incremental machinery operates at the crate level:
 
 - For each crate in the build graph, cargo computes a fingerprint hash of inputs (source files, dep versions, profile settings).
 - If the fingerprint matches the previous build's cached fingerprint, cargo skips the crate's compile.
-- Cached `.rlib` and `.sky-meta` files are reused from `target/deps/`.
+- Cached `.rlib` and `.sky-cache` files are reused from `target/<triple>/<profile>/deps/`.
 
 This works for Sky because skyc's workspace generation is deterministic (Section 18.5). When the user changes one `.sky` file, only the crates whose stub rlib source changed are invalidated. Pure-Rust deps are untouched.
 
@@ -4276,7 +4385,7 @@ The Temputs format includes a `fingerprint` field per item — a content-address
 
 v2's Sky-side cache can use the fingerprint to detect "this item is unchanged from last build" without walking the AST.
 
-Adding the fingerprint to the format from v1 is forward-compatibility for the v2 work. Cost: a few bytes per item in the sidecar.
+Adding the fingerprint to the format from v1 is forward-compatibility for the v2 work. Cost: a few bytes per item in the cache.
 
 ### 22.4 Perf model
 
@@ -4409,7 +4518,7 @@ slot. The audit re-derived the safety story from upstream declarations:
 | Query | Upstream `cache_on_disk_if` | Why safe under Sky |
 |---|---|---|
 | `per_instance_mir` | `false` (Sky fork patch) | Never disk-cached; per-compile re-derive. |
-| `layout_of` | (none → default `false`) | Never disk-cached. Re-derived from sidecar at every compile. |
+| `layout_of` | (none → default `false`) | Never disk-cached. Re-derived from the loaded `.sky-cache` universe at every compile. |
 | `cross_crate_inlinable` | (none → default `false`) | Never disk-cached. Sky's override return depends on `is_sky_active(tcx)` marker walk. |
 | `collect_and_partition_mono_items` | (none + `eval_always`) | Re-runs every compile; never cached. |
 | `deduced_param_attrs` | (none → default `false`) | Never disk-cached. `separate_provide_extern` so extern provider auto-decodes from rmeta. Sky's local-side override returns `&[]` for tagged items; the conservative empty value gets encoded into stub_rlib rmeta and downstream user_bin compiles read it back via the extern provider — no further override needed. Predicate is `is_consumer_codegen_target(tcx, def_id)` (marker walk + attribute check); reflects current compile's universe state. |
@@ -4612,9 +4721,11 @@ structural-equivalence story.
 
 ### 22.5 Deterministic output as a CI invariant
 
+**STATUS UPDATE (2026-06-28, sidecar→cache migration):** the determinism gate's `.sky-meta` target moves to `.sky-cache` under Step 3 (sidecar emission gated, cache is the sole upstream metadata artifact by default). The unit-level guarantee lives in `cache::tests::payload_determinism`; the integration-level fence lives at `toylangc/tests/cache_determinism.rs::step_2_fence_2_cache_byte_determinism`. The existing `test_s5_sidecar_determinism` is marked `#[ignore]` during the migration (delete after step 4).
+
 Sky's CI verifies deterministic build outputs as a regression test. The mechanism:
 
-1. Build the project once. Hash all outputs (`.rlib` files, `.sky-meta` files, the binary).
+1. Build the project once. Hash all outputs (`.rlib` files, `.sky-cache` files, the binary).
 2. Wipe `target/`. Rebuild. Hash all outputs again.
 3. Compare hashes. Mismatch = determinism regression.
 
@@ -4622,13 +4733,13 @@ The CI invariant catches regressions in:
 - Skyc's workspace generation (timestamps, random IDs, host paths leak into output).
 - Sky's typing pass output (HashMap iteration order, etc.).
 - Sky's codegen (any non-deterministic LLVM IR generation).
-- Sidecar serialization.
+- Cache serialization (sidecar serialization pre-migration).
 
 Without the invariant, non-determinism would accumulate silently until a user noticed "my builds keep changing the binary's hash even with no source changes."
 
 ### 22.6 Cross-references
 
-- Section 7.4 — sidecar determinism.
+- Section 7.5 — cache determinism.
 - Section 18.5 — skyc-generated workspace determinism.
 - Section 28 — phasing of v2 incremental work.
 
@@ -5109,7 +5220,7 @@ Reading a symbol name for a Sky Instance — whether via Sky's own helpers or vi
 
 **Where it bites:** any future change that adds `&mut state` to a query-provider callback signature. Type-system can't prevent it; reviewers must catch it.
 
-**Surviving lock sites today:** `create_state` (once at init), `after_rust_analysis` (once between typecheck and codegen), `on_sky_lib_loaded` (once per upstream sidecar), `collect_generic_rust_deps` (concurrent — fires from rustc's rayon workers; the only path where the mutex is genuinely contended), and `consumer_fill_modules` (the main-thread `fill_extra_modules` callback that emits Sky's CGU into the rustc-supplied module). The mutex is retained for plain serialisation of the concurrent path, not for deadlock avoidance.
+**Surviving lock sites today:** `create_state` (once at init), `after_rust_analysis` (once between typecheck and codegen), `on_sky_lib_cache_loaded` (once per upstream `.sky-cache`), `collect_generic_rust_deps` (concurrent — fires from rustc's rayon workers; the only path where the mutex is genuinely contended), and `consumer_fill_modules` (the main-thread `fill_extra_modules` callback that emits Sky's CGU into the rustc-supplied module). The mutex is retained for plain serialisation of the concurrent path, not for deadlock avoidance.
 
 ### 26.3 DPSFDOZ (DefPathStr Is For Diagnostics Only)
 
@@ -5314,14 +5425,15 @@ The mechanism for 1.x backward compatibility: every Sky source feature has an `e
 
 This subsection is recommended-not-locked because the editions mechanism hasn't been formally designed yet. The principle is locked; the details are open.
 
-### 27.2 Sidecar format versioning
+### 27.2 Cache format versioning (was: sidecar format versioning — retired)
 
-The sidecar carries a `format_version` (Section 7.2). Sky's compatibility posture:
+**Retired 2026-06-28 by the sidecar→cache migration (§7.8).** This section previously documented a "design now, implement at 1.0" cross-version migration story for the `.sky-meta` sidecar's `format_version`: pre-1.0 would refuse mismatched versions; 1.0+ would translate older formats via a sequence of migration functions, ranges of accepted versions, deprecation cycles for format bumps, etc.
 
-- **Pre-1.0:** format_version match required. Skyc refuses to load sidecars with mismatched format_version.
-- **1.0 onward:** skyc reads sidecars in a range of format_versions, applying migrations as needed. Format changes that break older readers require major-version bumps.
+Under the cache model (§7), none of that exists. The `cache_format_version` field in the cache header (§7.2) is a fast invalidation hook: a bump invalidates every entry, builds re-emit from source on next compile, no migration is ever attempted. The whole framework — version ranges, translation functions, cross-version compat testing — is gone.
 
-The migration machinery is non-trivial work and is deferred to 1.0. Pre-1.0, the strict matching policy is acceptable because Sky's user base is small and toolchain consistency is enforceable.
+**Why this works:** the cache is local-only (§7.1), never shipped on crates.io. There's no "older cache file at the consumer's machine produced by a different skyc" case — every cache file was produced by the currently-installed skyc, or it gets invalidated and rebuilt. A skyc version bump invalidates every cache; users pay one fresh re-frontend cost on their first post-bump build (typically seconds for normal-sized projects), then steady state resumes.
+
+The cross-version compat story for **source** remains §27.1 (editions). The cross-version compat story for the **cache** *doesn't exist* because the cache is never read by a different-version skyc than the one that wrote it. This is the single largest architectural simplification the sidecar→cache migration unlocked.
 
 ### 27.3 Cross-Sky-version binaries forbidden (all crates same toolchain)
 
@@ -5341,7 +5453,7 @@ For Sky 2.x: opportunity to evolve stdlib aggressively if needed. Source migrati
 
 ### 27.5 Cross-references
 
-- Section 7 — sidecar format and versioning.
+- Section 7 — cache format and versioning (§7.2 header; §7.8 sidecar→cache migration history).
 - Section 25 — risks around bump compatibility.
 - Section 28 — phasing of compatibility-related work.
 
@@ -5356,7 +5468,7 @@ This chapter describes the order in which Sky's implementation should be built. 
 | Phase | Must-read sections |
 |---|---|
 | Phase 1 (Fork + plugin) | §3 (fork patches), §4 (distribution, marker-based activation), §5 (codegen backend), §25.3.5 (pass-through invariant), §26 quick-reference table |
-| Phase 2 (Sky frontend MVP) | §1.7 (non-goals), §5.6.6 (path syntax), §6 (stub rlib model), §7 (sidecar format), §8 (Temputs), §9 (export semantics) |
+| Phase 2 (Sky frontend MVP) | §1.7 (non-goals), §5.6.6 (path syntax), §6 (stub rlib model), §7 (cache format), §8 (Temputs), §9 (export semantics) |
 | Phase 3 (Generics) | §2.6 (case 4, with empirical correction), §8.9.5 (discovered trait-impl instances), §10 (type representation), §19 (per_instance_mir mechanism), §F.13 + §F.14 (cascade timing) |
 | Phase 4 (Comptime) | §13 (full chapter), §10.6 (SkyOpaqueType wrapper) |
 | Phase 5 (Groups + linear types) | §11 (groups), §15 (drop / cancellation), §26.4 ELASZ |
@@ -5456,7 +5568,7 @@ shipped" while §28 stays forward-looking phasing for Sky proper.
    - **§9 export commitment** (non-export items get no rustc DefId) — fence with a stub_gen-equivalent unit test.
    - **Generic/non-generic uniformity** — grep-fence the discovery/typecheck/codegen paths for unmarked `type_params.is_empty()` branches (toylang's `architecture_fence.rs` is the reference).
    - **Cross-language inlining matrix** — toylang's inlining-matrix (Thread C) is the reference: 7-case taxonomy × 3 LTO modes + opt-level sweep + codegen-units variants, each asserting on disassembled binaries via `rustc-demangle` + `llvm-objdump`. A single `test_lto_smoke`-equivalent is NOT sufficient — the F1 investigation proved that vacuous assertions can survive for an extended period when the matrix is sparse.
-   - **Sidecar determinism** — Section 7.4; build twice with isolated target dirs, byte-compare `.sky-meta`.
+   - **Cache determinism** — Section 7.5; build twice with isolated target dirs, byte-compare `.sky-cache`.
 
    Without these fences, the architectural invariants degrade silently. With them, regressions surface as named test failures with specific file/line refs.
 
@@ -5559,6 +5671,228 @@ Section 18.4 recommends `.skybuild/Cargo.lock`. Open: should Sky users see a `sk
 
 Resolution criteria: design choice based on user feedback; bikeshedy but real.
 
+---
+
+## 29.A WIP Design Directions from the 2026-06-23 Review Exchange
+
+The subsections below capture design directions that emerged from the 2026-06-23 architectural review exchange (full transcript: `tmp/claude-conversation-2026-06-23-836f2993.md`). Each is a substantive future redirection of the corresponding locked chapter above, but **none of these has been empirically investigated or implemented yet** — they're commitments to design directions, not fully-spec'd implementations. The current arch-doc chapters they would supersede are still the operative description of Sky as it stands today.
+
+Status discipline: each entry below carries a **STATUS** field. When the corresponding work ships, the entry's content should migrate into the relevant arch-doc chapter (e.g., §29.A.cdylib's design migrates into §4.1 + §4.2; §29.A.skyref migrates into §12.1) and the §29.A entry collapses to "SHIPPED — see §X.Y" pointer.
+
+### 29.A.cdylib WIP: cdylib backend distribution
+
+**STATUS: design committed, not yet implemented (Phase G, ~5-7 days with wrapper-mode retirement as prerequisite).**
+
+**WHAT.** Sky's backend ships as a separately-loaded cdylib (`libsky_backend.so` / `.dylib` / `.dll`) instead of being statically linked into the forked rustc binary. The Sky toolchain bundle ships rustc-fork + libsky_backend.so as paired binaries; rustup-style atomic installation enforces pairing. Runtime version handshake at backend load detects mismatches.
+
+**WHY.** Post-elimination of mir_shims and symbol_name overrides (Phase E + F), Sky's rustc-touch surface shrunk from ~8 entry points to ~6. Smaller surface tilts the cdylib calculus favorable. Dev velocity: rebuilding rustc-fork is 5-15 minutes for any backend change; rebuilding a cdylib is 30s-2min. Order-of-magnitude faster iteration on backend hacking. Cranelift's cdylib operation validates the model. Reversible: if cdylib bites operationally, switch to static link in a subsequent release.
+
+**ALTERNATIVES CONSIDERED.**
+- Static link (current model from §4.1). Rejected for Phase 1 due to dev-velocity cost. May revisit if cdylib operational issues surface.
+- Hybrid (forked rustc + thin shim statically linked + Sky frontend as cdylib). Rejected — adds complexity without clear benefit.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky toolchain bundle structure: `bin/rustc` (forked rustc + codegen backend statically registered via `-Zcodegen-backend=sky` default), `lib/libsky_backend.{so,dylib,dll}` (Sky's frontend + codegen backend providing `Providers` setup + `fill_extra_modules` hook), `bin/skyc` (orchestrator), `bin/cargo` (vanilla). Rustc-fork's default codegen backend loads `libsky_backend.so` via the standard `CodegenBackend` plugin mechanism cranelift uses. Build-time version pin: both binaries built from the same commit. Runtime version handshake at load. Inkwell/LLVM version match enforced by bundle.
+
+**GOTCHAS.** Don't use `&mut dyn Trait` across the cdylib boundary for any providers/hooks — use `#[repr(C)]` function-pointer struct (Phase H's patch-4-rev-3 shape already provides this for `fill_extra_modules`). The marker check / `is_sky_active(tcx)` discipline must work the same across cdylib as statically linked. Wrapper-mode retirement is a prerequisite (toylangc's current `RUSTC_WORKSPACE_WRAPPER` model has no place in the cdylib model).
+
+**Doc impact at landing.** Restructure §4.1-§4.4 around the cdylib model. Add B22/B23 risk entries for version-pairing drift + FFI ABI drift in TyCtxt-typed arguments. Close §29.6 (cdylib as fork-reduction question — no longer open once Phase G ships).
+
+### 29.A.u128-typeids WIP: u128 typeids with universe-level collision detection
+
+**STATUS: design committed, not yet implemented (Phase J, ~2-3 days).**
+
+**WHAT.** Sky's content-addressed type identities are u128 BLAKE3-truncated hashes. Sky's universe table maintains a `HashMap<u128, SkyTypeInfo>` and detects collisions explicitly: on every insertion, compute the BLAKE3-truncated hash, look up; if mapped to identical content → fine; if mapped to DIFFERENT content → build fails with explicit error. Wrapper becomes `pub struct SkyOpaqueType<const T: u128>`.
+
+**WHY.** Round-1 reviewer raised collision risk for u64 typeids (birthday at ~2^32 = 4B types). u128 is collision-free up to ~2^64 types in a single program; readable in error messages and `tcx.def_path_debug_str` output. 256-bit (`[u8; 32]`) is overkill. Universe-level collision detection provides hard-error safety in the astronomically-unlikely collision case.
+
+**ALTERNATIVES CONSIDERED.**
+- u64 (current arch §10.6). Rejected — birthday collision at 4B types is small but non-zero; silent type confusion is the failure mode.
+- 256-bit `[u8; 32]`. Rejected — overkill; harder to read in error messages.
+- Monotonic IDs. Rejected — requires central registry; breaks distributed compilation.
+
+**IMPLEMENTATION NOTES (when picked up).** Change typeid type to `u128` in the facade. Update `SkyOpaqueType<const T: u128>` declaration. Universe table keys become u128 with collision check on insertion. Hashing: BLAKE3 of canonical content (source path for source-defined types; canonical recipe for comptime-produced types per §10.8), truncated to u128. Collision error includes both types' source paths/recipes.
+
+**GOTCHAS.** Collision detection runs on insertion, not lookup. "Content signature" for comparison is canonical content (path/recipe), not the full SkyTypeInfo (which may carry compile-derived layout metadata that varies legitimately). Don't share the u128 namespace between type typeids and value content hashes (§29.A.content-hash-const-args); different DefId namespaces but tag entries by kind for clean failure modes.
+
+**Doc impact at landing.** §10.6 wrapper definition → `const T: u128`. §10.8 typeid format spec → BLAKE3 truncated to u128 + universe-level collision detection. §13.8 same.
+
+### 29.A.content-hash-const-args WIP: Content-hash const args (retire slab-pointer-as-u64)
+
+**STATUS: design committed, not yet implemented (Phase K, ~1 week, depends on §29.A.u128-typeids).**
+
+**WHAT.** Sky's comptime values that flow to rustc as const generic arguments are surfaced as `ConstKind::Value(content_hash_bytes)` — content-addressed u128 hashes (same scheme as §29.A.u128-typeids, applied to value content). The slab (§13.2-§13.4) stays purely Sky-internal as the runtime substrate for mutable comptime evaluation; slab pointers never enter rustc's Instance args.
+
+**WHY.** Round-3 reviewer's most important architectural correction: if Sky's per_instance_mir bodies use slab-pointer-as-u64 (current §13.3 framing) as the const-arg surface, two Sky source sites that produce content-equal values at different slab offsets generate two distinct rustc Instances. Symbol naming via content-hash would then produce TWO MonoItems with the SAME symbol name → comdat dedup (best case) or linker error / non-deterministic pick (worst case). Doing content-hash dedup at the Instance level (not the symbol_name level) avoids the problem structurally.
+
+**ALTERNATIVES CONSIDERED.**
+- Slab-pointer-as-u64 + content-addressed symbol naming (the round-2 plan). Rejected — produces the dual-Instance/single-symbol conflict above.
+- Slab-pointer-as-u64 + Instance-level dedup via per_instance_mir canonicalization. Possible but invasive — requires Sky to canonicalize const args inside per_instance_mir. Content-hash-as-const-arg achieves the same result naturally.
+- Variable-size content as const arg. Rejected — doesn't fit const generic constraints.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky's frontend, when binding a comptime value to a generic arg: compute BLAKE3 of the (frozen) snapshot content, truncate to u128, synthesize `ConstKind::Value(u128_bytes)` for the Instance args. Stub source: `pub fn zork<const T: u128>(...)` — T is the content hash, not the slab offset. per_instance_mir looks up the value in Sky's universe via the content hash. Snapshot-at-capture semantics: when a comptime value is bound, take a snapshot; subsequent mutations don't propagate. Hash is computed from the frozen snapshot.
+
+**GOTCHAS.** Don't allow identity observation (`ptr_eq`) on generic-arg references in Sky source — under content-hash naming, two content-equal snapshots at different slab offsets collapse to the same Instance, so identity observation would conflate them. Sky's typechecker rejects `ptr_eq` on generic-arg refs. Hash table for value lookup is per-compile-invocation; cross-invocation, content-equal snapshots independently compute the same hash → cross-crate symbol matching works automatically.
+
+**Doc impact at landing.** §13.3 rewrite — retire slab-pointer-as-u64; describe content-hash const args. §13.4 clarify slab is purely Sky-internal substrate. §13.7-§13.8 unified content-hash mechanism for types and values. §13.9 keep "no new fork surface" framing as primary; content-addressing is bonus.
+
+### 29.A.skyref WIP: Per-view ref types `SkyRef<T, V>` for Send/'static honesty
+
+**STATUS: design committed, not yet implemented (Phase L, ~2 weeks, depends on §29.A.u128-typeids).** This is the deepest design change still pending.
+
+**WHAT.** Sky's stub rlib emits `SkyRef<T, V>` (parametric over view marker) for Sky references at the Rust boundary. View markers `Frozen` and `Mutable` (closed set, see §29.A.closed-V). Send/Sync/'static impls vary by view:
+
+```rust
+pub struct Frozen;
+pub struct Mutable;
+
+pub struct SkyRef<T, V> {
+    ptr: *const T,
+    _v: PhantomData<V>,
+}
+
+unsafe impl<T: Sync> Send for SkyRef<T, Frozen> {}
+// no Send impl for SkyRef<T, Mutable>
+
+// Methods polymorphic over view kind:
+impl<V> SkyRef<MyType, V> {
+    pub fn velocity(&self) -> f64 { unreachable!() }
+}
+
+// Frozen-view-only methods:
+impl SkyRef<MyType, Frozen> {
+    pub fn concurrent_read(&self) -> Data { unreachable!() }
+}
+```
+
+Sky's frontend picks the View at each `&` site based on the actual group's frozen/mutable status (which Sky's typechecker tracks). One Rust function/impl per Sky function/impl (parametric over view kind); cardinality doesn't double.
+
+**WHY.** The current §12.1 "global `unsafe impl Send` for every Sky type" is a silent-bug surface: Rust source can pass a non-sendable Sky value to `tokio::spawn`; rustc accepts (because of the global lie); runtime data race. The actual Sky model: sendability is group-view-based, not per-type. `&G Spaceship` is Send when group G is frozen (immutable). The per-view ref types make this structurally honest — what Sky's typechecker knows is what rustc sees.
+
+**ALTERNATIVES CONSIDERED.**
+- Global lie (current §12.1). Rejected — silent data races.
+- Refuse to project any Sky refs to Rust. Rejected — too restrictive.
+- Two distinct Rust types per ref (round-1 Option C original). Rejected — stub rlib doubling.
+- Per-type honest Send for owned values + per-view for refs (Option C' — adopted).
+
+**IMPLEMENTATION NOTES (when picked up).** Sky stdlib defines `Frozen`, `Mutable`, `SkyRef<T, V>` (and the Send/Sync impls). Sky's stub_gen, when emitting a function signature taking `&G Spaceship`, determines the group's view at the call site (typechecker knows) and emits `SkyRef<Spaceship, FrozenView>` or `SkyRef<Spaceship, MutableView>`. For Sky source generic over the view, the Rust signature is parametric: `pub fn process<V>(s: SkyRef<Spaceship, V>)`. Methods emit as one parametric impl per Sky type. For owned values (non-refs): per-type honest Send computation — Sky's typechecker analyzes structure; emits `unsafe impl Send` only when structurally sendable. Opt-in lie via `#[unsafe_send]` Sky annotation for nuanced cases (rare).
+
+**GOTCHAS.** The View parameter is a NEW dimension that Sky-source generics didn't have before — Sky's typechecker has to track it everywhere it tracks group views. Closed V set (next subsection) is structural — don't let users define new V kinds; coherence fragments otherwise. Tokio interop fallout: Sky futures capturing group-borrowed state can't `tokio::spawn` directly; they need conversion via a Sky-provided bridge crate (deferred — see §17 / §29 future work).
+
+**Doc impact at landing.** §12.1 rewrite around per-view ref types + per-type honest Send for owned. §12.2 rewrite — the 'static framing was wrong (per round-1 Q14); same Option C extension applies to lifetime-parameterized types. §17 Sky-native async primary; tokio via bridge crate. §11.2/§11.3 integrate with view-marker projection.
+
+### 29.A.closed-V WIP: Closed V set in Sky stdlib
+
+**STATUS: design committed, set contents TBD (subset of Phase L).**
+
+**WHAT.** The set of view markers in Sky stdlib is closed: `Frozen`, `Mutable` (possibly `Exclusive` for &own-style if needed). Users cannot define new view kinds. Custom borrow semantics are achieved by wrapping (newtype + delegation), not by introducing new V.
+
+**WHY.** With open V, coherence fragments across crates. Sky stdlib provides `impl<T: Send> Send for SkyRef<T, Frozen>`; a downstream crate could provide `impl<T> Send for SkyRef<T, MyCustomView>` for some custom view. Coherence is satisfied (different V), but the user model "Sky decides what's Send" fragments. Each new V is one more dimension to audit globally. Closed V makes coherence globally analyzable. Aligns with Sky's broader "wrap, don't fork" pattern (§6.6's first idiom).
+
+**ALTERNATIVES CONSIDERED.**
+- Open V (user-extensible). Rejected per the fragmentation argument.
+- Plugin-style V registration (Sky tooling enforces global registry). Possible but adds infrastructure; not justified absent demand.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky stdlib defines `Frozen`, `Mutable` (and possibly `Exclusive`) as marker types. Sky's typechecker rejects attempts to define a new view marker outside stdlib. The Send/Sync impls for `SkyRef<T, V>` are pinned to the closed set.
+
+**Open sub-question:** the exact set is unresolved. `Frozen + Mutable` is the minimum; `+Exclusive` adds &own-style; others may emerge from Phase 5 (groups + linear types) design work. The commitment is "closed"; the contents are open.
+
+**Doc impact at landing.** §12.1 + §12.2 note V is closed-set. §6.6 (or new subsection) documents the closed-V principle and how users get custom borrow semantics (via wrapping).
+
+### 29.A.async-typestate WIP: Async typestate pattern (one rustc type, source-level witnesses)
+
+**STATUS: design committed, not yet implemented (Phase M, ~3-5 days, depends on §29.A.skyref).**
+
+**WHAT.** Each Sky async fn produces ONE rustc-visible type whose storage is sized to hold both NotStarted and Running phase state. Sky source operates over this storage via two typestate witnesses (`SkyNotStarted_foo`, `SkyRunning_foo`) that share the underlying storage but expose different methods and have different safety properties enforced by Sky's typechecker. `.start()` is a typestate transition at Sky's source level; doesn't change rustc-level identity. The IntoFuture impl on the rustc-visible type handles polling in either phase via internal discriminant. Pin/Unpin properties are declared on the rustc-level type based on what the underlying state machine needs (migratory = Unpin; default = !Unpin). The typestate witness doesn't factor into Pin — Pin's contract is "no moves after pinning"; the pinning point is `.await` regardless of typestate. NotStarted phase IS movable for !Unpin types.
+
+**WHY.** Current §14.10 framing presents this as "two distinct rustc-level types," which the reviewer correctly pushed back on: the IntoFuture hybrid (which makes Rust callers see one type for `.await` ergonomics) implies the rustc-visible type IS singular; the "two-type split" was Sky-source-level discipline, not rustc-level structural. Typestate pattern is the honest description.
+
+**ALTERNATIVES CONSIDERED.**
+- Two distinct rustc-level types (current §14.10). Rejected per reviewer's catch.
+- One type with internal flag and runtime state checks. Rejected — typestate at source level enforces safety properties at compile time.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky's stub_gen emits ONE struct per Sky async fn: `pub struct __sky_async_foo<'a>(SkyOpaqueType<HASH>, PhantomData<&'a ()>);`. IntoFuture impl handles polling in NotStarted or Running phase via internal discriminant. Sky source typechecker tracks the typestate witness for source-level safety: can't `.start()` twice; can't access captures after start; can't drop a Running typestate of a default async fn (linearity); migratory/cancellable propagation per typestate. Pin/Unpin declarations: migratory → `impl Unpin`; default → NO Unpin impl.
+
+**GOTCHAS.** NotStarted-phase movability for !Unpin types works correctly (Pin's contract is "no moves AFTER pinning"; the pinning point is `.await`). SkyRunning typestate can't be passed to Rust APIs (Sky-source-only). Drop for default async in Running phase: Sky's drop function panics (per §29.A.strict-linear); the rustc-emitted drop_in_place path can still fire (when Rust source holds the future) — the drop function is the runtime safety net.
+
+**Doc impact at landing.** §14.10 substantial rewrite — typestate pattern, not two physical types. §14.5 clarify migratory's marker bundle on the rustc-level type. §14.7 cancellable wrapper's Drop semantics in the typestate model. §15.7 phase-dependent drop semantics for state machines.
+
+### 29.A.strict-linear WIP: Strict_linear default with `#[rust_droppable]` opt-out
+
+**STATUS: design committed, not yet implemented (subset of Phase M).**
+
+**WHAT.** Linear Sky types default to strict — runtime panic when Rust drops them (existing §15.7 design). User can opt-out via a `#[rust_droppable]` annotation; opt-out types drop normally without panic. Compile-time error path (`#[ultra_strict]` or similar) is DEFERRED to v2; v1 uses runtime panic.
+
+**WHY.** User explicitly stated Sky might make types linear-by-default. A compile-time-error path would forbid using Sky linear types directly in `Vec<T>` (the most common Rust container), creating too much friction. Two-level distinction: default (strict_linear) = runtime panic if Rust drops; opt-out (`#[rust_droppable]`) = drop is fine, runs Sky's normal cleanup.
+
+**ALTERNATIVES CONSIDERED.**
+- Compile-time error default. Rejected — too restrictive given linear-by-default Sky types.
+- Refuse to export linear types entirely. Rejected — too restrictive.
+- SkyOwn<T> wrapper as opt-in escape. Deferred — useful for v2 if compile-time-error path lands as ultra-strict tier.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky's typechecker tracks linearity per type. Stub_gen for linear types: default emits Drop impl bridge calling Sky drop function that panics; with `#[rust_droppable]` emits one that does normal cleanup. The Sky drop function body (via the standard `__toylang_drop` wrapper from §F.22): strict_linear → `sky_runtime_panic` + `abort()`; rust_droppable → normal Sky-side cleanup.
+
+**GOTCHAS.** Async future Drop is phase-dependent (per §29.A.async-typestate); the Sky drop function for state machines reads the discriminant. Cancellable wrapper Drop reads Ready/Pending. The `#[rust_droppable]` annotation is Sky source-level; stub_gen translates to the Drop impl body choice.
+
+**Doc impact at landing.** §15.7 keep as runtime panic for default; add `#[rust_droppable]` opt-out spec. §15 mention compile-time-error tier as deferred v2 work.
+
+### 29.A.may-dangle WIP: Narrowed `#[may_dangle]` policy (syntactic rule for synthesized types)
+
+**STATUS: design committed, not yet implemented (subset of Phase L/M).** One of the most important corrections from the review exchange — getting may_dangle wrong is a soundness bug, not just a UX issue.
+
+**WHAT.** `#[may_dangle] T` is emitted for a generic Sky type's Drop iff T appears in the lifted type's storage EXCLUSIVELY behind pointer indirection (`&T`, `&mut T`, raw pointers). By-value storage of T (or storage of types containing T by-value) DEFAULTS to STRICT (no may_dangle). This rule is SYNTACTIC — Sky's frontend reads it directly off the capture-analysis output. No recursive structural-drop analysis. No "is the drop structural" proof obligation. For SYNTHESIZED types (closures, async state machines): Sky's frontend auto-applies. For USER-DEFINED generic Sky types: default strict; user opts in via explicit annotation. For STDLIB CONTAINERS (SkyVec, SkyMap, SkyChannel): annotated by stdlib authors who guarantee structural drops.
+
+**WHY.** Recursive structural-drop analysis is a non-trivial property to maintain as Sky's type system evolves — every new feature (linear types, comptime-produced types, traits with default drop_in_place) has to re-prove "is structural drop preserved through this construct?" Skip a case → silently emit may_dangle for a Drop that actually reads T → silent unsoundness. The syntactic rule (T appears only behind pointer indirection) is what rustc itself uses internally for some of its dropck heuristics. Captures the common case (closures over borrowed data, async state machines holding refs across await points). By-value captures default strict; revisit if a real workload needs them.
+
+**ALTERNATIVES CONSIDERED.**
+- Emit may_dangle by default for generic Sky containers. Rejected — too permissive; soundness obligation passed to skyc's lifting analysis.
+- Always emit strict; user opts in for every case. Rejected — closure/async ergonomics suffer.
+- "Drop is structural over T" recursive analysis. Rejected — fragile to type-system evolution.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky's stub_gen, when emitting Drop for a generic Sky type: read the type's storage shape from Sky's typechecker. For each type parameter T, check: does T appear in storage exclusively behind `&`/`&mut`/raw pointer indirection? If yes → `unsafe impl<#[may_dangle] T> Drop`; if no → `unsafe impl<T> Drop`. For synthesized types: Sky's frontend has full info; auto-applies. For user-defined types: default strict; user opts in via `#[sky_may_dangle(T)]` source annotation; Sky's typechecker validates the opt-in (e.g., warns or rejects if the user's Drop body accesses T-typed values). Stdlib containers: stdlib authors explicitly annotate; no auto-inference.
+
+**GOTCHAS.** The syntactic rule is conservative — some closures with by-value captures whose Drop IS structural over T (rare) won't get may_dangle. User has to restructure or accept the borrowck friction. Don't try to auto-infer for user-defined Drop bodies; that's where the analysis fragility lives.
+
+**Doc impact at landing.** §15 — full `#[may_dangle]` policy subsection. §10 — stub-type contract notes the syntactic rule for synthesized types.
+
+### 29.A.sky-recursion WIP: Sky-side recursion limit alignment
+
+**STATUS: design committed, not yet implemented (Phase N, ~2-3 days).**
+
+**WHAT.** `walk_and_stash_internal_callees` (and any other Sky-side walker that enumerates dep graphs) gets memoization + depth counter aligned with `tcx.recursion_limit()`. Walks that exceed the limit emit a compile-time error attributed to a user-source entry point; don't stack-overflow Sky's walker.
+
+**WHY.** Rustc's `recursion_limit` applies to rustc's mono collector. Sky has its OWN walks (Sky-internal callee enumeration) that don't go through rustc's collector. Without explicit handling, pathologically deep Sky-internal recursion stack-overflows Sky's walker or wedges in a cycle, before rustc's standard recursion-limit error can fire.
+
+**ALTERNATIVES CONSIDERED.**
+- No protection (current). Rejected — pathological Sky code crashes Sky's walker.
+- Sky-specific limit independent of rustc. Rejected — surprising for users who configure recursion_limit and expect it to govern any walker.
+- Iterative-only (no recursion in Sky's walker). Possible refinement; recommended where feasible but recursion + depth counter is simpler to implement first.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky's `walk_and_stash_internal_callees`: add per-walk `visited: FxHashMap<(DefId, GenericArgsRef), DepListHandle>` initialized at walk entry. Add per-walk `depth: usize` counter, checked against `tcx.recursion_limit().value` before each recursive descent. On exceed: emit error with the walk's entry-point span (find by walking back through the in-flight stack to the outermost user-source DefId); return error sentinel. Iterative traversal where feasible (worklist-based). Memoization doubles as cycle detection.
+
+**GOTCHAS.** Diagnostic attribution: don't emit at a synthetic "Sky walker at line ???" span. Walk back to the outermost user-source frame and emit there. Memo + depth counter together are required: memo handles cycles (every cycle revisits a key); depth counter handles non-cyclic-but-deep cases.
+
+**Doc impact at landing.** §19.5 expand into "Sky-side recursion and cycle handling" subsection covering all three Sky-side walks (comptime, typechecker, dep enumeration) and their protections. §25 add B20 risk entry (Sky-side walker recursion safety).
+
+### 29.A.stub-contract WIP: Stub-type contract (Sky's drop function must not invalidate field storage that auto-drop will subsequently traverse)
+
+**STATUS: design committed, vacuously satisfied today (subset of Phase L).** Revisit if stub-gen evolves to expose non-ZST fields.
+
+**WHAT.** The structural invariant for Sky's stub types under the wrapper-emission model (§F.22):
+
+> Sky's drop function must not invalidate field storage that auto-drop will subsequently traverse. Field destructors run via the standard auto-drop ladder after `Drop::drop` returns; Sky's drop function does Sky-side cleanup that's independent of field storage.
+
+Today's ZST-only stub pattern (`SkyOpaqueType<HASH>` + `PhantomData<P>`) trivially satisfies this (no fields with destructors to traverse). Future stub-gen evolutions may expose non-ZST fields (with or without destructors) as long as the contract holds. NO `ManuallyDrop` requirement by default. ManuallyDrop is only needed in edge cases where Sky's drop function specifically wants to take ownership of field destruction (rare).
+
+**WHY.** Earlier framings ("stub fields must all be `!needs_drop`" / "non-ZST fields with destructors MUST be wrapped in `ManuallyDrop`") were too narrow. The actual invariant is about Sky's drop function's BEHAVIOR (don't invalidate field storage), not about the field TYPES. In practice: Sky's drop function operates on Sky's universe (off-stub), not on the stub allocation's bytes. The stub allocation is rustc-managed; Sky's universe holds the real data. Sky's drop function does universe-side cleanup that doesn't touch field storage. Field destructors via auto-drop work fine.
+
+**IMPLEMENTATION NOTES (when picked up).** Sky's drop body discipline: operate on Sky's universe; don't read or write the stub allocation's field storage in ways that would interfere with auto-drop. For the typical case (stub fields are ZSTs by convention), vacuously satisfied. For edge cases where Sky genuinely wants to take ownership of a field's destruction (e.g., specific ordering requirements), use `ManuallyDrop<T>` for that field and explicitly invoke `ManuallyDrop::drop(&mut self.field)` in Sky's drop function.
+
+**GOTCHAS.** This is a Sky drop function CORRECTNESS property, not a type-level structural property. CI fences can't easily enforce it at the type level; instead, enforce it at the emitter level. The earlier "stub fields are `!needs_drop` only" framing was a self-imposed restriction that's not needed — allow stub fields to be anything Sky's `layout_of` override can report consistent offsets for.
+
+**Doc impact at landing.** §10 / §15 state the invariant as the broader "auto-drop ladder finds only non-interfering fields" property. Today's ZST-only convention is one way to satisfy it; ManuallyDrop wrapping is the more flexible alternative for cases where Sky wants ownership.
+
+---
+
 ### 29.8 Cross-references
 
 - Each open question references its locked-context section (cross-referenced above).
@@ -5616,9 +5950,11 @@ This chapter defines terms used throughout the document. Where a term is specifi
 
 **Stub rlib [Sky]** — A skyc-generated Rust crate (rlib) containing Rust-source declarations of every Sky export item. Compiled by rustc as ordinary Rust; Sky's `collect_and_partition_mono_items` query override filters consumer items out of rustc's CGU list before LLVM codegen, so the stub bodies produce no `.o` symbol; Sky's `fill_extra_modules` hook emits the real `External`-linkage bodies. See §6.2 + §F.14.1 for the design history (including the brief 2026-06-21 → 2026-06-22 Option-4 detour that was reversed).
 
-**Sidecar [Sky]** — A binary file adjacent to each stub rlib, containing the Temputs for the library.
+**Cache [Sky]** — A local binary file at `target/<triple>/<profile>/deps/<crate>-<hash>.sky-cache` containing the Temputs for the library. Produced by the producer's compile, consumed by downstream compiles. Never shipped on crates.io (source-only distribution). Replaces the pre-2026-06-28 sidecar (see §7).
 
-**Temputs [Vale, adopted by Sky]** — Vale's typing-pass output. Sky inherits the representation and extends it for Rust interop concerns. The Temputs is the data the sidecar serializes.
+**Sidecar [Sky, retired 2026-06-28]** — Pre-migration term for the per-library binary blob with extension `.sky-meta`, shipped inside published `.crate` packages. Retired by the sidecar→cache migration; see §7.8 for the design history.
+
+**Temputs [Vale, adopted by Sky]** — Vale's typing-pass output. Sky inherits the representation and extends it for Rust interop concerns. The Temputs is the data the cache serializes (was: the sidecar serialized).
 
 **Marker [Sky]** — The `pub const __SKY_STUBS_MARKER: () = ();` declaration at the root of every Sky-generated stub rlib. Sky's `rustc` checks for the marker at crate-load time to decide whether to activate Sky's machinery.
 
@@ -5648,7 +5984,7 @@ This chapter defines terms used throughout the document. Where a term is specifi
 
 **`deduced_param_attrs` override [Sky, Phase P]** — Sky's `Config::override_queries` registration that returns `&[]` for items tagged `#[skyc::emit_consumer_body]`. Closes a silent-UB vector where rustc's MIR analysis on the stub's `unreachable!()` body would have wrongly inferred `readonly` + `captures(none)` for `PassMode::Indirect` params; without the override, LLVM would apply these attrs at every Rust caller's call site, and Sky's actual body (supplied by `fill_extra_modules`) could mutate the indirect-passed param → silent miscompile at -O2+. The conservative `&[]` default is sufficient for v1; v2's path-b emission may revisit for large-Sky-body workloads. See §F.19, §22.4 v1 wrapper-attr posture, and `rustc-lang-facade/src/queries/deduce_param_attrs.rs`.
 
-**`LIFECYCLE_TRAITS` registry [Sky]** — `const`-slice + `lifecycle_trait_by_name` lookup in `toylangc/src/toylang/callbacks_impl.rs` that names each trait whose method Sky's compiler auto-synthesizes at specific code positions. Currently one entry: `Drop → drop` (scope-end synthesis). Future planned entries: `Init` (comptime placement construction), `SkyDrop` (linear-type marker), async Drop variant. Adding a new lifecycle trait is one registry-entry append; the synthesis pass itself never branches on which trait it's handling. Per reviewer's round-4-close endorsement.
+**`LIFECYCLE_TRAITS` registry [Sky, RETIRED 2026-06-25]** — Briefly shipped in commit `8f85622` (round-4-close residual) as a `const`-slice + `lifecycle_trait_by_name` lookup that generalized the hardcoded `Drop` trait-name string in `local_needs_scope_drop`. Retired the same day in commit `7f8814d` when the drop-is-just-a-function migration (§F.22) replaced the predicate-based synthesis with unconditional `__toylang_drop::<T>` wrapper emission — neither the predicate nor the trait-name lookup exist anymore, so the registry has nothing to look up. If future lifecycle features (Init / SkyDrop / async-Drop) need similar machinery, they would either reuse the thin-wrapper pattern with their own wrappers or, if a registry genuinely returns, it would be insertion-site-policy-aware from the start.
 
 **path-b emission [Sky, v2 option]** — The deferred v2 perf-recovery option where Sky's `codegen_extern_wrapper` would stamp ground-truth ABI attrs (`readonly`, `captures(none)`, `noalias`) at the wrapper boundary based on explicit Sky-source-level mutability tracking, replacing Phase P's conservative `&[]` default with a precise per-export answer. Not pursued for v1 because Bench 1, Bench 4b, and the full Bench 3 matrix show Sky's wrapper boundary inlines through under thin LTO for bench-shaped workloads, making per-call attr decoration moot. v2 may revisit if profiling shows large-Sky-body workloads where the inliner DOESN'T fire (bodies above LLVM's inlining cost threshold, panic=unwind builds with cleanup paths inhibiting inlining). See §22.4.
 
@@ -5660,7 +5996,9 @@ This chapter defines terms used throughout the document. Where a term is specifi
 
 **Build.rs** — A Rust crate's build-script file. Skyc-generated build.rs scripts enforce Sky toolchain presence (Section 21.3).
 
-**`<crate>.sky-meta`** — File extension for sidecar files. Located adjacent to the stub rlib.
+**`<crate>-<hash>.sky-cache`** — File extension and naming convention for cache files. Located adjacent to the stub rlib at `target/<triple>/<profile>/deps/`. Magic bytes `SKYC` (§7.2). Not shipped on crates.io.
+
+**`<crate>.sky-meta` [retired 2026-06-28]** — Pre-migration file extension for sidecar files. Replaced by `.sky-cache`; see §7.8 for the design history.
 
 **`<crate>.sky-annotations.toml`** — File extension for sidecar annotation files. Provides additional binding information to Sky's typechecker.
 
@@ -5905,7 +6243,7 @@ The Temputs schema is an implementation concern, not an architectural one. The a
 - Item bodies + source positions — §8.6, §8.7.
 - Discovered trait-impl Instances (in-process Vec, no longer a registry field) — §8.9.5.
 
-For the actual struct shapes the toylang reference implementation uses, see `toylangc/src/toylang/registry.rs` (`ToylangRegistry`) and the surrounding `toylangc/src/toylang/sidecar.rs` (serialization).
+For the actual struct shapes the toylang reference implementation uses, see `toylangc/src/toylang/registry.rs` (`ToylangRegistry`) and `toylangc/src/cache.rs` + `toylangc/src/cache_key.rs` (serialization + cache-key Merkle digest). Pre-2026-06-28 the serialization lived in `toylangc/src/sidecar.rs`; that file was deleted by the sidecar→cache migration (§7.8).
 
 ### Appendix E. Sky Source Examples for Each Major Feature
 
@@ -6143,6 +6481,28 @@ The specialized accessor codegen path retires entirely.
 
 #### F.7 `SkyUniverse.struct_infos`: type-erased consumer metadata
 
+**STATUS NOTE (2026-06-29, post-sidecar→cache migration audit).** The
+sidecar→cache migration's "simplifications unlocked" inventory
+initially flagged this machinery as simplifiable on the grounds that
+the `Any`-erased layer existed for cross-version blob round-trip
+(now retired). A closer audit found the layer is load-bearing for a
+*different* reason: `monomorphize_type` is intentionally stateless
+(no `&mut dyn Any` state param, per @GCMLZ §26.2's deadlock-avoidance
+discipline — `layout_of` fires from inside rustc query providers
+during codegen, after which the consumer-state mutex may be held by
+other paths). The facade-owned `SkyUniverse` with type-erased
+metadata is the right shape because `monomorphize_type` can read
+from it without touching consumer state. Moving `struct_infos` to
+`ToylangState` would re-introduce the deadlock vector.
+
+The migration **did not** relax this constraint. The `Any` layer
+remains; only the doc rationale shifts ("cross-version blob
+round-trip" → "stateless query-provider access for cross-Sky-crate
+layout queries"). Toylang's bincode serialization of `ToylangRegistry`
+into the `.sky-cache` file is unaffected — the `Any` layer is
+in-memory only, between consumer-write at `on_sky_lib_cache_loaded`
+and stateless-read at `monomorphize_type`.
+
 Sky's design has the facade owning a content-addressed registry of
 Sky items (§7). For trait-impl discovery, layout queries, and Case 6
 cross-Sky-crate scenarios, the facade needs to look up "what fields
@@ -6366,7 +6726,7 @@ became `duplicate<Widget>` rather than `<Widget as Clone>::clone`.
 The cascade at the stub rlib compile is therefore architecturally
 **load-bearing**, not a leak. Sky's `per_instance_mir` provider must
 fire there for the rest of the system to function. The "lib compiles
-produce rlib + sidecar only" guidance in §5.5 reads as a rule about
+produce rlib + cache only" guidance in §5.5 reads as a rule about
 *Sky-emitted bodies*, not about *rust-emitted bodies the Sky cascade
 queues*. The qualifier in §5.5 makes this explicit.
 
@@ -6435,7 +6795,7 @@ The CGU-list filter: ~107 lines retired from `rustc-lang-facade/src/queries/part
 Still load-bearing post-chain:
 - **A.1.Y** (`walk_and_stash_internal_callees`): Sky's intra-process discovery of Sky-internal transitive callees so `fill_extra_modules` can emit their bodies. Has nothing to do with rustc's mono walker. STAYS — this is the correct architectural place per the locked principle.
 - **Patch 5** (`consumer_lang_active` gated CGU-placement escape, fork-side): historically described here as "STAYS at 5 patches" because retirement was blocked under Option 4's AvailableExternally architecture. **Update 2026-06-22:** patch 5 RETIRED jointly with Option 4 — restoring the partition filter eliminated the CGU-placement hazard structurally. Fork is now 4 patches; see §3.2 / §F.17 retirement note.
-- **Capture itself** (`collect_consumer_trait_impl_instances`): still runs at stub_rlib compile, but its consumer changed from "ship to user_bin via sidecar" to "inline-drain at same session."
+- **Capture itself** (`collect_consumer_trait_impl_instances`): still runs at stub_rlib compile, but its consumer changed from "ship to user_bin via sidecar" (pre-2026-06-21) to "inline-drain at same session" (current). The cache file (§7) does NOT carry these — the in-process drain is the architecturally correct shape.
 
 **Why this preserves F1's LTO inlining promise.** `AvailableExternally`
 means the body IS in the IR pool, just not in the `.o`. LTO's IR
@@ -6778,25 +7138,28 @@ appends synthetic `TypedExprKind::StaticCall { ty: "Drop", method:
 existing dep walker, codegen, and cascade-discovery machinery handle
 them identically to any other trait static call.
 
-**Specialness audit, principle adherence ~95%.** Drop-aware code
-post-refactor lives in ONE site: `insert_scope_end_drops` (~30 lines)
-plus `local_needs_scope_drop` predicate (~25 lines) plus
+**Specialness audit, principle adherence at Phase-E.d landing: ~95%.**
+Drop-aware code post-refactor lived in ONE site: `insert_scope_end_drops`
+(~30 lines) plus `local_needs_scope_drop` predicate (~25 lines) plus
 `synth_scope_drop_call` AST builder (~20 lines) plus one
 `pub use core::ops::Drop` line in stub_gen. After the synth pass,
-every downstream stage treats drop calls as ordinary `StaticCall`
+every downstream stage treated drop calls as ordinary `StaticCall`
 AST nodes. No drop-specific paths in: dep walker, mono cascade,
 per_instance_mir, codegen, symbol resolution, link.
 
-The remaining 5% leak (mostly closed 2026-06-25 in commit `8f85622`
-per reviewer's round-4-close endorsement): the predicate now consults
-a `LIFECYCLE_TRAITS` const-slice registry rather than hardcoding the
-trait name. Currently one entry: `Drop → drop`. Adding a new lifecycle
-trait (Init, SkyDrop, async-Drop variant, etc.) is one registry-entry
-append; the synthesis pass itself never branches on which trait it's
-handling. See §15.7 for the post-Phase-E mechanism description with
-the registry hookup.
+**Subsequent migration closed the residual 5% (2026-06-25, §F.22).** The
+predicate + builder + the brief `LIFECYCLE_TRAITS` registry (commit
+`8f85622`) all retired in commit `7f8814d` when the drop-is-just-a-function
+migration switched `insert_scope_end_drops` to emit a single shape —
+`FnCall { name: "__toylang_drop", type_args: [T], args: [Ref(Var(local))] }` —
+for every let unconditionally. The wrapper bottoms out at `drop_in_place::<T>`,
+which rustc handles correctly for both trivially-droppable and needs-drop T.
+Post-migration the mono path is fully drop-agnostic — the word "drop"
+does not appear in any code triggered by `per_instance_mir`. See §F.22
+for the migration narrative and §15.7 for the current mechanism description.
 
-**Two surprises caught during implementation.**
+**Two surprises caught during implementation** (Phase-E.d historical;
+subsequent §F.22 migration changed the surface):
 
 1. **`codegen_extern_wrapper` had unconditional `module.add_function`.**
    When the body's call site (`__toylang_internal_main`'s
@@ -6810,16 +7173,20 @@ the registry hookup.
    This fix is RETAINED post-refactor — it covers any future case
    where call-site declarations precede body codegen.
 
-2. **`tcx.adt_destructor(adt_def.did())` is load-bearing in the predicate.**
-   Without it, the synth pass synthesized `Drop::drop` calls for
+2. **`tcx.adt_destructor(adt_def.did())` was load-bearing in the
+   predicate (until §F.22 retired the predicate).** Without the filter,
+   the Phase-E.d synth pass synthesized `Drop::drop` calls for
    `Option`/`Result`/`Stdout`/primitives whose drop semantics flow
    through auto-generated DropGlue with no trait-method symbol. Rustc's
    mono collector ICEs ("failed to resolve instance for
-   `<Option<i32> as Drop>::drop`"). The query returns `Some(_)` iff
-   the ADT has an explicit `impl Drop`; the predicate gates on this.
+   `<Option<i32> as Drop>::drop`"). The query returned `Some(_)` iff
+   the ADT had an explicit `impl Drop`; the predicate gated on this.
    Tests like `option_unwrap_basic`, `result_unwrap_basic`,
-   `stdout_call` all surfaced this immediately when the broad
-   predicate first ran without the filter.
+   `stdout_call` surfaced this immediately when the broad predicate
+   first ran without the filter. Post-§F.22 this surprise no longer
+   applies: `__toylang_drop::<T>(&local)` emits unconditionally and
+   the wrapper's `drop_in_place::<T>` handles the no-Drop-impl case as
+   a no-op via rustc's standard DropGlue machinery.
 
 **Two gotchas worth documenting.**
 
@@ -7078,16 +7445,20 @@ reasoning chains against the rate of empirical surprises in prior
 rounds. Build fixtures BEFORE the typechecker / codegen change those
 fixtures will validate.
 
-**Lifecycle-traits registry (round-4-close residual, commit `8f85622`).**
-Per reviewer's endorsement, generalized the previously-hardcoded `Drop`
-trait-name string in `local_needs_scope_drop` and `synth_scope_drop_call`
-to a `LIFECYCLE_TRAITS` const-slice + `lifecycle_trait_by_name`
-lookup. Currently one entry (`Drop → drop`); future planned entries
-are `Init` (comptime placement construction), `SkyDrop` (linear-type
-marker), async Drop variant. The synthesis pass no longer branches on
-which trait it's emitting for. Per §15.7 step "remaining 5% leak"
-paragraph: adding the next lifecycle trait is one registry-entry
-append.
+**Lifecycle-traits registry (round-4-close residual, commit `8f85622`)
+— RETIRED same day in commit `7f8814d`.** Per reviewer's endorsement,
+generalized the previously-hardcoded `Drop` trait-name string in
+`local_needs_scope_drop` and `synth_scope_drop_call` to a
+`LIFECYCLE_TRAITS` const-slice + `lifecycle_trait_by_name` lookup.
+Single entry (`Drop → drop`). The drop-is-just-a-function migration
+(§F.22) retired the predicate, the AST builder, and the registry
+together later the same day — the wrapper-emission scheme moved the
+trivially-droppable-vs-needs-drop decision into `drop_in_place::<T>`
+itself, leaving nothing for a trait-name registry to look up. Future
+Init / SkyDrop / async-Drop variants would either reuse the thin-wrapper
+pattern with their own wrappers (e.g. `__toylang_init::<T>(&local)`,
+emitted at struct-construction sites) or, if a registry genuinely
+returns, it would be insertion-site-policy-aware from the start.
 
 #### F.20 Sunny-karp: eager type-resolve + typed-body cache + bare-T drop closure (2026-06-25)
 
@@ -7143,14 +7514,18 @@ drop-synth checks.
   Cache miss (synthesized accessors not eager-typed) → fall back to
   `type_resolve_body`. All call sites threaded: per_instance_mir,
   populate channels, cascade drain, llvm_gen.
-- **E — drop-synth split.** New `drop_synthesized: bool` field on
-  `TypedStmt::Let`. Eager `insert_scope_end_drops` sets `true` on lets
-  it emits drops for. New `insert_late_scope_end_drops` at mono
-  re-checks any `false`-flagged let against its now-concrete substituted
-  type. Closes a long-standing silent gap: bare-`TypeParam` locals
-  (`let x: T = ...`) previously fell through the eager predicate's
-  `_ => false` arm because the drop status genuinely needed the
-  concrete substituted type. Two fixtures verify:
+- **E — drop-synth split (subsequently retired by §F.22).** New
+  `drop_synthesized: bool` field on `TypedStmt::Let`. Eager
+  `insert_scope_end_drops` sets `true` on lets it emits drops for. New
+  `insert_late_scope_end_drops` at mono re-checks any `false`-flagged
+  let against its now-concrete substituted type. Closes a long-standing
+  silent gap: bare-`TypeParam` locals (`let x: T = ...`) previously fell
+  through the eager predicate's `_ => false` arm because the drop status
+  genuinely needed the concrete substituted type. The drop-is-just-a-function
+  migration later the same day (§F.22, commit `7f8814d`) retired the
+  flag + late pass + predicate together — wrapper emission handles bare
+  T structurally without a two-pass scheme. Two fixtures still verify
+  the bare-T case under the wrapper scheme:
   `drop/fixture10_generic_consume_t_with_drop` (positive, `T = Widget`)
   and `drop/fixture11_generic_consume_t_no_drop` (negative, `T = i32`).
 - **F — unify three re-resolve sites.** `collect_rust_deps_recursive`,
@@ -7257,7 +7632,7 @@ miscompile becomes unrepresentable.
   Lives in: the parser AST (`Expr::*::type_args`), the registry
   (`ToyField.rust_type`, `ToyParam.ty`, `ToyFunction.return_ty`,
   `typeid_table` args, `synthesize_accessor_fn`), stub_gen's rendering
-  layer, the sidecar (via the registry), and the immediate output of
+  layer, the cache (via the registry, §7), and the immediate output of
   `oracle::rustc_ty_to_source_type`.
 - **`ResolvedType`** — resolved-shape. Sky structs MUST appear as
   `Struct { name, type_args, field_types }` with `field_types`
@@ -7346,6 +7721,123 @@ unrepresentable rather than relying on the implementer to remember the
 chain at every new callsite. Future implementers reading the code
 cannot accidentally reintroduce the bug because they would have to
 literally invent a new `ResolvedType::StructRef` variant.
+
+#### F.22 Drop is just a function: `__toylang_drop<T>` wrapper retires the mono-time drop pass (2026-06-25)
+
+The implementation arc closing sunny-karp's residual drop specialness.
+After §F.20 shipped the typed-body cache + bare-`TypeParam` two-pass
+drop scheme, the user surfaced a sharper architectural principle:
+**`per_instance_mir`/mono should not need to think about drop as
+special in any way, ever. Drop is not special. To `per_instance_mir`,
+drop is just another function like any other. There should never be
+the word "drop" anywhere in `per_instance_mir`'s code.** Sunny-karp's
+late pass technically violated this — `insert_late_scope_end_drops`
+fired inside `resolve_caller_from_instance`, which `per_instance_mir`
+calls — even though it ran as a `&mut` pass over typed AST rather than
+as anything genuinely drop-shaped. The fix is structural: emit drop
+calls in a shape that needs no mono-time decision at all.
+
+**The shape.** stub_gen emits a thin Sky-owned wrapper into every stub
+rlib:
+
+```rust
+#[inline(always)]
+pub unsafe fn __toylang_drop<T>(x: *mut T) {
+    core::ptr::drop_in_place(x)
+}
+```
+
+The wrapper is a NORMAL generic Rust fn (`InstanceKind::Item`, real
+MIR body). `insert_scope_end_drops` at the eager pass appends a plain
+`FnCall { name: "__toylang_drop", type_args: [T], args: [Ref(Var(local))] }`
+for every let in LIFO order. No predicate, no `local_needs_scope_drop`,
+no `LIFECYCLE_TRAITS` registry, no `tcx.adt_destructor` check, no
+`drop_synthesized` flag, no second pass. The wrapper bottoms out at
+`drop_in_place::<T>` which rustc generates as a no-op for trivially-
+droppable T (i32, primitives, types-without-Drop) and as the full drop
+chain for needs-drop T (Vec, Widget, types-with-Drop). The wrapper's
+`#[inline(always)]` means LLVM inlines it at every Sky call site, so
+the wrapper has no runtime cost beyond what `drop_in_place::<T>` itself
+costs (zero for trivially-droppable T).
+
+**Why this works without Sky's drop-trait machinery touching the mono
+path.** When rustc's mono collector walks `per_instance_mir`'s synthetic
+body, it sees a `ReifyFnPointer` cast targeting `__toylang_drop::<ConcreteT>`.
+It queues the wrapper instance (`InstanceKind::Item`), walks the wrapper's
+MIR body, sees the `drop_in_place::<T>` call inside, and queues
+`drop_in_place::<T>` via its standard `InstanceKind::DropGlue` machinery —
+all transparent to Sky's mono path. Cascade discovery
+(`is_consumer_trait_impl_method`) captures Sky-defined `<Widget as Drop>::drop`
+instances reachable through the drop-glue chain, and `fill_extra_modules`
+emits the user's body — exactly the same path case4's Clone uses.
+
+**What retired together (commit `7f8814d`).** `insert_late_scope_end_drops`,
+`local_needs_scope_drop` predicate, `LIFECYCLE_TRAITS` registry,
+`LifecycleTrait` enum, `drop_synthesized: bool` flag on `TypedStmt::Let`,
+`synth_scope_drop_call` AST builder, the brief `tcx.adt_destructor`
+check, the bare-`TypeParam` two-pass scheme from §F.20. ~80 lines net
+deletion across `callbacks_impl.rs`, `typed_ast.rs`, `llvm_gen.rs`,
+`type_resolve.rs`, plus 2 lines added to `stub_gen.rs` for the wrapper.
+
+**Empirical verification.** `git grep "drop"` over the post-migration
+`rustc-lang-facade/src/queries/per_instance.rs`,
+`toylangc/src/toylang/{callbacks_impl,type_resolve}.rs` consumer-callback
+chain, and `toylangc/src/llvm_gen.rs` returns ZERO non-comment hits in
+any code path triggered by `per_instance_mir`. The wrapper name
+`__toylang_drop` is the only string identifier; structurally it's just
+another use-imported generic Rust fn.
+
+**B24 fence redesigned.** Pre-migration, the B24 drop-glue-shape stability
+fence was a `Vec<Vec<Widget>>` fixture testing two-level iteration. The
+shape exposed a different concern: under wrapper emission every let
+gets dropped (no move-tracking elision), so the nested-Vec case
+double-drops the moved-out inner Vec. Redesigned to a simpler
+`Vec<Widget>` (4 widgets, forward iteration) that locks in the iteration
+order without depending on Sky tracking moves. The original nested-Vec
+shape isn't a sensible test for any compiler without move tracking; the
+new shape exercises the real B24 surface (rustc's `<Vec<T> as Drop>::drop`
+iteration semantics under wrapper-mediated dispatch).
+
+**Surprise mid-flight.** An interim attempt used `mem::drop(x)` (by-value
+`pub fn drop<T>(_x: T) {}`) instead of `drop_in_place::<T>(&raw mut x)`
+(by-pointer). `mem::drop` is the simpler "just a generic free fn" shape,
+but Sky doesn't track moves; with by-value semantics, every let — even
+moved-out ones — gets a drop call materialized via stack copy, and a
+`Vec<Vec<Widget>>` shape double-frees because both the moved-from inner
+Vec and the moved-to outer Vec drop their elements. By-pointer
+`drop_in_place` preserves the pre-migration `Drop::drop(&local)` semantics
+(reads the post-move state) without losing the "just a function" shape —
+the wrapper hides `drop_in_place`'s `InstanceKind::DropGlue` resolution
+inside its body. The wrapper indirection cost is zero at `#[inline(always)]`;
+correctness is preserved.
+
+**Test count.** 451/0/1 — same as the pre-migration baseline (446
+post-two-enum-split + 2 new sunny-karp fixtures + 1 B24 fixture + 2
+B25 fences + 2 B26 fences). The two bare-T fixtures from §F.20
+(`fixture10`, `fixture11`) still pass under the new wrapper-emission
+scheme without modification — `T = Widget` triggers the full drop chain
+via `drop_in_place::<Widget>` → `<Widget as Drop>::drop`; `T = i32` is
+a no-op.
+
+**Principle-adherence at 100%.** Drop-aware code lives in ONE site:
+`insert_scope_end_drops` (~25 lines, simpler than pre-migration because
+it has no predicate and emits one shape unconditionally) plus two lines
+in stub_gen emitting the wrapper. The mono path doesn't see drop at
+all; it sees a generic Rust fn whose body it walks normally. Future
+lifecycle features (Init, SkyDrop, async-Drop) would follow the same
+pattern — a thin generic Sky-owned wrapper per lifecycle operation,
+synthesized at the appropriate AST position, with no special-case
+machinery downstream.
+
+**Connection to §25.3.6.** The drop-is-just-a-function principle is
+sharper than the post-Phase-E "5% leak via lifecycle registry" framing
+admitted. Sunny-karp's late pass was a textbook §25.3.6 surprise — the
+"this is fine, the registry hides the trait-name string from the
+synthesis pass" reasoning was empirically valid in terms of "did the
+code work" but structurally wrong in terms of "does the mono path know
+about drop." Listening to the architectural principle ("never the word
+'drop' in per_instance_mir") produced a cleaner shape than the iterative
+"let's slightly improve the encapsulation" path would have.
 
 This is the master design document for Sky's compiler & Rust interop architecture. Total length: ~30 chapters, 6 appendices, approximately 100 pages.
 

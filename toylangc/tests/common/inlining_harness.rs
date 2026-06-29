@@ -42,6 +42,10 @@ pub enum Profile {
 /// the symbol is mangled or already demangled in objdump's output.
 pub struct DisasmContext {
     pub project_name: String,
+    /// Diagnostic-only: retained for ad-hoc inspection paths that may
+    /// re-run llvm-objdump against the binary outside the harness.
+    /// Not read by the harness itself.
+    #[allow(dead_code)]
     pub bin_path: PathBuf,
     /// `(demangled_function_name, body_lines)` in source order.
     /// `Vec` (not `HashMap`) because callers often want to scan ALL

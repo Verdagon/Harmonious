@@ -275,30 +275,37 @@ pub trait LangCallbacks: Send + Sync {
 
     /// Called once per upstream Sky-marked rlib loaded into the local
     /// compile, BEFORE `after_rust_analysis`. The facade discovers the
-    /// rlib by walking `tcx.crates(())` and checking each crate root for
-    /// the `__lang_stubs` marker (Phase 3 E.1 will replace the hardcoded
-    /// crate-name check with `__SKY_STUBS_MARKER` per the architecture
-    /// doc §4.5 / §6.3), then locates the adjacent `.sky-meta` sidecar
-    /// via `tcx.used_crate_source(c).rlib` with the extension swapped,
-    /// reads the file, and invokes this callback with the raw bytes.
+    /// rlib by walking `tcx.crates(())` and checking each crate root
+    /// for the `__lang_stubs` marker (Phase 3 E.1 will replace the
+    /// hardcoded crate-name check with `__SKY_STUBS_MARKER` per the
+    /// architecture doc §4.5 / §6.3), then locates the adjacent
+    /// `.sky-cache` file via `tcx.used_crate_source(c).rlib` with the
+    /// extension swapped, reads the file, and invokes this callback
+    /// with the raw bytes plus the cache key digest from the header.
     ///
-    /// The facade deliberately knows nothing about the consumer's payload
-    /// shape — it just hands over the bytes. The consumer is responsible
-    /// for deserialization (toylang routes through
-    /// `crate::sidecar::deserialize_sidecar`) and for merging the loaded
+    /// The facade deliberately knows nothing about the consumer's
+    /// payload shape — it just hands over the bytes. The consumer is
+    /// responsible for deserialization (toylang routes through
+    /// `crate::cache::deserialize_cache`) and for merging the loaded
     /// universe into its own state.
     ///
-    /// Per the S.4 Workstream-S task (course-correct.md quarter-of-work
-    /// plan): the loader lands here; downstream A.3 will consume the
-    /// loaded registries to populate the codegen queue at the user-bin
-    /// compile. S.4 itself does NOT change codegen behavior — toylang
-    /// just stashes the registry for later workstreams.
-    fn on_sky_lib_loaded<'tcx>(
+    /// `cache_key_digest` is the 16-byte BLAKE3-truncated Merkle
+    /// digest from the cache file's header. The consumer stores it so
+    /// computing THIS crate's own cache digest can incorporate
+    /// transitive upstream digests (Plan Decision 1, Option 1
+    /// transitive Merkle fingerprinting).
+    ///
+    /// Sidecar→cache migration Step 4 (2026-06-29): this method
+    /// replaces the retired `on_sky_lib_loaded` callback. The cache
+    /// is the sole upstream metadata artifact; sidecar emission and
+    /// the corresponding callback are gone.
+    fn on_sky_lib_cache_loaded<'tcx>(
         &self,
         state: &mut dyn Any,
         tcx: TyCtxt<'tcx>,
         crate_name: &str,
-        sidecar_bytes: &[u8],
+        cache_bytes: &[u8],
+        cache_key_digest: &[u8; 16],
     );
 
     /// Approach B (rustc-owns-lends, patch 4 rev 2): fill the consumer's
@@ -384,12 +391,13 @@ struct StatefulVtable {
         TyCtxt<'tcx>,
     ),
 
-    on_sky_lib_loaded: for<'tcx> fn(
+    on_sky_lib_cache_loaded: for<'tcx> fn(
         &(dyn Any + Send + Sync),
         &mut (dyn Any + Send + Sync),
         TyCtxt<'tcx>,
         &str,
         &[u8],
+        &[u8; 16],
     ),
 
     consumer_fill_modules: for<'tcx, 'a, 'b> fn(
@@ -541,6 +549,17 @@ pub struct SkyUniverse {
     /// `upstream_structs: HashMap<String, ToyStruct>` mutex-mirror that
     /// duplicated this surface to handle cross-Sky-crate layouts (Case 6
     /// sharpening).
+    ///
+    /// **Why `Any` (post-2026-06-28 sidecar→cache migration audit, see
+    /// arch §F.7).** The type erasure is load-bearing for
+    /// stateless-callback access, not cross-version blob round-trip:
+    /// `monomorphize_type` (called from inside `layout_of` query
+    /// providers during codegen) cannot touch consumer state per
+    /// @GCMLZ §26.2's deadlock-avoidance discipline. The facade-owned
+    /// `SkyUniverse` is the only state-free read path; type erasure
+    /// keeps the facade consumer-agnostic. Migrating away would
+    /// require restructuring `monomorphize_type`'s call sites, which
+    /// would re-introduce the deadlock vector. Keep as-is.
     pub struct_infos: HashMap<String, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     // `discoveries` field retired 2026-06-21 along with A.2 / the
     // SkyUniverse-mediated synthesis path.
@@ -887,20 +906,32 @@ pub(crate) fn call_after_rust_analysis<'tcx>(tcx: TyCtxt<'tcx>) {
     (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx)
 }
 
-/// Call the consumer's on_sky_lib_loaded. Holds the mutable state mutex for
-/// the entire call. Per S.4 (course-correct.md quarter-of-work plan): the
-/// facade hands the consumer the raw sidecar bytes; the consumer deserializes.
-pub(crate) fn call_on_sky_lib_loaded<'tcx>(
+/// Sidecar→cache migration Step 4 (2026-06-29): the `call_on_sky_lib_loaded`
+/// dispatch retired alongside the sidecar emission. The cache is now the
+/// sole upstream metadata path; see `call_on_sky_lib_cache_loaded` below.
+///
+/// Call the consumer's `on_sky_lib_cache_loaded`. Fires once per
+/// upstream Sky-marked rlib whose adjacent `.sky-cache` file is present
+/// and well-formed.
+pub(crate) fn call_on_sky_lib_cache_loaded<'tcx>(
     tcx: TyCtxt<'tcx>,
     crate_name: &str,
-    sidecar_bytes: &[u8],
+    cache_bytes: &[u8],
+    cache_key_digest: &[u8; 16],
 ) {
     let c = CONFIG.get().expect("config not installed");
-    let func = c.stateful_vtable.on_sky_lib_loaded;
+    let func = c.stateful_vtable.on_sky_lib_cache_loaded;
     let callbacks_ptr: *const (dyn Any + Send + Sync) = &*c.callbacks;
     let mut g = MUTABLE_STATE.get().expect("state not installed").lock().unwrap();
     let state_ptr: *mut (dyn Any + Send + Sync) = &mut **g;
-    (func)(unsafe { &*callbacks_ptr }, unsafe { &mut *state_ptr }, tcx, crate_name, sidecar_bytes)
+    (func)(
+        unsafe { &*callbacks_ptr },
+        unsafe { &mut *state_ptr },
+        tcx,
+        crate_name,
+        cache_bytes,
+        cache_key_digest,
+    )
 }
 
 /// Call the consumer's consumer_fill_modules. Holds MUTABLE_STATE for the
@@ -1002,14 +1033,21 @@ fn trampoline_after_rust_analysis<'tcx, C: LangCallbacks + 'static>(
     data.downcast_ref::<C>().unwrap().after_rust_analysis(state, tcx)
 }
 
-fn trampoline_on_sky_lib_loaded<'tcx, C: LangCallbacks + 'static>(
+fn trampoline_on_sky_lib_cache_loaded<'tcx, C: LangCallbacks + 'static>(
     data: &(dyn Any + Send + Sync),
     state: &mut (dyn Any + Send + Sync),
     tcx: TyCtxt<'tcx>,
     crate_name: &str,
-    sidecar_bytes: &[u8],
+    cache_bytes: &[u8],
+    cache_key_digest: &[u8; 16],
 ) {
-    data.downcast_ref::<C>().unwrap().on_sky_lib_loaded(state, tcx, crate_name, sidecar_bytes)
+    data.downcast_ref::<C>().unwrap().on_sky_lib_cache_loaded(
+        state,
+        tcx,
+        crate_name,
+        cache_bytes,
+        cache_key_digest,
+    )
 }
 
 fn trampoline_consumer_fill_modules<'tcx, C: LangCallbacks + 'static>(
@@ -1036,7 +1074,7 @@ pub(crate) fn install_callbacks<C: LangCallbacks + 'static>(
             collect_generic_rust_deps: trampoline_collect_generic_rust_deps::<C>,
             // consumer_symbol_for_callback_name slot retired 2026-06-24 (Phase F).
             after_rust_analysis: trampoline_after_rust_analysis::<C>,
-            on_sky_lib_loaded: trampoline_on_sky_lib_loaded::<C>,
+            on_sky_lib_cache_loaded: trampoline_on_sky_lib_cache_loaded::<C>,
             consumer_fill_modules: trampoline_consumer_fill_modules::<C>,
         },
     });

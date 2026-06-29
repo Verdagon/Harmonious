@@ -4,10 +4,11 @@ extern crate rustc_driver;
 extern crate rustc_target;
 
 mod build;
+mod cache;
+mod cache_key;
 mod llvm_gen;
 mod manifest;
 mod oracle;
-mod sidecar;
 mod stub_gen;
 mod toylang;
 mod typeid;
@@ -94,6 +95,21 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
     );
 
     let exit_code = rustc_driver::catch_with_exit_code(|| {
+        // Sidecar→cache migration (2026-06-28, Step 1.5): the stub
+        // crate now has a `build.rs`, and cargo invokes the wrapper
+        // when compiling it. Skip toylang processing for build-script
+        // compiles — cargo sets `CARGO_CRATE_NAME=build_script_build`
+        // for these, and the input file is a plain `.rs`. Without
+        // this gate the wrapper tries to validate the planted
+        // toylang.toml's `.toylang` source against the build.rs file
+        // currently being compiled, producing a confusing
+        // "extern function not found" error.
+        let cargo_crate_name = std::env::var("CARGO_CRATE_NAME").unwrap_or_default();
+        if cargo_crate_name == "build_script_build" {
+            run_plain_rustc(&argv);
+            return;
+        }
+
         // Per @MRRIWMZ, this is read site 2 of toylang.toml. Build mode parses
         // it first to orchestrate cargo; wrapper mode re-parses it here to
         // locate the .toylang source, using the manifest as a single source of
@@ -162,7 +178,17 @@ fn run_wrapper_mode(mut argv: Vec<String>) {
         // than the literal `__lang_stubs`.
         let pkg_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
         let is_user_bin_compile = !pkg_name.starts_with("lang_stubs_");
-        run_toylang_compile(registry, argv.clone(), is_user_bin_compile);
+        // Sidecar→cache migration (2026-06-28): pass the manifest +
+        // source paths through to the callbacks struct so the
+        // producer-side cache write can hash them into the cache key's
+        // SkyTomlHash + LocalSourceHashes axes.
+        run_toylang_compile(
+            registry,
+            argv.clone(),
+            is_user_bin_compile,
+            manifest_path.clone(),
+            source_path.clone(),
+        );
     });
 
     std::process::exit(exit_code);
@@ -189,6 +215,8 @@ fn run_toylang_compile(
     registry: ToylangRegistry,
     mut args: Vec<String>,
     is_user_bin_compile: bool,
+    manifest_path: PathBuf,
+    source_path: PathBuf,
 ) {
     let has_functions = registry.functions.values().any(|f| f.body.is_some());
     if has_functions {
@@ -199,6 +227,10 @@ fn run_toylang_compile(
     let toylang_callbacks = toylang::callbacks_impl::ToylangCallbacks {
         registry: Arc::new(registry),
         is_user_bin_compile,
+        // Sidecar→cache migration (2026-06-28): paths threaded to the
+        // producer-side cache write site.
+        manifest_path,
+        source_path,
         // Tier 3 #7.4 + #8 retired `upstream_fn_names` / `upstream_type_names`
         // / `upstream_structs` — all three live in the facade's `SkyUniverse`
         // now (names + typeids in dedicated fields, full ToyStruct info as

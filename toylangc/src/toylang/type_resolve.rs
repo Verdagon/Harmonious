@@ -6,8 +6,6 @@
 use std::collections::HashMap;
 
 use super::ast::{Expr, Stmt};
-#[cfg(test)]
-use super::ast::Block;
 use super::registry::{ToylangRegistry, ToyFunction};
 use super::typed_ast::*;
 

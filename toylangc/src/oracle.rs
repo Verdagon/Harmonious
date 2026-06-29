@@ -1353,14 +1353,11 @@ pub fn build_opaque_args<'tcx>(
     args
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::toylang::typed_ast::ResolvedType;
-
-    // `contains_type_param_*` retired 2026-06-25 (two-enum split + sunny-karp):
-    // the helper itself retired (oracle queries no longer defer on Params).
-    // `unresolved_rust_type_is_deferred_only_for_deferred_context` retired
-    // same day: `DeferredTypeParam` variant gone; `is_deferred()` is now
-    // a vestigial `false` constant.
-}
+// `tests` mod retired 2026-06-25 (two-enum split + sunny-karp):
+//   - `contains_type_param_*` tests retired with the helper (oracle queries
+//     no longer defer on Params).
+//   - `unresolved_rust_type_is_deferred_only_for_deferred_context` retired
+//     same day: `DeferredTypeParam` variant gone; `is_deferred()` is now
+//     a vestigial `false` constant.
+// The mod itself was empty after retirement; deleted 2026-06-29 to clear
+// dead-code warnings.

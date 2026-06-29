@@ -23,10 +23,10 @@ pub struct ToyStruct {
 /// All Toylang definitions visible to the current compilation.
 ///
 /// `structs` and `functions` use `BTreeMap` rather than `HashMap` so iteration
-/// is deterministic — load-bearing for sidecar byte-equality
-/// (`docs/architecture/sidecar-format.md` "Determinism requirements"). The
-/// `serialize_sidecar` / `deserialize_sidecar` machinery in
-/// `crate::sidecar` round-trips this whole struct.
+/// is deterministic — load-bearing for cache byte-equality (Fence 2 /
+/// `cache_determinism::step_2_fence_2_cache_byte_determinism`). The
+/// `serialize_cache` / `deserialize_cache` machinery in `crate::cache`
+/// round-trips this whole struct.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToylangRegistry {
     pub structs: BTreeMap<String, ToyStruct>,

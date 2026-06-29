@@ -1444,16 +1444,19 @@ fn test_s4_sidecar_load_smoke() {
     let log = std::fs::read_to_string(&log_path)
         .unwrap_or_else(|e| panic!("callback log not written at {}: {}", log_path.display(), e));
 
-    // The Debug print of `OnSkyLibLoaded` looks like:
-    //   [compile=userbin] OnSkyLibLoaded { crate_name: "__lang_stubs", n_structs: 0, n_functions: N }
+    // Post-sidecar→cache-migration Step 4: the sidecar callback is
+    // retired; only the cache-load callback fires. The Debug print of
+    // the universe-load callback looks like:
+    //   [compile=userbin] OnSkyLibCacheLoaded { crate_name: "__lang_stubs", n_structs: 0, n_functions: N }
+    //
     // The `[compile=rlib]/[compile=userbin]` prefix is added by
     // callbacks_impl::consumer_fill_modules per §5.5 Round 2 V7/DQ-J.
     // `strip_compile_tag` removes it so the structured prefix match still works.
     let entry_line = log.lines().map(str::trim).map(strip_compile_tag).find(|line| {
-        line.starts_with("OnSkyLibLoaded { crate_name: \"__lang_stubs\"")
+        line.starts_with("OnSkyLibCacheLoaded { crate_name: \"__lang_stubs\"")
     }).unwrap_or_else(|| {
         panic!(
-            "expected OnSkyLibLoaded entry for `__lang_stubs` in callback log; \
+            "expected OnSkyLibCacheLoaded entry for `__lang_stubs` in callback log; \
              got:\n{}",
             log,
         )
@@ -1464,7 +1467,7 @@ fn test_s4_sidecar_load_smoke() {
     let n_fns: usize = {
         let key = "n_functions: ";
         let start = entry_line.find(key).unwrap_or_else(|| {
-            panic!("OnSkyLibLoaded entry missing `n_functions` field: {:?}", entry_line)
+            panic!("OnSkyLibCacheLoaded entry missing `n_functions` field: {:?}", entry_line)
         }) + key.len();
         let rest = &entry_line[start..];
         let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
@@ -1684,139 +1687,6 @@ fn test_phase2_const_u64_round_trip() {
     );
 }
 
-// ============================================================================
-// S.5 sidecar determinism CI invariant (course-correct.md quarter-of-work
-// plan, Workstream S final).
-//
-// Builds a fixture twice — wiping the target dir + the project's
-// `.toylang-build` between runs — and asserts the two produced
-// `.sky-meta` files are byte-identical. This is the architecture doc
-// §7.4 determinism invariant tested end-to-end. Sidecar S.2 already
-// has a unit-level `payload_determinism` test; this test guards the
-// FULL pipeline (typing pass output, `BTreeMap` iteration, bincode
-// fixed-int encoding, BLAKE3 checksum) against silent drift.
-//
-// Isolation: uses a dedicated `CARGO_TARGET_DIR` under
-// `target/s5-determinism-<run>/` so two consecutive builds don't share
-// cargo's fingerprint cache (which could mask a non-deterministic
-// pipeline by reusing cached output).
-//
-// If this test fails, the failure is structural — the test prints the
-// first byte index where the two outputs differ to give a starting
-// point for diagnosis. Common causes:
-//   - HashMap iteration order leaking into a structurally-walked field
-//     (BTreeMap is the standing guard; check that any new collections
-//     in `ToylangRegistry`/`ToyStruct`/`ToyFunction` are BTreeMap, not
-//     HashMap).
-//   - Bincode config drift (S.2 pins fixed-int + little-endian; any
-//     change to `bincode_cfg()` could introduce length-varying
-//     encoding that's input-dependent).
-//   - A new timestamp / random ID / host-path field added to a
-//     serialized type.
-// ============================================================================
-
-#[test]
-fn test_s5_sidecar_determinism() {
-    let project = projects_dir().join("arithmetic");
-    assert!(project.is_dir(), "fixture not found: {}", project.display());
-
-    // Per-run isolated target dirs so cargo's cross-run fingerprint cache
-    // can't mask non-determinism by reusing a prior `.sky-meta`. Cleaned
-    // up at function exit on a best-effort basis (test failure aborts
-    // before cleanup; the dir lives under `target/` and gets swept by
-    // `cargo clean`).
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-    let target_a = base.join("s5-determinism-a");
-    let target_b = base.join("s5-determinism-b");
-    for d in [&target_a, &target_b] {
-        if d.exists() {
-            std::fs::remove_dir_all(d).unwrap_or_else(|e| {
-                panic!("failed to wipe {}: {}", d.display(), e)
-            });
-        }
-    }
-
-    let build_once = |target_dir: &Path| -> Vec<u8> {
-        let build_dir = project.join(".toylang-build");
-        if build_dir.exists() {
-            std::fs::remove_dir_all(&build_dir).unwrap();
-        }
-        let build_out = {
-            let _guard = BUILD_LOCK.lock().expect("build lock poisoned");
-            Command::new(toylangc_bin())
-                .current_dir(&project)
-                .env("DYLD_LIBRARY_PATH", sysroot_lib())
-                .env("LD_LIBRARY_PATH", sysroot_lib())
-                .env("CARGO_TARGET_DIR", target_dir)
-                .args(["build"])
-                .output()
-                .expect("failed to spawn toylangc")
-        };
-        assert!(
-            build_out.status.success(),
-            "build failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&build_out.stdout),
-            String::from_utf8_lossy(&build_out.stderr),
-        );
-
-        // Locate the produced sidecar. S.3 writes it adjacent to the rlib
-        // at `target_dir/debug/deps/__lang_stubs-<hash>.sky-meta`. Exactly
-        // one such file is expected — the per-run target dir holds only
-        // this fixture's stubs.
-        let deps = target_dir.join("debug/deps");
-        let mut candidates: Vec<PathBuf> = std::fs::read_dir(&deps)
-            .unwrap_or_else(|e| panic!("read_dir {}: {}", deps.display(), e))
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("__lang_stubs-") && n.ends_with(".sky-meta"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        candidates.sort();
-        assert_eq!(
-            candidates.len(),
-            1,
-            "expected exactly one __lang_stubs-*.sky-meta in {}; found: {:?}",
-            deps.display(),
-            candidates,
-        );
-        std::fs::read(&candidates[0])
-            .unwrap_or_else(|e| panic!("read {}: {}", candidates[0].display(), e))
-    };
-
-    let bytes_a = build_once(&target_a);
-    let bytes_b = build_once(&target_b);
-
-    if bytes_a != bytes_b {
-        let mismatch_at = bytes_a
-            .iter()
-            .zip(bytes_b.iter())
-            .position(|(x, y)| x != y)
-            .unwrap_or_else(|| std::cmp::min(bytes_a.len(), bytes_b.len()));
-        panic!(
-            "sidecar determinism regression: build A produced {} bytes, \
-             build B produced {} bytes; first mismatch at byte {}.\n\
-             a[{}] = {:?}, b[{}] = {:?}\n\
-             See `test_s5_sidecar_determinism` comment for common causes.",
-            bytes_a.len(),
-            bytes_b.len(),
-            mismatch_at,
-            mismatch_at,
-            bytes_a.get(mismatch_at),
-            mismatch_at,
-            bytes_b.get(mismatch_at),
-        );
-    }
-
-    // Best-effort cleanup. Leaving these dirs around on test success is
-    // not catastrophic — next run wipes them — but keeping `target/`
-    // tidy avoids surprises.
-    let _ = std::fs::remove_dir_all(&target_a);
-    let _ = std::fs::remove_dir_all(&target_b);
-}
 
 // ============================================================================
 // Stage 5c.4 — layout probe tests. Each triggers `layout_of` for a
