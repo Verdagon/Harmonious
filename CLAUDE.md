@@ -98,3 +98,16 @@ Instead, use relative paths for cargo commands:
 ```
 cargo check --manifest-path ./FrontendRust/Cargo.toml --tests > ./tmp/slab15-build.txt 2>&1
 ```
+
+## SEE ALSO (auto)
+
+- **Read when investigating a compiler bug by tracing execution with debug printouts and narrowing the call graph.** → docs/skills/collapsed-call-tree.md
+- **Read when starting a new feature, to follow the gated discuss/plan/stub/test/implement sequence.** → docs/skills/feature-development-flow.md
+- **Read when the architect says the literal phrase "fire commit" (or you're about to commit + sync as a TL).** → docs/skills/fire-commit.md
+- **Read when the architect says the literal phrase "fire rebase".** → docs/skills/fire-rebase.md
+- **Read when reviewing or critiquing a plan for testing correctness before implementation.** → docs/skills/good-testing.md
+- **Read when acting as JR in a Guardian-gated loop.** → docs/skills/guardian-jr.md
+- **Read when a human tells you to ordain yourself or gives you the Guardian ordain password.** → docs/skills/guardian-ordain.md
+- **Read when acting as or setting up the architect, TL, or JR in a Guardian-gated loop.** → docs/skills/guardian-tl.md
+- **Read when adding a new skill to docs/skills/ or Luz/skills/.** → docs/skills/luz-add-skill.md
+- **Read when writing a plan that includes implementation work — every such plan needs an RFIGA list, defined here.** → docs/skills/tdd.md
